@@ -30,7 +30,7 @@ use crate::{
         dav_seal::resource_id,
         drain::{DrainOn, body, partstat_of, set_partstat},
         fanout::{CONTENT_TYPE, MKCALENDAR, NO_REPLY, Party, attendee_statuses, uid_copies},
-        mail::{Traced, TracedEvent, metadata_rows, row_is_stub},
+        mail::{Traced, TracedEvent, metadata_rows, row_is_stub, stored_blob},
         pinning::{pin, with_partstat},
         uid_lease::{self, put},
         user_permissions,
@@ -51,6 +51,7 @@ use common::za::{
 };
 use groupware::{calendar::ChangedBy, scheduling::ItipSummary};
 use hyper::{Method, StatusCode};
+use mail_parser::MessageParser;
 use serde_json::json;
 use std::{collections::HashSet, future::Future, time::Duration};
 use trc::{CalendarEvent, EventType, Key};
@@ -68,8 +69,10 @@ const NOPERM: &str = "imip-noperm@example.com";
 /// A key account whose setup is pending, so it serves no public key: not
 /// attempted (5.1).
 const PENDING: &str = "imip-pending@example.com";
-/// A local mailing list of `OUT_KEY2` and `OUT_PLAIN`: a mail recipient
-/// (Jay's decision 10).
+/// A local mailing list of `OUT_KEY2`: a mail recipient (Jay's decision 10).
+/// `OUT_PLAIN` is not a member (final review A-5): an attendee mailed both
+/// directly and through the list gets two overlapping deliveries, which
+/// upstream's ingest may both import (no lock on the UID).
 const LIST: &str = "imip-list@example.com";
 /// A key account granted `edit` on the owner's calendar `imip-shared`
 /// (release 4, D12).
@@ -120,7 +123,7 @@ pub async fn test(test: &mut TestServer) {
         .registry_create_object(MailingList {
             name: LIST.split_once('@').unwrap().0.to_string(),
             domain_id,
-            recipients: Map::new(vec![OUT_KEY2.to_string(), OUT_PLAIN.to_string()]),
+            recipients: Map::new(vec![OUT_KEY2.to_string()]),
             ..Default::default()
         })
         .await;
@@ -449,15 +452,16 @@ fn is_method_for(message: &SinkMessage, method: &str, uid: &str) -> bool {
         })
 }
 
-/// Spec 5.4, 5.6, invariant 41: Task 6's PUT now mails ATT, imip-out-plain and
-/// imip-list once each, with no task (the consumer held), no RSVP link; the plain
-/// attendee and the plain member import it; the key member's mail is sealed and its
-/// inbox gets no item (decision 10).
+/// Spec 5.4, 5.6, 8.2, invariant 41: Task 6's PUT now mails ATT, imip-out-plain
+/// and imip-list once each, with no task (the consumer held), no RSVP link; the
+/// plain attendee imports it from its one delivery, whose copy has no RSVP link;
+/// the key member's mail is sealed and its inbox gets no item (decision 10).
 async fn mailed_once(test: &TestServer, owner: &Party, key2: &Party, plain: &Account) {
     let plain_id = plain.id().document_id();
     sink().clear();
-    let (plain_mail, key2_rows, key2_items) = (
+    let (plain_mail, plain_rows, key2_rows, key2_items) = (
         mail_count(test, plain_id).await,
+        metadata_rows(test, plain_id).await,
         metadata_rows(test, key2.id).await,
         inbox_ids(test, key2.id).await,
     );
@@ -480,14 +484,36 @@ async fn mailed_once(test: &TestServer, owner: &Party, key2: &Party, plain: &Acc
     );
     assert_eq!(
         mail_count(test, plain_id).await,
-        plain_mail + 2,
-        "imip-out-plain is mailed directly and through the list"
+        plain_mail + 1,
+        "imip-out-plain is mailed once, directly"
     );
     assert_eq!(
         uid_copies(test, plain_id, "imip-out-1").await,
         1,
         "the plain attendee imports the invitation"
     );
+    // Spec 8.2 (final review C-10): the plain local attendee's delivered copy
+    // carries no RSVP link, in its HTML or its text.
+    let new_plain_rows = metadata_rows(test, plain_id)
+        .await
+        .into_iter()
+        .filter(|(id, _)| !plain_rows.iter().any(|(before, _)| before == id))
+        .collect::<Vec<_>>();
+    assert_eq!(new_plain_rows.len(), 1, "imip-out-plain's delivered copy");
+    let raw = stored_blob(test, &new_plain_rows[0].1.unarchive().unwrap().blob_hash()).await;
+    let delivered = MessageParser::new()
+        .parse(&raw)
+        .expect("the delivered copy parses");
+    for (part, text) in [
+        ("HTML", delivered.body_html(0)),
+        ("text", delivered.body_text(0)),
+    ] {
+        let text = text.unwrap_or_else(|| panic!("the delivered copy has no {part} part"));
+        assert!(
+            !text.contains("/calendar/rsvp"),
+            "an RSVP link in the {part} part of imip-out-plain's copy"
+        );
+    }
     // Decision 10: the key member's copy of the list's email is sealed, and
     // its inbox holds only the fan-out's internal item.
     let new_rows = metadata_rows(test, key2.id)

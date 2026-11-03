@@ -551,9 +551,10 @@ pub async fn test_scheduling(test: &mut TestServer) {
         response.headers
     );
     wait_for_delivery(test).await;
-    // iMIP spec 5.6, 8.5: the invitation reached plain once, without RSVP
-    // links; its ingest (upstream's) lists one notification and imports
-    // one copy.
+    // iMIP spec 5.6, 8.5: the invitation reached plain once; its ingest
+    // (upstream's) lists one notification and imports one copy. Its lack of
+    // RSVP links is read from a plain local attendee's delivered copy in
+    // `imip::outbound`'s `mailed_once` (final review C-10).
     assert_eq!(mail_count(test, plain_id).await, plain_mail + 1);
     assert_eq!(members(&plain_client, plain_inbox).await.len(), 1);
     assert_eq!(uid_copies(test, plain_id, "za-invite-1").await, 1);

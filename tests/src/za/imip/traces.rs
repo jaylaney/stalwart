@@ -330,13 +330,24 @@ fn is_itip(typ: EventType) -> bool {
     )
 }
 
+/// Whether the event is one of the fork's own (its `Details` is a fixed
+/// `zero-access:` string): never exempt, whatever span or type it carries
+/// (final review C-8), so a fork trace in a delivery's span that named the
+/// sender would fail.
+fn is_fork_event(event: &Captured) -> bool {
+    event
+        .string(Key::Details)
+        .is_some_and(|details| details.starts_with("zero-access:"))
+}
+
 /// The events that name `canary` and are not the SMTP layer's transit: those
 /// of a `PreCommit` window when `strict` (nothing may name an attendee before
 /// a write's commit, transit included), and those that are not an SMTP,
 /// delivery or queue event, nor an event of the span of one naming the
 /// canary, nor, in a `PostCommit` window and when `cache`, a cache lookup
 /// (the session's own RCPT lookups, upstream's `rcpt_resolve`, carry no span
-/// id). An `ItipMessage*` event is never exempt.
+/// id). An `ItipMessage*` event and one of the fork's own (`is_fork_event`)
+/// are never exempt.
 fn outside_transit<'a>(
     events: &'a [Captured],
     canary: &str,
@@ -354,6 +365,7 @@ fn outside_transit<'a>(
         .filter(|event| {
             (strict && event.window == Window::PreCommit)
                 || is_itip(event.typ)
+                || is_fork_event(event)
                 || !(is_transit(event.typ)
                     || event.span.is_some_and(|span| spans.contains(&span))
                     || (cache
@@ -363,9 +375,13 @@ fn outside_transit<'a>(
         .collect()
 }
 
-/// Upstream's own lookup of the sender's domain: the LMTP session evaluates
-/// `is_local_domain(sender_domain)` for the envelope's MAIL FROM
-/// (`domain()`, which traces the name), a span-less `Cache` event of the
+/// Upstream's own lookup of the sender's domain: the LMTP session's DATA
+/// stage evaluates the DKIM signing-domain default,
+/// `is_local_domain(sender_domain) && !is_empty(authenticated_as)`
+/// (`eval_signers` over `dkim.sign`, `crates/smtp/src/inbound/data.rs`
+/// about `:863-866`; the default in `crates/registry/src/schema/
+/// structs_impl.rs` about `:47749`), whose `is_local_domain` goes through
+/// `domain()`, which traces the name: a span-less `Cache` event of the
 /// session's transit that names the domain whoever the sender is.
 fn is_session_domain_lookup(event: &Captured) -> bool {
     matches!(
@@ -663,6 +679,12 @@ pub async fn test(test: &mut TestServer) {
             .any(|event| event.reason() == Some("EventNotFound")),
         "the unknown UID's CANCEL: {ours:#?}"
     );
+    // D17 (ledger 234): a refusal row carries `From`, redacted (checked for
+    // every iMIP event above).
+    assert!(
+        not_taken.iter().all(|event| event.has(Key::From)),
+        "From on the refusals: {not_taken:#?}"
+    );
     // Row: the size limit (account id, fixed details, Limit, Size). The
     // delivery's step 1 refused it, not the item writer (which has its own
     // size check and traces `ZA_IMIP_ITEM_REFUSED`).
@@ -673,6 +695,7 @@ pub async fn test(test: &mut TestServer) {
     assert!(!too_large.is_empty(), "the size refusal: {ours:#?}");
     for event in &too_large {
         assert_eq!(event.details(), Some(ZA_IMIP_TOO_LARGE), "{event:?}");
+        assert!(event.has(Key::From), "From on the size row: {event:?}");
         assert_eq!(event.uint(Key::Limit), Some(limit as u64), "{event:?}");
         assert!(
             event
@@ -823,8 +846,9 @@ pub async fn test(test: &mut TestServer) {
     // (`account_id_from_email`) emits a `Cache` event keyed by the sender's
     // domain, so the domain label is a canary; the traced lookup of a local
     // sender also emits events keyed by its local part. Upstream's session
-    // itself looks the sender's domain up once per message (the MAIL FROM's
-    // `is_local_domain`), the one exemption: exactly one such span-less
+    // itself looks the sender's domain up once per message (the DATA stage's
+    // DKIM signing-domain default, `is_session_domain_lookup`), the one
+    // exemption: exactly one such span-less
     // `Cache` event per delivery from the sender's domain, none in any other
     // step (the drains included), so a second lookup of the sender, the
     // fork's, shows as a second event in its delivery step or one in a drain

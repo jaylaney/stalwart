@@ -35,7 +35,9 @@
 //! cases (the SEQUENCE reconciliation, the `SENT-BY` scrub, a failed
 //! submission) are not exercised.
 
-use super::{ATT, ORG, add_contact, delete_contact, deliver, event, itip_mail};
+use super::{
+    ATT, ORG, add_contact, delete_contact, deliver, event, itip_mail, rcpt_throttles, set_throttles,
+};
 use crate::{
     utils::{
         account::Account,
@@ -56,15 +58,10 @@ use crate::{
         user_permissions,
     },
 };
-use ::registry::schema::{
-    enums::MtaInboundThrottleKey,
-    prelude::{ObjectType, Property},
-    structs::{CalendarScheduling, MtaInboundThrottle},
-};
+use ::registry::schema::{prelude::Property, structs::CalendarScheduling};
 use calcard::icalendar::ICalendar;
 use groupware::calendar::EVENT_NOTIFICATION_ZA_PENDING;
 use hyper::{Method, StatusCode};
-use serde_json::json;
 use std::fmt;
 use types::id::Id;
 
@@ -660,12 +657,16 @@ async fn compare(
         "{label}: the exchange's items"
     );
 
-    // The stored event, each read with a DAV GET.
+    // The stored event, each read with a DAV GET, and where it lives: the
+    // calendar and the resource name (spec 3.3 item 2 maps the hrefs; an
+    // imported name is a placeholder, item 3).
     if key_present {
         let mut stored = Vec::new();
+        let mut hrefs = Vec::new();
         for party in [plain, key] {
             let href = copy_href(test, party.id, uid).await;
             stored.push(body(&party.client, &href).await);
+            hrefs.push(href);
         }
         tally.same(
             "stored event",
@@ -673,6 +674,7 @@ async fn compare(
             Some(&stored[0]),
             Some(&stored[1]),
         );
+        tally.same("stored href", Kind::Body, Some(&hrefs[0]), Some(&hrefs[1]));
         // What the exchange says it holds, on both sides.
         for (party, body) in [plain, key].into_iter().zip(&stored) {
             let unfolded = body.replace("\r\n ", "");
@@ -847,39 +849,6 @@ async fn set_http_rsvp(admin: &Account, enable: bool) -> bool {
         .await;
     admin.reload_settings().await;
     prior
-}
-
-/// The enabled inbound throttles keyed by recipient (upstream's default
-/// "Sender address to recipient throttle" among them), as `imip::inbound`
-/// reads them.
-async fn rcpt_throttles(admin: &Account) -> Vec<Id> {
-    admin
-        .registry_get_all::<MtaInboundThrottle>()
-        .await
-        .into_iter()
-        .filter(|(_, throttle)| {
-            throttle.enable
-                && throttle
-                    .key
-                    .iter()
-                    .any(|key| *key == MtaInboundThrottleKey::Rcpt)
-        })
-        .map(|(id, _)| id)
-        .collect()
-}
-
-/// Enables or disables the throttles `ids`, then reloads the settings.
-async fn set_throttles(admin: &Account, ids: &[Id], enable: bool) {
-    for id in ids {
-        admin
-            .registry_update_object(
-                ObjectType::MtaInboundThrottle,
-                *id,
-                json!({ "enable": enable }),
-            )
-            .await;
-    }
-    admin.reload_settings().await;
 }
 
 /// The oracle must not be blind (spec 3.4): each normalization equates what
@@ -1132,4 +1101,39 @@ fn self_check() {
     );
     assert_eq!(raw_header(&message, "Subject").as_deref(), Some("top"));
     assert_eq!(raw_header(&message, "Reply-To"), None);
+
+    // `mail_parts`' kind for the iCalendar part (ledger 222): a CANCEL's is
+    // read as a stored copy (item 4 applies), a REQUEST's or REPLY's
+    // strictly, so a fork status in either still fails.
+    let itip = |method: &str| SinkMessage {
+        mail_from: KEY.to_string(),
+        rcpt_to: vec![ATT.to_string()],
+        data: format!(
+            concat!(
+                "From: <{key}>\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n",
+                "--x\r\nContent-Type: text/calendar; method={method}; charset=utf-8\r\n\r\n",
+                "BEGIN:VCALENDAR\r\nMETHOD:{method}\r\nEND:VCALENDAR\r\n--x--\r\n"
+            ),
+            key = KEY,
+            method = method
+        )
+        .into_bytes(),
+    };
+    for (method, kind) in [
+        ("CANCEL", Kind::IcsCopy),
+        ("REQUEST", Kind::Ics),
+        ("REPLY", Kind::Ics),
+    ] {
+        let message = itip(method);
+        let parts = mail_parts(&message);
+        let (_, got, value) = parts
+            .iter()
+            .find(|(part, ..)| *part == "Ics")
+            .expect("an iCalendar part");
+        assert_eq!(
+            (*got, value.is_some()),
+            (kind, true),
+            "the iCalendar part of a {method}"
+        );
+    }
 }

@@ -84,12 +84,12 @@ use crate::{
         webdav::DummyWebDavClient,
         za::{
             Conn, IDS_ONLY_DOCUMENT, InboxItem, PlantedItem, copy_href, destroy_inbox_item,
-            envelope_wrap, expire_and_purge_blobs, hold_index_partition, hold_task_consumer,
-            inbox_ids, inbox_items, internal_search, itip_tasks_for, mail_borne_items,
-            new_inbox_items, open_pending_item_as, pending_ids, pin_record, plain_dav_container,
-            plant_container, plant_event, plant_inbox_item, plant_plain_message,
-            plant_sealed_event, queued_recipients, release_index_partition, substitute_public_key,
-            trigger_drain, wait_for_delivery, wait_for_queue, za_unlock,
+            envelope_wrap, hold_index_partition, hold_task_consumer, inbox_ids, inbox_items,
+            internal_search, itip_tasks_for, mail_borne_items, new_inbox_items,
+            open_pending_item_as, pending_ids, pin_record, plain_dav_container, plant_container,
+            plant_event, plant_inbox_item, plant_plain_message, plant_sealed_event,
+            queued_recipients, release_index_partition, substitute_public_key, trigger_drain,
+            wait_for_delivery, wait_for_queue, za_unlock,
         },
     },
     za::drain::{DrainOn, body, set_partstat},
@@ -1935,12 +1935,13 @@ fn mail_canary_message(n: u32) -> String {
 
 /// iMIP spec 8.5: once the outbound mail is at the sink, its queue blobs
 /// (which hold the canaries) are purged before a scan. While the task
-/// consumer is held the scheduler's purge task cannot run, so these are
-/// `expire_and_purge_blobs`'s two steps run in place: every temporary link
-/// expired, then the purge.
+/// consumer is held the scheduler's purge task cannot run, so the purge
+/// runs in place. No temporary link is expired first (final review C-1): a
+/// delivered queue message's blob is unlinked and goes with the purge alone,
+/// while a blob held only by a temporary link stays for the scan's
+/// temporary-link check (mail spec 11) and its canary search.
 async fn sink_and_purge_held(test: &TestServer) {
     wait_for_queue(test).await;
-    test.blob_expire_all().await;
     purge_blobs(test).await;
 }
 
@@ -2825,8 +2826,9 @@ pub async fn test_imip(test: &mut TestServer) {
 
     // Purge the queue's blobs (they hold the canaries until then), then the
     // rows: no address (a principal id or the empty address), no decoded
-    // row with the sender canary.
-    expire_and_purge_blobs(test, &admin).await;
+    // row with the sender canary. The purge alone, no temporary link expired
+    // (final review C-1; spec 8.4's erratum in the plan 15 outcome note).
+    purge_blobs(test).await;
     let rows = all_inbox_items(test, &[key.id, key2.id]).await;
     assert!(
         rows.len() >= 4,
@@ -3251,9 +3253,11 @@ pub async fn test(test: &mut TestServer) {
     )
     .await;
 
-    // iMIP spec 8.5: every email sunk and the queue blobs purged first.
+    // iMIP spec 8.5: every email sunk and the queue blobs purged first, by
+    // the purge alone (final review C-1: a blob held by a temporary link
+    // stays for the scan).
     wait_for_queue(test).await;
-    expire_and_purge_blobs(test, test.account("admin@example.com")).await;
+    purge_blobs(test).await;
     let result = scan(test, id).await;
     println!(
         "Leak scan: {} records, {} archives, {} blobs, {} search index records ({} of the account, none calendar), {} events, {} calendars, {} items, {} emails",

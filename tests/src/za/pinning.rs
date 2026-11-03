@@ -16,6 +16,7 @@ use super::{
         CONTENT_TYPE, MKCALENDAR, NO_REPLY, Party, START_A, START_B, attendee_statuses, invite,
         uid_copies,
     },
+    user_permissions,
 };
 use crate::utils::{
     http::HttpRequest,
@@ -23,10 +24,10 @@ use crate::utils::{
     smtp_sink::sink,
     webdav::DummyWebDavClient,
     za::{
-        HookParked, VaultReply, copy_href, inbox_ids, item_method, item_partstat, new_inbox_items,
-        open_pending_item_as, pending_ids, pin_record, raw_pins, restore_wrap, rewrap_legacy,
-        saved_wrap, set_raw_pins, substitute_public_key, trigger_drain, vault_revision,
-        wait_for_queue, wrap_mark, write_pin_record, writer_key, za_post, za_unpin,
+        HookParked, VaultReply, copy_href, inbox_ids, item_method, item_partstat, mail_count,
+        new_inbox_items, open_pending_item_as, pending_ids, pin_record, raw_pins, restore_wrap,
+        rewrap_legacy, saved_wrap, set_raw_pins, substitute_public_key, trigger_drain,
+        vault_revision, wait_for_queue, wrap_mark, write_pin_record, writer_key, za_post, za_unpin,
     },
 };
 use ::registry::{
@@ -101,6 +102,8 @@ pub async fn test(test: &mut TestServer) {
     pr_4_rotation_identity_and_failed_cleanup(test).await;
     pr_5_ordinary_put_replies_per_local_address(test).await;
     pr_6_untokened_address(test).await;
+    c9_redelivery_stays_internal(test).await;
+    a2_remapped_pin_withholds_mail(test).await;
 }
 
 /// Spec 9 case 1: alice, who never pinned, invites bob. The fan-out pins
@@ -3945,6 +3948,182 @@ async fn pr_6_untokened_address(test: &TestServer) {
     clear_recipient(test, &bob, &bob_start, "pin-pr6a").await;
     clear_recipient(test, &bob, &bob_start, "pin-pr6b").await;
     bob_alias(test, false).await;
+}
+
+/// iMIP spec 5.5, D15 (final review C-9): `contacts/pin`'s redelivery is a
+/// key-recipient mechanism (its fan-out runs `internal_only`). alice holds a
+/// withheld entry for `BOB_ALIAS`; her `contacts/pin` for it (pinning bob's
+/// key, which `BOB_ALIAS` still serves) is parked in its drain, importing
+/// carol's invitation, while bob loses the address. The redelivery then
+/// finds the address of the mail class: not attempted (`5.3`), so the entry
+/// is dropped. Were it to attempt the mail class, the address alice just
+/// pinned would be withheld (`3.8`, ruling A-2) and the entry would stay.
+async fn c9_redelivery_stays_internal(test: &TestServer) {
+    const UID: &str = "pin-c9";
+    const CAROL_UID: &str = "pin-c9-carol";
+    let (alice, bob, carol) = parties(test);
+    let (alice_start, bob_start, carol_start) = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+        inbox_ids(test, carol.id).await,
+    );
+    bob_alias(test, true).await;
+    let (path, original, _) = refuse_once_at(test, &alice, &bob, BOB_ALIAS, UID).await;
+    substitute_public_key(test, bob.id, &original, true).await;
+    assert_eq!(withheld(test, alice.id, BOB_ALIAS).await.len(), 1);
+    // carol's invitation waits in alice's inbox, for the pin's drain.
+    let carol_path = event_path(&carol, CAROL_UID);
+    carol
+        .client
+        .request_with_headers(
+            "PUT",
+            &carol_path,
+            [CONTENT_TYPE],
+            invite_from(CAROL, CAROL_UID, START_A, &[ALICE]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(pending_ids(test, alice.id).await.len(), 1);
+    let fingerprint = display_fingerprint(&served(test, bob.id).await);
+    let parked = HookParked::start(
+        alice.id,
+        test_hooks::set_drain_lookup_pause,
+        pin_request(ALICE, BOB_ALIAS, &fingerprint),
+    )
+    .await;
+    bob_alias(test, false).await;
+    assert_eq!(
+        parked.finish().await.expect(200),
+        json!({"ok": true, "delivered": 0, "failed": 0, "dropped": 1, "remaining": 0}),
+        "the redelivery attempted the mail class"
+    );
+    assert!(withheld(test, alice.id, BOB_ALIAS).await.is_empty());
+
+    // Cleanup: the events (no CANCEL), alice's copy of carol's, the items.
+    delete_event(&alice, &path).await;
+    delete_event(&carol, &carol_path).await;
+    clear_recipient(test, &alice, &alice_start, CAROL_UID).await;
+    clear_recipient(test, &bob, &bob_start, UID).await;
+    carol.delete_items_since(test, &carol_start).await;
+}
+
+/// Final review ruling A-2 (fail closed; spec 5.2's amendment pending Jay's
+/// confirmation): alice invites bob at `BOB_ALIAS`, which pins bob's key
+/// for that address. The address then moves to a plain account (bob loses
+/// it, a plain account gets it as an alias), as an operator's remap would.
+/// alice's next edit records `3.8` for it and mails nothing; after alice
+/// forgets the pin, her next edit mails the plain account (`1.1`).
+async fn a2_remapped_pin_withholds_mail(test: &TestServer) {
+    const UID: &str = "pin-a2";
+    const PLAIN: &str = "pin-remap-plain@example.com";
+    let (alice, bob, _) = parties(test);
+    let (alice_start, bob_start) = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+    );
+    bob_alias(test, true).await;
+    let path = event_path(&alice, UID);
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            invite_from(ALICE, UID, START_A, &[BOB_ALIAS]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        attendee_statuses(&alice.client, &path, BOB_ALIAS).await,
+        ["1.2"]
+    );
+    assert!(
+        pin_record(test, alice.id, STRONG)
+            .await
+            .is_some_and(|record| record.pin(BOB_ALIAS).is_some()),
+        "the invitation pinned the address"
+    );
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+
+    // The remap.
+    bob_alias(test, false).await;
+    let admin = test.account("admin@example.com").clone();
+    let plain = admin
+        .create_user_account(
+            PLAIN,
+            STRONG,
+            "pin remap plain",
+            &[BOB_ALIAS],
+            user_permissions(),
+        )
+        .await;
+    let plain_id = plain.id().document_id();
+    assert_eq!(
+        test.server
+            .za_account_id_from_email(BOB_ALIAS)
+            .await
+            .unwrap(),
+        Some(plain_id),
+        "the address resolves to the plain account"
+    );
+    let mails = mail_count(test, plain_id).await;
+    let edit = |version: &'static str| {
+        let path = path.clone();
+        let client = &alice.client;
+        async move {
+            let edited = body(client, &path).await.replace(
+                &format!("fo-title {UID}"),
+                &format!("fo-title {UID} {version}"),
+            );
+            put_raw(ALICE, &path, edited).await
+        }
+    };
+    assert_eq!(edit("v2").await, 204);
+    assert_eq!(
+        attendee_statuses(&alice.client, &path, BOB_ALIAS).await,
+        ["3.8"],
+        "the remapped pinned address"
+    );
+    wait_for_queue(test).await;
+    assert_eq!(
+        mail_count(test, plain_id).await,
+        mails,
+        "the remapped pinned address was mailed"
+    );
+    assert!(
+        pin_record(test, alice.id, STRONG)
+            .await
+            .is_some_and(|record| record.pin(BOB_ALIAS).is_some()
+                && record
+                    .withheld
+                    .iter()
+                    .all(|entry| entry.address != BOB_ALIAS)),
+        "the pin record is unchanged: the pin stands, no entry"
+    );
+
+    // Forgotten, the address is of the mail class like any other.
+    assert_eq!(
+        forget(ALICE, Some(BOB_ALIAS)).await.expect(200),
+        json!({"ok": true})
+    );
+    assert_eq!(edit("v3").await, 204);
+    assert_eq!(
+        attendee_statuses(&alice.client, &path, BOB_ALIAS).await,
+        ["1.1"]
+    );
+    wait_for_queue(test).await;
+    assert_eq!(
+        mail_count(test, plain_id).await,
+        mails + 1,
+        "the forgotten address was not mailed"
+    );
+
+    // Cleanup: the event (no CANCEL), bob's copy and items, the plain account.
+    delete_event(&alice, &path).await;
+    alice.delete_items_since(test, &alice_start).await;
+    clear_recipient(test, &bob, &bob_start, UID).await;
+    admin.destroy_account(plain).await;
+    test.wait_for_tasks().await;
 }
 
 /// Reseals the account's event at `href` (unchanged plaintext) with only the

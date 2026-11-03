@@ -17,18 +17,23 @@ use crate::utils::{
 };
 use ::registry::{
     schema::{
-        enums::MtaProtocol,
-        prelude::Property,
-        structs::{Expression, ExpressionMatch, MtaOutboundStrategy, MtaRoute, MtaRouteRelay},
+        enums::{MtaInboundThrottleKey, MtaProtocol},
+        prelude::{ObjectType, Property},
+        structs::{
+            Expression, ExpressionMatch, MtaInboundThrottle, MtaOutboundStrategy, MtaRoute,
+            MtaRouteRelay,
+        },
     },
     types::list::List,
 };
 use common::Server;
 use hyper::StatusCode;
+use serde_json::json;
 use std::{
     net::Ipv4Addr,
     time::{Duration, Instant},
 };
+use types::id::Id;
 
 pub mod inbound;
 pub mod oracle;
@@ -160,6 +165,40 @@ pub fn is_request_for(message: &SinkMessage, uid: &str) -> bool {
                 .lines()
                 .any(|line| line.trim_end() == uid_line)
         })
+}
+
+/// The enabled inbound throttles keyed by recipient (upstream's default
+/// "Sender address to recipient throttle" among them, 25 messages an hour
+/// per sender domain and recipient), for the modules that mail one
+/// recipient more often (`imip::inbound`, `imip::oracle`).
+pub async fn rcpt_throttles(admin: &Account) -> Vec<Id> {
+    admin
+        .registry_get_all::<MtaInboundThrottle>()
+        .await
+        .into_iter()
+        .filter(|(_, throttle)| {
+            throttle.enable
+                && throttle
+                    .key
+                    .iter()
+                    .any(|key| *key == MtaInboundThrottleKey::Rcpt)
+        })
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Enables or disables the throttles `ids`, then reloads the settings.
+pub async fn set_throttles(admin: &Account, ids: &[Id], enable: bool) {
+    for id in ids {
+        admin
+            .registry_update_object(
+                ObjectType::MtaInboundThrottle,
+                *id,
+                json!({ "enable": enable }),
+            )
+            .await;
+    }
+    admin.reload_settings().await;
 }
 
 /// Deletes the ContactCard whose href `add_contact` returned.

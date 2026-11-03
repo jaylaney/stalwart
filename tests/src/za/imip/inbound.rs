@@ -13,7 +13,7 @@
 
 use super::{
     ATT, DELEGATE, NODMARC, ORG, STRANGER, add_contact, delete_contact, deliver, event,
-    is_request_for, itip_mail, with_method,
+    is_request_for, itip_mail, rcpt_throttles, set_throttles, with_method,
 };
 use crate::{
     utils::{
@@ -26,7 +26,7 @@ use crate::{
             InboxItem, copy_href, envelope_wrap, inbox_ids, inbox_items, item_method,
             item_partstat, mail_borne_items, mail_count, new_inbox_items, open_pending_item_as,
             pending_ids, schedule_statuses, trigger_drain, wait_for_delivery, wait_for_queue,
-            za_unlock,
+            za_setup, za_setup_token, za_unlock,
         },
     },
     za::{
@@ -37,9 +37,6 @@ use crate::{
         uid_lease::put,
         user_permissions,
     },
-};
-use ::registry::schema::{
-    enums::MtaInboundThrottleKey, prelude::ObjectType, structs::MtaInboundThrottle,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use calcard::icalendar::{ICalendar, ICalendarComponentType, ICalendarMethod, ICalendarProperty};
@@ -57,8 +54,6 @@ use groupware::calendar::{
 };
 use hyper::StatusCode;
 use mail_parser::MessageParser;
-use serde_json::json;
-use types::id::Id;
 
 /// The key attendee of this module's cases.
 pub const KEY: &str = "imip-key@example.com";
@@ -106,6 +101,9 @@ pub async fn test(test: &mut TestServer) {
     drained_request_and_merges(test, &key).await;
     replies(test, &key).await;
     contact_deleted_before_drain(test, &key).await;
+    event_deleted_before_drain(test, &key).await;
+    sender_not_organizer(test, &key).await;
+    sender_provisioned_before_drain(test, &key).await;
     refresh_answer(test, &key).await;
     outside_delegation(test, &key, &key2).await;
     pairs_untouched_by_mail(test, &key, &key2).await;
@@ -124,38 +122,6 @@ pub async fn test(test: &mut TestServer) {
     )
     .await;
     set_throttles(&admin, &throttles, true).await;
-}
-
-/// The enabled inbound throttles keyed by recipient (upstream's default
-/// "Sender address to recipient throttle" among them).
-async fn rcpt_throttles(admin: &Account) -> Vec<Id> {
-    admin
-        .registry_get_all::<MtaInboundThrottle>()
-        .await
-        .into_iter()
-        .filter(|(_, throttle)| {
-            throttle.enable
-                && throttle
-                    .key
-                    .iter()
-                    .any(|key| *key == MtaInboundThrottleKey::Rcpt)
-        })
-        .map(|(id, _)| id)
-        .collect()
-}
-
-/// Enables or disables the throttles `ids`, then reloads the settings.
-async fn set_throttles(admin: &Account, ids: &[Id], enable: bool) {
-    for id in ids {
-        admin
-            .registry_update_object(
-                ObjectType::MtaInboundThrottle,
-                *id,
-                json!({ "enable": enable }),
-            )
-            .await;
-    }
-    admin.reload_settings().await;
 }
 
 /// Spec 4.1, 4.2, 8.2: an outside REQUEST gives one pending item beside the sealed mail.
@@ -509,6 +475,9 @@ const DRAIN_UIDS: &[&str] = &[
     "imip-in-d3",
     "imip-in-r",
     "imip-in-d2",
+    "imip-in-gone",
+    "imip-in-fwd",
+    "imip-in-prov",
     "imip-in-dl",
     "imip-in-p",
     "imip-in-sd",
@@ -778,6 +747,32 @@ async fn replies(test: &TestServer, key: &Party) {
         Some("TENTATIVE")
     );
 
+    // D7 (final review C-4, ledger 143): the same REPLY again, a duplicate
+    // without REQUEST-STATUS, for which upstream's merge has no action (spec
+    // 4.6): the drain deletes the item (`NothingToMerge`), the event unchanged.
+    let tag = etag(&key.client, &href).await;
+    let before = inbox_ids(test, key.id).await;
+    mail_in(
+        test,
+        ATT,
+        key.name,
+        "REPLY",
+        &reply_ics(uid, key.name, 0, &[(ATT, "TENTATIVE")]),
+    )
+    .await;
+    let items = new_inbox_items(test, key.id, &before).await;
+    assert_eq!(items.len(), 1, "the duplicate REPLY took an item");
+    drain(key).await;
+    assert!(
+        !inbox_ids(test, key.id).await.contains(&items[0].0),
+        "the duplicate REPLY's item outlived the drain's NothingToMerge"
+    );
+    assert_eq!(
+        etag(&key.client, &href).await,
+        tag,
+        "the duplicate REPLY changed the event"
+    );
+
     // 4.6: a non-participant's REPLY takes a pending slot, then the drain
     // rejects and deletes it; the event is unchanged.
     let tag = etag(&key.client, &href).await;
@@ -856,6 +851,145 @@ async fn contact_deleted_before_drain(test: &TestServer, key: &Party) {
         !inbox_ids(test, key.id).await.contains(&items[0].0),
         "the item outlived the drain's AutoAddDisabled"
     );
+}
+
+/// D7 (final review C-4, ledger 143): ATT's REPLY to the key organizer's
+/// event, delivered while the drain is skipped; the event is then deleted
+/// without a CANCEL before any drain, whose lookup finds no event
+/// (`EventNotFound`): the item is deleted, as upstream's ingest would have
+/// left no inbox item.
+async fn event_deleted_before_drain(test: &TestServer, key: &Party) {
+    let uid = "imip-in-gone";
+    let href = own_href(key, uid);
+    assert_eq!(
+        put(
+            key.name,
+            STRONG,
+            href.clone(),
+            event(uid, key.name, &[ATT], 0, "")
+        )
+        .await,
+        201
+    );
+    let before = inbox_ids(test, key.id).await;
+    mail_in(
+        test,
+        ATT,
+        key.name,
+        "REPLY",
+        &reply_ics(uid, key.name, 0, &[(ATT, "ACCEPTED")]),
+    )
+    .await;
+    let items = new_inbox_items(test, key.id, &before).await;
+    assert_eq!(items.len(), 1, "the REPLY took an item");
+    delete_quietly(&key.client, &href).await;
+
+    let _drain = DrainOn::new();
+    drain(key).await;
+    assert_eq!(uid_copies(test, key.id, uid).await, 0, "a copy came back");
+    assert!(
+        !inbox_ids(test, key.id).await.contains(&items[0].0),
+        "the item outlived the drain's EventNotFound"
+    );
+}
+
+/// Spec 3.2 item 3, 4.1 step 2, 4.4 (final review C-3): a REQUEST whose
+/// sender (ORG, a ContactCard) is not its ORGANIZER, a forwarded invitation
+/// for a new UID, is refused at delivery as upstream refuses it
+/// (`SenderIsNotOrganizer`), and a drain imports nothing.
+async fn sender_not_organizer(test: &TestServer, key: &Party) {
+    let uid = "imip-in-fwd";
+    let before = inbox_ids(test, key.id).await;
+    mail_in(
+        test,
+        ORG,
+        key.name,
+        "REQUEST",
+        &event(uid, STRANGER, &[key.name], 0, ""),
+    )
+    .await;
+    assert_eq!(
+        inbox_ids(test, key.id).await,
+        before,
+        "the forwarded REQUEST took an item"
+    );
+    let _drain = DrainOn::new();
+    drain(key).await;
+    assert_eq!(
+        uid_copies(test, key.id, uid).await,
+        0,
+        "the forwarded REQUEST was imported"
+    );
+}
+
+/// Spec 4.4, invariant 44 (final review C-2): the drain repeats delivery's
+/// key-account sender refusal. A passwordless account, not yet given a setup
+/// token (from its token on, as `imip::outbound`'s `imip-pending`, it counts
+/// as a key account and delivery would refuse it), mails imip-key a REQUEST
+/// over LMTP (it holds no password to submit with): delivery writes the item,
+/// the sender being a plain local principal. The sender then gets its setup
+/// token and is provisioned, and imip-key's drain deletes the item and
+/// imports nothing.
+async fn sender_provisioned_before_drain(test: &TestServer, key: &Party) {
+    const SENDER: &str = "imip-provisioned@example.com";
+    let uid = "imip-in-prov";
+    let admin = test.account("admin@example.com").clone();
+    let sender = admin
+        .create_passwordless_user_account(
+            SENDER,
+            STRONG,
+            "iMIP provisioned",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    assert!(
+        !test
+            .server
+            .za_is_key_account(sender.id().document_id())
+            .await
+            .unwrap(),
+        "the sender is a plain principal at delivery"
+    );
+    let before = inbox_ids(test, key.id).await;
+    deliver(
+        "dmarc-provisioned@remote.test",
+        key.name,
+        &itip_mail(
+            SENDER,
+            key.name,
+            "REQUEST",
+            &event(uid, SENDER, &[key.name], 0, ""),
+        ),
+    )
+    .await;
+    wait_for_queue(test).await;
+    let items = new_inbox_items(test, key.id, &before).await;
+    assert_eq!(items.len(), 1, "the plain local sender's item");
+    let (_, carriers) = open_pending_item_as(test, key.id, STRONG, items[0].0).await;
+    assert_eq!(carriers.sender.as_deref(), Some(SENDER));
+
+    let token = za_setup_token(&admin, SENDER).await;
+    za_setup(SENDER, &token, STRONG).await;
+    assert!(
+        test.server
+            .za_is_key_account(sender.id().document_id())
+            .await
+            .unwrap(),
+        "the sender is a key account"
+    );
+    let _drain = DrainOn::new();
+    drain(key).await;
+    assert_eq!(
+        uid_copies(test, key.id, uid).await,
+        0,
+        "the provisioned sender's invitation was imported"
+    );
+    assert!(
+        !inbox_ids(test, key.id).await.contains(&items[0].0),
+        "the item outlived the drain's key-account sender refusal"
+    );
+    admin.destroy_account(sender).await;
 }
 
 /// D14: a REFRESH is answered by mail, after the item's deletion.
