@@ -9996,11 +9996,12 @@ enrolment (new keys, so contacts pin afresh). Keep the pre-cutover store snapsho
 - Ruling 102: a key account reaches its quota sooner, by about 485 bytes per sealed event
   and 491 per calendar.
 
-**Pending gates and authorizations.**
-- Dispatching `product-build.yml` for the exact-source Linux build.
-- Running the native client checklist against that build.
-- The optional clean-context Fable review of the whole branch.
-- Opening the pull request.
+**Pending gates and authorizations** (status on 2026-11-02).
+- The exact-source Linux build: done. The tag `fork-v0.2.0-beta.1` ran `product-build.yml`
+  (run 41485088188), and the build was published as the prerelease `release-0.2.0-beta-1`.
+- The native client checklist: passed on the deployed `fork-v0.2.0-beta.1` build, per Jay.
+- The optional clean-context Fable review of the whole branch: pending.
+- The pull request: PR #69, merged.
 
 ### PR review fixes
 
