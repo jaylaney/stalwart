@@ -61,8 +61,10 @@ fn instance() -> Arc<ServerInstance> {
 /// Upstream's composer for one (message, recipient): the setup with the
 /// sender's domain (as `send_imip` derives it), the per-message step with
 /// the quiet sender lookup (D17), and the per-recipient submission with RSVP
-/// links off and the session's redaction flag on (D12). The SMTP response
-/// text is not kept: only its stage and reply code.
+/// links off and the session's redaction flag on (D12), which also exempts
+/// the session from the inbound rate limiters (PR review ruling O-1: a 4xx
+/// there is never retried). The SMTP response text is not kept: only its
+/// stage and reply code.
 async fn submit_one(server: &Server, mail: ZaImipMail) -> ZaImipOutcome {
     let ZaImipMail {
         account_id,

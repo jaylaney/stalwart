@@ -229,7 +229,9 @@ pub(crate) struct ImipComposer<'x> {
 
 /// The per-recipient options: `rsvp` personalizes the body with the RSVP
 /// block (`ItipTemplate::set_recipient`), `za_redact` sets the session's
-/// `SessionData::za_key_rcpt` (iMIP spec D12), `session_id` is the local
+/// `SessionData::za_key_rcpt` (iMIP spec D12) and `za_imip_submission` (PR
+/// review ruling O-1: the release 5 submitter's session skips the inbound
+/// rate limiters; upstream's task passes `false`), `session_id` is the local
 /// session's id.
 pub(crate) struct ImipSubmitOptions {
     pub(crate) rsvp: bool,
@@ -441,6 +443,7 @@ impl ImipComposer<'_> {
                 SessionData::local(sender_info, None, vec![], vec![], session_id),
             );
             session.data.za_key_rcpt = za_redact;
+            session.data.za_imip_submission = za_redact;
 
             // MAIL FROM
             let _ = session
