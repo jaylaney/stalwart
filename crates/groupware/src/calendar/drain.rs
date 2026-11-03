@@ -80,8 +80,8 @@ use crate::{
         CalendarEventNotificationContent, ChangedBy, EVENT_NOTIFICATION_IS_CHANGE,
         alerts::{DefaultAlerts, DefaultAlertsResolver},
         fanout::{
-            ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaScheduleStatus, ZaSource, za_imip_mail,
-            za_set_schedule_status,
+            ITIP_STATUS_KEY_REFUSED, ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaScheduleStatus,
+            ZaSource, za_imip_mail, za_mail_withheld, za_set_schedule_status,
         },
         itip::{itip_auto_add_allowed, itip_fill_organizer, itip_sender_snapshot},
         privacy::{EventPrivacy, ICalendarPrivacy},
@@ -117,7 +117,10 @@ use common::{
     auth::AccountInfo,
     storage::index::SplitUpdate,
     za::{
-        imip::{ZA_IMIP_ITEM_DELETED, ZA_IMIP_KEY_SENDER, ZA_IMIP_LOOKUP_FAILED, za_imip_submit},
+        imip::{
+            ZA_IMIP_ITEM_DELETED, ZA_IMIP_KEY_SENDER, ZA_IMIP_LOOKUP_FAILED, ZaImipPending,
+            za_imip_trace_withheld,
+        },
         lease::{ZaUidLease, ZaUidLeaseGuard},
     },
 };
@@ -1206,24 +1209,50 @@ enum Step {
 
 /// iMIP spec D14: a REFRESH is answered by mail only after the item's
 /// deletion commits; its archive assertion admits one session, so one
-/// answer goes out per REFRESH. No item, pin or status is written for it;
-/// each submission is traced by `za_imip_submit`.
+/// answer goes out per REFRESH. No item, pin or status is written for it.
+/// Final review ruling A-2 (fail closed): a recipient that holds a contact
+/// pin in the account's pin record, or every one when the pin state cannot
+/// be read or decided, gets no answer, traced without the address; the item
+/// is deleted all the same. The answers are held by the abandonment guard
+/// from before the deletion's commit (rulings A-3 and A-4): submitted after
+/// it returns `Ok`, traced as dropped after an error and as abandoned when
+/// the request ends first; each submission is traced by `za_imip_submit`.
 async fn answer_refresh(
     ctx: &ItemCtx<'_>,
     event_id: u32,
     message: ItipMessage<ICalendar>,
 ) -> trc::Result<bool> {
-    let deleted = ctx.delete_mail("Refresh").await?;
-    if deleted {
-        for to in &message.to {
-            za_imip_submit(
-                ctx.server,
-                za_imip_mail(ctx.keys.account_id, event_id, &message, to),
-            )
-            .await;
+    let account_id = ctx.keys.account_id;
+    let state = match ctx.server.za_pin_state(ctx.keys).await {
+        Ok(state) => Some(state),
+        Err(err) => {
+            trc::error!(
+                err.account_id(account_id)
+                    .details("zero-access: pin record read failed")
+                    .caused_by(trc::location!())
+            );
+            None
+        }
+    };
+    let mut answers = ZaImipPending::default();
+    for to in &message.to {
+        match za_mail_withheld(state.as_ref(), to) {
+            Some(status) => {
+                za_imip_trace_withheld(account_id, event_id, status == ITIP_STATUS_KEY_REFUSED)
+            }
+            None => answers.push(za_imip_mail(account_id, event_id, &message, to)),
         }
     }
-    Ok(deleted)
+    match answers.on_err(ctx.delete_mail("Refresh").await)? {
+        true => {
+            answers.submit(ctx.server).await;
+            Ok(true)
+        }
+        false => {
+            answers.dropped();
+            Ok(false)
+        }
+    }
 }
 
 /// An instance's identity across two snapshots of one event: `None` for
@@ -1952,15 +1981,21 @@ impl ItemCtx<'_> {
     /// ingest leaves no inbox item for (an iTIP-level rejection, the
     /// key-account sender, `AutoAddDisabled`, `EventNotFound`, a merge that
     /// changes nothing, a REFRESH) is deleted. `reason` is a fixed name.
+    /// Traced once the deletion committed (final review, ledger 142): a
+    /// session that loses the item's assertion, or a store error, traces no
+    /// deletion.
     async fn delete_mail(&self, reason: &'static str) -> trc::Result<bool> {
-        trc::event!(
-            Calendar(trc::CalendarEvent::ItipMessageError),
-            AccountId = self.keys.account_id,
-            DocumentId = self.document_id,
-            Reason = reason,
-            Details = ZA_IMIP_ITEM_DELETED,
-        );
-        self.delete().await
+        let deleted = self.delete().await?;
+        if deleted {
+            trc::event!(
+                Calendar(trc::CalendarEvent::ItipMessageError),
+                AccountId = self.keys.account_id,
+                DocumentId = self.document_id,
+                Reason = reason,
+                Details = ZA_IMIP_ITEM_DELETED,
+            );
+        }
+        Ok(deleted)
     }
 
     /// Spec 6.5, token mismatch: a traced drop of a forgery, a REPLY from

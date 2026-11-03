@@ -109,7 +109,10 @@ use common::{
         AccountInfo, BuildAccessToken,
         vault::{ZaMark, ZaPinState, ZaPinStep, ZaPinTransact, za_normalize_address},
     },
-    za::{imip::ZaImipMail, lease::ZaUidLease},
+    za::{
+        imip::{ZaImipMail, ZaImipPending, za_imip_trace_withheld},
+        lease::ZaUidLease,
+    },
 };
 use registry::schema::enums::{Permission, StorageQuota};
 use store::{
@@ -154,8 +157,11 @@ pub struct ZaFanOutResult {
     /// iMIP spec 5.4: one attempt per (message, mail-class address), in
     /// message order, built from the reconciled, `SENT-BY`-marked message,
     /// for the caller to submit once its commit returns `Ok`. Empty under
-    /// `internal_only`.
-    pub mail: Vec<ZaImipMail>,
+    /// `internal_only`, and without the addresses the pin rule withholds
+    /// (final review ruling A-2). Armed from here, before the caller's
+    /// commit: settled by `submit` or `dropped`, it otherwise traces its
+    /// attempts as abandoned (rulings A-4 and 189).
+    pub mail: ZaImipPending,
 }
 
 /// A CANCEL (organizer) or declined REPLY (attendee) that a key account's
@@ -326,7 +332,11 @@ pub trait ZaFanOut: Sync + Send {
     /// records `1.1` and yields one attempt in the result's `mail`, which
     /// the caller submits after its commit; with `internal_only` (D15: the
     /// drain's delegating merge and `contacts/pin`) it records `5.3` and
-    /// yields none.
+    /// yields none. Final review ruling A-2 (fail closed): a mail-class
+    /// address that holds a contact pin in the sender's pin record records
+    /// `3.8` and yields none, and so does every mail-class address, with
+    /// `5.1`, when the pin state cannot be read or decided
+    /// (`za_mail_withheld`); the record is read only then, never written.
     #[allow(clippy::too_many_arguments)]
     fn za_fan_out(
         &self,
@@ -539,12 +549,20 @@ impl ZaFanOut for Server {
                     key,
                     self_allowed: resolution.is_some()
                         && tagged.provenance == ZaMessageProvenance::DelegatedSelf,
+                    failed: matches!(recipient, Some(Recipient::Failed)),
                 });
             }
         }
+        // Final review ruling A-2: the pin rule of mail needs the record
+        // whenever an attempt would be mailed.
+        let mails = !internal_only
+            && attempts
+                .iter()
+                .any(|attempt| matches!(attempt.route, Route::Mail { .. }));
         if read.is_none()
             && (!internal.is_empty()
-                || (!delegated && kind == ZaFanOutKind::Deletion && !messages.is_empty()))
+                || (!delegated && kind == ZaFanOutKind::Deletion && !messages.is_empty())
+                || mails)
         {
             read = match self.za_pin_state(keys).await {
                 Ok(state) => Some(state),
@@ -558,6 +576,21 @@ impl ZaFanOut for Server {
                 }
             };
         }
+        // Final review ruling A-2 (fail closed): the mail attempts the pin
+        // rule withholds, by address, with their status, from the state read
+        // above (`None`: the read failed).
+        let withheld_mail: AHashMap<&str, &'static str> = if mails {
+            attempts
+                .iter()
+                .filter(|attempt| matches!(attempt.route, Route::Mail { .. }))
+                .filter_map(|attempt| {
+                    za_mail_withheld(read.as_ref(), attempt.address)
+                        .map(|status| (attempt.address, status))
+                })
+                .collect()
+        } else {
+            AHashMap::new()
+        };
         // Spec 5.2 phase 4: a deletion with a message to send retires every
         // entry of the deleted document, each under the refusal id read
         // here.
@@ -692,26 +725,40 @@ impl ZaFanOut for Server {
             }
         }
         let mut statuses = Vec::new();
-        let mut mail = Vec::new();
+        let mut mail = ZaImipPending::default();
         let mut not_written: AHashSet<&str> = AHashSet::new();
         for attempt in &attempts {
             let status = match &attempt.route {
+                // iMIP spec 5.1: a lookup failure stays `Failed` (`5.1`),
+                // whatever the route.
+                _ if attempt.failed => ITIP_STATUS_DELIVERY_FAILED,
                 Route::NotAttempted { .. } => ITIP_STATUS_NOT_ATTEMPTED,
                 // iMIP spec 5.4, D15: an internal-only fan-out does not
                 // attempt the mail class.
                 Route::Mail { .. } if internal_only => ITIP_STATUS_NOT_ATTEMPTED,
                 // iMIP spec 5.4: handed to the mailer, which the caller runs
                 // after its commit; `attempt.message` is reconciled and
-                // `SENT-BY`-marked.
-                Route::Mail { .. } => {
-                    mail.push(za_imip_mail(
-                        event_account.account_id,
-                        source.document_id,
-                        attempt.message,
-                        attempt.address,
-                    ));
-                    ITIP_STATUS_SENT
-                }
+                // `SENT-BY`-marked. Final review ruling A-2: unless the pin
+                // rule withholds it, traced without the address.
+                Route::Mail { .. } => match withheld_mail.get(attempt.address) {
+                    Some(&status) => {
+                        za_imip_trace_withheld(
+                            sender_id,
+                            source.document_id,
+                            status == ITIP_STATUS_KEY_REFUSED,
+                        );
+                        status
+                    }
+                    None => {
+                        mail.push(za_imip_mail(
+                            event_account.account_id,
+                            source.document_id,
+                            attempt.message,
+                            attempt.address,
+                        ));
+                        ITIP_STATUS_SENT
+                    }
+                },
                 Route::Deliver {
                     pair, reply_token, ..
                 } => match attempt.key.as_deref().map(|key| (key, recipients.get(key))) {
@@ -915,6 +962,37 @@ struct Attempt<'m> {
     /// `None` otherwise, or when it does not sanitize.
     key: Option<String>,
     self_allowed: bool,
+    /// The address's lookup failed (`Recipient::Failed`): `5.1` whatever
+    /// the route (iMIP spec 5.1).
+    failed: bool,
+}
+
+/// Final review ruling A-2 (fail closed; a spec 5.2 amendment pending Jay's
+/// confirmation): whether a mail attempt to `address` is withheld, and with
+/// which status, under the sender's pin state (`None`: the read failed). An
+/// address that holds a contact pin, key pinning's address-level pin keyed
+/// by the normalized address (`ZaPinRecord::pin`), records `3.8`, as a key
+/// change does: a remapped pinned address waits for `contacts/forget`. A
+/// state that cannot tell records `5.1`: the read failed, or no usable
+/// record under a wrap that is not legacy (key pinning spec 4.4's
+/// fail-closed table; a legacy wrap has never pinned). An address that does
+/// not normalize cannot be checked and is not mailed either. `None`: mail
+/// it. Pins are never written for mail recipients.
+pub(crate) fn za_mail_withheld(state: Option<&ZaPinState>, address: &str) -> Option<&'static str> {
+    let (Some(state), Some(key)) = (state, za_normalize_address(address)) else {
+        return Some(ITIP_STATUS_DELIVERY_FAILED);
+    };
+    match &state.pins.record {
+        Some(record) => record.pin(&key).map(|_| ITIP_STATUS_KEY_REFUSED),
+        None if state
+            .mark
+            .as_ref()
+            .is_some_and(|mark| mark.mark == ZaMark::Legacy) =>
+        {
+            None
+        }
+        None => Some(ITIP_STATUS_DELIVERY_FAILED),
+    }
 }
 
 /// Phase 2's decision for an internal recipient (key pinning spec 5.1).
@@ -1768,6 +1846,61 @@ mod tests {
         vec!["org@example.com".to_string()]
     }
 
+    /// Final review ruling A-2: the pin rule of mail. A pinned address (by
+    /// its normalized form) is `3.8`, an unpinned one is mailed; a failed
+    /// read, an address that does not normalize, and an absent or unusable
+    /// record under a wrap that is not legacy are `5.1`; an absent record
+    /// under the legacy wrap (never pinned) is mailed.
+    #[test]
+    fn the_pin_rule_withholds_pinned_and_undecided_mail() {
+        use common::auth::vault::{ZaMarkRead, ZaPinRead};
+        let state = |record: Option<ZaPinRecord>, mark: Option<ZaMark>| ZaPinState {
+            pins: ZaPinRead { raw: None, record },
+            mark: mark.map(|mark| ZaMarkRead {
+                vault: None,
+                mark,
+                private_key: None,
+            }),
+        };
+        let mut record = ZaPinRecord::new();
+        record.set_pin("bob@example.com", [7; 32], PinSource::FirstUse, 0);
+        let pinned = state(Some(record), None);
+        assert_eq!(
+            za_mail_withheld(Some(&pinned), "bob@example.com"),
+            Some(ITIP_STATUS_KEY_REFUSED)
+        );
+        assert_eq!(
+            za_mail_withheld(Some(&pinned), "Bob@Example.COM"),
+            Some(ITIP_STATUS_KEY_REFUSED),
+            "compared by the normalized address"
+        );
+        assert_eq!(za_mail_withheld(Some(&pinned), "carol@example.com"), None);
+        assert_eq!(
+            za_mail_withheld(Some(&pinned), "not an address"),
+            Some(ITIP_STATUS_DELIVERY_FAILED)
+        );
+        assert_eq!(
+            za_mail_withheld(None, "carol@example.com"),
+            Some(ITIP_STATUS_DELIVERY_FAILED),
+            "a failed read fails closed"
+        );
+        assert_eq!(
+            za_mail_withheld(
+                Some(&state(None, Some(ZaMark::Legacy))),
+                "carol@example.com"
+            ),
+            None,
+            "never pinned"
+        );
+        for mark in [Some(ZaMark::Pinned), Some(ZaMark::Neither), None] {
+            assert_eq!(
+                za_mail_withheld(Some(&state(None, mark)), "carol@example.com"),
+                Some(ITIP_STATUS_DELIVERY_FAILED),
+                "no usable record under {mark:?}"
+            );
+        }
+    }
+
     fn message(from: &str, from_organizer: bool, method: &str) -> ItipMessage<ICalendar> {
         ItipMessage {
             from: from.to_string(),
@@ -2397,6 +2530,7 @@ mod tests {
                 },
                 key: Some(BOB.to_string()),
                 self_allowed: false,
+                failed: false,
             })
             .collect();
         let entry = ZaWithheld {
@@ -2538,6 +2672,7 @@ mod tests {
                     },
                     key: Some(address.to_string()),
                     self_allowed: false,
+                    failed: false,
                 })
                 .collect()
         }

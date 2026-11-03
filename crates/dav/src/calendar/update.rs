@@ -712,7 +712,7 @@ impl CalendarUpdateRequestHandler for Server {
                 // immediately before the sealed commit, the items go out; the
                 // fan-out decides the pairs the bundle keeps. Its mail
                 // attempts wait for the commit (iMIP spec 5.4, decision 9).
-                let mut za_mail = Vec::new();
+                let mut za_mail = common::za::imip::ZaImipPending::default();
                 if let Some(messages) = za_messages {
                     // The stored UID, which the new one was validated equal to.
                     let fan_out = self
@@ -799,7 +799,7 @@ impl CalendarUpdateRequestHandler for Server {
                             self.notify_task_queue();
                             // iMIP spec 5.4: mail only once the commit
                             // (or the bounded retry's) returned `Ok`.
-                            common::za::imip::za_imip_submit_all(self, za_mail).await;
+                            za_mail.submit(self).await;
                             return Ok(HttpResponse::new(StatusCode::NO_CONTENT)
                                 .with_etag_opt(serves_submitted_ical.then_some(etag))
                                 .with_schedule_tag_opt(schedule_tag));
@@ -818,10 +818,14 @@ impl CalendarUpdateRequestHandler for Server {
                             {
                                 contexts = fresh;
                             } else {
+                                za_mail.dropped();
                                 return Err(error.caused_by(trc::location!()).into());
                             }
                         }
-                        Err(error) => return Err(error.caused_by(trc::location!()).into()),
+                        Err(error) => {
+                            za_mail.dropped();
+                            return Err(error.caused_by(trc::location!()).into());
+                        }
                     }
                 }
                 unreachable!("bounded event retry always returns");
@@ -1420,7 +1424,7 @@ async fn za_create_event(
     let mut pairs = None;
     // iMIP spec 5.4, decision 9: the fan-out's mail attempts wait for the
     // commit.
-    let mut za_mail = Vec::new();
+    let mut za_mail = common::za::imip::ZaImipPending::default();
     if let Some(messages) = messages {
         let fan_out = match server
             .za_fan_out(
@@ -1526,6 +1530,7 @@ async fn za_create_event(
         #[cfg(feature = "test_mode")]
         if common::za::test_hooks::take_commit_fail(account_id) {
             lease.take().unwrap().0.release().await;
+            za_mail.dropped();
             return Err(trc::StoreEvent::UnexpectedError
                 .into_err()
                 .details("zero-access test hook: sender commit failure")
@@ -1551,19 +1556,22 @@ async fn za_create_event(
                     let (lease_guard, uid) = lease.take().unwrap();
                     let (batch, retry_etag) = build(&sealed, &contexts, Some(lease_guard.lease()))?;
                     etag = retry_etag;
-                    za_commit_create(
-                        server,
-                        resources,
-                        access_token,
-                        batch,
-                        lease_guard,
-                        account_id,
-                        calendar_id,
-                        &uid,
-                    )
-                    .await?;
+                    za_mail.on_err(
+                        za_commit_create(
+                            server,
+                            resources,
+                            access_token,
+                            batch,
+                            lease_guard,
+                            account_id,
+                            calendar_id,
+                            &uid,
+                        )
+                        .await,
+                    )?;
                 } else {
                     let (lease, uid) = lease.take().unwrap();
+                    za_mail.dropped();
                     return za_lost_create_fence(
                         server,
                         resources,
@@ -1578,19 +1586,19 @@ async fn za_create_event(
             }
             Err(error) => {
                 lease.take().unwrap().0.release().await;
+                za_mail.dropped();
                 return Err(error.caused_by(trc::location!()).into());
             }
         }
     } else {
-        server
-            .commit_batch(batch)
-            .await
+        za_mail
+            .on_err(server.commit_batch(batch).await)
             .caused_by(trc::location!())?;
     }
     server.notify_task_queue();
     // iMIP spec 5.4: reached only once the commit (or `za_commit_create`'s
     // retry) returned `Ok`; every failure returned above.
-    common::za::imip::za_imip_submit_all(server, za_mail).await;
+    za_mail.submit(server).await;
 
     Ok(HttpResponse::new(StatusCode::CREATED)
         .with_etag_opt(serves_submitted_ical.then_some(etag))

@@ -450,7 +450,7 @@ impl CalendarDeleteRequestHandler for Server {
 
         // iMIP spec 5.4, decision 9: each fan-out's mail attempts wait for
         // the deletion's one commit.
-        let mut za_mail = Vec::new();
+        let mut za_mail = common::za::imip::ZaImipPending::default();
         if let (Some(keys), Some(roles)) = (&za_keys, &za_roles) {
             // Spec 5.4: the items first, immediately before the commit.
             for message in za_messages {
@@ -578,7 +578,7 @@ impl CalendarDeleteRequestHandler for Server {
         }
         .await;
         if let Err(error) = committed {
-            common::za::imip::za_imip_trace_dropped(account_id, &za_mail);
+            za_mail.dropped();
             return Err(error);
         }
         // The committed deletion retires every grant. Evict the grantees'
@@ -599,7 +599,7 @@ impl CalendarDeleteRequestHandler for Server {
         // iMIP spec 5.4, section 7: the deletion (or its retry) committed, so
         // its mail goes whether or not the invalidation failed; the
         // invalidation's error is returned after.
-        common::za::imip::za_imip_submit_all(self, za_mail).await;
+        za_mail.submit(self).await;
         invalidated?;
 
         Ok(HttpResponse::new(StatusCode::NO_CONTENT))
