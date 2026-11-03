@@ -14,7 +14,7 @@
 //! location. Every outcome is traced with ids, the SMTP stage, the reply code
 //! and fixed strings only (section 7, D17).
 
-use crate::Server;
+use crate::{Server, auth::EmailCache};
 use registry::schema::structs::TaskCalendarItipContents;
 use std::{future::Future, pin::Pin, sync::OnceLock};
 
@@ -68,7 +68,10 @@ pub const ZA_IMIP_DROPPED: &str = "zero-access: iMIP mail dropped, the deletion 
 /// that disconnects) anywhere from the fan-out to the last submission, or an
 /// error returned before the commit's outcome settled them. Their outcome is
 /// unknown: the change may or may not have committed, and the attempt in
-/// flight may already be queued. Traced once per event (section 7,
+/// flight may already be queued. An error returned before the commit was
+/// called traces this too, although nothing was committed then (PR review
+/// ruling O-2: the DAV callers' error returns between the fan-out and the
+/// commit do not settle the guard). Traced once per event (section 7,
 /// `ZaImipPending`).
 pub const ZA_IMIP_ABANDONED: &str = "zero-access: iMIP submission abandoned";
 
@@ -80,6 +83,68 @@ pub const ZA_IMIP_PINNED: &str = "zero-access: iMIP withheld, the address holds 
 /// The details of a mail attempt withheld because the sender's pin state
 /// could not be read or decided (`5.1`; a REFRESH gets no answer).
 pub const ZA_IMIP_PIN_UNREAD: &str = "zero-access: iMIP withheld, the pin record could not be read";
+
+// The mail class's local routes (PR review ruling P1, fail closed; a D9
+// amendment).
+
+/// The details of a mail attempt withheld because its address is in a local
+/// domain and the registry resolves it to neither an account nor a mailing
+/// list (`ZaMailClass::Withheld`), or to an account it no longer finds, or
+/// (the REFRESH answer) to a key account (`5.1`; a REFRESH gets no answer).
+pub const ZA_IMIP_UNROUTED: &str =
+    "zero-access: iMIP withheld, the local address is not of the mail class";
+
+/// PR review ruling P1 (fail closed; a D9 amendment): the class of a
+/// scheduling address as the registry resolves it (`Server::za_mail_class`).
+/// The SMTP layer's `rcpt_resolve` reaches further than the registry's own
+/// answer (it falls through a disabled entry to the catch-all and consults
+/// an external directory first), so a local address is mailed only when the
+/// registry resolves it to a non-key account or a mailing list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZaMailClass {
+    /// The address's domain is not local: the mail class.
+    NotLocal,
+    /// A local account, directly or through the domain's catch-all when the
+    /// address has no entry. The caller decides by the account: a key
+    /// account keeps the internal route, any other is the mail class.
+    Account(u32),
+    /// A local mailing list, directly or through the catch-all (Jay's
+    /// decision 10): the mail class.
+    List,
+    /// Any other address in a local domain: a disabled account or list
+    /// address, no entry and no catch-all, or a catch-all that resolves to
+    /// neither an account nor a list. Never mailed (`5.1`).
+    Withheld,
+}
+
+/// `ZaMailClass`'s decision, from the address's own registry entry (`entry`)
+/// and, only when it has none and its domain names a catch-all, the
+/// catch-all's entry (`catch_all`, `Some(None)` when the catch-all resolves
+/// to nothing), as `account_id_from_email(address, true)` consults the
+/// catch-all.
+pub fn za_mail_class_of(
+    entry: Option<EmailCache>,
+    catch_all: Option<Option<EmailCache>>,
+) -> ZaMailClass {
+    match entry.or(catch_all.flatten()) {
+        Some(EmailCache::Account(account_id)) => ZaMailClass::Account(account_id),
+        Some(EmailCache::MailingList(_)) => ZaMailClass::List,
+        Some(EmailCache::DisabledAccountAddress(_) | EmailCache::DisabledListAddress(_)) | None => {
+            ZaMailClass::Withheld
+        }
+    }
+}
+
+/// PR review ruling P1: traces one mail attempt withheld because its local
+/// address is not of the mail class; ids and a fixed string only.
+pub fn za_imip_trace_unrouted(account_id: u32, document_id: u32) {
+    trc::event!(
+        Calendar(trc::CalendarEvent::ItipMessageError),
+        AccountId = account_id,
+        DocumentId = document_id,
+        Details = ZA_IMIP_UNROUTED,
+    );
+}
 
 /// One (message, recipient) of spec 5.3: the event's account (upstream's
 /// task account), the event's document id, and one message as
@@ -322,6 +387,60 @@ mod tests {
         CalendarEvent, Collector, EventType, Key,
         ipc::subscriber::{EventBatch, Interests, SubscriberBuilder},
     };
+
+    /// PR review ruling P1: a local address is the mail class only through
+    /// an account or a list, its own entry first and the catch-all only when
+    /// it has none; a disabled entry is withheld whatever the catch-all says.
+    #[test]
+    fn the_mail_class_withholds_every_local_route_but_accounts_and_lists() {
+        use EmailCache::*;
+        let cases = [
+            // The address's own entry.
+            (Some(Account(7)), None, ZaMailClass::Account(7)),
+            (Some(MailingList(8)), None, ZaMailClass::List),
+            (Some(DisabledAccountAddress(7)), None, ZaMailClass::Withheld),
+            (Some(DisabledListAddress(8)), None, ZaMailClass::Withheld),
+            // No entry and no catch-all.
+            (None, None, ZaMailClass::Withheld),
+            // No entry: the catch-all decides.
+            (None, Some(Some(Account(9))), ZaMailClass::Account(9)),
+            (None, Some(Some(MailingList(10))), ZaMailClass::List),
+            (None, Some(None), ZaMailClass::Withheld),
+            (
+                None,
+                Some(Some(DisabledAccountAddress(9))),
+                ZaMailClass::Withheld,
+            ),
+            (
+                None,
+                Some(Some(DisabledListAddress(10))),
+                ZaMailClass::Withheld,
+            ),
+            // An entry is never overridden by the catch-all.
+            (
+                Some(DisabledAccountAddress(7)),
+                Some(Some(Account(9))),
+                ZaMailClass::Withheld,
+            ),
+            (
+                Some(DisabledListAddress(8)),
+                Some(Some(MailingList(10))),
+                ZaMailClass::Withheld,
+            ),
+            (
+                Some(Account(7)),
+                Some(Some(Account(9))),
+                ZaMailClass::Account(7),
+            ),
+        ];
+        for (entry, catch_all, class) in cases {
+            assert_eq!(
+                za_mail_class_of(entry, catch_all),
+                class,
+                "{entry:?} {catch_all:?}"
+            );
+        }
+    }
 
     /// Section 7 (final review rulings A-4 and 189): the guard is armed from
     /// the fan-out's return, before the commit. Dropped before any

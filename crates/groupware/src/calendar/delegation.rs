@@ -17,6 +17,7 @@ use calcard::icalendar::{ICalendar, ICalendarProperty, ICalendarScheduleForceSen
 use common::{
     Server,
     auth::{AccountInfo, vault::za_normalize_address},
+    za::imip::ZaMailClass,
 };
 
 pub struct ZaSelfMessages {
@@ -45,7 +46,12 @@ pub enum ZaSelfOperation {
 
 pub(crate) enum ZaResolvedAccount {
     Account(u32),
+    /// The mail class without an account: a domain that is not local, or a
+    /// local list.
     NotFound,
+    /// iMIP PR review ruling P1: any other local address
+    /// (`ZaMailClass::Withheld`).
+    Withheld,
     Failed,
 }
 
@@ -141,16 +147,17 @@ pub async fn za_resolve_delegation(
                 let result = if fail {
                     Err(trc::StoreEvent::UnexpectedError.into_err())
                 } else {
-                    server.za_account_id_from_email(&key).await
+                    server.za_mail_class(&key).await
                 };
                 let result = match result {
-                    Ok(Some(id)) => {
+                    Ok(ZaMailClass::Account(id)) => {
                         if id == writer_account.account_id {
                             resolution.recipients.insert(key.clone());
                         }
                         ZaResolvedAccount::Account(id)
                     }
-                    Ok(None) => ZaResolvedAccount::NotFound,
+                    Ok(ZaMailClass::NotLocal | ZaMailClass::List) => ZaResolvedAccount::NotFound,
+                    Ok(ZaMailClass::Withheld) => ZaResolvedAccount::Withheld,
                     Err(err) => {
                         trc::error!(
                             err.account_id(writer_account.account_id)

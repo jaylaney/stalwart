@@ -81,7 +81,7 @@ use crate::{
         alerts::{DefaultAlerts, DefaultAlertsResolver},
         fanout::{
             ITIP_STATUS_KEY_REFUSED, ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaScheduleStatus,
-            ZaSource, za_imip_mail, za_mail_withheld, za_set_schedule_status,
+            ZaSource, za_imip_mail, za_mail_reachable, za_mail_withheld, za_set_schedule_status,
         },
         itip::{itip_auto_add_allowed, itip_fill_organizer, itip_sender_snapshot},
         privacy::{EventPrivacy, ICalendarPrivacy},
@@ -119,7 +119,7 @@ use common::{
     za::{
         imip::{
             ZA_IMIP_ITEM_DELETED, ZA_IMIP_KEY_SENDER, ZA_IMIP_LOOKUP_FAILED, ZaImipPending,
-            za_imip_trace_withheld,
+            za_imip_trace_unrouted, za_imip_trace_withheld,
         },
         lease::{ZaUidLease, ZaUidLeaseGuard},
     },
@@ -1210,33 +1210,41 @@ enum Step {
 /// iMIP spec D14: a REFRESH is answered by mail only after the item's
 /// deletion commits; its archive assertion admits one session, so one
 /// answer goes out per REFRESH. No item, pin or status is written for it.
-/// Final review ruling A-2 (fail closed): a recipient that holds a contact
-/// pin in the account's pin record, or every one when the pin state cannot
-/// be read or decided, gets no answer, traced without the address; the item
-/// is deleted all the same. The answers are held by the abandonment guard
-/// from before the deletion's commit (rulings A-3 and A-4): submitted after
-/// it returns `Ok`, traced as dropped after an error and as abandoned when
-/// the request ends first; each submission is traced by `za_imip_submit`.
+/// PR review ruling P1 (fail closed): a recipient that is not of the mail
+/// class (`za_mail_reachable`, the fan-out's classification) gets no answer,
+/// traced without the address. Final review ruling A-2 (fail closed): nor
+/// does a recipient that holds a contact pin in the account's pin record,
+/// or any when no usable record decides it (`za_mail_withheld`). The item
+/// is deleted all the same. A store error reading the pin state or a
+/// recipient's class is returned (ruling O-4: section 7's transient class),
+/// so the item stays pending and counts toward `DRAIN_ITEM_FAILURE_LIMIT`.
+/// The answers are held by the abandonment guard from before the deletion's
+/// commit (rulings A-3 and A-4): submitted after it returns `Ok`, traced as
+/// dropped after an error and as abandoned when the request ends first;
+/// each submission is traced by `za_imip_submit`.
 async fn answer_refresh(
     ctx: &ItemCtx<'_>,
     event_id: u32,
     message: ItipMessage<ICalendar>,
 ) -> trc::Result<bool> {
     let account_id = ctx.keys.account_id;
-    let state = match ctx.server.za_pin_state(ctx.keys).await {
-        Ok(state) => Some(state),
-        Err(err) => {
-            trc::error!(
-                err.account_id(account_id)
-                    .details("zero-access: pin record read failed")
-                    .caused_by(trc::location!())
-            );
-            None
-        }
-    };
+    // `za_pin_state` answers an unusable record as a state (no record, its
+    // mark read), so its error is a store error.
+    let state = ctx
+        .server
+        .za_pin_state(ctx.keys)
+        .await
+        .caused_by(trc::location!())?;
     let mut answers = ZaImipPending::default();
     for to in &message.to {
-        match za_mail_withheld(state.as_ref(), to) {
+        if !za_mail_reachable(ctx.server, account_id, to)
+            .await
+            .caused_by(trc::location!())?
+        {
+            za_imip_trace_unrouted(account_id, event_id);
+            continue;
+        }
+        match za_mail_withheld(Some(&state), to) {
             Some(status) => {
                 za_imip_trace_withheld(account_id, event_id, status == ITIP_STATUS_KEY_REFUSED)
             }
@@ -1304,11 +1312,17 @@ impl Attendance {
     /// of the instance that governs it (`governing_instance`: the latest
     /// range override at or before it, else the master), so a delegator's
     /// own per-occurrence delegation does not make the delegator new.
-    fn is_new(&self, instance: InstanceKey, attendee: &Attendee<'_>) -> bool {
+    /// PR review ruling P2: a mail-borne merge (`mail`) counts only an
+    /// attendee absent from that instance before; a DELEGATED-FROM gain on
+    /// an existing attendee waits for the organizer's next update, as
+    /// upstream's plain path, so an outside attendee cannot re-invite an
+    /// existing key co-attendee without its token or an organizer edit.
+    fn is_new(&self, instance: InstanceKey, attendee: &Attendee<'_>, mail: bool) -> bool {
         match self.attendees.get(&(
             governing_instance(instance, &self.instances),
             attendee.email.email.to_ascii_lowercase(),
         )) {
+            Some(_) if mail => false,
             Some(before) => !delegators(attendee).is_subset(before),
             None => true,
         }
@@ -1536,6 +1550,7 @@ async fn merge(
             // Upgrade ruling 154: the new delegates whose invitation's split
             // failed, for their `5.1`.
             let mut split_failed: Vec<String> = Vec::new();
+            let mail = matches!(incoming, Incoming::Mail { .. });
             let new_attendees = match itip_snapshot(&event.content.data.event, addresses, false) {
                 Ok(after) => {
                     // Compared per instance, so a delegate who already
@@ -1546,7 +1561,7 @@ async fn merge(
                     for (instance, snapshot) in &after.components {
                         let instance = instance_key(instance);
                         for attendee in &snapshot.attendees {
-                            if before.is_new(instance, attendee) {
+                            if before.is_new(instance, attendee, mail) {
                                 new_attendees.insert(attendee.email.email.to_ascii_lowercase());
                             }
                         }
@@ -2576,10 +2591,50 @@ mod tests {
                 .find(|attendee| attendee.email.email == "del@example.com")
                 .unwrap();
             assert!(
-                !before.is_new(None, del),
+                !before.is_new(None, del, false),
                 "the union lost delegator {delegator}"
             );
         }
+    }
+
+    /// PR review ruling P2: a DELEGATED-FROM gain makes an existing attendee
+    /// new on release 2's token-authenticated path, never on the mail arm;
+    /// an attendee absent before is new on both.
+    #[test]
+    fn mail_counts_only_attendees_absent_before() {
+        fn attendee<'x>(tree: &'x ICalendar, address: &str) -> Attendee<'x> {
+            itip_snapshot(tree, &organizer(), false)
+                .unwrap()
+                .components
+                .get(&InstanceId::Main)
+                .unwrap()
+                .attendees
+                .iter()
+                .find(|attendee| attendee.email.email == address)
+                .unwrap()
+                .clone()
+        }
+        let org = organizer();
+        // `del` attends without a delegator, then gains one.
+        let before = parse(concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\n",
+            "UID:stale-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\n",
+            "DTEND:20990102T100000Z\r\nSEQUENCE:0\r\nORGANIZER:mailto:org@example.com\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:del@example.com\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ));
+        let before = Attendance::of(&itip_snapshot(&before, &org, false).unwrap());
+        let gained = delegated_by(&["a@example.com"]);
+        let del = attendee(&gained, "del@example.com");
+        assert!(
+            before.is_new(None, &del, false),
+            "the gain on release 2's path"
+        );
+        assert!(!before.is_new(None, &del, true), "the gain on the mail arm");
+        // `del` did not attend before (only att@example.com did).
+        let absent = Attendance::of(&itip_snapshot(&event(None), &org, false).unwrap());
+        assert!(absent.is_new(None, &del, false), "absent, release 2's path");
+        assert!(absent.is_new(None, &del, true), "absent, the mail arm");
     }
 
     #[test]
