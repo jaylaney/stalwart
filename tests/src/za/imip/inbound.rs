@@ -106,6 +106,7 @@ pub async fn test(test: &mut TestServer) {
     sender_provisioned_before_drain(test, &key).await;
     refresh_answer(test, &key).await;
     outside_delegation(test, &key, &key2).await;
+    existing_attendee_not_reinvited(test, &key, &key2).await;
     pairs_untouched_by_mail(test, &key, &key2).await;
     delegate_reply_into_delegators_copy(test, &key, &key2).await;
     plain_local_organizer(test, &key, &plain).await;
@@ -479,6 +480,7 @@ const DRAIN_UIDS: &[&str] = &[
     "imip-in-fwd",
     "imip-in-prov",
     "imip-in-dl",
+    "imip-in-xd",
     "imip-in-p",
     "imip-in-sd",
     "imip-in-pl",
@@ -1089,6 +1091,89 @@ async fn outside_delegation(test: &TestServer, key: &Party, key2: &Party) {
     assert_eq!(
         partstat_of(&key.client, &href, KEY2).await.as_deref(),
         Some("ACCEPTED")
+    );
+    delete_quietly(&key2.client, &copy).await;
+    delete_quietly(&key.client, &href).await;
+}
+
+/// PR review ruling P2: imip-key2 has accepted; ATT's REPLY delegating to
+/// imip-key2, already an attendee, resets imip-key2's line to
+/// `PARTSTAT=NEEDS-ACTION;RSVP=TRUE`. It merges into the organizer's copy as
+/// upstream merges it, and the mail arm's delegating fan-out re-invites no
+/// existing attendee: imip-key2's inbox gains nothing and its own copy stays
+/// accepted. (A `PARTSTAT=DECLINED` line cannot drive the re-invitation:
+/// upstream's organizer builder addresses no declined attendee,
+/// `Attendee::send_update_messages`.)
+async fn existing_attendee_not_reinvited(test: &TestServer, key: &Party, key2: &Party) {
+    let _drain = DrainOn::new();
+    let uid = "imip-in-xd";
+    let href = own_href(key, uid);
+    assert_eq!(
+        put(
+            key.name,
+            STRONG,
+            href.clone(),
+            event(uid, key.name, &[ATT, KEY2], 0, "")
+        )
+        .await,
+        201
+    );
+    // imip-key2 imports its invitation and accepts; its token-authenticated
+    // REPLY merges into the organizer's copy.
+    drain(key2).await;
+    let copy = copy_href(test, key2.id, uid).await;
+    set_partstat(&key2.client, &copy, KEY2, "ACCEPTED").await;
+    drain(key).await;
+    assert_eq!(
+        partstat_of(&key.client, &href, KEY2).await.as_deref(),
+        Some("ACCEPTED")
+    );
+    let before2 = inbox_ids(test, key2.id).await;
+    let delegated = format!(
+        concat!(
+            "ATTENDEE;PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:{key2}\":mailto:{att}\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:{att}\":mailto:{key2}\r\n"
+        ),
+        key2 = KEY2,
+        att = ATT
+    );
+    mail_in(
+        test,
+        ATT,
+        key.name,
+        "REPLY",
+        &event(uid, key.name, &[], 0, &delegated),
+    )
+    .await;
+    drain(key).await;
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        before2,
+        "the mail arm re-invited an existing attendee"
+    );
+    // Upstream's merge: ATT delegated, imip-key2's line overwritten from
+    // the REPLY.
+    let got = body(&key.client, &href).await;
+    assert_eq!(partstat(&got, ATT).as_deref(), Some("DELEGATED"), "{got}");
+    assert_eq!(
+        partstat(&got, KEY2).as_deref(),
+        Some("NEEDS-ACTION"),
+        "{got}"
+    );
+    assert!(
+        got.replace("\r\n ", "")
+            .lines()
+            .any(|line| line.starts_with("ATTENDEE")
+                && line.ends_with(&format!("mailto:{KEY2}"))
+                && line.to_ascii_lowercase().contains("delegated-from=")
+                && line.contains(ATT)),
+        "{got}"
+    );
+    // imip-key2's own participation is unchanged (its request drains first).
+    assert_eq!(
+        partstat_of(&key2.client, &copy, KEY2).await.as_deref(),
+        Some("ACCEPTED"),
+        "an outside attendee reset imip-key2's copy"
     );
     delete_quietly(&key2.client, &copy).await;
     delete_quietly(&key.client, &href).await;

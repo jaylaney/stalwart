@@ -32,7 +32,7 @@ use ::registry::{
     types::{list::List, map::Map},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use common::za::test_hooks;
+use common::za::{imip::ZA_IMIP_UNROUTED, test_hooks};
 use hyper::{Method, StatusCode};
 use serde_json::json;
 use std::{collections::HashSet, sync::Arc};
@@ -170,14 +170,13 @@ enum Window {
     PostCommit,
 }
 
-/// One captured event: its type, its window, its span id, its `Reason` and
-/// `Code`, and every string it carries.
+/// One captured event: its type, its window, its span id, its `Reason`, and
+/// every string it carries.
 struct Captured {
     typ: EventType,
     window: Window,
     span: Option<u64>,
     reason: Option<String>,
-    code: Option<u64>,
     values: String,
 }
 
@@ -195,13 +194,12 @@ fn capture(rx: &mut mpsc::Receiver<EventBatch>, window: Window, into: &mut Vec<C
     while let Ok(batch) = rx.try_recv() {
         for event in batch {
             let mut values = Vec::new();
-            let (mut span, mut reason, mut code) = (None, None, None);
+            let (mut span, mut reason) = (None, None);
             for (key, value) in event.keys.iter() {
                 strings(value, &mut values);
                 match (key, value) {
                     (Key::SpanId, trc::Value::UInt(id)) => span = Some(*id),
                     (Key::Reason, trc::Value::String(text)) => reason = Some(text.to_string()),
-                    (Key::Code, trc::Value::UInt(value)) => code = Some(*value),
                     _ => {}
                 }
             }
@@ -210,7 +208,6 @@ fn capture(rx: &mut mpsc::Receiver<EventBatch>, window: Window, into: &mut Vec<C
                 window,
                 span,
                 reason,
-                code,
                 values: values.join("\n"),
             });
         }
@@ -971,8 +968,9 @@ pub async fn test(test: &mut TestServer) {
     wait_for_queue(test).await;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     capture(&mut rx, Window::PostCommit, &mut captured);
-    // The two unknown local attendees are refused at RCPT after the commit
-    // (iMIP spec 5.4, section 7: the stage and the reply code).
+    // iMIP PR review ruling P1: the two unknown local attendees are
+    // withheld before the commit (traced with ids only), never submitted,
+    // so nothing is refused at RCPT after it.
     let rcpt_refusals = |captured: &[Captured]| {
         captured
             .iter()
@@ -980,14 +978,23 @@ pub async fn test(test: &mut TestServer) {
                 event.window == Window::PostCommit
                     && event.typ == EventType::Calendar(CalendarEvent::ItipMessageError)
                     && event.reason.as_deref() == Some("RCPT-TO")
-                    && event.code.is_some_and(|code| code / 100 == 5)
+            })
+            .count()
+    };
+    let unrouted = |captured: &[Captured]| {
+        captured
+            .iter()
+            .filter(|event| {
+                event.window == Window::PreCommit
+                    && event.typ == EventType::Calendar(CalendarEvent::ItipMessageError)
+                    && event.values.contains(ZA_IMIP_UNROUTED)
             })
             .count()
     };
     assert_eq!(
-        rcpt_refusals(&captured),
-        2,
-        "the PUT's two unknown local attendees were not refused at RCPT"
+        (unrouted(&captured), rcpt_refusals(&captured)),
+        (2, 0),
+        "the PUT's two unknown local attendees were not withheld"
     );
     // The external attendee reaches the sink.
     assert_eq!(
@@ -999,17 +1006,17 @@ pub async fn test(test: &mut TestServer) {
         1,
         "the external attendee was not mailed"
     );
-    // iMIP spec 5.1, 5.4: an address no account has is the mail class,
-    // handed to the mailer (`1.1`, written before the commit), where release
-    // 2 recorded `5.3`.
+    // iMIP PR review ruling P1 (fail closed): a local address no account or
+    // list has is withheld (`5.1`), where release 5 first mailed it (`1.1`)
+    // and release 2 recorded `5.3`.
     assert_eq!(
         attendee_statuses(&key_client, &invite_path, LOOKUP_LOCAL_ATTENDEE).await,
-        ["1.1"]
+        ["5.1"]
     );
     // The rule resolves the attendee to a local part no account has.
     assert_eq!(
         attendee_statuses(&key_client, &invite_path, SUBADDR_ATTENDEE).await,
-        ["1.1"]
+        ["5.1"]
     );
     capture(&mut rx, Window::Other, &mut captured);
     let request = HttpRequest::with_credentials(8899, "key1@example.com", STRONG);
@@ -1033,9 +1040,9 @@ pub async fn test(test: &mut TestServer) {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     capture(&mut rx, Window::PostCommit, &mut captured);
     assert_eq!(
-        rcpt_refusals(&captured),
-        4,
-        "the DELETE's two CANCELs to unknown local attendees were not refused at RCPT"
+        (unrouted(&captured), rcpt_refusals(&captured)),
+        (4, 0),
+        "the DELETE's two CANCELs to unknown local attendees were not withheld"
     );
     assert_eq!(
         sink().take_to(LOOKUP_EXT_ATTENDEE).len(),
@@ -1282,12 +1289,14 @@ pub async fn test(test: &mut TestServer) {
             .map(|event| format!("{:?}: {}", event.typ, event.values))
             .collect::<Vec<_>>()
     };
-    // Positive control: the submissions' SMTP layer names them.
+    // Positive control: the submissions' SMTP layer names the external
+    // attendee (the local ones are withheld before any submission, PR
+    // review ruling P1).
     assert!(
         captured
             .iter()
-            .any(|event| is_transit(event.typ) && event.values.contains(LOOKUP_LOCAL_CANARY)),
-        "no transit event named the local attendee"
+            .any(|event| is_transit(event.typ) && event.values.contains(LOOKUP_DOMAIN_CANARY)),
+        "no transit event named the external attendee"
     );
     for (canary, what) in [
         (LOOKUP_LOCAL_CANARY, "local attendee"),

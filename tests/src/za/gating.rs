@@ -11,6 +11,7 @@ use super::{
     fanout::{NO_REPLY, uid_copies},
 };
 use crate::utils::{
+    http::HttpRequest,
     jmap::{JmapResponse, JmapUtils},
     server::TestServer,
     webdav::DummyWebDavClient,
@@ -27,7 +28,7 @@ use groupware::calendar::{
     CalendarEvent, CalendarEventContent, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
     itip::{ItipIngest, RsvpError, RsvpRequest, RsvpResponse},
 };
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use serde_json::{Value, json};
 use std::time::Duration;
 use types::collection::SyncCollection;
@@ -536,17 +537,18 @@ pub async fn test_scheduling(test: &mut TestServer) {
     // Organizer is a key account (invitations spec 5.1, `SendSealed`): the
     // schedule tag is set as upstream sets it. plain is a non-key account,
     // of iMIP's mail class: mailed after the commit (iMIP spec 5.4, 8.5).
-    let response = key_client
-        .request_with_headers(
-            "PUT",
+    // The PUT mails plain: the raw client (5 s, PR review T-2).
+    let response = HttpRequest::with_credentials(8899, "key1@example.com", STRONG)
+        .send_full(
+            Method::PUT,
             &format!("{key_cal}invite.ics"),
-            [CONTENT_TYPE],
-            KEY_INVITE,
+            Some(KEY_INVITE.as_bytes().to_vec()),
+            Some(CONTENT_TYPE.1),
         )
-        .await
-        .with_status(StatusCode::CREATED);
+        .await;
+    assert_eq!(response.status.as_u16(), 201, "{}", response.body);
     assert!(
-        response.headers.get("schedule-tag").is_some(),
+        response.header("schedule-tag").is_some(),
         "{:?}",
         response.headers
     );

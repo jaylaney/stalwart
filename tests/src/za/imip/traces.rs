@@ -11,7 +11,7 @@
 //! invitation) names a recipient or a sender, as it names them for every
 //! message; the fork's own lookups stay quiet.
 
-use super::{add_contact, delete_contact, deliver, event, is_request_for, itip_mail};
+use super::{add_contact, delete_contact, deliver, event, is_request_for, itip_mail, with_method};
 use crate::{
     utils::{
         http::HttpRequest,
@@ -30,13 +30,16 @@ use crate::{
         user_permissions,
     },
 };
+use ::registry::{schema::structs::TaskCalendarItipContents, types::map::Map};
 use common::za::{
     imip::{
         ZA_IMIP_DROPPED, ZA_IMIP_FAILED, ZA_IMIP_ITEM_DELETED, ZA_IMIP_ITEM_REFUSED,
         ZA_IMIP_KEY_SENDER, ZA_IMIP_NOT_TAKEN, ZA_IMIP_REFUSED, ZA_IMIP_TOO_LARGE,
+        ZA_IMIP_UNROUTED, ZaImipMail, ZaImipOutcome, za_imip_submit,
     },
     test_hooks,
 };
+use groupware::scheduling::ItipSummary;
 use hyper::{Method, StatusCode};
 use std::{
     collections::HashSet,
@@ -75,7 +78,8 @@ const FROM: &str = "imiptrace-from-canary@imiptrace-domain-canary.remote.test";
 const FROM_HEADER: &str =
     "\"imiptrace-name-canary\" <imiptrace-from-canary@imiptrace-domain-canary.remote.test>";
 /// The attendee the module's invitations mail (a sink address), and an
-/// attendee at a local domain no account has (refused at RCPT).
+/// attendee at a local domain no account has: withheld before the commit
+/// (PR review ruling P1), and refused at RCPT when the seam submits to it.
 const ATT_CANARY: &str = "imiptrace-att-canary";
 const ATT: &str = "imiptrace-att-canary@remote.test";
 const NOBODY_CANARY: &str = "imiptrace-local-canary";
@@ -489,8 +493,9 @@ pub async fn test(test: &mut TestServer) {
     // A new invitation to an outside attendee and to a local address no
     // account has, parked before its commit: the events up to there are
     // captured apart (no event may name an attendee), then the commit, the
-    // submissions and their delivery. Row: a mail attempt accepted (ATT) and
-    // one refused at RCPT (the local address).
+    // submissions and their delivery. Rows: a mail attempt accepted (ATT) and
+    // one withheld before the commit (the local address, PR review ruling
+    // P1).
     let out = own_path("imiptrace-out");
     let parked = HookParked::start(
         key.id,
@@ -518,6 +523,7 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(mailed.len(), 1, "the attendee was mailed once");
     assert!(is_request_for(&mailed[0], "imiptrace-out"));
     assert_eq!(attendee_statuses(&key.client, &out, ATT).await, ["1.1"]);
+    assert_eq!(attendee_statuses(&key.client, &out, NOBODY).await, ["5.1"]);
     assert_eq!(
         pending_ids(test, key.id).await,
         Vec::<u32>::new(),
@@ -597,7 +603,7 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(sink().count_to(ATT), 0, "the dropped CANCEL was mailed");
 
     // The DELETE again, parked before its commit like the PUT: its CANCEL to
-    // the attendee is accepted, the local address refused at RCPT.
+    // the attendee is accepted, the one to the local address withheld.
     let parked = HookParked::start(
         key.id,
         test_hooks::set_delete_commit_pause,
@@ -615,6 +621,37 @@ pub async fn test(test: &mut TestServer) {
     let cancelled = sink().take_to(ATT);
     assert_eq!(cancelled.len(), 1, "the attendee was mailed the CANCEL");
     assert_eq!(cancelled[0].calendar_method().as_deref(), Some("CANCEL"));
+
+    // Row: a mail attempt refused at a stage with its reply code. The
+    // fan-out no longer submits to a local address no account has (PR review
+    // ruling P1), so the seam submits to it directly, as after a commit: the
+    // local session refuses it at RCPT, and only its transit names it.
+    let refused_ics = with_method(
+        &canaried("imiptrace-seam", TRACE_KEY, &[NOBODY], 0, ""),
+        "REQUEST",
+    );
+    assert!(matches!(
+        za_imip_submit(
+            &test.server,
+            ZaImipMail {
+                account_id: key.id,
+                document_id: 0,
+                contents: TaskCalendarItipContents {
+                    from: TRACE_KEY.into(),
+                    to: Map::new(vec![NOBODY.into()]),
+                    is_from_organizer: true,
+                    i_calendar_data: refused_ics,
+                    summary: serde_json::to_string(&ItipSummary::Invite(vec![])).unwrap(),
+                },
+            },
+        )
+        .await,
+        ZaImipOutcome::Refused { stage: "RCPT-TO", code } if code / 100 == 5
+    ));
+    wait_for_queue(test).await;
+    capture
+        .settle(Window::PostCommit, "a submission refused at RCPT")
+        .await;
 
     let captured = capture.finish().await;
     let mailed_total = mailed.len() + cancelled.len();
@@ -739,9 +776,8 @@ pub async fn test(test: &mut TestServer) {
     );
 
     // Row: a mail attempt failed (account id, document id, stage, reply
-    // code): the local address refused at RCPT after the PUT's and the
-    // DELETE's commits; and a submission that failed before an answer (the
-    // hook).
+    // code): the local address refused at RCPT (the seam's submission); and
+    // a submission that failed before an answer (the hook).
     let refused = ours
         .iter()
         .filter(|event| {
@@ -752,8 +788,24 @@ pub async fn test(test: &mut TestServer) {
         })
         .count();
     assert!(
-        refused >= 2,
-        "the local address was refused at RCPT after the PUT and the DELETE: {ours:#?}"
+        refused >= 1,
+        "the local address was refused at RCPT: {ours:#?}"
+    );
+    // Row (PR review ruling P1): a mail attempt withheld before the commit
+    // because its local address is not of the mail class (account id,
+    // document id, fixed string): the PUT's REQUEST and the DELETE's CANCEL
+    // to the local address.
+    let unrouted = ours
+        .iter()
+        .filter(|event| {
+            event.details() == Some(ZA_IMIP_UNROUTED)
+                && event.window == Window::PreCommit
+                && event.has(Key::DocumentId)
+        })
+        .count();
+    assert!(
+        unrouted >= 2,
+        "the local address was withheld on the PUT and the DELETE: {ours:#?}"
     );
     assert!(
         ours.iter()
@@ -794,7 +846,8 @@ pub async fn test(test: &mut TestServer) {
         // The remote attendee's domain is not local, so no recipient lookup
         // by local part runs for it: no event of any kind may name it outside
         // the transit. The local address resolves (and misses) in the
-        // session's RCPT lookups.
+        // session's RCPT lookups (the seam's submission); the fan-out's
+        // lookups of it, before each commit, are quiet.
         let named = outside_transit(&captured, canary, true, canary == NOBODY_CANARY);
         assert!(
             named.is_empty(),

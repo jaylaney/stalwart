@@ -20,9 +20,9 @@ use crate::{
         webdav::DummyWebDavClient,
         za::{
             HookParked, copy_href, hold_task_consumer, inbox_ids, item_partstat, itip_tasks_for,
-            mail_borne_items, mail_count, new_inbox_items, open_pending_item_as, queued_recipients,
-            trigger_drain, wait_for_delivery, wait_for_queue, za_app_password, za_post,
-            za_setup_token,
+            mail_borne_items, mail_count, new_inbox_items, open_pending_item_as, pin_record,
+            queued_recipients, trigger_drain, wait_for_delivery, wait_for_queue, za_app_password,
+            za_post, za_setup_token,
         },
     },
     za::{
@@ -40,14 +40,24 @@ use ::registry::{
     schema::{
         enums::Permission,
         prelude::{ObjectType, Property},
-        structs::{MailingList, Permissions, PermissionsList, TaskCalendarItipContents},
+        structs::{
+            EmailAlias, MailingList, MtaInboundThrottle, Permissions, PermissionsList, Rate,
+            TaskCalendarItipContents,
+        },
     },
-    types::map::Map,
+    types::{duration::Duration as RegistryDuration, list::List, map::Map},
 };
 use calcard::{Entry, Parser, icalendar::ICalendar};
-use common::za::{
-    imip::{ZA_IMIP_DROPPED, ZA_IMIP_FAILED, ZaImipMail, ZaImipOutcome, za_imip_submit},
-    test_hooks::{self, ForceCommitSplit},
+use common::{
+    ipc::CacheInvalidation,
+    network::RcptResolution,
+    za::{
+        imip::{
+            ZA_IMIP_DROPPED, ZA_IMIP_FAILED, ZA_IMIP_UNROUTED, ZaImipMail, ZaImipOutcome,
+            za_imip_submit,
+        },
+        test_hooks::{self, ForceCommitSplit},
+    },
 };
 use groupware::{calendar::ChangedBy, scheduling::ItipSummary};
 use hyper::{Method, StatusCode};
@@ -80,6 +90,16 @@ const GRANTEE: &str = "imip-grantee@example.com";
 /// A key account whose second address is `ALIAS_TWO` (Review Focus 3).
 const ALIAS: &str = "imip-alias@example.com";
 const ALIAS_TWO: &str = "imip-alias-two@example.com";
+/// PR review ruling P1: a plain account whose alias `UNROUTED_DISABLED` is
+/// disabled, on `UNROUTED_DOMAIN`, a local domain whose catch-all is
+/// `OUT_KEY2`; the module destroys both.
+const UNROUTED_OWNER: &str = "imip-out-disabled@example.com";
+const UNROUTED_DOMAIN: &str = "imip-catchall.test";
+const UNROUTED_DISABLED: &str = "imip-off@imip-catchall.test";
+/// A local address with no entry, in a domain without a catch-all.
+const UNROUTED_NOBODY: &str = "imip-out-nobody@example.com";
+/// PR review ruling O-1: the outside address the throttled case mails.
+const THROTTLED: &str = "imip-throttled@remote.test";
 
 /// The seam case's iTIP REQUEST from `OUT_KEY` to `ATT`.
 const SEAM_ICS: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//imip seam//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:imip-out-seam\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20990105T090000Z\r\nDTEND:20990105T100000Z\r\nSUMMARY:Seam\r\nORGANIZER:mailto:imip-out-key@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:imip-att@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
@@ -158,6 +178,8 @@ pub async fn test(test: &mut TestServer) {
     chunked_collection_delete(test, &owner).await;
     rf_3_alias_attendee(test, &alias).await;
     rf_5_many_recipients(test, &owner).await;
+    unrouted_local_addresses(test, &owner, &key2).await;
+    unthrottled_submissions(test, &owner).await;
 
     cleanup(
         test,
@@ -533,6 +555,15 @@ async fn mailed_once(test: &TestServer, owner: &Party, key2: &Party, plain: &Acc
         "imip-out-key2's inbox: the internal item only"
     );
     assert_eq!(items[0].1.changed_by, ChangedBy::PrincipalId(owner.id));
+    // Invariant 46: a mail recipient is never pinned (PR review T-6): the
+    // organizer's pin record holds no pin and no entry for ATT.
+    assert!(
+        pin_record(test, owner.id, STRONG)
+            .await
+            .is_none_or(|record| record.pin(ATT).is_none()
+                && record.withheld.iter().all(|entry| entry.address != ATT)),
+        "the organizer's pin record names the mailed outside attendee"
+    );
 
     // Control: a plain organizer's invitation, upstream's path, carries the
     // RSVP link the key organizer's lacks.
@@ -672,11 +703,8 @@ async fn attendee_replies(test: &TestServer, attendee: &Party) {
         wait_for_queue(test).await;
         partstats.push(reply());
     }
-    attendee
-        .client
-        .request("DELETE", &copy, "")
-        .await
-        .with_status(StatusCode::NO_CONTENT);
+    // The DELETE mails its REPLY: the raw client (5 s, PR review T-2).
+    assert_eq!(delete_raw(attendee.name, STRONG, copy.clone()).await, 204);
     wait_for_queue(test).await;
     partstats.push(reply());
     assert_eq!(
@@ -788,11 +816,27 @@ async fn grantee_write(test: &TestServer, owner: &Party, grantee: &Party) {
             .contains("sent-by=\"mailto:imip-grantee@example.com\""),
         "{organizer}"
     );
-    owner
-        .client
-        .request_with_headers("DELETE", &path, [NO_REPLY], "")
-        .await
-        .with_status(StatusCode::NO_CONTENT);
+    // PR review T-7: the grantee's DELETE mails the CANCEL from the owner's
+    // address, `SENT-BY` naming the grantee.
+    sink().clear();
+    assert_eq!(delete_raw(grantee.name, STRONG, path.clone()).await, 204);
+    wait_for_queue(test).await;
+    let to_att = sink().take_to(ATT);
+    assert_eq!(to_att.len(), 1, "the grantee's cancellation");
+    assert!(is_method_for(&to_att[0], "CANCEL", "imip-out-g"));
+    assert_eq!(to_att[0].mail_from, owner.name);
+    assert_eq!(to_att[0].from_address().as_deref(), Some(owner.name));
+    let ics = to_att[0].calendar_part().unwrap().replace("\r\n ", "");
+    let organizer = ics
+        .lines()
+        .find(|line| line.starts_with("ORGANIZER"))
+        .expect("an ORGANIZER");
+    assert!(
+        organizer
+            .to_ascii_lowercase()
+            .contains("sent-by=\"mailto:imip-grantee@example.com\""),
+        "{organizer}"
+    );
     za_post(
         "shares/revoke",
         &json!({"username":owner.name,"password":STRONG,"calendar":"imip-shared","grant":grantee.id}),
@@ -875,18 +919,19 @@ async fn commit_failures(test: &TestServer, owner: &Party) {
     wait_for_queue(test).await;
     assert!(!sink_holds("imip-cf-create"), "the failed create mailed");
 
-    // Update: `UPDATE_COMMIT_FAIL_ONCE`.
+    // Update: `UPDATE_COMMIT_FAIL_ONCE`. The base PUT mails ATT: the raw
+    // client (5 s, PR review T-2).
     let update = own_path(owner, "imip-out-cf2");
-    owner
-        .client
-        .request_with_headers(
-            "PUT",
-            &update,
-            [CONTENT_TYPE],
-            summarized("imip-out-cf2", owner.name, "imip-cf-base"),
+    assert_eq!(
+        put(
+            owner.name,
+            STRONG,
+            update.clone(),
+            summarized("imip-out-cf2", owner.name, "imip-cf-base")
         )
-        .await
-        .with_status(StatusCode::CREATED);
+        .await,
+        201
+    );
     wait_for_queue(test).await;
     sink().clear();
     test_hooks::set_update_commit_fail_once(Some(owner.id));
@@ -907,16 +952,16 @@ async fn commit_failures(test: &TestServer, owner: &Party) {
     // Single-event DELETE: `DELETE_COMMIT_FAIL_ONCE`. Its CANCEL carries the
     // event's own SUMMARY, so the sink is cleared after the creation.
     let delete = own_path(owner, "imip-out-cf3");
-    owner
-        .client
-        .request_with_headers(
-            "PUT",
-            &delete,
-            [CONTENT_TYPE],
-            summarized("imip-out-cf3", owner.name, "imip-cf-delete"),
+    assert_eq!(
+        put(
+            owner.name,
+            STRONG,
+            delete.clone(),
+            summarized("imip-out-cf3", owner.name, "imip-cf-delete")
         )
-        .await
-        .with_status(StatusCode::CREATED);
+        .await,
+        201
+    );
     wait_for_queue(test).await;
     sink().clear();
     test_hooks::set_delete_commit_fail_once(Some(owner.id));
@@ -1071,16 +1116,17 @@ async fn chunked_collection_delete(test: &TestServer, owner: &Party) {
         .with_status(StatusCode::CREATED);
     let mut ids = Vec::new();
     for uid in ["imip-out-k1", "imip-out-k2"] {
-        owner
-            .client
-            .request_with_headers(
-                "PUT",
-                &format!("{calendar}{uid}.ics"),
-                [CONTENT_TYPE],
-                event(uid, owner.name, &[ATT], 0, ""),
+        // Each PUT mails ATT: the raw client (5 s, PR review T-2).
+        assert_eq!(
+            put(
+                owner.name,
+                STRONG,
+                format!("{calendar}{uid}.ics"),
+                event(uid, owner.name, &[ATT], 0, "")
             )
-            .await
-            .with_status(StatusCode::CREATED);
+            .await,
+            201
+        );
         ids.push(resource_id(test, owner.id, &format!("imip-coll/{uid}.ics")).await);
     }
     // `delete_with_events_za` walks the children in ascending order, one
@@ -1210,6 +1256,205 @@ async fn rf_5_many_recipients(test: &TestServer, owner: &Party) {
         .request_with_headers("DELETE", &path, [NO_REPLY], "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+}
+
+/// PR review ruling P1 (fail closed; a D9 amendment): a local address the
+/// registry resolves to neither a non-key account nor a list is withheld
+/// (`5.1`, traced, never mailed), even where the SMTP layer would deliver
+/// it: a disabled plain address whose domain's catch-all is an active key
+/// account (`rcpt_resolve` falls through the disabled entry to it), and a
+/// local address with no entry where no catch-all applies. An outside
+/// address, the control, is mailed (`1.1`).
+async fn unrouted_local_addresses(test: &TestServer, owner: &Party, key2: &Party) {
+    let admin = test.account("admin@example.com").clone();
+    let domain = admin.find_or_create_domain(UNROUTED_DOMAIN).await;
+    admin
+        .registry_update_object(
+            ObjectType::Domain,
+            domain,
+            json!({ "catchAllAddress": OUT_KEY2 }),
+        )
+        .await;
+    let disabled = admin
+        .create_user_account(
+            UNROUTED_OWNER,
+            STRONG,
+            "iMIP disabled alias",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            disabled.id(),
+            json!({ Property::Aliases: List::from_iter([EmailAlias {
+                name: UNROUTED_DISABLED.split_once('@').unwrap().0.to_string(),
+                domain_id: domain,
+                enable: false,
+                description: None,
+            }]) }),
+        )
+        .await;
+    test.server.invalidate_local_caches(&[
+        CacheInvalidation::Domain(domain.document_id()),
+        CacheInvalidation::Account(disabled.id().document_id()),
+    ]);
+    test.server.invalidate_all_local_negative_caches();
+    // The premise: the SMTP layer delivers the disabled address to the
+    // catch-all, an active key account.
+    assert!(
+        matches!(
+            test.server
+                .rcpt_resolve(UNROUTED_DISABLED, true, 0)
+                .await
+                .unwrap(),
+            RcptResolution::Rewrite(address) if address == OUT_KEY2
+        ),
+        "the disabled address does not reach the catch-all"
+    );
+
+    sink().clear();
+    let (key2_rows, key2_items) = (
+        metadata_rows(test, key2.id).await.len(),
+        inbox_ids(test, key2.id).await,
+    );
+    let traced = Traced::start(&[EventType::Calendar(CalendarEvent::ItipMessageError)]);
+    let path = own_path(owner, "imip-out-u");
+    assert_eq!(
+        put(
+            owner.name,
+            STRONG,
+            path.clone(),
+            event(
+                "imip-out-u",
+                owner.name,
+                &[UNROUTED_DISABLED, UNROUTED_NOBODY, ATT],
+                0,
+                ""
+            )
+        )
+        .await,
+        201
+    );
+    for (address, status) in [
+        (UNROUTED_DISABLED, "5.1"),
+        (UNROUTED_NOBODY, "5.1"),
+        (ATT, "1.1"),
+    ] {
+        assert_eq!(
+            attendee_statuses(&owner.client, &path, address).await,
+            [status],
+            "{address}"
+        );
+    }
+    wait_for_queue(test).await;
+    assert_eq!(
+        sink()
+            .messages()
+            .iter()
+            .map(|message| message.rcpt_to.clone())
+            .collect::<Vec<_>>(),
+        [vec![ATT.to_string()]],
+        "only the outside address is mailed"
+    );
+    assert_eq!(
+        metadata_rows(test, key2.id).await.len(),
+        key2_rows,
+        "the catch-all key account's mailbox gained a message"
+    );
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        key2_items,
+        "the catch-all key account's inbox gained an item"
+    );
+    let unrouted = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| {
+            event.details == ZA_IMIP_UNROUTED && event.account_id == Some(owner.id as u64)
+        })
+        .count();
+    assert_eq!(unrouted, 2, "one trace per withheld address");
+
+    owner
+        .client
+        .request_with_headers("DELETE", &path, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    admin.destroy_account(disabled).await;
+    admin
+        .registry_destroy(ObjectType::Domain, [domain])
+        .await
+        .assert_destroyed(&[domain]);
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::Domain(domain.document_id())]);
+    test.server.invalidate_all_local_negative_caches();
+}
+
+/// PR review ruling O-1: the fork's own submissions are exempt from the
+/// inbound rate limiters, whose 4xx a key account's mail never retries. With
+/// upstream's default recipient throttle (sender domain and recipient) at two
+/// an hour, three single-event DELETEs mail three CANCELs to one outside
+/// address, and all three reach the sink.
+async fn unthrottled_submissions(test: &TestServer, owner: &Party) {
+    let admin = test.account("admin@example.com").clone();
+    let uids = ["imip-out-t1", "imip-out-t2", "imip-out-t3"];
+    for uid in uids {
+        assert_eq!(
+            put(
+                owner.name,
+                STRONG,
+                own_path(owner, uid),
+                event(uid, owner.name, &[THROTTLED], 0, "")
+            )
+            .await,
+            201
+        );
+    }
+    wait_for_queue(test).await;
+    // Upstream's default "Sender address to recipient throttle". Its rate is
+    // part of its key, so at two an hour it starts from zero.
+    let (throttle, saved) = admin
+        .registry_get_all::<MtaInboundThrottle>()
+        .await
+        .into_iter()
+        .find(|(_, throttle)| {
+            throttle.enable && throttle.description == "Sender address to recipient throttle"
+        })
+        .map(|(id, throttle)| (id, throttle.rate))
+        .expect("upstream's default recipient throttle");
+    let set_rate = async |rate: &Rate| {
+        admin
+            .registry_update_object(
+                ObjectType::MtaInboundThrottle,
+                throttle,
+                json!({ "rate": rate }),
+            )
+            .await;
+        admin.reload_settings().await;
+    };
+    set_rate(&Rate {
+        count: 2,
+        period: RegistryDuration::from_millis(60 * 60 * 1000),
+    })
+    .await;
+    sink().clear();
+    for uid in uids {
+        assert_eq!(
+            delete_raw(owner.name, STRONG, own_path(owner, uid)).await,
+            204
+        );
+    }
+    wait_for_queue(test).await;
+    let cancels = sink()
+        .take_to(THROTTLED)
+        .iter()
+        .filter(|message| uids.iter().any(|uid| is_method_for(message, "CANCEL", uid)))
+        .count();
+    assert_eq!(cancels, 3, "a CANCEL was throttled");
+    set_rate(&saved).await;
 }
 
 /// D17, invariant 47: the submission's own lookups are quiet and its own
