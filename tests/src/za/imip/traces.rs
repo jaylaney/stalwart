@@ -54,6 +54,11 @@ const TRACE_KEY: &str = "imip-trace-key@example.com";
 /// A key account other than the module's: its address as a mail sender is
 /// refused (spec 4.1 step 4).
 const KEY_SENDER: &str = "key1@example.com";
+/// The sender's full domain, the key of a traced lookup of it.
+const SENDER_DOMAIN: &str = "imiptrace-domain-canary.remote.test";
+/// The cache key of a traced lookup of `KEY_SENDER`'s local part
+/// (`rcpt_id_from_parts`); nothing else in the module looks it up.
+const KEY_SENDER_LOCAL: &str = "key1";
 
 /// Content canaries: the SUMMARY and the LOCATION of every event the module
 /// sends or receives, and the sender's display name.
@@ -62,8 +67,13 @@ const LOCATION_CANARY: &str = "imiptrace-loc-canary";
 const NAME_CANARY: &str = "imiptrace-name-canary";
 /// The sender of the module's incoming mail.
 const FROM_CANARY: &str = "imiptrace-from-canary";
-const FROM: &str = "imiptrace-from-canary@remote.test";
-const FROM_HEADER: &str = "\"imiptrace-name-canary\" <imiptrace-from-canary@remote.test>";
+/// The sender's domain label: a lookup of the sender's address that traces
+/// the domain (upstream's `account_id_from_email`) names it, where the fork's
+/// quiet lookup does not.
+const DOMAIN_CANARY: &str = "imiptrace-domain-canary";
+const FROM: &str = "imiptrace-from-canary@imiptrace-domain-canary.remote.test";
+const FROM_HEADER: &str =
+    "\"imiptrace-name-canary\" <imiptrace-from-canary@imiptrace-domain-canary.remote.test>";
 /// The attendee the module's invitations mail (a sink address), and an
 /// attendee at a local domain no account has (refused at RCPT).
 const ATT_CANARY: &str = "imiptrace-att-canary";
@@ -72,11 +82,12 @@ const NOBODY_CANARY: &str = "imiptrace-local-canary";
 const NOBODY: &str = "imiptrace-local-canary@example.com";
 
 /// Every canary the fork's own events must not carry.
-const CANARIES: [&str; 6] = [
+const CANARIES: [&str; 7] = [
     SUMMARY_CANARY,
     LOCATION_CANARY,
     NAME_CANARY,
     FROM_CANARY,
+    DOMAIN_CANARY,
     ATT_CANARY,
     NOBODY_CANARY,
 ];
@@ -93,21 +104,27 @@ fn is_transit(typ: EventType) -> bool {
     )
 }
 
-/// Where a captured event was emitted. `Strict`: while a write was parked
-/// before its commit, or during a step that submits nothing; no event may
-/// name an attendee. `Open`: elsewhere, after a commit included, where the
-/// SMTP layer's transit and the cache lookups of its recipient resolution
-/// may.
+/// Where a captured event was emitted (as `za::tracing`'s windows).
+/// `PreCommit`: while a write was parked before its commit, or during a step
+/// that submits nothing; no event may name an attendee, the SMTP layer's
+/// included. `PostCommit`: after a write's commit, its submissions and their
+/// delivery; the only window where the cache lookups of the session's
+/// recipient resolution (upstream's `rcpt_resolve`) may name a recipient.
+/// `Other`: the delivery and drain steps and the flushes between steps,
+/// where no cache event may name anything.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Window {
-    Strict,
-    Open,
+    Other,
+    PreCommit,
+    PostCommit,
 }
 
 /// One captured event: its type, its window, and every key and value.
 struct Captured {
     typ: EventType,
     window: Window,
+    /// The scenario step that emitted it, for the failure messages.
+    step: &'static str,
     span: Option<u64>,
     account_id: Option<u64>,
     keys: Vec<(Key, trc::Value)>,
@@ -151,7 +168,7 @@ impl Captured {
 
 impl std::fmt::Debug for Captured {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {}", self.typ, self.text)
+        write!(f, "[{}] {:?}: {}", self.step, self.typ, self.text)
     }
 }
 
@@ -206,8 +223,9 @@ impl Capture {
         }
     }
 
-    /// Moves every event the subscriber holds into `events`, tagged `window`.
-    fn take(&mut self, window: Window) {
+    /// Moves every event the subscriber holds into `events`, tagged `window`
+    /// and `step`.
+    fn take(&mut self, window: Window, step: &'static str) {
         while let Ok(batch) = self.rx.try_recv() {
             for event in batch {
                 let mut values = Vec::new();
@@ -223,6 +241,7 @@ impl Capture {
                 self.events.push(Captured {
                     typ: event.inner.typ,
                     window,
+                    step,
                     span,
                     account_id,
                     keys: event.keys.clone(),
@@ -233,13 +252,14 @@ impl Capture {
     }
 
     /// Lets the collector deliver what the last step emitted, then takes it.
-    async fn settle(&mut self, window: Window) {
+    async fn settle(&mut self, window: Window, step: &'static str) {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        self.take(window);
+        self.take(window, step);
     }
 
     async fn finish(mut self) -> Vec<Captured> {
-        self.settle(Window::Open).await;
+        self.settle(Window::PostCommit, "after the last DELETE")
+            .await;
         Collector::remove_subscriber(SUBSCRIBER_ID.into());
         Collector::reload();
         self.events
@@ -296,13 +316,33 @@ fn own_path(name: &str) -> String {
     )
 }
 
+/// Whether `typ` is one of the fork's iMIP events (`ItipMessage*`): never
+/// exempt, whatever span it carries (spec section 7: only the SMTP layer's
+/// transit names a recipient or a sender).
+fn is_itip(typ: EventType) -> bool {
+    matches!(
+        typ,
+        EventType::Calendar(
+            CalendarEvent::ItipMessageReceived
+                | CalendarEvent::ItipMessageError
+                | CalendarEvent::ItipMessageSent
+        )
+    )
+}
+
 /// The events that name `canary` and are not the SMTP layer's transit: those
-/// of a `Strict` window when `strict` (nothing may name an attendee before a
-/// write's commit, transit included), and those that are not in the span of
-/// a transit event naming it and, after a commit (`Open`) with `cache`, not
-/// a cache lookup. The SMTP session's own RCPT lookups (`rcpt_resolve`,
-/// upstream's `Cache` events) carry no span id.
-fn outside_transit(events: &[Captured], canary: &str, strict: bool, cache: bool) -> Vec<String> {
+/// of a `PreCommit` window when `strict` (nothing may name an attendee before
+/// a write's commit, transit included), and those that are not an SMTP,
+/// delivery or queue event, nor an event of the span of one naming the
+/// canary, nor, in a `PostCommit` window and when `cache`, a cache lookup
+/// (the session's own RCPT lookups, upstream's `rcpt_resolve`, carry no span
+/// id). An `ItipMessage*` event is never exempt.
+fn outside_transit<'a>(
+    events: &'a [Captured],
+    canary: &str,
+    strict: bool,
+    cache: bool,
+) -> Vec<&'a Captured> {
     let spans = events
         .iter()
         .filter(|event| is_transit(event.typ) && event.text.contains(canary))
@@ -312,13 +352,33 @@ fn outside_transit(events: &[Captured], canary: &str, strict: bool, cache: bool)
         .iter()
         .filter(|event| event.text.contains(canary))
         .filter(|event| {
-            (strict && event.window == Window::Strict)
+            (strict && event.window == Window::PreCommit)
+                || is_itip(event.typ)
                 || !(is_transit(event.typ)
                     || event.span.is_some_and(|span| spans.contains(&span))
-                    || (cache && matches!(event.typ, EventType::Cache(_))))
+                    || (cache
+                        && event.window == Window::PostCommit
+                        && matches!(event.typ, EventType::Cache(_))))
         })
-        .map(|event| format!("{event:?}"))
         .collect()
+}
+
+/// Upstream's own lookup of the sender's domain: the LMTP session evaluates
+/// `is_local_domain(sender_domain)` for the envelope's MAIL FROM
+/// (`domain()`, which traces the name), a span-less `Cache` event of the
+/// session's transit that names the domain whoever the sender is.
+fn is_session_domain_lookup(event: &Captured) -> bool {
+    matches!(
+        event.typ,
+        EventType::Cache(trc::CacheEvent::Hit | trc::CacheEvent::Miss)
+    ) && event.span.is_none()
+        && event.window == Window::Other
+        && event.step.starts_with("delivery:")
+        && event.string(Key::Key) == Some(SENDER_DOMAIN)
+        && matches!(
+            event.string(Key::Name),
+            Some("domainName" | "domainNameNegative")
+        )
 }
 
 pub async fn test(test: &mut TestServer) {
@@ -343,7 +403,7 @@ pub async fn test(test: &mut TestServer) {
     // part (refused at step 1), a CANCEL for a UID the account does not know
     // (refused at step 5).
     let limit = test.server.core.groupware.itip_inbound_max_ical_size;
-    for (envelope_from, message) in [
+    for ((envelope_from, message), step) in [
         (
             format!("dmarc-{FROM}"),
             itip_mail(
@@ -386,9 +446,17 @@ pub async fn test(test: &mut TestServer) {
                 ),
             ),
         ),
-    ] {
+    ]
+    .into_iter()
+    .zip([
+        "delivery: the REQUEST",
+        "delivery: a key account's REQUEST",
+        "delivery: the oversized part",
+        "delivery: the unknown UID's CANCEL",
+    ]) {
         deliver(&envelope_from, TRACE_KEY, &message).await;
         wait_for_queue(test).await;
+        capture.settle(Window::Other, step).await;
     }
     let delivered = new_inbox_items(test, key.id, &start).await;
     assert_eq!(
@@ -408,7 +476,6 @@ pub async fn test(test: &mut TestServer) {
     // submissions and their delivery. Row: a mail attempt accepted (ATT) and
     // one refused at RCPT (the local address).
     let out = own_path("imiptrace-out");
-    capture.settle(Window::Open).await;
     let parked = HookParked::start(
         key.id,
         test_hooks::set_commit_pause,
@@ -420,10 +487,17 @@ pub async fn test(test: &mut TestServer) {
         ),
     )
     .await;
-    capture.settle(Window::Strict).await;
+    capture
+        .settle(
+            Window::PreCommit,
+            "PUT before its commit (the drain imports the REQUEST)",
+        )
+        .await;
     assert_eq!(parked.finish().await, 201);
     wait_for_queue(test).await;
-    capture.settle(Window::Open).await;
+    capture
+        .settle(Window::PostCommit, "PUT after its commit")
+        .await;
     let mailed = sink().take_to(ATT);
     assert_eq!(mailed.len(), 1, "the attendee was mailed once");
     assert!(is_request_for(&mailed[0], "imiptrace-out"));
@@ -460,11 +534,13 @@ pub async fn test(test: &mut TestServer) {
     )
     .await;
     wait_for_queue(test).await;
+    capture.settle(Window::Other, "delivery: the REPLY").await;
     let reply_items = new_inbox_items(test, key.id, &before).await;
     assert_eq!(reply_items.len(), 1, "the REPLY took an item");
     let reply_item = reply_items[0].0;
     assert_eq!(pending_ids(test, key.id).await, [reply_item]);
     assert_eq!(trigger_drain(TRACE_KEY, STRONG).await, 207);
+    capture.settle(Window::Other, "drain: the REPLY").await;
     assert!(
         !inbox_ids(test, key.id).await.contains(&reply_item),
         "the drain did not delete the non-participant's REPLY"
@@ -473,7 +549,6 @@ pub async fn test(test: &mut TestServer) {
     // A submission that fails (the hook): the status stays `1.1`, the failure
     // is traced, nothing is submitted, so no event names the attendee.
     let failed = own_path("imiptrace-fail");
-    capture.settle(Window::Open).await;
     test_hooks::set_imip_submit_fail_once(Some(key.id));
     assert_eq!(
         put(
@@ -487,34 +562,40 @@ pub async fn test(test: &mut TestServer) {
     );
     test_hooks::set_imip_submit_fail_once(None);
     wait_for_queue(test).await;
-    capture.settle(Window::Strict).await;
+    capture
+        .settle(Window::PreCommit, "PUT whose submission fails")
+        .await;
     assert_eq!(sink().count_to(ATT), 0, "the failed submission was mailed");
     assert_eq!(attendee_statuses(&key.client, &failed, ATT).await, ["1.1"]);
 
     // A DELETE whose commit fails: its CANCELs are dropped (row: a DELETE's
     // mail dropped after its commit erred), nothing is submitted.
-    capture.settle(Window::Open).await;
     test_hooks::set_delete_commit_fail_once(Some(key.id));
     assert_eq!(delete(out.clone()).await, 500);
     test_hooks::set_delete_commit_fail_once(None);
     wait_for_queue(test).await;
-    capture.settle(Window::Strict).await;
+    capture
+        .settle(Window::PreCommit, "DELETE whose commit fails")
+        .await;
     assert_eq!(uid_copies(test, key.id, "imiptrace-out").await, 1);
     assert_eq!(sink().count_to(ATT), 0, "the dropped CANCEL was mailed");
 
     // The DELETE again, parked before its commit like the PUT: its CANCEL to
     // the attendee is accepted, the local address refused at RCPT.
-    capture.settle(Window::Open).await;
     let parked = HookParked::start(
         key.id,
         test_hooks::set_delete_commit_pause,
         delete(out.clone()),
     )
     .await;
-    capture.settle(Window::Strict).await;
+    capture
+        .settle(Window::PreCommit, "DELETE before its commit")
+        .await;
     assert_eq!(parked.finish().await, 204);
     wait_for_queue(test).await;
-    capture.settle(Window::Open).await;
+    capture
+        .settle(Window::PostCommit, "DELETE after its commit")
+        .await;
     let cancelled = sink().take_to(ATT);
     assert_eq!(cancelled.len(), 1, "the attendee was mailed the CANCEL");
     assert_eq!(cancelled[0].calendar_method().as_deref(), Some("CANCEL"));
@@ -522,25 +603,10 @@ pub async fn test(test: &mut TestServer) {
     let captured = capture.finish().await;
     let mailed_total = mailed.len() + cancelled.len();
 
-    // The fork's iMIP events of this account.
-    let ours = captured
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.typ,
-                EventType::Calendar(
-                    CalendarEvent::ItipMessageReceived
-                        | CalendarEvent::ItipMessageError
-                        | CalendarEvent::ItipMessageSent
-                )
-            ) && event.account_id == Some(key.id as u64)
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        ours.len() >= 8,
-        "the scenario's events were captured: {ours:#?}"
-    );
-    for event in &ours {
+    // Every iMIP event of the capture, whatever its account: none carries an
+    // address or a canary, and `From`, where present, is the redaction
+    // marker.
+    for event in captured.iter().filter(|event| is_itip(event.typ)) {
         assert!(
             !event.text.contains('@') && !CANARIES.iter().any(|canary| event.text.contains(canary)),
             "an iMIP event carries an address or content: {event:?}"
@@ -553,6 +619,15 @@ pub async fn test(test: &mut TestServer) {
             );
         }
     }
+    // The fork's iMIP events of this account.
+    let ours = captured
+        .iter()
+        .filter(|event| is_itip(event.typ) && event.account_id == Some(key.id as u64))
+        .collect::<Vec<_>>();
+    assert!(
+        ours.len() >= 8,
+        "the scenario's events were captured: {ours:#?}"
+    );
     let of_type = |typ: CalendarEvent| {
         ours.iter()
             .filter(move |event| event.typ == EventType::Calendar(typ))
@@ -706,7 +781,7 @@ pub async fn test(test: &mut TestServer) {
         let exempt = captured
             .iter()
             .filter(|event| {
-                event.window == Window::Open
+                event.window == Window::PostCommit
                     && matches!(event.typ, EventType::Cache(_))
                     && event.text.contains(canary)
                     && event.span.is_none()
@@ -716,6 +791,16 @@ pub async fn test(test: &mut TestServer) {
         println!(
             "{canary}: {} cache events after a commit: {exempt:#?}",
             exempt.len()
+        );
+        // Positive control, on upstream's behaviour: the session's recipient
+        // resolution of the local address does reach the collector as
+        // non-transit `Cache` events, so the checks above are not vacuous
+        // for a cache event; the remote attendee's domain is not local, so
+        // none exists for it.
+        assert_eq!(
+            !exempt.is_empty(),
+            canary == NOBODY_CANARY,
+            "upstream's rcpt_resolve cache events for {canary}: {exempt:#?}"
         );
     }
     // The incoming mail's sender: named by the inbound SMTP session (its
@@ -730,6 +815,67 @@ pub async fn test(test: &mut TestServer) {
     assert!(
         named.is_empty(),
         "the sender traced outside the SMTP layer's transit: {named:#?}"
+    );
+
+    // Invariant 47, spec section 7 ("the fork's own lookups stay quiet"):
+    // delivery's step 4 and the drain's repeat of it look the sender up with
+    // `za_account_id_from_email`. The traced lookup of a remote sender
+    // (`account_id_from_email`) emits a `Cache` event keyed by the sender's
+    // domain, so the domain label is a canary; the traced lookup of a local
+    // sender also emits events keyed by its local part. Upstream's session
+    // itself looks the sender's domain up once per message (the MAIL FROM's
+    // `is_local_domain`), the one exemption: exactly one such span-less
+    // `Cache` event per delivery from the sender's domain, none in any other
+    // step (the drains included), so a second lookup of the sender, the
+    // fork's, shows as a second event in its delivery step or one in a drain
+    // step. Never an `ItipMessage*` event.
+    assert!(
+        captured
+            .iter()
+            .any(|event| is_transit(event.typ) && event.text.contains(DOMAIN_CANARY)),
+        "no transit event named the sender's domain"
+    );
+    let mut per_delivery = Vec::<&str>::new();
+    let named = outside_transit(&captured, DOMAIN_CANARY, false, false)
+        .into_iter()
+        .filter(|event| {
+            // The session's one lookup of its delivery.
+            if is_session_domain_lookup(event) && !per_delivery.contains(&event.step) {
+                per_delivery.push(event.step);
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        named.is_empty(),
+        "a lookup of the sender other than the session's traced its domain: {named:#?}"
+    );
+    // Positive control, on upstream's behaviour: the session's lookup was
+    // collected in each delivery from the sender's domain (all but the key
+    // account's), so the check above is not vacuous.
+    assert_eq!(
+        per_delivery,
+        [
+            "delivery: the REQUEST",
+            "delivery: the oversized part",
+            "delivery: the unknown UID's CANCEL",
+            "delivery: the REPLY",
+        ],
+        "the session's lookup of the sender's domain, once per delivery"
+    );
+    let named = captured
+        .iter()
+        .filter(|event| {
+            matches!(event.typ, EventType::Cache(_))
+                && event.string(Key::Key) == Some(KEY_SENDER_LOCAL)
+        })
+        .map(|event| format!("{event:?}"))
+        .collect::<Vec<_>>();
+    assert!(
+        named.is_empty(),
+        "a lookup of the key sender traced its local part: {named:#?}"
     );
 
     // Cleanup: the module's events (without a CANCEL), inbox items (pending
