@@ -22,8 +22,11 @@
 //!    file names are replaced by placeholders (MIME boundaries decode away in
 //!    the compared parts). The module runs with `httpRsvpEnable` off, so the
 //!    email bodies otherwise compare exactly.
-//! 4. `SCHEDULE-STATUS` parameters, removed in stored copies and in the
-//!    CANCELs that copy them (Jay's decision 9).
+//! 4. `SCHEDULE-STATUS` parameters, removed only in stored copies (the DAV
+//!    GET of each side's event) and in the iCalendar part of the CANCELs that
+//!    copy them (Jay's decision 9). Inbox item trees and the iCalendar parts
+//!    of every other message (a REQUEST, a REPLY) keep them, so a fork status
+//!    in outside mail that upstream's does not carry fails.
 //!
 //! Spec 3.3's other permitted differences are not normalizations: the
 //! sealing (item 1) is the unsealed view, timing (item 5) is the drain
@@ -42,7 +45,7 @@ use crate::{
         webdav::DummyWebDavClient,
         za::{
             copy_href, inbox_ids, inbox_items, item_partstat, mail_borne_items, new_inbox_items,
-            trigger_drain, wait_for_delivery,
+            trigger_drain, wait_for_delivery, wait_for_queue,
         },
     },
     za::{
@@ -89,8 +92,13 @@ enum Side {
 /// What a value is, which decides the normalizations that apply to it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
-    /// iCalendar content: unfolded; DTSTAMP and `SCHEDULE-STATUS` removed.
+    /// iCalendar content: unfolded; DTSTAMP removed. An inbox item's tree and
+    /// the iCalendar part of a REQUEST or REPLY email.
     Ics,
+    /// iCalendar content that spec 3.3 item 4 lets differ in
+    /// `SCHEDULE-STATUS`: as `Ics`, with the parameter removed. A stored copy
+    /// and the iCalendar part of a CANCEL.
+    IcsCopy,
     /// A header value or an envelope address: unfolded.
     Header,
     /// A decoded body part: nothing is unfolded.
@@ -107,7 +115,7 @@ fn normalize(side: Side, kind: Kind, text: &str) -> String {
         return "<volatile>".to_string();
     }
     let mut text = text.to_string();
-    if matches!(kind, Kind::Ics | Kind::Header) {
+    if matches!(kind, Kind::Ics | Kind::IcsCopy | Kind::Header) {
         // Item 2's consequence: a fold point follows the mapped line length.
         for fold in ["\r\n ", "\r\n\t", "\n ", "\n\t"] {
             text = text.replace(fold, "");
@@ -117,7 +125,7 @@ fn normalize(side: Side, kind: Kind, text: &str) -> String {
         // Item 2: addresses, display names and hrefs.
         text = text.replace(PLAIN_NAME, KEY_NAME);
     }
-    if kind == Kind::Ics {
+    if matches!(kind, Kind::Ics | Kind::IcsCopy) {
         text = text
             .split('\n')
             .map(|line| {
@@ -128,9 +136,11 @@ fn normalize(side: Side, kind: Kind, text: &str) -> String {
                 // Item 3: DTSTAMP.
                 let line = if line.starts_with("DTSTAMP") {
                     "DTSTAMP:<volatile>".to_string()
-                } else {
-                    // Item 4: SCHEDULE-STATUS.
+                } else if kind == Kind::IcsCopy {
+                    // Item 4: SCHEDULE-STATUS, in stored copies and CANCELs.
                     without_schedule_status(line)
+                } else {
+                    line.to_string()
                 };
                 line + end
             })
@@ -434,6 +444,10 @@ async fn exchange(test: &TestServer, oracle: &Oracle, direction: Direction) {
         for side in [Side::Plain, Side::Key] {
             perform(test, direction, n, oracle.party(side)).await;
         }
+        // Local delivery happens in the SMTP queue, and `deliver` returns
+        // after a fixed sleep: wait for the queue, so the key account's item
+        // is written before the drain that is to take it.
+        wait_for_queue(test).await;
         // Spec 3.3 item 5: the key account's inbound effects follow its next
         // DAV request.
         assert_eq!(
@@ -655,7 +669,7 @@ async fn compare(
         }
         tally.same(
             "stored event",
-            Kind::Ics,
+            Kind::IcsCopy,
             Some(&stored[0]),
             Some(&stored[1]),
         );
@@ -768,6 +782,13 @@ fn mail_key(message: &SinkMessage) -> (String, String) {
 /// text, HTML and iCalendar parts, and the presence of Message-ID and Date.
 fn mail_parts(message: &SinkMessage) -> Vec<(&'static str, Kind, Option<String>)> {
     let header = |name| raw_header(message, name);
+    // Spec 3.3 item 4 lets only a CANCEL's copy of the attendee lines differ
+    // in SCHEDULE-STATUS; a REQUEST or REPLY keeps the parameter.
+    let ics = if message.calendar_method().as_deref() == Some("CANCEL") {
+        Kind::IcsCopy
+    } else {
+        Kind::Ics
+    };
     vec![
         ("MAIL FROM", Kind::Header, Some(message.mail_from.clone())),
         ("RCPT TO", Kind::Header, Some(message.rcpt_to.join(","))),
@@ -781,7 +802,7 @@ fn mail_parts(message: &SinkMessage) -> Vec<(&'static str, Kind, Option<String>)
         ("Method", Kind::Body, message.calendar_method()),
         ("Text", Kind::Body, message.text_part()),
         ("Html", Kind::Body, message.html_part()),
-        ("Ics", Kind::Ics, message.calendar_part()),
+        ("Ics", ics, message.calendar_part()),
     ]
 }
 
@@ -902,20 +923,41 @@ fn self_check() {
     };
     let (stamp, later) = ("20260101T000000Z", "20261102T101500Z");
     let base = stored(KEY_NAME, stamp, "", "same");
-    let ics = |side, text: &str| normalize(side, Kind::Ics, text);
+    // `ics` reads a stored copy or a CANCEL (item 4 applies); `strict` reads
+    // an inbox item's tree or a REQUEST or REPLY email's iCalendar part
+    // (SCHEDULE-STATUS is kept).
+    let ics = |side, text: &str| normalize(side, Kind::IcsCopy, text);
+    let strict = |side, text: &str| normalize(side, Kind::Ics, text);
     // Every sample is read as the key side unless it is the mapped one, so
     // each rule is exercised alone.
     let same = |a: &str, b: &str| ics(Side::Key, a) == ics(Side::Key, b);
+    let strict_same = |a: &str, b: &str| strict(Side::Key, a) == strict(Side::Key, b);
+    let with_status = stored(KEY_NAME, stamp, ";SCHEDULE-STATUS=2.0", "same");
 
-    // Item 3: DTSTAMP alone.
+    // Item 3: DTSTAMP alone, in both readings.
     assert!(same(&base, &stored(KEY_NAME, later, "", "same")), "DTSTAMP");
-    // Item 4: SCHEDULE-STATUS alone, and a quoted value with a colon.
     assert!(
-        same(
-            &base,
-            &stored(KEY_NAME, stamp, ";SCHEDULE-STATUS=2.0", "same")
+        strict_same(&base, &stored(KEY_NAME, later, "", "same")),
+        "DTSTAMP, strict"
+    );
+    // Item 4: SCHEDULE-STATUS alone is a permitted difference of a stored copy
+    // or a CANCEL, and of nothing else: a REQUEST or REPLY iCalendar part, or
+    // an item's tree, that differs only in SCHEDULE-STATUS compares unequal.
+    assert!(same(&base, &with_status), "SCHEDULE-STATUS");
+    assert!(
+        !strict_same(&base, &with_status),
+        "SCHEDULE-STATUS is kept outside stored copies and CANCELs"
+    );
+    assert_ne!(
+        strict(
+            Side::Plain,
+            &stored(PLAIN_NAME, stamp, ";SCHEDULE-STATUS=2.0", "same")
         ),
-        "SCHEDULE-STATUS"
+        strict(
+            Side::Key,
+            &stored(KEY_NAME, stamp, ";SCHEDULE-STATUS=1.1", "same")
+        ),
+        "two statuses stay different, strict"
     );
     assert_eq!(
         without_schedule_status("ATTENDEE;SCHEDULE-STATUS=\"3.7;x:y\";CN=A:mailto:a@b"),
@@ -930,15 +972,50 @@ fn self_check() {
         ics(Side::Key, &base),
         "the mapping"
     );
-    assert!(same(&base, &base.replace("\r\n ", "")), "a fold");
-    // All of them together.
     assert_eq!(
-        ics(
-            Side::Plain,
-            &stored(PLAIN_NAME, stamp, ";SCHEDULE-STATUS=2.0", "same")
-        ),
-        ics(Side::Key, &stored(KEY_NAME, later, "", "same")),
+        strict(Side::Plain, &plain_copy),
+        strict(Side::Key, &base),
+        "the mapping, strict"
+    );
+    assert!(same(&base, &base.replace("\r\n ", "")), "a fold");
+    assert!(
+        strict_same(&base, &base.replace("\r\n ", "")),
+        "a fold, strict"
+    );
+    // All of them together: a plain copy with another DTSTAMP, an address of
+    // the mapping, a SCHEDULE-STATUS and other fold points equals the key
+    // copy as a stored copy or a CANCEL; read strictly, the same pair equals
+    // without the SCHEDULE-STATUS and not with it.
+    let plain_status = stored(PLAIN_NAME, stamp, ";SCHEDULE-STATUS=2.0", "same");
+    let key_later = stored(KEY_NAME, later, "", "same");
+    assert_eq!(
+        ics(Side::Plain, &plain_status),
+        ics(Side::Key, &key_later),
         "the permitted differences together"
+    );
+    assert_eq!(
+        strict(Side::Plain, &stored(PLAIN_NAME, stamp, "", "same")),
+        strict(Side::Key, &key_later),
+        "the permitted differences together, strict"
+    );
+    assert_ne!(
+        strict(Side::Plain, &plain_status),
+        strict(Side::Key, &key_later),
+        "a SCHEDULE-STATUS beside the permitted differences, strict"
+    );
+    // The combined negative (brief Step 3): the same pair, also differing in
+    // SUMMARY, compares unequal across the plain-side mapping, as a stored
+    // copy or a CANCEL and strictly.
+    let plain_changed = stored(PLAIN_NAME, stamp, ";SCHEDULE-STATUS=2.0", "changed");
+    assert_ne!(
+        ics(Side::Plain, &plain_changed),
+        ics(Side::Key, &key_later),
+        "the permitted differences and a SUMMARY"
+    );
+    assert_ne!(
+        strict(Side::Plain, &plain_changed),
+        strict(Side::Key, &key_later),
+        "the permitted differences and a SUMMARY, strict"
     );
 
     // And nothing else: a different SUMMARY, PARTSTAT, address, property or
