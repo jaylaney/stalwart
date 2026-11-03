@@ -50,6 +50,12 @@ pub const ZA_IMIP_LOOKUP_FAILED: &str = "zero-access: iMIP sender lookup failed"
 /// Upstream's details for an iMIP part over `itip_inbound_max_ical_size`.
 pub const ZA_IMIP_TOO_LARGE: &str = "iMIP message too large";
 
+// The drain (spec 4.3, D7, section 7).
+
+/// The details of a mail-borne item the drain deletes, as upstream's ingest
+/// would have left no inbox item (the reason is the outcome's fixed name).
+pub const ZA_IMIP_ITEM_DELETED: &str = "zero-access: mail-borne item deleted";
+
 /// One (message, recipient) of spec 5.3: the event's account (upstream's
 /// task account), the event's document id, and one message as
 /// `ItipMessages::new` fills it, with `to` the one recipient. No `Debug`:

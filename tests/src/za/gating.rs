@@ -7,6 +7,7 @@
 use super::{
     STRONG,
     dav_seal::{raw_event, raw_event_records},
+    drain::DrainOn,
     fanout::NO_REPLY,
 };
 use crate::utils::{
@@ -14,8 +15,8 @@ use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
     za::{
-        SERVER_URL, delete_inbox_item, inbox_ids, mail_count, new_inbox_items, pending_ids,
-        plant_event, wait_for_delivery,
+        SERVER_URL, copy_href, delete_inbox_item, inbox_ids, inbox_items, mail_count,
+        new_inbox_items, pending_ids, plant_event, trigger_drain, wait_for_delivery,
     },
 };
 use common::auth::oauth::GrantType;
@@ -696,6 +697,36 @@ pub async fn test_scheduling(test: &mut TestServer) {
     );
     assert_eq!(members(&key_client, key_inbox).await, Vec::<String>::new());
     assert_eq!(members(&key_client, key_cal).await, Vec::<String>::new());
+    // iMIP spec 4.3, 4.5, 8.5: key1's drain imports the item as a copy and
+    // keeps the item, drained, as the mail-borne history upstream's ingest
+    // writes. The copy and the item go before the RSVP block below plants
+    // its own copy of the same UID.
+    {
+        let _drain = DrainOn::new();
+        assert_eq!(trigger_drain("key1@example.com", STRONG).await, 207);
+        assert_eq!(
+            pending_ids(test, key1_id).await,
+            key_pending,
+            "the drain left the invitation pending"
+        );
+        let copy = copy_href(test, key1_id, "za-invite-2").await;
+        let drained = inbox_items(test, key1_id)
+            .await
+            .into_iter()
+            .find(|(id, _)| *id == invited[0].0)
+            .map(|(_, item)| item)
+            .expect("the drained item");
+        assert!(
+            drained.changed_by == ChangedBy::CalendarAddress(String::new())
+                && drained.flags & EVENT_NOTIFICATION_ZA_PENDING == 0,
+            "the item is not one drained mail-borne item"
+        );
+        key_client
+            .request_with_headers("DELETE", &copy, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+        delete_inbox_item(test, &key_client, key1_id, invited[0].0).await;
+    }
 
     // RSVP from the key attendee on the non-key organizer's page: the
     // organizer's copy records it, and the key attendee's own copy is never
@@ -793,14 +824,21 @@ pub async fn test_scheduling(test: &mut TestServer) {
             .with_status(StatusCode::NO_CONTENT);
     }
 
+    let before_cancel = inbox_ids(test, key1_id).await;
     plain_client
         .request("DELETE", &format!("{plain_cal}invite.ics"), "")
         .await
         .with_status(StatusCode::NO_CONTENT);
     wait_for_delivery(test).await;
-    // The CANCEL email was delivered too; whatever item delivery made of it
-    // is pending, hidden from the listing (iMIP spec 4.1, 8.5).
+    // The CANCEL email was delivered too, and makes no item: the drain
+    // consumed the invitation's item and its copy is gone, so the UID is
+    // unknown at delivery (iMIP spec 4.1 step 5: `EventNotFound`).
     assert_eq!(mail_count(test, key1_id).await, key_mail + 2);
+    assert_eq!(
+        inbox_ids(test, key1_id).await,
+        before_cancel,
+        "the CANCEL of an unknown UID made an item"
+    );
     assert_eq!(members(&key_client, key_inbox).await, Vec::<String>::new());
     assert_eq!(members(&key_client, key_cal).await, Vec::<String>::new());
     // iMIP spec 8.5: this test's mail-borne items go with it.

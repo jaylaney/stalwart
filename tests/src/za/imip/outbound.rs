@@ -8,17 +8,22 @@
 //! to the mail class leave as upstream's email through the SMTP queue, read
 //! back at the suite's SMTP sink.
 
-use super::ATT;
+use super::{ATT, deliver, event, is_request_for, itip_mail};
 use crate::{
     utils::{
         server::TestServer,
         smtp_sink::sink,
-        za::{queued_recipients, wait_for_queue},
+        za::{
+            HookParked, inbox_ids, new_inbox_items, queued_recipients, trigger_drain,
+            wait_for_queue, za_app_password,
+        },
     },
     za::{
         STRONG,
-        fanout::Party,
+        drain::DrainOn,
+        fanout::{NO_REPLY, Party},
         mail::{Traced, TracedEvent},
+        uid_lease::put,
         user_permissions,
     },
 };
@@ -28,6 +33,7 @@ use common::za::{
     test_hooks,
 };
 use groupware::scheduling::ItipSummary;
+use hyper::StatusCode;
 use std::collections::HashSet;
 use trc::{CalendarEvent, EventType, Key};
 
@@ -47,6 +53,7 @@ pub async fn test(test: &mut TestServer) {
     let owner = Party::new(test, OUT_KEY);
 
     seam(test, &owner).await;
+    refresh_two_sessions(test, &owner).await;
 }
 
 /// Spec 5.3, D11, D12: one (message, recipient) in process memory, handed to
@@ -105,6 +112,78 @@ async fn seam(test: &TestServer, owner: &Party) {
     wait_for_queue(test).await;
     assert!(sink().take_to(ATT).is_empty());
     assert_quiet(&traced.finish().await, owner);
+}
+
+/// D14, 8.2: two sessions drain one REFRESH item; exactly one answer goes out.
+async fn refresh_two_sessions(test: &TestServer, owner: &Party) {
+    let _drain = DrainOn::new();
+    let uid = "imip-out-r";
+    let href = format!(
+        "/dav/cal/{}/default/{uid}.ics",
+        owner.name.replace('@', "%40")
+    );
+    assert_eq!(
+        put(
+            owner.name,
+            STRONG,
+            href.clone(),
+            event(uid, owner.name, &[ATT], 0, "")
+        )
+        .await,
+        201
+    );
+    // The second session first: an app password is a second key-cache
+    // entry, so a second drain lock (invitations spec 6.3).
+    let second = za_app_password(owner.name, STRONG, "imip-second-session").await;
+    sink().clear();
+    let before = inbox_ids(test, owner.id).await;
+    deliver(
+        "dmarc-imip-att@remote.test",
+        owner.name,
+        &itip_mail(
+            ATT,
+            owner.name,
+            "REFRESH",
+            &event(uid, owner.name, &[ATT], 0, ""),
+        ),
+    )
+    .await;
+    wait_for_queue(test).await;
+    let items = new_inbox_items(test, owner.id, &before).await;
+    assert_eq!(items.len(), 1, "the REFRESH item");
+    // The losing session's pass defers; no deferral outlives this case.
+    test_hooks::set_drain_retry_override(Some(0));
+    // Session 1 (the password) parks after its UID lookup, before the merge
+    // (spec question 3); session 2 drains the item and answers it; session
+    // 1 then loses the item deletion's assertion and mails nothing.
+    let parked = HookParked::start(
+        owner.id,
+        test_hooks::set_drain_lookup_pause,
+        trigger_drain(owner.name, STRONG),
+    )
+    .await;
+    assert_eq!(trigger_drain(owner.name, &second).await, 207);
+    assert_eq!(parked.finish().await, 207);
+    test_hooks::set_drain_retry_override(None);
+    wait_for_queue(test).await;
+    assert_eq!(
+        sink()
+            .take_to(ATT)
+            .iter()
+            .filter(|m| is_request_for(m, uid))
+            .count(),
+        1,
+        "one answer per REFRESH"
+    );
+    assert!(
+        !inbox_ids(test, owner.id).await.contains(&items[0].0),
+        "the REFRESH item outlived its answer"
+    );
+    owner
+        .client
+        .request_with_headers("DELETE", &href, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
 }
 
 /// D17, invariant 47: the submission's own lookups are quiet and its own

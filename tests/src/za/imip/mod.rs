@@ -12,7 +12,7 @@ use crate::utils::{
     account::Account,
     dns::DnsCache,
     smtp::SmtpConnection,
-    smtp_sink::{self, ZA_SINK_PORT},
+    smtp_sink::{self, SinkMessage, ZA_SINK_PORT},
     webdav::DummyWebDavClient,
 };
 use ::registry::{
@@ -147,6 +147,17 @@ pub async fn add_contact(client: &DummyWebDavClient, account: &str, email: &str)
         .await
         .with_status(StatusCode::CREATED);
     href
+}
+
+/// Whether a message the sink received is an iTIP REQUEST for `uid`.
+pub fn is_request_for(message: &SinkMessage, uid: &str) -> bool {
+    let uid_line = format!("UID:{uid}");
+    message.calendar_method().as_deref() == Some("REQUEST")
+        && message.calendar_part().is_some_and(|ics| {
+            ics.replace("\r\n ", "")
+                .lines()
+                .any(|line| line.trim_end() == uid_line)
+        })
 }
 
 /// Deletes the ContactCard whose href `add_contact` returned.

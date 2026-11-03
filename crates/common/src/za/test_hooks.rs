@@ -38,8 +38,10 @@
 //!   entries one `contacts/pin` call attempts (`http::api::contacts`,
 //!   through `common::za::redeliver_batch_override`).
 //! - `DRAIN_LOOKUP_PAUSE`: in the drain's import, after the first UID
-//!   lookup found nothing and before the creation lease, keyed by the
-//!   draining account (`groupware::calendar::drain`).
+//!   lookup found nothing and before the creation lease, and in its mail
+//!   arm after the UID lookup found the event and before the merge (iMIP
+//!   spec question 3), keyed by the draining account
+//!   (`groupware::calendar::drain`).
 //! - `DRAIN_LEASE_PAUSE`: in the drain's import, holding the lease, after
 //!   the second lookup and immediately before the commit, keyed by the
 //!   draining account.

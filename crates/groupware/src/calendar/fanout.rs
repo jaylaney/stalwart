@@ -78,7 +78,7 @@ use crate::{
         storage::za_oldest_drained_notification,
     },
     scheduling::{
-        Email, ItipError, ItipMessage,
+        Email, ItipError, ItipMessage, ItipMessages,
         inbound::itip_method,
         itip::{
             ITIP_STATUS_DELIVERED, ITIP_STATUS_DELIVERY_FAILED, ITIP_STATUS_INVALID_USER,
@@ -99,7 +99,7 @@ use common::{
         AccountInfo, BuildAccessToken,
         vault::{ZaMark, ZaPinState, ZaPinStep, ZaPinTransact, za_normalize_address},
     },
-    za::lease::ZaUidLease,
+    za::{imip::ZaImipMail, lease::ZaUidLease},
 };
 use registry::schema::enums::{Permission, StorageQuota};
 use store::{
@@ -255,6 +255,33 @@ pub fn za_mark_sent_by(
                 }
             }
         }
+    }
+}
+
+/// iMIP spec 5.3 (D14): one (message, recipient) for `za_imip_submit`, the
+/// message with `to` the one recipient, its summary and tree cloned, as
+/// upstream's task holds it (`ItipMessages::new`'s conversion). `account_id`
+/// and `document_id` are the event's.
+pub fn za_imip_mail(
+    account_id: u32,
+    document_id: u32,
+    message: &ItipMessage<ICalendar>,
+    recipient: &str,
+) -> ZaImipMail {
+    let contents = ItipMessages::new(vec![ItipMessage {
+        from: message.from.clone(),
+        from_organizer: message.from_organizer,
+        to: vec![recipient.to_string()],
+        summary: message.summary.clone(),
+        message: message.message.clone(),
+    }])
+    .messages
+    .pop()
+    .unwrap_or_default();
+    ZaImipMail {
+        account_id,
+        document_id,
+        contents,
     }
 }
 
