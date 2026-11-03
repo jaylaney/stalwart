@@ -31,6 +31,7 @@ use std::{
 };
 
 pub mod inbound;
+pub mod oracle;
 pub mod outbound;
 
 /// Outside parties (spec 8.2), mail-only addresses read at the sink.

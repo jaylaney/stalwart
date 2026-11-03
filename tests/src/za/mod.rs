@@ -174,6 +174,7 @@ pub async fn za_tests() {
     pinning::test(&mut test).await;
     imip::inbound::test(&mut test).await;
     imip::outbound::test(&mut test).await;
+    imip::oracle::test(&mut test).await;
     sharing_move_atomic::test(&mut test).await;
     sharing_tombstones::test(&mut test).await;
     sharing_review::test(&mut test).await;
