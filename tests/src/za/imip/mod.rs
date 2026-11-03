@@ -33,6 +33,7 @@ use std::{
 pub mod inbound;
 pub mod oracle;
 pub mod outbound;
+pub mod traces;
 
 /// Outside parties (spec 8.2), mail-only addresses read at the sink.
 pub const ORG: &str = "imip-org@remote.test";
