@@ -20,6 +20,7 @@ Plan 15 builds release 5 (spec `2026-11-02-zero-access-imip-design.md`, revision
   - Task 12: the commit of this note with the release 5 checklist section and `CLAUDE.md` (docs only; the mutation runs applied temporary edits and reverted them, no product code changed), `b3306e092`;
   - the final fix wave (`## Final review`): `c3d356b51` (the mail guard armed before the commit, the pin rule of mail, `5.1` for a failed lookup, the loss path that cannot be `Ok`, the deletion traced after its commit), `2d1aa3029` (the review's test gaps), and the commit of this note's final review with `CLAUDE.md`.
   - the PR review's fix wave (`## PR review`, base `bce58234d`): `5162e8f3e` (rulings P1, P2, O-2, O-3 and O-4: local routes fail closed, the mail arm's new delegates, the REFRESH answer's store errors, the withheld trace's account), `21572355e` (ruling O-1: the submitter's session skips the inbound rate limiters), `2fdafa41a` (T-5: no dead hook branches), `8f1750bb0` (the wave's cases and T-1, T-2, T-6, T-7, T-10), and the commit of this note's PR review with `CLAUDE.md`.
+  - the coverage gate (`### The coverage gate`): `4e09dc72a` (issue #79's REFRESH cases, the hook `PIN_READ_FAIL_ONCE`, delivery's refusal rows, the grantee's withheld attendee, the orphaned submission) and `593d97c64` (its review round).
 - The verification matrix of Task 12 Step 4, run on the branch head `f13e0075a` (the tree of this commit differs from it by the three documents only), one cargo command at a time, long runs in the background:
 
   Every command ran on its own on the head's tree, in this order, with the shipping features or the test features CI uses (`STORE=RocksDb RUST_MIN_STACK=16777216` for the integration suites). Times are the suite's own `finished in` (integration) or the command's wall time (the rest, which include any rebuild). Every suite passed on its first run; no known flake occurred, so no rerun was needed.
@@ -295,7 +296,7 @@ Each is accepted by the spec or by a ruling of the final review or the PR review
 7. **Final review B-4 (beside 5.1's group-organizer consequence, no code change).** D15's gate reads the stored ORGANIZER as local when it is any of the account's addresses, which include its groups' (`build_account_info`). A key member of group G whose copy of a G-organized event receives an outside attendee's delegating REPLY runs the organizer-side fan-out on that copy: stray history items at the delegates, pins and statuses on the member's copy (pollution only; upstream merges the same REPLY for a plain member and fans out nothing).
 8. **PR review T-3: request latency is linear in the mail-class recipients.** By decision 9 the request submits each mail attempt in order before it answers (`ZaImipPending::submit_each`), a local SMTP session, a queue blob write and a queue entry each; `rf_5_many_recipients` runs 20 under the raw client's 5 s budget. A client inviting a 60-address list waits for 60 local SMTP transactions before the PUT answers. No bound is set; detaching the loop was not taken (invariant 41).
 9. **PR review P-4: a non-relay deployment holds an undeliverable invitation in plaintext for the queue's whole retry window.** Section 2 says the queue holds it "until relay or local delivery". With a relay the plaintext leaves at once; a deployment delivering by MX keeps a mistyped or temporarily undeliverable outside attendee's invitation, with the full event, through every retry until expiry (days), then a DSN with its header section back through the queue, and the organizer sees no `SCHEDULE-STATUS` hint (3.2 item 8). Mail spec invariant 28's queue residual covers the class.
-10. **PR review re-review R-2: a vanished list behind a cached entry.** `za_mail_class` answers the list class for any `EmailCache::MailingList` entry, while `rcpt_resolve` expands a list only when `try_list` finds it and otherwise falls through to the domain's catch-all (`crates/common/src/network/mta.rs`, about `:192-219`). A list whose object is gone while the cache still holds its entry (a registry inconsistency, or a node that has not yet applied the list's invalidation) is mailed (`1.1`), and SMTP delivers the invitation to the catch-all, which in the product is a key account: plaintext through the queue (invariant 42). The fix is the account step's: carry the list's id and withhold when `try_list` finds none. Recorded, no code change: it needs a registry inconsistency or a cross-node invalidation gap, and the product runs one node. If wrong: a plaintext invitation reaches a key catch-all in that window.
+10. **PR review re-review R-2: a vanished list behind a cached entry.** `za_mail_class` answers the list class for any `EmailCache::MailingList` entry, while `rcpt_resolve` expands a list only when `try_list` finds it and otherwise falls through to the domain's catch-all (`crates/common/src/network/mta.rs`, about `:192-219`). A list whose object is gone while the cache still holds its entry (a registry inconsistency, or a node that has not yet applied the list's invalidation) is mailed (`1.1`), and SMTP delivers the invitation to the catch-all, which in the product is a key account: plaintext through the queue (invariant 42). The fix is the account step's: carry the list's id and withhold when `try_list` finds none. Recorded, no code change: it needs a registry inconsistency or a cross-node invalidation gap, and the product runs one node. If wrong: a plaintext invitation reaches a key catch-all in that window. Follow-up: issue #78.
 11. **PR review re-review R-3: a local catch-all naming an outside mailbox.** In a local domain whose catch-all forwards to an outside address (a vanity domain forwarding to a mail provider), `za_mail_class` cannot resolve the catch-all to a local account or list, so an unknown address there is withheld (`5.1`, nothing sent), where `rcpt_resolve` rewrites it to the catch-all and relays it. Fail closed by ruling P1 ("a catch-all that resolves to neither"), a cost beside item 2's relay-enabled domain; one arm in `za_mail_class_of` would mail it, if Jay asks.
 12. **PR review re-review R-5: the submitter's exemption skips every inbound limiter of its session.** `Session::is_allowed` is the only limiter check at MAIL FROM and RCPT, so the exemption skips the `sender`, `rcpt` and `remote` limiter sets, an operator's limiter keyed on the authenticated sender included. A key account's iMIP mail is then bounded only by the queue quota (`452 4.3.1` at DATA, a permanent loss by item 2) and, for the delivery rate, by the outbound throttles; ruling O-1's "if wrong" clause names only the latter. No other session can set or inherit the flag: `reset()` leaves it alone, the local session never calls `reset()`, and `SessionData` is not cloned.
 
@@ -636,6 +637,8 @@ Every ledger line holding a `Ruling:` in `.superpowers/sdd/2026-11-03-release5-f
 - Ruling: R-4 (no case reaches answer_refresh's class-withheld arm or O-4's error return) recorded as a deferred test gap, offered to Jay — the arms share the resolver the fan-out case kills — if wrong: a regression in those two arms goes unseen
 - Ruling: R-5 (the exemption also skips operator limiters keyed on the sender; the queue quota still bounds enqueueing) recorded as O-1's sharpened cost — the session is the server's own and its 4xx is never retried — if wrong: an operator's sender limiter does not bound a key account's iMIP mail
 - Ruling: concern 5 widened to two pre-existing constant-false branches (fanout.rs pin-record write, delegation.rs:145-149), deferred — key pinning and release 4 code outside T-5 — if wrong: two dead branches in shipping source
+- Ruling: store-error and defensive arms stay uncovered (no hooks added for coverage alone) — a hook per store-error arm widens the test_mode surface for no behaviour claim — cost if wrong: a thinner margin on the runtime figure.
+- Ruling: I-1, M-1, M-2, M-3, M-5, M-6, M-8 fixed; M-4 reworded (step 2 already observable at the sink); M-7 only if a one-liner — all test-side, cheap, and I-1 is the P1 "never mailed" rule on the REFRESH loop — if wrong: test time only.
 
 ### Kill checks of the PR review fix wave
 
@@ -671,7 +674,7 @@ In the brief's order, one cargo command at a time, on the wave's code (`5162e8f3
 | CI step table | `python3 -I scripts/tests/ci_steps.py` | 0 differences | under 1 s |
 | gate tests | `python3 -I scripts/tests/test_gates.py` | 43 tests OK, 2 skipped | 3.9 s |
 
-Earlier runs in the wave: the first za suite run failed in `imip::traces` (`traces.rs:754`), whose RCPT-refusal row relied on the fan-out submitting to a local address no account has; the module was adjusted (adjusted assertions above) and the suite passed (453.68 s), as did the filesystem-blob run (442.32 s), before the P2 case's rework; the final tree's runs are the ones in the table. The other harnesses (IMAP and JMAP in both modes, the upstream suites, the product build, the fresh-store gate, the CalDAV client) were not rerun: the wave changes no code they reach beyond the za paths, the SMTP session's one new check (exercised by the SMTP run above) and the brief's list does not name them. The weekly gates job, which measures the fork cohort's covered fraction with the three new `cohort.additions` entries (T-1), was not dispatched.
+Earlier runs in the wave: the first za suite run failed in `imip::traces` (`traces.rs:754`), whose RCPT-refusal row relied on the fan-out submitting to a local address no account has; the module was adjusted (adjusted assertions above) and the suite passed (453.68 s), as did the filesystem-blob run (442.32 s), before the P2 case's rework; the final tree's runs are the ones in the table. The other harnesses (IMAP and JMAP in both modes, the upstream suites, the product build, the fresh-store gate, the CalDAV client) were not rerun: the wave changes no code they reach beyond the za paths, the SMTP session's one new check (exercised by the SMTP run above) and the brief's list does not name them. The weekly gates job, which measures the fork cohort's covered fraction with the three new `cohort.additions` entries (T-1), was not dispatched in the wave; Jay's later dispatch found the runtime figure one line short (`### The coverage gate`).
 
 ### Scoped re-review
 
@@ -680,10 +683,83 @@ One read-only Fable re-review of `bce58234d..c2f3f008f`, against the fix brief, 
 | Finding | Disposition |
 |---|---|
 | R-1: `### Rulings` above claimed every ledger ruling and held the first seven | Fixed in this section's commit: the later rulings appended verbatim; residual 5.4 item 6 names the one-condition option |
-| R-2: a vanished list behind a cached entry is mailed, and SMTP falls through to the catch-all | Recorded: residual 5.4, 10 |
+| R-2: a vanished list behind a cached entry is mailed, and SMTP falls through to the catch-all | Recorded: residual 5.4, 10; follow-up issue #78 |
 | R-3: a local catch-all naming an outside mailbox is withheld where SMTP relays | Recorded: residual 5.4, 11 |
-| R-4: no case reaches `answer_refresh`'s class-withheld arm (`za_mail_reachable`) or O-4's error return; KP1's mutation was caught first at the fan-out case, and no hook fails a pin read | Deferred test gap: a REFRESH from a disabled local alias by authenticated submission (item deleted, `ZA_IMIP_UNROUTED` traced, nothing in the sink), and a one-shot pin-read failure hook |
+| R-4: no case reaches `answer_refresh`'s class-withheld arm (`za_mail_reachable`) or O-4's error return; KP1's mutation was caught first at the fan-out case, and no hook fails a pin read | Filed as issue #79, then done in this PR (`### The coverage gate` below): `imip::inbound::refresh_withheld`, the hook `PIN_READ_FAIL_ONCE`, kill checks K1, K3, K5 and K6 |
 | R-5: the exemption skips every inbound limiter of its session | Recorded: residual 5.4, 12 |
 | R-6: "resolves to neither a non-key account nor a list", read literally, included a resolved key account | Fixed in this section's commit (wording) |
 
 The fix wave's concern 5 covers two pre-existing constant-false hook branches in shipping source, not one: key pinning's pin-record write in `fanout.rs` and release 4's `delegation.rs` (about `:145-149`). Both are deferred, outside T-5's two sites.
+
+### The coverage gate
+
+**The failure.**
+- On `9237bafb4`, Jay's dispatch of the weekly gates job, run `41696909302`, passed the inventory gate.
+- The coverage gate failed on its runtime-only figure, by one line: 13150/13892 (94.659%) against the baseline's 10646/11246 (94.665%). It needs `covered * 11246 >= 10646 * lines`.
+- The full figure passed: 96.51% against 96.38%.
+- `main`'s last run before release 5 (schedule `41486324575`, `235f84cbd`) stood at 12539/13198 (95.01%). Release 5 added 694 runtime cohort lines (T-1's three `cohort.additions` and the grown fan-out and drain), and the tests ran 611 of them.
+- On the same commit, a local net of the `unit-tests` and `za-tests` steps measured 13147/13892. Of the uncovered runtime lines, 85 were lines release 5 added.
+
+**Jay's decision (2026-11-03):** fix it in this PR rather than in a follow-up before the next Monday run, so issue #79 (R-4 above) lands here too.
+
+**The fix.** The coverage commit `4e09dc72a` and its review round `593d97c64` add tests and one `test_mode` hook. No shipping path changes.
+- `imip::inbound::refresh_withheld` (issue #79), on one event with three senders. In each of steps 1 to 3 the REFRESH is not answered and the item is deleted:
+  1. a REFRESH from a local address with no entry, traced `ZA_IMIP_UNROUTED` (ruling P1, the class arm of `answer_refresh`);
+  2. one from an outside address holding a contact pin, traced `ZA_IMIP_PINNED` (ruling A-2);
+  3. one while the pin record is unusable under the pinned wrap, traced `ZA_IMIP_PIN_UNREAD`;
+  4. one whose pin-state read fails once (ruling O-4, the new hook `PIN_READ_FAIL_ONCE` at the head of `Server::za_pin_state`). The pass returns the error as the item's failure (`run_pass` traces it once), the item stays pending and nothing is mailed. The next pass answers it with one REQUEST, the positive control.
+- In steps 1 to 3 the account's iMIP events must be exactly the withholding and the item's deletion. A local address the SMTP layer refuses at RCPT never reaches the sink, so the trace set is what shows that no answer was submitted.
+- The pin of step 2 is planted in the key account's pin record. A pin on an address outside the local domains arises when an operator removes or renames a local domain that held a pinned key account; `contacts/pin` pins only a local key account. Step 3 writes junk to field 151, and the record's saved bytes are restored afterwards.
+- `refused_cases` gains three rows: no sender (its mail lands in the Inbox, so upstream's gate let the part through), a VCALENDAR with no component, and the notification limit at zero. Every row now asserts that its refusal is the account's one iMIP event, and that it carries no address.
+- `imip::outbound::grantee_write` invites a local address with no entry, which the delegated path withholds (`5.1`, traced once, no refused submission).
+- `seam` submits for an event's account that the registry no longer finds: the outcome is `Failed`, traced once, and nothing is sent.
+
+**Result.**
+- Local net, same two steps: runtime 13178/13898 (94.82%), 21 lines above the 13157 the gate needs at 13898 lines. Full: 23050/23859 (96.61%).
+- The 6 added runtime lines are the hook's check in `vault.rs`, all covered.
+- Uncovered lines release 5 added: 85 before, 61 after.
+- Left uncovered on purpose:
+  - the store-error arms: delivery's lookup and write failures, and `sender_lookup_error`. No hook is added only to reach one.
+  - defensive arms that no product path reaches:
+    - `drain.rs:814` and `:1260-1261`;
+    - `fanout.rs:1652` and `:1690`;
+    - delivery's `:227-228`, since `itip_sender_snapshot` runs `itip_method` first;
+    - delivery's `:188-189`, since an SMTP delivery's token never holds keys;
+    - the submitter's contract guards `:76` and `:88`;
+    - the unregistered submitter, since the harness always registers it.
+- llvm-cov's line attribution inside `trc::event!` fields moves a line or two between runs, independent of what runs. The margin absorbs it.
+
+**Kill checks.** Each was applied alone, and the za suite failed first at the new case:
+
+| Id | Mutation | First failure |
+|----|----------|---------------|
+| K1 | `answer_refresh` only: `za_mail_reachable`'s answer forced `true` | `refresh_withheld` step 1: `ZA_IMIP_UNROUTED` not traced once (the answer was submitted and refused at RCPT 550) |
+| K2 | `answer_refresh` only: `za_mail_withheld(Some(&state), to)` became `None` | step 2: the REFRESH was answered |
+| K3 | `answer_refresh`: the pin-state error treated as an unusable state | step 4: the item did not stay pending |
+| K4 | `delegation.rs`: `ZaMailClass::Withheld` mapped to `ZaResolvedAccount::NotFound` | `grantee_write`: `["1.1"]` where `["5.1"]` was expected |
+| K5 | `answer_refresh`: only the `continue` after the unrouted trace deleted | step 1: the account's events held the RCPT refusal beside the withholding and the deletion |
+| K6 | `answer_refresh`: the pin-state error mapped to `Ok(false)` (left pending, uncounted) | step 4: no `drain pass failed` event where one was expected |
+
+**Review.**
+- One read-only Opus review of `4e09dc72a` found no Critical finding, one Important and eight Minor:
+  - **I-1:** step 1's sink and "no `ItipMessageSent`" checks hold even when an answer is submitted, since the local address is refused at RCPT.
+  - **M-1:** the same pattern in `grantee_write`.
+  - **M-2 and M-6:** step 4 did not show that the error counts as the item's failure, and did not check its trace for an address.
+  - **M-3:** `CLAUDE.md`'s wording.
+  - **M-4:** the planted pin's comment cited the remap case.
+  - **M-5:** a refused row's event was not shown to be the only one.
+  - **M-7:** the "no sender" row could not tell delivery's arm from upstream's gate.
+  - **M-8:** `seam` did not wait for the destroyed account's task.
+- The reviewer agreed that `:227-228` and `:188-189` are unreachable.
+- Ruling: every finding fixed in `593d97c64`, test-side. M-4 by rewording, since step 2's wrong answer is already observable at the sink. The controller read the round's diff.
+
+**Verification (local).**
+- `4e09dc72a`:
+  - fmt clean; the shipping check with 0 warnings, and the hook's strings appear only under `test_mode`;
+  - `cargo check -p tests --tests`; `common`'s unit tests;
+  - the za suite under the coverage net (plain), and again with `BLOB_STORE=FileSystem` (453.14 s);
+  - `ci_steps.py` (0 differences) and `test_gates.py` (43 OK, 2 skipped).
+- `593d97c64`:
+  - fmt and `cargo check -p tests --tests`;
+  - the za suite plain (471.15 s) and with `BLOB_STORE=FileSystem` (452.46 s).
+- The PR's CI and a gates dispatch run on the pushed head; the PR records their results.
