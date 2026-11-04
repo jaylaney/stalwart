@@ -53,8 +53,8 @@ use common::{
     network::RcptResolution,
     za::{
         imip::{
-            ZA_IMIP_DROPPED, ZA_IMIP_FAILED, ZA_IMIP_UNROUTED, ZaImipMail, ZaImipOutcome,
-            za_imip_submit,
+            ZA_IMIP_DROPPED, ZA_IMIP_FAILED, ZA_IMIP_REFUSED, ZA_IMIP_UNROUTED, ZaImipMail,
+            ZaImipOutcome, za_imip_submit,
         },
         test_hooks::{self, ForceCommitSplit},
     },
@@ -264,6 +264,7 @@ async fn seam(test: &TestServer, owner: &Party) {
         .await;
     let gone_id = gone.id().document_id();
     admin.destroy_account(gone).await;
+    test.wait_for_tasks().await;
     // iMIP spec 5.4: earlier writes (`imip::inbound`'s key organizer
     // inviting ATT) are mailed too; this case counts only its own.
     sink().clear();
@@ -838,21 +839,33 @@ async fn grantee_write(test: &TestServer, owner: &Party, grantee: &Party) {
         ["5.1"],
         "the grantee's write did not withhold the local address"
     );
-    let unrouted = traced
+    let owners = traced
         .finish()
         .await
         .into_iter()
         .filter(|event| event.account_id == Some(owner.id as u64))
-        .inspect(|event| {
-            assert!(
-                !event.text.contains('@'),
-                "an iMIP event carries an address: {}",
-                event.text
-            )
-        })
-        .filter(|event| event.details == ZA_IMIP_UNROUTED)
-        .count();
-    assert_eq!(unrouted, 1, "the withheld address is traced once");
+        .collect::<Vec<_>>();
+    for event in &owners {
+        assert!(
+            !event.text.contains('@'),
+            "an iMIP event carries an address: {}",
+            event.text
+        );
+    }
+    assert_eq!(
+        owners
+            .iter()
+            .filter(|event| event.details == ZA_IMIP_UNROUTED)
+            .count(),
+        1,
+        "the withheld address is traced once"
+    );
+    // The local address would be refused at RCPT, so the sink cannot show
+    // its submission; the refusal's trace would.
+    assert!(
+        !owners.iter().any(|event| event.details == ZA_IMIP_REFUSED),
+        "a submission was refused: {owners:#?}"
+    );
     assert_eq!(
         sink()
             .messages()

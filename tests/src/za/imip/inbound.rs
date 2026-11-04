@@ -53,13 +53,14 @@ use common::{
     auth::{BuildAccessToken, vault::ZaMark},
     za::{
         imip::{
-            ZA_IMIP_ITEM_REFUSED, ZA_IMIP_KEY_SENDER, ZA_IMIP_PIN_UNREAD, ZA_IMIP_PINNED,
-            ZA_IMIP_TOO_LARGE, ZA_IMIP_UNROUTED,
+            ZA_IMIP_ITEM_DELETED, ZA_IMIP_ITEM_REFUSED, ZA_IMIP_KEY_SENDER, ZA_IMIP_PIN_UNREAD,
+            ZA_IMIP_PINNED, ZA_IMIP_TOO_LARGE, ZA_IMIP_UNROUTED,
         },
         test_hooks,
     },
 };
 use email::{
+    cache::{MessageCacheFetch, email::MessageCacheAccess},
     mailbox::INBOX_ID,
     message::{
         delivery::SenderAuthentication,
@@ -74,7 +75,7 @@ use hyper::StatusCode;
 use mail_parser::MessageParser;
 use serde_json::json;
 use store::write::now;
-use trc::{CalendarEvent, EventType, Key};
+use trc::{CalendarEvent, EventType, Key, StoreEvent};
 use vault::pins::PinSource;
 
 /// The key attendee of this module's cases.
@@ -91,6 +92,9 @@ const REFRESH_PINNED: &str = "imip-pinned@remote.test";
 /// `refresh_withheld`'s outside address whose REFRESH is answered unless
 /// the pin state withholds it.
 const REFRESHER: &str = "imip-refresher@remote.test";
+/// The details `run_pass` (`groupware::calendar::drain`) adds to the error a
+/// drain pass returns, an item's counted failure among them.
+const DRAIN_PASS_FAILED: &str = "zero-access: drain pass failed";
 
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access iMIP inbound tests...");
@@ -213,6 +217,9 @@ struct Refused {
     /// Delivered while the account's notification limit
     /// (`maxCalendarEventNotifications`) is zero.
     no_room: bool,
+    /// The mail is asserted stored in the Inbox, not Junk: upstream's gate
+    /// (`!is_spam`) let the part through to `za_imip_item`.
+    inbox: bool,
     /// The fixed reason (or, for the size limit, the details) of the one
     /// refusal event delivery traces; `None` where upstream's gate stops
     /// the part or the refusal is silent, and no fork event is traced.
@@ -248,6 +255,7 @@ fn refused_cases(test: &TestServer, key: &Party) -> Vec<Refused> {
         message,
         junk,
         no_room: false,
+        inbox: false,
         traced,
         to,
         account_id: key.id,
@@ -291,19 +299,23 @@ fn refused_cases(test: &TestServer, key: &Party) -> Vec<Refused> {
         ),
         // Upstream's sender rule finds no sender: the From field holds no
         // address that sanitizes (upstream's own ingest skips such a part
-        // too). Nothing is traced.
-        case(
-            "no sender",
-            "dmarc-org@remote.test",
-            itip_mail(
-                "imip-in-nosender",
-                to,
-                "REQUEST",
-                &event("imip-in-nosender", ORG, &[to], 0, ""),
-            ),
-            false,
-            None,
-        ),
+        // too). Nothing is traced; the mail in the Inbox shows that the
+        // gate let the part through.
+        Refused {
+            inbox: true,
+            ..case(
+                "no sender",
+                "dmarc-org@remote.test",
+                itip_mail(
+                    "imip-in-nosender",
+                    to,
+                    "REQUEST",
+                    &event("imip-in-nosender", ORG, &[to], 0, ""),
+                ),
+                false,
+                None,
+            )
+        },
         // Step 2: a VCALENDAR holding no other component, which upstream's
         // parse refuses.
         case(
@@ -376,15 +388,24 @@ fn refused_cases(test: &TestServer, key: &Party) -> Vec<Refused> {
 }
 
 /// Spec 4.1 steps 1-6, 8.2, section 7: no item for any of these; each mail
-/// is still stored, and a refusal delivery traces is traced once, without
-/// the sender.
+/// is still stored, and a refusal delivery traces is the account's one iMIP
+/// event, without the sender.
 async fn refused_deliveries(test: &TestServer, key: &Party) {
     let admin = test.account("admin@example.com").clone();
     let account = test.account(key.name).id();
+    let in_inbox = async || {
+        test.server
+            .get_cached_messages(key.id)
+            .await
+            .unwrap()
+            .in_mailbox(INBOX_ID)
+            .count()
+    };
     for case in refused_cases(test, key) {
-        let (before, mails) = (
+        let (before, mails, inboxed) = (
             inbox_ids(test, key.id).await,
             mail_count(test, key.id).await,
+            in_inbox().await,
         );
         if case.no_room {
             admin
@@ -425,16 +446,24 @@ async fn refused_deliveries(test: &TestServer, key: &Party) {
             "{}: the mail was not stored",
             case.label
         );
+        if case.inbox {
+            assert_eq!(
+                in_inbox().await,
+                inboxed + 1,
+                "{}: the mail is not in the Inbox",
+                case.label
+            );
+        }
         let ours = fork_events(&events, key.id, case.label);
         match case.traced {
-            Some(fixed) => assert_eq!(
-                ours.iter()
-                    .filter(|event| event.typ
+            Some(fixed) => assert!(
+                matches!(
+                    ours.as_slice(),
+                    [event] if event.typ
                         == EventType::Calendar(CalendarEvent::ItipMessageError)
-                        && (event.reason == fixed || event.details == fixed))
-                    .count(),
-                1,
-                "{}: the refusal was not traced once: {ours:#?}",
+                        && (event.reason == fixed || event.details == fixed)
+                ),
+                "{}: the refusal is not the account's one iMIP event: {ours:#?}",
                 case.label
             ),
             None => assert!(
@@ -1697,9 +1726,9 @@ async fn rf_4_recurring_instance(test: &TestServer, key: &Party, plain: &Account
 /// turn:
 /// 1. from `REFRESH_NOBODY`, not of the mail class: no answer,
 ///    `ZA_IMIP_UNROUTED`, the item deleted;
-/// 2. from `REFRESH_PINNED`, which holds a contact pin (planted, as an
-///    operator's remap leaves one on a mail-class address,
-///    `pinning::a2_remapped_pin_withholds_mail`): no answer,
+/// 2. from `REFRESH_PINNED`, which holds a contact pin (planted: a pin on an
+///    address outside the local domains arises when an operator removes or
+///    renames a local domain that held a pinned key account): no answer,
 ///    `ZA_IMIP_PINNED`, the item deleted;
 /// 3. from `REFRESHER`, with the pin record unusable under the pinned wrap:
 ///    no answer, `ZA_IMIP_PIN_UNREAD`, the item deleted;
@@ -1760,12 +1789,18 @@ async fn refresh_withheld(test: &TestServer, key: &Party) {
     set_raw_pins(test, key.id, saved.as_deref()).await;
 
     // 4. Ruling O-4: a store error reading the pin state is returned, so the
-    // item stays pending and counts toward the failure limit. The deferral
-    // is a deadline taken at the failing pass, so the zero backoff comes
-    // first.
+    // item stays pending and counts toward the failure limit: the pass
+    // returns it as the item's failure, which `run_pass` traces (a pass
+    // left pending traces nothing). The deferral is a deadline taken at the
+    // failing pass, so the zero backoff comes first.
     test_hooks::set_drain_retry_override(Some(0));
     let item = refresh_item(test, key, uid, REFRESHER).await;
     sink().clear();
+    let traced = Traced::start(&[
+        EventType::Store(StoreEvent::UnexpectedError),
+        EventType::Calendar(CalendarEvent::ItipMessageError),
+        EventType::Calendar(CalendarEvent::ItipMessageSent),
+    ]);
     test_hooks::set_pin_read_fail_once(Some(key.id));
     drain(key).await;
     assert!(
@@ -1773,6 +1808,15 @@ async fn refresh_withheld(test: &TestServer, key: &Party) {
         "the drain did not read the pin state"
     );
     wait_for_queue(test).await;
+    let events = traced.finish().await;
+    let ours = fork_events(&events, key.id, "the failed pin read");
+    assert_eq!(
+        ours.iter()
+            .filter(|event| event.details == DRAIN_PASS_FAILED)
+            .count(),
+        1,
+        "the pin state's read error was not returned as the item's failure: {ours:#?}"
+    );
     assert!(
         pending_ids(test, key.id).await.contains(&item),
         "the REFRESH item did not stay pending after the pin state's read failed"
@@ -1843,17 +1887,26 @@ async fn refresh_not_answered(
         0,
         "{details}: the REFRESH was answered"
     );
+    // Exactly the withholding and the item's deletion: no submission, which
+    // would trace `ItipMessageSent`, or `ZA_IMIP_REFUSED` for a local
+    // address the SMTP layer refuses at RCPT, and no `ZA_IMIP_FAILED`.
     let ours = fork_events(&events, key.id, details);
+    let mut seen = ours
+        .iter()
+        .map(|event| {
+            (
+                event.typ == EventType::Calendar(CalendarEvent::ItipMessageError),
+                event.details.as_str(),
+                event.reason.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    seen.sort_unstable();
+    let mut expected = vec![(true, details, ""), (true, ZA_IMIP_ITEM_DELETED, "Refresh")];
+    expected.sort_unstable();
     assert_eq!(
-        ours.iter().filter(|event| event.details == details).count(),
-        1,
-        "{details}: not traced once: {ours:#?}"
-    );
-    assert!(
-        !ours
-            .iter()
-            .any(|event| event.typ == EventType::Calendar(CalendarEvent::ItipMessageSent)),
-        "{details}: an answer was submitted: {ours:#?}"
+        seen, expected,
+        "{details}: the account's iMIP events are not the withholding and the deletion: {ours:#?}"
     );
     assert!(
         !inbox_ids(test, key.id).await.contains(&item),

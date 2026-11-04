@@ -165,7 +165,12 @@ removed; they allocate no permanent accounts. The mail modules' next free names 
 Release 5 reserves the `imip-*` family, all at example.com and unique across modules:
 `imip::inbound` creates `imip-key`, `imip-key2` (key), `imip-plain` (plain) and
 `imip-provisioned` (passwordless; given its setup token and provisioned after it mails, destroyed
-by the module); `imip::outbound` creates `imip-out-key`, `imip-out-key2`, `imip-alias` (alias
+by the module), and its `refresh_withheld` (issue #79) drains REFRESHes from
+`imip-in-nobody@example.com` (a local address with no entry, not an account),
+`imip-pinned@remote.test` and `imip-refresher@remote.test`: three withheld (by class, by a pin, by
+an unusable pin record), then one answered after a failed pin read; it plants a pin of
+`imip-pinned@remote.test` in `imip-key`'s pin record, then writes junk bytes to field 151, then
+restores the record's prior bytes; `imip::outbound` creates `imip-out-key`, `imip-out-key2`, `imip-alias` (alias
 `imip-alias-two`), `imip-grantee` (key), `imip-noperm` (key, without
 `CalendarSchedulingReceive`), `imip-pending` (passwordless with a setup token, destroyed by the
 module), `imip-out-plain` (plain), the mailing list `imip-list` (one member, `imip-out-key2`;
@@ -174,10 +179,7 @@ case, the plain `imip-out-disabled` with the disabled alias `imip-off@imip-catch
 local domain `imip-catchall.test`, whose catch-all is `imip-out-key2` (the case destroys the
 account and the domain; `imip-out-nobody@example.com` is a local address with no entry, not an
 account), and the plain `imip-out-gone`, which the seam case destroys at once (an event's account
-the registry no longer finds); `imip::inbound`'s `refresh_withheld` (issue #79) answers REFRESHes
-from `imip-in-nobody@example.com` (a local address with no entry, not an account) and two outside
-addresses, and plants, then restores, a pin of `imip-pinned@remote.test` in `imip-key`'s pin
-record; `imip::oracle` creates
+the registry no longer finds); `imip::oracle` creates
 `imip-oracle-key` and `imip-oracle-plain`; `imip::traces` creates `imip-trace-key`;
 `leak::test_imip` creates `imip-leak-key` and `imip-leak-key2`. `pinning`'s A-2 case creates the
 plain `pin-remap-plain` (alias `key2@pin-alias.test`) and destroys it. Outside
