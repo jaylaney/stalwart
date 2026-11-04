@@ -6,6 +6,261 @@ The inherited [CHANGELOG.md](CHANGELOG.md) records upstream Stalwart history.
 
 ## Unreleased
 
+## 0.3.0-beta.1 — 2026-11-04
+
+Immutable tag: `fork-v0.3.0-beta.1`. A limited prerelease on upstream Stalwart `v1.0.1`, and
+the first with release 5: invitations by email (iMIP) for key accounts. Published as a
+GitHub prerelease, it claims no general client or production readiness until its pending
+gates (below) pass.
+
+### Provenance
+
+- Fork source: the commit the tag `fork-v0.3.0-beta.1` names, resolved by
+  `git rev-parse 'fork-v0.3.0-beta.1^{commit}'`. The published release notes and shipped
+  `stalwart.provenance.json` record the exact full commit.
+- Fully integrated upstream base: Stalwart `v1.0.1`, commit
+  `23b69755cb3cd8ecd952fe0443c5ac067a506184`
+  ([release notes](https://github.com/stalwartlabs/stalwart/releases/tag/v1.0.1)), unchanged
+  from `0.2.0-beta.1` and pinned in `fork-release.toml` and in the verifier's
+  `PINNED_UPSTREAM_TAGS`.
+- No additional upstream backports. Upstream `v1.0.2` and `v1.0.3` are released and not
+  integrated: none of their changes is in this preview.
+- The published `fork-v0.1.0-beta.1`, `fork-v0.1.1-beta.1` and `fork-v0.2.0-beta.1` tags and
+  artifacts retain their original identity.
+
+### Changes
+
+Release 5 (issue #18; [spec](docs/superpowers/specs/2026-11-02-zero-access-imip-design.md),
+[outcome](docs/superpowers/plans/2026-11-02-zero-access-plan15-outcome.md)), merged through
+PR #76. Before it, a key account's outside and plain local attendees were not invited
+(`5.3`), and iMIP mail delivered to a key account had no calendar effect.
+
+- **Key accounts invite by email.** A key account's CalDAV PUT or DELETE, as organizer or as
+  attendee, mails the recipients that are not key accounts on this server: outside
+  addresses, plain local accounts, local mailing lists and groups. A key attendee's reply to
+  an outside or plain local organizer is mailed the same way, and a grantee writing in a
+  shared calendar mails from the owner's address with `SENT-BY` naming the grantee. The
+  message is upstream's iMIP email, composed in the user's own request and handed to the
+  SMTP queue only after the change commits, never through the task queue. It carries no
+  RSVP link or token: recipients answer from their own mail or calendar client, and the HTTP
+  RSVP page stays refused for key accounts. Invitations between key accounts are unchanged:
+  sealed internal delivery, never mail.
+- **Key accounts are invited by email.** An iMIP request, update, cancellation, reply, ADD
+  or REFRESH delivered to a key account becomes a pending item sealed to its public key,
+  with the sender's address only inside the seal; the mail itself is stored sealed whatever
+  happens to the item. The account's next session (any DAV request holding its keys)
+  drains the item and applies upstream's merge, so the change appears at the client's next
+  sync, not on arrival. Accepting or declining in the client mails the reply back.
+- **What is mailed, and `SCHEDULE-STATUS`.** Each mailed recipient records `1.1` (sent,
+  delivery not confirmed), written before the commit; a later emailed reply replaces it, as
+  upstream does, with the reply's REQUEST-STATUS (or `2.0` when the reply carries none),
+  and a submission that fails after the commit is traced and leaves `1.1`
+  in place. Never mailed:
+  - an active local key account's address, reached only through sealed internal delivery
+    (one that cannot receive scheduling is not attempted, `5.3`);
+  - any other address in a local domain that the registry does not resolve to a local
+    account that is not a key account, or to a list (directly, or through the catch-all when
+    the address has no entry): a disabled address, no entry and no catch-all, a catch-all
+    that resolves to neither, an account the registry no longer finds. It records `5.1` and
+    is traced;
+  - an address that holds a contact pin in the sender's pin record, which records `3.8`.
+    When the sender's pin state cannot be read or decided, every address that would be
+    mailed records `5.1`. Mail recipients are never pinned.
+
+  A failed recipient lookup records `5.1`. The drain's delegating fan-out and key pinning's
+  redelivery stay internal: a recipient they would mail is not attempted (`5.3`).
+- **Inbound requirements.** An item is written only past upstream's gate (scheduling
+  enabled, not spam, the recipient allowed to receive scheduling) for a sender that passes
+  the authentication upstream accepts (DMARC, or an authenticated local submission) and is
+  not a local key account; key accounts reach each other only through internal delivery. A
+  request for an unknown UID is kept only when the sender is a local principal, a contact
+  card of the account holds the sender's address, or `autoAddInvitations` is on (off by
+  default); any other method needs a UID the account already knows (an event or a pending
+  item). PUBLISH, COUNTER and DECLINECOUNTER are not applied. Delivery decides from the
+  message and keyless indexes only; the drain repeats every check it can with the keys.
+- **REFRESH.** A listed attendee's emailed REFRESH is answered by mail with the event's
+  current state, after the item's deletion commits, so one session answers each REFRESH
+  item. It is withheld (the item deleted, no answer) for an address the rules above would
+  not mail, for a pinned address, and when the sender's pin record is unusable; a store
+  error reading the pin state leaves the item pending for a retry.
+- **Integrity limit (Jay's decision 11, issue #72).** A mail-borne item, sealed to the public
+  key, has no authenticity, so an operator who can write to the store can forge one, sender
+  included. At the user's next session a forged REFRESH naming a listed attendee makes the
+  drain mail the event's current full state through the SMTP queue, and a forged delegating
+  reply adds delegates, of whom a key account is invited at once. Both need a listed
+  attendee that is not a local key account, unless the store writer also remaps or disables
+  a key attendee's address.
+- **Traces.** The fork's iMIP events (delivery, the drain, each submission, withheld and
+  dropped mail) carry ids, counts, SMTP stages, reply codes and fixed reasons, never an
+  address or content; delivery events show `From` as `[redacted]`, and every SMTP
+  transaction the outbound path opens is redacted as a key account's. The SMTP layer still
+  traces a mailed invitation's envelope, as it does for every message.
+- **Rate limiters.** The release 5 submitter's own local SMTP session is exempt from the
+  inbound rate limiters (ruling O-1), because a temporary refusal there is never retried:
+  upstream's default throttle (25 messages an hour per sender domain and recipient) would
+  otherwise lose invitations and cancellations permanently. The exemption covers every
+  inbound limiter of that session, an operator's limiter keyed on the sender included; the
+  outbound queue's quota and throttles still apply.
+- Ordinary accounts keep upstream's behaviour: every new path is a key account's.
+
+### Operator actions
+
+- Invitations to outside addresses leave through the server's SMTP routing (the
+  deployment's relay, or delivery by MX), from the organizer's or replier's address. The
+  deployment needs working outbound mail with DKIM signing and DMARC alignment for the
+  sender's domain; otherwise providers junk or refuse the invitations, and no
+  `SCHEDULE-STATUS` reports it (a remote bounce returns to the sender's mailbox as a DSN).
+- A mailed invitation, update, cancellation or reply exists in plaintext in the SMTP queue
+  (until relay or local delivery, and its blob until the next blob purge) and at the
+  recipient, and the relay sees it in transit: the recorded amendment of release 2's
+  invariant 12, whose task-queue part still holds. A deployment that delivers by MX instead
+  of a relay keeps an undeliverable invitation in plaintext for the queue's whole retry
+  window. A local list or group is mailed as upstream mails it, so the invitation crosses
+  the queue in plaintext to every member, key members included (who receive it as sealed
+  mail, with no calendar effect). SMTP logs record each mailed invitation's envelope, and
+  `ItipMessageSent`'s queue id links it to the event's account and document ids: the
+  operator learns who meets whom outside the server, and when.
+- Inbound trust is upstream's: mail that fails DMARC (forwarded mail, many mailing lists)
+  has no calendar effect, and with `mustMatchSender` off any authenticated local account can
+  send iMIP from any address. Turning `autoAddInvitations` on lets any authenticated
+  sender's invitation for an unknown UID create a pending item.
+- Keep the calendar notification limit (`maxEventNotifications`) at its default, unlimited,
+  or above the longest plausible logged-out stream: once every stored notification of an
+  account is pending, new items are refused, a cancellation for a pending invitation
+  included, which then exists only as sealed mail.
+- Local domains fail closed: an address in a local domain that the registry does not
+  resolve to a local account or list gets no invitation (`5.1`). That includes colleagues
+  of a relay-enabled local domain hosted elsewhere, and unknown addresses of a local domain
+  whose catch-all forwards to an outside mailbox.
+
+### Compatibility and upgrade instructions
+
+From `0.2.0-beta.1`: the store schema version is unchanged and release 5 changes no stored
+layout (a mail-borne item is a release 2 pending item with one more sealed carrier), so a
+store written by `0.2.0-beta.1` is expected to open in place. No automated test covers this
+upgrade: CI's fresh-store job checks a fresh store only. Back up the complete database, blob
+store and configuration, and verify the restoration, before replacing the binary. A
+rollback to `0.2.0-beta.1` restores that backup and loses every write made after the
+upgrade; this release does not claim that a `0.2.0-beta.1` binary reads data that
+`0.3.0-beta.1` has written. Events created before the upgrade keep `5.3` for their outside
+and plain local attendees, and nothing re-invites them automatically: they are mailed on
+the next change that builds a message for them, and an edit that builds none (an alarm, a
+change without scheduling content) mails nobody.
+
+From `0.1.x`: not supported. Upstream 1.0.1 cannot open a `0.1.x` store, so moving is the
+fresh-store rebuild the `0.2.0-beta.1` entry below describes. Fresh stores are supported.
+
+The planned shipping configuration is unchanged: Linux `x86_64-unknown-linux-gnu` with
+RocksDB, without the enterprise and `test_mode` features, requiring an `x86-64-v2` CPU.
+Check the artifact's provenance for its highest referenced GLIBC symbol version and test
+its runtime dependencies on the deployment host; it is not a static or broadly portable
+musl build.
+
+The existing key-account privacy and functionality limits remain described in the
+[README](README.md) and [sharing API](docs/zero-access/calendar-sharing-api.md), and release
+5's in its spec. Key-account JMAP calendars, calendar full-text search, re-sharing,
+free/busy-only grants, cross-server sharing and key-account mail sharing remain refused or
+deferred, as do free/busy with outside parties and iSchedule.
+
+### Known limits and follow-ups
+
+- **#77, mail lost on disconnect.** Mail is submitted inside the user's request, after the
+  commit. A client that disconnects before the last submission loses the mail not yet
+  queued (traced `ZA_IMIP_ABANDONED`, outcome unknown), and a crash there loses it
+  silently. Nothing is retried: a lost cancellation or declining reply from a DELETE is
+  permanent, where upstream's task retries for three days. Issue #77 moves submission to a
+  detached task.
+- **#78, a vanished list.** A mailing list the registry no longer finds while a cached entry
+  still names it (a registry inconsistency, or a cluster node that has not applied the
+  invalidation) is mailed, and SMTP delivers to the domain's catch-all, which can be a key
+  account: a plaintext invitation through the queue. The product runs one node.
+- **#72, DKIM provenance** of mail-borne items (decision 11, above). A REFRESH that claims a
+  listed attendee's address also needs no store write when it arrives as an authenticated
+  local submission or as DMARC-passing mail from a domain the server signs for; the DKIM
+  check #72 plans would not cover the submission route.
+- **#70, no notification email between key accounts.** An invitation between key accounts
+  sends no email; the invitee sees it at its client's next sync.
+- Temporary refusals are not retried: after the commit, a 4xx from the local SMTP layer (an
+  address-verification error, the outbound queue's quota, a transient queue write failure,
+  or an operator's milter, hook or script) loses that message permanently. The recipient
+  keeps `1.1`, as it does after a local 5xx refusal.
+- Each mailed recipient is one local SMTP transaction before the PUT or DELETE answers, so a
+  write that invites many outside addresses answers more slowly.
+- A retried inbound delivery writes one item per attempt (key accounts skip upstream's
+  duplicate check), so a retried request can drain as a second change notification and a
+  retried REFRESH can be answered more than once. A sender who knows a UID can fill a
+  logged-out account's pending slots, evicting drained history.
+- An alias removed between delivery and the drain makes the drain delete the pending
+  invitation; the sealed mail remains.
+- A mail-borne item, and the event imported from it, keep the outside organizer's `PRODID`,
+  time zone ids and timestamps visible, beside release 1's visible fields.
+- Inherited from upstream 1.0.1: DMARC is the basis of trust for outside senders; a request,
+  ADD or cancellation must come from the organizer's own address (no `SENT-BY` assistant,
+  no forwarded request); a reply is applied whatever its SEQUENCE; a key attendee invited at
+  a sub-address cannot reply from it (`mustMatchSender` compares MAIL FROM exactly); no
+  `SCHEDULE-STATUS` follows a mail's fate.
+- In a domain whose external directory looks up recipients and which has a catch-all to a
+  list or a plain account, the registry's classification can differ from SMTP's, and a key
+  account's unsynchronized alias can be mailed in plaintext. The product's shape (key
+  accounts on the internal directory) never has this.
+
+### Verification and outstanding gates
+
+The [release 5 outcome](docs/superpowers/plans/2026-11-02-zero-access-plan15-outcome.md)
+records the local runs, mutation checks, rulings and residuals. In summary:
+
+- PR #76's final head `95543bfd1`:
+  [run 41852181302](https://github.com/jaylaney/stalwart/actions/runs/41852181302) passed
+  every pull-request job: style and the gates' workflow check, unit tests, upstream's
+  suites, the `Test` job, the zero-access suites, the product build with the release
+  verifier, the independent python-caldav client and the fresh-store restart gate (the test
+  retention gates run only weekly and on dispatch). The merge `92680dd3b` has the same tree
+  as `95543bfd1`, and `81c23b37b`, where this release's branch starts, changes `CLAUDE.md`
+  only.
+- The test retention gates on `466f83d4e`, gates dispatch
+  [run 41749193954, attempt 2](https://github.com/jaylaney/stalwart/actions/runs/41749193954/attempts/2)
+  (attempt 1's runner ran out of disk during the build): the inventory gate passed, 795
+  tests; coverage, runtime-only 13,180 / 13,898 covered lines against the 0.16.27
+  baseline's 10,646 / 11,246, 23 lines of margin; full 23,052 / 23,859 against
+  17,821 / 18,490, 56 lines of margin. An earlier dispatch had failed the runtime-only
+  figure by one line, and the PR added tests for it. `466f83d4e` precedes the drain fixes
+  of rulings P2-R and P2-R2 and their tests.
+- Still running at preparation, and required before the tag:
+  - the test retention gates on `95543bfd1`
+    ([run 41852258119](https://github.com/jaylaney/stalwart/actions/runs/41852258119));
+  - CI on `main` after the merge:
+    [run 41858534411](https://github.com/jaylaney/stalwart/actions/runs/41858534411) at
+    `92680dd3b`, and [run 41860172138](https://github.com/jaylaney/stalwart/actions/runs/41860172138)
+    at `81c23b37b`.
+
+  The published release notes record their results.
+- Reviews: the final whole-branch review (three Opus lenses and a docs review); the
+  PR-stage review (four Fable lenses and two PR comments, a fix wave and a scoped Fable
+  re-review); the Codex re-review of `466f83d4e`, whose fixes (rulings P2-R and P2-R2) each
+  had a scoped Fable review. No Critical or Important finding remains.
+- Release-preparation checks, run at the preparation commit: 9 release-metadata tests
+  (`python3 -I scripts/tests/test_release_metadata.py`) and 25 product-verifier tests
+  (`python3 -B -I -m unittest discover -s scripts/release -p 'test_*.py'`) passed, and the
+  gates' workflow check (`python3 -I scripts/tests/ci_steps.py`, 0 differences) and tests
+  (`python3 -I scripts/tests/test_gates.py`, 43 passed, 2 skipped) stayed green. No product
+  was built during preparation.
+
+Gates beyond the automated runs, recorded after publication:
+
+- the exact-source Linux shipping build and its verification, from the tag through
+  `product-build.yml`;
+- the release 5 real-provider round, the Gmail, Outlook.com and iCloud section
+  ("Invitations by email (release 5)") of the
+  [manual checklist](docs/zero-access/manual-checklist.md): pending;
+- native client verification of release 5's flows: pending. The native Calendar and Mail
+  checklist passed on `0.2.0-beta.1`'s deployed build (2026-11-02, per Jay) and has not
+  been run on this release;
+- a clean-context whole-branch review, carried over from `0.2.0-beta.1`: pending.
+
+Not qualified: SQL and FoundationDB stores, multi-node execution, platforms other than the
+one named above, upstream's private test suites and the external protocol suites (Dovecot
+imaptest, Fastmail's JMAP test suite, Apple's CalDAVTester).
+
 ## 0.2.0-beta.1 — 2026-11-02
 
 Immutable tag: `fork-v0.2.0-beta.1`. A limited prerelease on upstream Stalwart `v1.0.1`,

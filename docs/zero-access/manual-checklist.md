@@ -72,7 +72,7 @@ Server-side, after the run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p
 
 ## Invitations by email (release 5)
 
-Release 5 (invitations by email, iMIP; spec `docs/superpowers/specs/2026-11-02-zero-access-imip-design.md`, section 8.7). Run against real Gmail, Outlook.com and iCloud accounts, once per release, against a server built from this branch.
+Release 5 (invitations by email, iMIP; spec `docs/superpowers/specs/2026-11-02-zero-access-imip-design.md`, section 8.7). Run against real Gmail, Outlook.com and iCloud accounts, once per release, against a server built from this branch. For `0.3.0-beta.1`, the first release that includes release 5, that is the published `fork-v0.3.0-beta.1` shipping artifact, whose `--version` reads `Stalwart Server fork v0.3.0-beta.1 (upstream v1.0.1 23b69755cb3cd8ecd952fe0443c5ac067a506184; source <commit>; clean)`; record the exact line and the binary's checksum with the results. The `0.2.0-beta.1` build named at the top of this checklist does not include release 5.
 
 Preconditions: a deployment those providers reach, outbound through the relay with SPF and DKIM aligned for the key account's domain, and a key account with Apple Calendar, Thunderbird or DAVx5 connected. Item 7 needs a second key account.
 

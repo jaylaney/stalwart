@@ -87,26 +87,43 @@ its upstream updates during merges; do not insert fork release entries there.
 
 The first preview is `0.1.0-beta.1`, tagged `fork-v0.1.0-beta.1` and titled
 `release-0.1.0-beta-1`; `0.1.1-beta.1` (tag `fork-v0.1.1-beta.1`) followed on upstream
-`v0.16.27`. `fork-release.toml` is the fork identity source: it records the fork version and
+`v0.16.27`, and `0.2.0-beta.1` (tag `fork-v0.2.0-beta.1`) moved the fork to upstream
+`v1.0.1`. `fork-release.toml` is the fork identity source: it records the fork version and
 upstream base tag/full commit. The shipping `stalwart` package version must match it. The
-current prerelease is `0.2.0-beta.1` (tag `fork-v0.2.0-beta.1`), with fully integrated
-upstream `v1.0.1` (`23b69755cb3cd8ecd952fe0443c5ac067a506184`). Internal upstream crate
+current prerelease is `0.3.0-beta.1` (tag `fork-v0.3.0-beta.1`), which adds release 5
+(invitations by email) on the same fully integrated upstream `v1.0.1`
+(`23b69755cb3cd8ecd952fe0443c5ac067a506184`). Internal upstream crate
 versions and numeric compatibility checks follow `1.0.1`; the fork-owned `vault` crate
 retains `0.16.25`. The published `fork-v0.1.0-beta.1`, `fork-v0.1.1-beta.1` and
 `fork-v0.2.0-beta.1` tags and artifacts remain immutable.
 
-`0.2.0-beta.1` is a limited prerelease. It supports fresh stores only: upstream 1.0.1 cannot
+`0.2.0-beta.1` was a limited prerelease. It supported fresh stores only: upstream 1.0.1 cannot
 open a store written by upstream 0.16 or by the fork's `0.1.x` releases, and the fork adds no
-conversion or legacy reader. An existing installation moves by provisioning a fresh store and
+conversion or legacy reader. An existing installation moved by provisioning a fresh store and
 setting its key accounts up again, keeping the old store and the `0.1.x` binary for rollback;
-rollback restores the old store as it was, without the writes made after the cutover. This
-prerelease uses public upstream and fork tests for qualification and adds no private-test
-dependency. Record fresh results before publication; existing results do not
-establish new backend, cluster, platform or native-client qualification, and results from
-the `0.1.x` base are not evidence for this prerelease. Its exact-source Linux product build
+rollback restores the old store as it was, without the writes made after the cutover. That
+prerelease used public upstream and fork tests for qualification, and results from the
+`0.1.x` base were not evidence for it. Its exact-source Linux product build
 ran from the tag through `product-build.yml`, and the published release notes record its
 verification. The native Calendar and Mail client checklist passed on the deployed build on
-2026-11-02, per Jay; its remaining gate is a clean-context whole-branch review.
+2026-11-02, per Jay; its remaining gate, a clean-context whole-branch review, carries over
+to `0.3.0-beta.1`.
+
+`0.3.0-beta.1` is a limited prerelease. It supports an in-place upgrade from `0.2.0-beta.1`:
+the store schema version is unchanged and release 5 changes no stored layout, so the
+existing store is expected to open. No automated test covers that upgrade (CI's
+fresh-store job checks a fresh store only), so the database, blob store and configuration
+are backed up first. Rollback to `0.2.0-beta.1` restores that backup, without the writes
+made after the upgrade; no claim is made that a `0.2.0-beta.1` binary reads data
+`0.3.0-beta.1` has written. It also supports fresh stores; moving from `0.1.x` remains a
+fresh-store rebuild. This prerelease uses public upstream and fork tests for qualification
+and adds no private-test dependency. Record fresh results before publication; existing
+results do not establish new backend, cluster, platform or native-client qualification. Its
+exact-source Linux product build runs from the tag through `product-build.yml`, and the
+published release notes record its verification. Its pending gates are the release 5
+real-provider round (the Gmail, Outlook.com and iCloud section of the
+[manual checklist](zero-access/manual-checklist.md)), native client verification of release
+5's flows, and the clean-context whole-branch review carried over from `0.2.0-beta.1`.
 SQL backends, clusters, other platforms and the external
 protocol suites are not qualified. It stays a prerelease until its applicable
 gates pass; the [fork changelog](../CHANGELOG-fork.md) records its automated results.
