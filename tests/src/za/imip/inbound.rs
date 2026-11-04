@@ -26,8 +26,8 @@ use crate::{
             InboxItem, copy_href, envelope_wrap, inbox_ids, inbox_items, item_method,
             item_partstat, mail_borne_items, mail_count, new_inbox_items, open_pending_item_as,
             pending_ids, pin_record, raw_pins, schedule_statuses, set_raw_pins, trigger_drain,
-            wait_for_delivery, wait_for_queue, wrap_mark, write_pin_record, za_setup,
-            za_setup_token, za_unlock,
+            wait_for_delivery, wait_for_index_queue, wait_for_queue, wrap_mark, write_pin_record,
+            za_setup, za_setup_token, za_unlock,
         },
     },
     za::{
@@ -74,6 +74,7 @@ use groupware::calendar::{
 use hyper::StatusCode;
 use mail_parser::MessageParser;
 use serde_json::json;
+use std::time::Duration;
 use store::write::now;
 use trc::{CalendarEvent, EventType, Key, StoreEvent};
 use vault::pins::PinSource;
@@ -1195,6 +1196,8 @@ async fn sender_provisioned_before_drain(test: &TestServer, key: &Party) {
         !inbox_ids(test, key.id).await.contains(&items[0].0),
         "the item outlived the drain's key-account sender refusal"
     );
+    // 1.0's destroy window: no index pass of the account may still run.
+    wait_for_index_queue(test, sender.id().document_id(), Duration::from_secs(30)).await;
     admin.destroy_account(sender).await;
 }
 
@@ -2232,6 +2235,9 @@ async fn cleanup(
     for card in cards {
         delete_contact(&key.client, &card).await;
     }
+    // imip-plain's mail and events are indexed asynchronously; 1.0's destroy
+    // window leaves orphaned search documents if a pass is still running.
+    wait_for_index_queue(test, plain.id().document_id(), Duration::from_secs(30)).await;
     admin.destroy_account(plain).await;
     test.wait_for_tasks().await;
 }

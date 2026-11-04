@@ -27,7 +27,8 @@ use crate::utils::{
         HookParked, VaultReply, copy_href, inbox_ids, item_method, item_partstat, mail_count,
         new_inbox_items, open_pending_item_as, pending_ids, pin_record, raw_pins, restore_wrap,
         rewrap_legacy, saved_wrap, set_raw_pins, substitute_public_key, trigger_drain,
-        vault_revision, wait_for_queue, wrap_mark, write_pin_record, writer_key, za_post, za_unpin,
+        vault_revision, wait_for_index_queue, wait_for_queue, wrap_mark, write_pin_record,
+        writer_key, za_post, za_unpin,
     },
 };
 use ::registry::{
@@ -49,7 +50,7 @@ use common::{auth::vault::ZaMark, za::test_hooks};
 use groupware::cache::GroupwareCache;
 use hyper::{Method, StatusCode};
 use serde_json::{Value, json};
-use std::future::Future;
+use std::{future::Future, time::Duration};
 use store::write::now;
 use types::collection::SyncCollection;
 use vault::{
@@ -4124,6 +4125,10 @@ async fn a2_remapped_pin_withholds_mail(test: &TestServer) {
     delete_event(&alice, &path).await;
     alice.delete_items_since(test, &alice_start).await;
     clear_recipient(test, &bob, &bob_start, UID).await;
+    // The plain account's mail and event are indexed asynchronously: an
+    // index pass still running when the account is destroyed leaves orphaned
+    // search documents (1.0's destroy window, upgrade rulings 69 and 85).
+    wait_for_index_queue(test, plain_id, Duration::from_secs(30)).await;
     admin.destroy_account(plain).await;
     test.wait_for_tasks().await;
 }

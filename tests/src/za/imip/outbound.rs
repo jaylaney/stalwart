@@ -21,8 +21,8 @@ use crate::{
         za::{
             HookParked, copy_href, hold_task_consumer, inbox_ids, item_partstat, itip_tasks_for,
             mail_borne_items, mail_count, new_inbox_items, open_pending_item_as, pin_record,
-            queued_recipients, trigger_drain, wait_for_delivery, wait_for_queue, za_app_password,
-            za_post, za_setup_token,
+            queued_recipients, trigger_drain, wait_for_delivery, wait_for_index_queue,
+            wait_for_queue, za_app_password, za_post, za_setup_token,
         },
     },
     za::{
@@ -226,6 +226,9 @@ async fn cleanup(
         delete_contact(&party.client, card).await;
     }
     for account in accounts {
+        // imip-out-plain's mail is indexed asynchronously; 1.0's destroy
+        // window leaves orphaned search documents if a pass is still running.
+        wait_for_index_queue(test, account.id().document_id(), Duration::from_secs(30)).await;
         admin.destroy_account(account).await;
     }
     admin
@@ -1458,6 +1461,8 @@ async fn unrouted_local_addresses(test: &TestServer, owner: &Party, key2: &Party
         .request_with_headers("DELETE", &path, [NO_REPLY], "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+    // 1.0's destroy window: no index pass of the account may still run.
+    wait_for_index_queue(test, disabled.id().document_id(), Duration::from_secs(30)).await;
     admin.destroy_account(disabled).await;
     admin
         .registry_destroy(ObjectType::Domain, [domain])

@@ -47,7 +47,7 @@ use crate::{
         webdav::DummyWebDavClient,
         za::{
             copy_href, inbox_ids, inbox_items, item_partstat, mail_borne_items, new_inbox_items,
-            trigger_drain, wait_for_delivery, wait_for_queue,
+            trigger_drain, wait_for_delivery, wait_for_index_queue, wait_for_queue,
         },
     },
     za::{
@@ -62,7 +62,7 @@ use ::registry::schema::{prelude::Property, structs::CalendarScheduling};
 use calcard::icalendar::ICalendar;
 use groupware::calendar::EVENT_NOTIFICATION_ZA_PENDING;
 use hyper::{Method, StatusCode};
-use std::fmt;
+use std::{fmt, time::Duration};
 use types::id::Id;
 
 /// The key account of the oracle (spec 8.3).
@@ -355,6 +355,9 @@ pub async fn test(test: &mut TestServer) {
     }
     drop(drain);
     sink().clear();
+    // Before the destroy, the plain account's index queue drains (1.0's
+    // destroy window: a pass still running leaves orphaned search documents).
+    wait_for_index_queue(test, plain.id().document_id(), Duration::from_secs(30)).await;
     admin.destroy_account(plain).await;
     set_throttles(&admin, &throttles, true).await;
     set_http_rsvp(&admin, rsvp).await;
