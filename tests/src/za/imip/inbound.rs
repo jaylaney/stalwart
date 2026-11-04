@@ -35,7 +35,7 @@ use crate::{
         drain::{DrainOn, body, partstat_of, relative, set_partstat},
         fanout::{CONTENT_TYPE, MKCALENDAR, NO_REPLY, Party, stored_pairs, uid_copies},
         mail::{Traced, TracedEvent},
-        pinning::with_partstat,
+        pinning::{partstat_in, with_partstat},
         uid_lease::put,
         user_permissions,
     },
@@ -141,6 +141,7 @@ pub async fn test(test: &mut TestServer) {
     refresh_answer(test, &key).await;
     outside_delegation(test, &key, &key2).await;
     existing_attendee_not_reinvited(test, &key, &key2).await;
+    existing_attendee_not_reinvited_recurring(test, &key, &key2).await;
     pairs_untouched_by_mail(test, &key, &key2).await;
     delegate_reply_into_delegators_copy(test, &key, &key2).await;
     plain_local_organizer(test, &key, &plain).await;
@@ -680,6 +681,7 @@ const DRAIN_UIDS: &[&str] = &[
     "imip-in-prov",
     "imip-in-dl",
     "imip-in-xd",
+    "imip-in-xr",
     "imip-in-p",
     "imip-in-sd",
     "imip-in-pl",
@@ -1377,6 +1379,165 @@ async fn existing_attendee_not_reinvited(test: &TestServer, key: &Party, key2: &
     );
     delete_quietly(&key2.client, &copy).await;
     delete_quietly(&key.client, &href).await;
+}
+
+/// PR review ruling P2-R, the recurring form of
+/// `existing_attendee_not_reinvited`: imip-key's daily series lists ATT and
+/// imip-key2, and its existing override of the 12th lists ATT only.
+/// imip-key2 accepts the master. ATT's REPLY delegates to imip-key2 in both
+/// components and resets imip-key2's master line to
+/// `PARTSTAT=NEEDS-ACTION;RSVP=TRUE`. Upstream's merge adds imip-key2 to the
+/// override, where it was absent, but imip-key2 attended the master, so the
+/// mail arm's delegating fan-out does not count it as new (the full build
+/// and the split per recipient would re-send it the master): imip-key2's
+/// inbox gains nothing and its own master stays accepted.
+async fn existing_attendee_not_reinvited_recurring(test: &TestServer, key: &Party, key2: &Party) {
+    let _drain = DrainOn::new();
+    let uid = "imip-in-xr";
+    let href = own_href(key, uid);
+    let recurrence_id = "20990112T090000Z";
+    // The override of the 12th as a VEVENT, listing `attendees` and `lines`.
+    let overridden = |attendees: &[&str], lines: &str| {
+        let ics = event(
+            uid,
+            key.name,
+            attendees,
+            0,
+            &format!("RECURRENCE-ID:{recurrence_id}\r\n{lines}"),
+        )
+        .replace("DTSTART:20990110T090000Z", "DTSTART:20990112T090000Z")
+        .replace("DTEND:20990110T100000Z", "DTEND:20990112T100000Z");
+        let start = ics.find("BEGIN:VEVENT").unwrap();
+        let end = ics.find("END:VCALENDAR").unwrap();
+        ics[start..end].to_string()
+    };
+    // `master`'s VCALENDAR with `overridden` after its VEVENT.
+    let series = |master: String, overridden: String| {
+        master.replace(
+            "END:VCALENDAR\r\n",
+            &format!("{overridden}END:VCALENDAR\r\n"),
+        )
+    };
+    assert_eq!(
+        put(
+            key.name,
+            STRONG,
+            href.clone(),
+            series(
+                event(uid, key.name, &[ATT, KEY2], 0, "RRULE:FREQ=DAILY;COUNT=5"),
+                overridden(&[ATT], "")
+            )
+        )
+        .await,
+        201
+    );
+    // imip-key2 imports its invitation and accepts the master; its
+    // token-authenticated REPLY merges into the organizer's copy.
+    drain(key2).await;
+    let copy = copy_href(test, key2.id, uid).await;
+    set_partstat(&key2.client, &copy, KEY2, "ACCEPTED").await;
+    drain(key).await;
+    let got = body(&key.client, &href).await;
+    assert_eq!(
+        attendee_line(&got, None, KEY2)
+            .as_deref()
+            .and_then(line_partstat),
+        Some("ACCEPTED"),
+        "{got}"
+    );
+    assert_eq!(
+        attendee_line(&got, Some(recurrence_id), KEY2),
+        None,
+        "{got}"
+    );
+    let before2 = inbox_ids(test, key2.id).await;
+    let delegated = format!(
+        concat!(
+            "ATTENDEE;PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:{key2}\":mailto:{att}\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:{att}\":mailto:{key2}\r\n"
+        ),
+        key2 = KEY2,
+        att = ATT
+    );
+    mail_in(
+        test,
+        ATT,
+        key.name,
+        "REPLY",
+        &series(
+            event(uid, key.name, &[], 0, &delegated),
+            overridden(&[], &delegated),
+        ),
+    )
+    .await;
+    drain(key).await;
+    // Upstream's merge of both components (the positive control): the
+    // override gained imip-key2, delegated from ATT, and imip-key2's master
+    // line was overwritten from the REPLY.
+    let got = body(&key.client, &href).await;
+    let delegate = attendee_line(&got, Some(recurrence_id), KEY2)
+        .unwrap_or_else(|| panic!("the override did not gain imip-key2: {got}"));
+    assert!(
+        delegate.to_ascii_lowercase().contains("delegated-from=") && delegate.contains(ATT),
+        "{got}"
+    );
+    assert_eq!(
+        attendee_line(&got, Some(recurrence_id), ATT)
+            .as_deref()
+            .and_then(line_partstat),
+        Some("DELEGATED"),
+        "{got}"
+    );
+    assert_eq!(
+        attendee_line(&got, None, KEY2)
+            .as_deref()
+            .and_then(line_partstat),
+        Some("NEEDS-ACTION"),
+        "{got}"
+    );
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        before2,
+        "the mail arm re-invited an attendee of another instance"
+    );
+    // imip-key2's own master is unchanged (its request drains first).
+    assert_eq!(
+        partstat_in(&key2.client, &copy, None, KEY2)
+            .await
+            .as_deref(),
+        Some("ACCEPTED"),
+        "an outside attendee reset imip-key2's master"
+    );
+    delete_quietly(&key2.client, &copy).await;
+    delete_quietly(&key.client, &href).await;
+}
+
+/// The unfolded ATTENDEE line of `address` in `body`'s master VEVENT
+/// (`None`) or in its override whose RECURRENCE-ID is `recurrence_id`.
+fn attendee_line(body: &str, recurrence_id: Option<&str>, address: &str) -> Option<String> {
+    let unfolded = body.replace("\r\n ", "");
+    let target = format!("mailto:{}", address.to_ascii_lowercase());
+    unfolded
+        .split("BEGIN:VEVENT")
+        .skip(1)
+        .find(|component| match recurrence_id {
+            Some(recurrence_id) => {
+                component.contains(&format!("\r\nRECURRENCE-ID:{recurrence_id}\r\n"))
+            }
+            None => !component.contains("\r\nRECURRENCE-ID"),
+        })?
+        .split("\r\n")
+        .find(|line| line.starts_with("ATTENDEE") && line.to_ascii_lowercase().ends_with(&target))
+        .map(str::to_string)
+}
+
+/// The PARTSTAT value of an ATTENDEE line.
+fn line_partstat(line: &str) -> Option<&str> {
+    let at = line.find("PARTSTAT=")? + "PARTSTAT=".len();
+    let end = line[at..]
+        .find([';', ':'])
+        .map_or(line.len(), |end| at + end);
+    Some(&line[at..end])
 }
 
 /// The pair count and each of `addresses`' tokens, to compare pairs.

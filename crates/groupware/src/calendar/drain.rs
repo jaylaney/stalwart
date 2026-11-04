@@ -1277,10 +1277,12 @@ pub fn instance_key(instance: &InstanceId) -> InstanceKey {
 
 /// An event's attendance before a merge, per instance (spec 6.4,
 /// "Delegates"): for each attendee's lowercased address, the lowercased
-/// addresses of its DELEGATED-FROM.
+/// addresses of its DELEGATED-FROM; and, for the mail arm, every
+/// lowercased address that attended any instance.
 struct Attendance {
     instances: AHashSet<InstanceKey>,
     attendees: AHashMap<(InstanceKey, String), AHashSet<String>>,
+    addresses: AHashSet<String>,
 }
 
 impl Attendance {
@@ -1288,6 +1290,7 @@ impl Attendance {
         let mut attendance = Attendance {
             instances: AHashSet::new(),
             attendees: AHashMap::new(),
+            addresses: AHashSet::new(),
         };
         for (instance, snapshot) in &snapshots.components {
             let instance = instance_key(instance);
@@ -1295,9 +1298,11 @@ impl Attendance {
             // An address listed twice in one instance keeps the union of
             // its DELEGATED-FROM sets.
             for attendee in &snapshot.attendees {
+                let address = attendee.email.email.to_ascii_lowercase();
+                attendance.addresses.insert(address.clone());
                 attendance
                     .attendees
-                    .entry((instance, attendee.email.email.to_ascii_lowercase()))
+                    .entry((instance, address))
                     .or_default()
                     .extend(delegators(attendee));
             }
@@ -1306,23 +1311,33 @@ impl Attendance {
     }
 
     /// Whether `attendee`, as `instance` of the merged event lists it, is
-    /// new to that instance: it did not attend it before, or its
+    /// new. On release 2's token-authenticated path (`mail` false): new to
+    /// that instance, because it did not attend it before or its
     /// DELEGATED-FROM gained an address (a new delegation to an existing
     /// attendee). An override the merge created inherits the attendance
     /// of the instance that governs it (`governing_instance`: the latest
     /// range override at or before it, else the master), so a delegator's
     /// own per-occurrence delegation does not make the delegator new.
-    /// PR review ruling P2: a mail-borne merge (`mail`) counts only an
-    /// attendee absent from that instance before; a DELEGATED-FROM gain on
-    /// an existing attendee waits for the organizer's next update, as
-    /// upstream's plain path, so an outside attendee cannot re-invite an
-    /// existing key co-attendee without its token or an organizer edit.
+    /// PR review rulings P2 and P2-R: a mail-borne merge (`mail`) counts
+    /// only an address absent from every instance of the event before.
+    /// Per instance is not enough on mail: the delegating fan-out keeps
+    /// its recipients by address, and upstream's full build and the split
+    /// per recipient give each one every instance it attends, so an
+    /// address new to one instance would also be re-sent the instances it
+    /// already attended, with the answer an outside attendee's mail reset
+    /// there, without its token or an organizer edit. The cost: an
+    /// attendee that the mail adds to an instance it did not attend, or
+    /// whose DELEGATED-FROM gained an address, learns it at the
+    /// organizer's next update, as upstream's plain path.
     fn is_new(&self, instance: InstanceKey, attendee: &Attendee<'_>, mail: bool) -> bool {
-        match self.attendees.get(&(
-            governing_instance(instance, &self.instances),
-            attendee.email.email.to_ascii_lowercase(),
-        )) {
-            Some(_) if mail => false,
+        let address = attendee.email.email.to_ascii_lowercase();
+        if mail {
+            return !self.addresses.contains(&address);
+        }
+        match self
+            .attendees
+            .get(&(governing_instance(instance, &self.instances), address))
+        {
             Some(before) => !delegators(attendee).is_subset(before),
             None => true,
         }
@@ -1553,10 +1568,12 @@ async fn merge(
             let mail = matches!(incoming, Incoming::Mail { .. });
             let new_attendees = match itip_snapshot(&event.content.data.event, addresses, false) {
                 Ok(after) => {
-                    // Compared per instance, so a delegate who already
-                    // attends another instance is new to this one, and an
-                    // attendee that became a delegate is new too; the set
-                    // dedups the addresses for delivery.
+                    // On release 2's token path, compared per instance, so
+                    // a delegate who already attends another instance is
+                    // new to this one, and an attendee that became a
+                    // delegate is new too. On the mail arm only an address
+                    // absent from every instance before is new (rulings P2
+                    // and P2-R). The set dedups the addresses for delivery.
                     let mut new_attendees: AHashSet<String> = AHashSet::new();
                     for (instance, snapshot) in &after.components {
                         let instance = instance_key(instance);
@@ -2635,6 +2652,102 @@ mod tests {
         let absent = Attendance::of(&itip_snapshot(&event(None), &org, false).unwrap());
         assert!(absent.is_new(None, &del, false), "absent, release 2's path");
         assert!(absent.is_new(None, &del, true), "absent, the mail arm");
+    }
+
+    /// A daily master listing `master` and an override of the 3rd listing
+    /// `overridden`, each address on a NEEDS-ACTION line.
+    fn attended(master: &[&str], overridden: &[&str]) -> ICalendar {
+        fn lines(addresses: &[&str]) -> String {
+            addresses
+                .iter()
+                .map(|address| format!("ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:{address}\r\n"))
+                .collect()
+        }
+        parse(&format!(
+            concat!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\n",
+                "UID:stale-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\n",
+                "DTEND:20990102T100000Z\r\nRRULE:FREQ=DAILY;COUNT=5\r\nSEQUENCE:0\r\n",
+                "ORGANIZER:mailto:org@example.com\r\n{}END:VEVENT\r\nBEGIN:VEVENT\r\n",
+                "UID:stale-1\r\nRECURRENCE-ID:20990103T090000Z\r\nDTSTAMP:20240101T000000Z\r\n",
+                "DTSTART:20990103T100000Z\r\nDTEND:20990103T110000Z\r\nSEQUENCE:0\r\n",
+                "ORGANIZER:mailto:org@example.com\r\n{}END:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+            lines(master),
+            lines(overridden)
+        ))
+    }
+
+    /// PR review ruling P2-R: on the mail arm an address that attended any
+    /// instance before is never new, in whichever instance the merge lists
+    /// it; release 2's token-authenticated path stays per instance.
+    #[test]
+    fn mail_counts_only_addresses_absent_from_every_instance() {
+        /// The instance and the attendee `address` of `tree`'s master
+        /// (`overridden` false) or of its override.
+        fn listed<'x>(
+            tree: &'x ICalendar,
+            overridden: bool,
+            address: &str,
+        ) -> (InstanceKey, Attendee<'x>) {
+            let snapshots = itip_snapshot(tree, &organizer(), false).unwrap();
+            let (instance, snapshot) = snapshots
+                .components
+                .iter()
+                .find(|(instance, _)| matches!(instance, InstanceId::Main) != overridden)
+                .unwrap();
+            let attendee = snapshot
+                .attendees
+                .iter()
+                .find(|attendee| attendee.email.email == address)
+                .unwrap()
+                .clone();
+            (instance_key(instance), attendee)
+        }
+        let org = organizer();
+        let (att, del) = ("att@example.com", "del@example.com");
+        // `del` attends the master, not the override; the merge lists it in
+        // the override too.
+        let before = attended(&[att, del], &[att]);
+        let before = Attendance::of(&itip_snapshot(&before, &org, false).unwrap());
+        let after = attended(&[att, del], &[att, del]);
+        let (instance, listed_del) = listed(&after, true, del);
+        assert!(instance.is_some(), "the override's instance");
+        assert!(
+            before.is_new(instance, &listed_del, false),
+            "master to override, release 2's path"
+        );
+        assert!(
+            !before.is_new(instance, &listed_del, true),
+            "master to override, the mail arm"
+        );
+        // `del` attends the override only; the merge lists it in the master.
+        let before = attended(&[att], &[att, del]);
+        let before = Attendance::of(&itip_snapshot(&before, &org, false).unwrap());
+        let (instance, listed_del) = listed(&after, false, del);
+        assert!(instance.is_none(), "the master's instance");
+        assert!(
+            before.is_new(instance, &listed_del, false),
+            "override to master, release 2's path"
+        );
+        assert!(
+            !before.is_new(instance, &listed_del, true),
+            "override to master, the mail arm"
+        );
+        // `del` attends no instance before: new in either, on both paths.
+        let before = attended(&[att], &[att]);
+        let before = Attendance::of(&itip_snapshot(&before, &org, false).unwrap());
+        for overridden in [false, true] {
+            let (instance, listed_del) = listed(&after, overridden, del);
+            assert!(
+                before.is_new(instance, &listed_del, false),
+                "absent from every instance, release 2's path ({overridden})"
+            );
+            assert!(
+                before.is_new(instance, &listed_del, true),
+                "absent from every instance, the mail arm ({overridden})"
+            );
+        }
     }
 
     #[test]
