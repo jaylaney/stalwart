@@ -142,6 +142,7 @@ pub async fn test(test: &mut TestServer) {
     outside_delegation(test, &key, &key2).await;
     existing_attendee_not_reinvited(test, &key, &key2).await;
     existing_attendee_not_reinvited_recurring(test, &key, &key2).await;
+    existing_attendee_not_reinvited_subaddress(test, &key, &key2).await;
     pairs_untouched_by_mail(test, &key, &key2).await;
     delegate_reply_into_delegators_copy(test, &key, &key2).await;
     plain_local_organizer(test, &key, &plain).await;
@@ -682,6 +683,7 @@ const DRAIN_UIDS: &[&str] = &[
     "imip-in-dl",
     "imip-in-xd",
     "imip-in-xr",
+    "imip-in-xs",
     "imip-in-p",
     "imip-in-sd",
     "imip-in-pl",
@@ -1472,8 +1474,9 @@ async fn existing_attendee_not_reinvited_recurring(test: &TestServer, key: &Part
     .await;
     drain(key).await;
     // Upstream's merge of both components (the positive control): the
-    // override gained imip-key2, delegated from ATT, and imip-key2's master
-    // line was overwritten from the REPLY.
+    // override gained imip-key2, delegated from ATT, ATT delegated in both
+    // components, and imip-key2's master line was overwritten from the
+    // REPLY.
     let got = body(&key.client, &href).await;
     let delegate = attendee_line(&got, Some(recurrence_id), KEY2)
         .unwrap_or_else(|| panic!("the override did not gain imip-key2: {got}"));
@@ -1481,13 +1484,15 @@ async fn existing_attendee_not_reinvited_recurring(test: &TestServer, key: &Part
         delegate.to_ascii_lowercase().contains("delegated-from=") && delegate.contains(ATT),
         "{got}"
     );
-    assert_eq!(
-        attendee_line(&got, Some(recurrence_id), ATT)
-            .as_deref()
-            .and_then(line_partstat),
-        Some("DELEGATED"),
-        "{got}"
-    );
+    for instance in [Some(recurrence_id), None] {
+        assert_eq!(
+            attendee_line(&got, instance, ATT)
+                .as_deref()
+                .and_then(line_partstat),
+            Some("DELEGATED"),
+            "{instance:?}: {got}"
+        );
+    }
     assert_eq!(
         attendee_line(&got, None, KEY2)
             .as_deref()
@@ -1507,6 +1512,90 @@ async fn existing_attendee_not_reinvited_recurring(test: &TestServer, key: &Part
             .as_deref(),
         Some("ACCEPTED"),
         "an outside attendee reset imip-key2's master"
+    );
+    delete_quietly(&key2.client, &copy).await;
+    delete_quietly(&key.client, &href).await;
+}
+
+/// PR review ruling P2-R2: imip-key2 has accepted; ATT's REPLY delegates to
+/// both `imip-key2@example.com` and its sub-address `KEY2_SUB`, resets
+/// imip-key2's line to `PARTSTAT=NEEDS-ACTION;RSVP=TRUE` and adds the
+/// sub-address's line. The sub-address is absent from the event before, so
+/// P2-R's string rule counts it as new, but `example.com` has sub-addressing
+/// on (the registry's default), so it resolves to imip-key2's account,
+/// which attended: the mail arm's delegating fan-out drops it, imip-key2's
+/// inbox gains nothing and its own copy stays accepted.
+async fn existing_attendee_not_reinvited_subaddress(test: &TestServer, key: &Party, key2: &Party) {
+    const KEY2_SUB: &str = "imip-key2+x@example.com";
+    let _drain = DrainOn::new();
+    let uid = "imip-in-xs";
+    let href = own_href(key, uid);
+    assert_eq!(
+        put(
+            key.name,
+            STRONG,
+            href.clone(),
+            event(uid, key.name, &[ATT, KEY2], 0, "")
+        )
+        .await,
+        201
+    );
+    // imip-key2 imports its invitation and accepts; its token-authenticated
+    // REPLY merges into the organizer's copy.
+    drain(key2).await;
+    let copy = copy_href(test, key2.id, uid).await;
+    set_partstat(&key2.client, &copy, KEY2, "ACCEPTED").await;
+    drain(key).await;
+    assert_eq!(
+        partstat_of(&key.client, &href, KEY2).await.as_deref(),
+        Some("ACCEPTED")
+    );
+    let before2 = inbox_ids(test, key2.id).await;
+    let delegated = format!(
+        concat!(
+            "ATTENDEE;PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:{key2}\",\"mailto:{sub}\":mailto:{att}\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:{att}\":mailto:{key2}\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:{att}\":mailto:{sub}\r\n"
+        ),
+        key2 = KEY2,
+        sub = KEY2_SUB,
+        att = ATT
+    );
+    mail_in(
+        test,
+        ATT,
+        key.name,
+        "REPLY",
+        &event(uid, key.name, &[], 0, &delegated),
+    )
+    .await;
+    drain(key).await;
+    // Upstream's merge (the positive control): the sub-address joined,
+    // delegated from ATT, and imip-key2's line was overwritten from the
+    // REPLY.
+    let got = body(&key.client, &href).await;
+    let delegate = attendee_line(&got, None, KEY2_SUB)
+        .unwrap_or_else(|| panic!("the copy did not gain {KEY2_SUB}: {got}"));
+    assert!(
+        delegate.to_ascii_lowercase().contains("delegated-from=") && delegate.contains(ATT),
+        "{got}"
+    );
+    assert_eq!(partstat(&got, ATT).as_deref(), Some("DELEGATED"), "{got}");
+    assert_eq!(
+        partstat(&got, KEY2).as_deref(),
+        Some("NEEDS-ACTION"),
+        "{got}"
+    );
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        before2,
+        "the mail arm re-invited an attendee's account under a second address"
+    );
+    // imip-key2's own participation is unchanged (its request drains first).
+    assert_eq!(
+        partstat_of(&key2.client, &copy, KEY2).await.as_deref(),
+        Some("ACCEPTED"),
+        "an outside attendee reset imip-key2's copy"
     );
     delete_quietly(&key2.client, &copy).await;
     delete_quietly(&key.client, &href).await;

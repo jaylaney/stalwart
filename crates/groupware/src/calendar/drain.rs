@@ -119,7 +119,7 @@ use common::{
     za::{
         imip::{
             ZA_IMIP_ITEM_DELETED, ZA_IMIP_KEY_SENDER, ZA_IMIP_LOOKUP_FAILED, ZaImipPending,
-            za_imip_trace_unrouted, za_imip_trace_withheld,
+            ZaMailClass, za_imip_trace_unrouted, za_imip_trace_withheld,
         },
         lease::{ZaUidLease, ZaUidLeaseGuard},
     },
@@ -1322,13 +1322,15 @@ impl Attendance {
     /// only an address absent from every instance of the event before.
     /// Per instance is not enough on mail: the delegating fan-out keeps
     /// its recipients by address, and upstream's full build and the split
-    /// per recipient give each one every instance it attends, so an
+    /// per recipient give each one every instance it attends. So an
     /// address new to one instance would also be re-sent the instances it
-    /// already attended, with the answer an outside attendee's mail reset
-    /// there, without its token or an organizer edit. The cost: an
-    /// attendee that the mail adds to an instance it did not attend, or
-    /// whose DELEGATED-FROM gained an address, learns it at the
-    /// organizer's next update, as upstream's plain path.
+    /// already attended, and its own line there would be whatever the
+    /// outside attendee's mail had reset it to, without its token or an
+    /// organizer edit. The cost: an attendee that the mail adds to an
+    /// instance it did not attend, or whose DELEGATED-FROM gained an
+    /// address, learns it at the organizer's next update, as upstream's
+    /// plain path. This string rule is the mail arm's first filter; ruling
+    /// P2-R2 then compares by account (`za_drop_attended_accounts`).
     fn is_new(&self, instance: InstanceKey, attendee: &Attendee<'_>, mail: bool) -> bool {
         let address = attendee.email.email.to_ascii_lowercase();
         if mail {
@@ -1342,6 +1344,49 @@ impl Attendance {
             None => true,
         }
     }
+}
+
+/// PR review ruling P2-R2, the mail arm's second filter after
+/// `Attendance::is_new`: drops from `candidates`, the new delegates by
+/// address, every address that resolves to an account some address of
+/// `before` resolves to. The string rule alone is not enough on mail:
+/// internal delivery is per account, and `Server::za_mail_class` folds a
+/// sub-address (on by default), an alias and a second domain name into one
+/// account, so a co-attendee's second address would re-open the reset
+/// rulings P2 and P2-R closed. Only an account counts; any other class is
+/// left as it is, since the fan-out's `internal_only` already keeps it
+/// from being mailed. The resolver is the quiet one (invariant 47: no
+/// cache event carries an address); a lookup error is returned, so the
+/// item stays pending and counts as its failure (as ruling O-4). The
+/// cost: a few registry lookups per mail-borne REPLY into a key
+/// organizer's copy, and a delegate who shares an account with an earlier
+/// attendee learns of it at the organizer's next update.
+async fn za_drop_attended_accounts(
+    server: &Server,
+    before: &Attendance,
+    candidates: &mut AHashSet<String>,
+) -> trc::Result<()> {
+    let mut attended = AHashSet::new();
+    for address in &before.addresses {
+        if let ZaMailClass::Account(account_id) = server.za_mail_class(address).await? {
+            attended.insert(account_id);
+        }
+    }
+    if attended.is_empty() {
+        return Ok(());
+    }
+    let mut dropped = Vec::new();
+    for candidate in candidates.iter() {
+        if let ZaMailClass::Account(account_id) = server.za_mail_class(candidate).await?
+            && attended.contains(&account_id)
+        {
+            dropped.push(candidate.clone());
+        }
+    }
+    for candidate in dropped {
+        candidates.remove(&candidate);
+    }
+    Ok(())
 }
 
 /// An attendee's DELEGATED-FROM addresses, lowercased.
@@ -1573,7 +1618,9 @@ async fn merge(
                     // new to this one, and an attendee that became a
                     // delegate is new too. On the mail arm only an address
                     // absent from every instance before is new (rulings P2
-                    // and P2-R). The set dedups the addresses for delivery.
+                    // and P2-R), and then only if its account attended no
+                    // instance either (ruling P2-R2). The set dedups the
+                    // addresses for delivery.
                     let mut new_attendees: AHashSet<String> = AHashSet::new();
                     for (instance, snapshot) in &after.components {
                         let instance = instance_key(instance);
@@ -1582,6 +1629,11 @@ async fn merge(
                                 new_attendees.insert(attendee.email.email.to_ascii_lowercase());
                             }
                         }
+                    }
+                    if mail && !new_attendees.is_empty() {
+                        za_drop_attended_accounts(server, &before, &mut new_attendees)
+                            .await
+                            .caused_by(trc::location!())?;
                     }
                     if new_attendees.is_empty() {
                         Ok(None)
