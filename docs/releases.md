@@ -105,9 +105,8 @@ rollback restores the old store as it was, without the writes made after the cut
 prerelease used public upstream and fork tests for qualification, and results from the
 `0.1.x` base were not evidence for it. Its exact-source Linux product build
 ran from the tag through `product-build.yml`, and the published release notes record its
-verification. The native Calendar and Mail client checklist passed on the deployed build on
-2026-11-02, per Jay; its remaining gate, a clean-context whole-branch review, carries over
-to `0.3.0-beta.1`.
+verification. Its native client checklist has no recorded results and stays pending. Its
+other remaining gate, a clean-context whole-branch review, carries over to `0.3.0-beta.1`.
 
 `0.3.0-beta.1` is a limited prerelease. It supports an in-place upgrade from `0.2.0-beta.1`:
 the store schema version is unchanged and release 5 changes no stored layout, so the

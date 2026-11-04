@@ -1,8 +1,7 @@
 # Zero-access calendar: manual client checklist
 
-**Status for the `0.2.0-beta.1` prerelease (upstream `v1.0.1`): passed on the deployed
-`fork-v0.2.0-beta.1` build, 2026-11-02, per Jay.** No per-client breakdown (clients and
-versions, the `--version` line, the binary's checksum) was recorded for that run. The build to test is the published `fork-v0.2.0-beta.1`
+**Status for the `0.2.0-beta.1` prerelease (upstream `v1.0.1`): pending; no results
+recorded.** The build to test is the published `fork-v0.2.0-beta.1`
 shipping artifact (the GitHub prerelease `release-0.2.0-beta-1`), built in the shipping
 configuration (`cargo build --release --locked -p stalwart --no-default-features --features
 rocks`), whose `--version` reads `Stalwart Server fork v0.2.0-beta.1 (upstream v1.0.1

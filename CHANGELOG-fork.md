@@ -252,9 +252,8 @@ Gates beyond the automated runs, recorded after publication:
 - the release 5 real-provider round, the Gmail, Outlook.com and iCloud section
   ("Invitations by email (release 5)") of the
   [manual checklist](docs/zero-access/manual-checklist.md): pending;
-- native client verification of release 5's flows: pending. The native Calendar and Mail
-  checklist passed on `0.2.0-beta.1`'s deployed build (2026-11-02, per Jay) and has not
-  been run on this release;
+- native client verification of release 5's flows: pending, with no recorded results on
+  this release or on `0.2.0-beta.1`;
 - a clean-context whole-branch review, carried over from `0.2.0-beta.1`: pending.
 
 Not qualified: SQL and FoundationDB stores, multi-node execution, platforms other than the
@@ -379,10 +378,8 @@ Gates beyond the automated runs, recorded after publication:
   ([run 41485088188](https://github.com/jaylaney/stalwart/actions/runs/41485088188)). The
   published release notes record the checksums, the attestation and the measured GLIBC
   requirement of the real artifact;
-- the native Apple Calendar (macOS and iOS), Thunderbird, DAVx5 and mail-client checklist
-  under the [manual checklist](docs/zero-access/manual-checklist.md): passed on the deployed
-  `fork-v0.2.0-beta.1` build, 2026-11-02, per Jay, with no per-client breakdown recorded;
-  results from the `0.1.x` base are not evidence for this release;
+- the native client [manual checklist](docs/zero-access/manual-checklist.md): no recorded
+  results; pending. Results from the `0.1.x` base are not evidence for this release;
 - a clean-context whole-branch review: pending. The final review's four lenses were given
   the execution ledger and its rulings, which is not the clean context the plan specifies.
 
