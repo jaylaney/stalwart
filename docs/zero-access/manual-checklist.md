@@ -29,7 +29,7 @@ For each client:
 10. Change the password through the account page, reconnect the client with the new password.
 11. Log in with an app password; revoke it through the account page; confirm the client is refused.
 12. Enrol TOTP through the account page (the account page is where TOTP is enrolled and removed); confirm the client needs an app password; remove TOTP. A client with a cached session keeps working until its next authentication (spec 5), so reconnect the client before judging the result.
-13. Invitations between two key accounts (release 2), with a client connected to each: from the first account, invite the second; confirm the invitation appears in the second client's inbox and on its calendar at its next refresh (no email is sent). Accept it from the second client; confirm the first client shows the attendee as accepted. Move the event from the first client; confirm the second client shows the new time. Delete the event from the first client; confirm the second client shows it cancelled. Repeat the invitation once with an external address alongside the second account; confirm the client shows delivery to the external address as not attempted (`SCHEDULE-STATUS` 5.3, shown as a delivery failure by clients that show it) and that nothing is sent.
+13. Invitations between two key accounts (release 2), with a client connected to each: from the first account, invite the second; confirm the invitation appears in the second client's inbox and on its calendar at its next refresh (no email is sent). Accept it from the second client; confirm the first client shows the attendee as accepted. Move the event from the first client; confirm the second client shows the new time. Delete the event from the first client; confirm the second client shows it cancelled. Repeat the invitation once with an external address alongside the second account; confirm the external address receives the invitation email and the client shows its `SCHEDULE-STATUS` as `1.1` (sent), while the second account gets no email.
 14. Reply handling across clients (release 2): with an organizer client and an attendee client connected to two key accounts, invite, let the attendee accept, then move the event from the organizer and let the attendee accept again. The organizer must show the second acceptance. A client that strips SEQUENCE from the attendee's copy would have every reply to a rescheduled event kept as history (the drain's stale-reply check reads an absent SEQUENCE as 0); if the organizer never shows the second acceptance, record the client and its version.
 15. Key pinning's refusal (`SCHEDULE-STATUS` 3.8): with clients connected to two key accounts, invite the second account from the first, then give the second account a new key (destroy it, re-create it with the same address and set it up again; only a fresh setup changes a key), and edit the event from the first client. Record how Apple Calendar, Thunderbird and DAVx5 show `3.8` on that attendee (shown as such, shown as a delivery failure, or not shown) and their versions. The account page's contacts screen is where the user compares and confirms the new key.
 
@@ -69,3 +69,24 @@ For each client:
 11. Turn the vacation response on (through the client's vacation or ManageSieve setting, or JMAP `VacationResponse`), send the account a message from outside and confirm the sender receives the auto-reply and the message still reads in the client; turn it off and confirm no reply follows.
 
 Server-side, after the run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests` passes against the same build, as do `imap::imap_tests` and `jmap::jmap_tests` with `ZA_KEY_ACCOUNTS=1`, and the `Mail leak scan` line of that `za_tests` run (an automated check on the test server, not on the server exercised by hand) shows only stubs for the key accounts' messages.
+
+## Invitations by email (release 5)
+
+Release 5 (invitations by email, iMIP; spec `docs/superpowers/specs/2026-11-02-zero-access-imip-design.md`, section 8.7). Run against real Gmail, Outlook.com and iCloud accounts, once per release, against a server built from this branch.
+
+Preconditions: a deployment those providers reach, outbound through the relay with SPF and DKIM aligned for the key account's domain, and a key account with Apple Calendar, Thunderbird or DAVx5 connected. Item 7 needs a second key account.
+
+Record the client, the provider and their versions, and what the client shows at once and after a refresh. For each provider:
+
+1. Add the provider's address as a contact (CardDAV), then invite the key account from the provider: the email reads and the event appears after the next refresh. From an address that is not a contact: the email only.
+2. Accept, then decline, then answer tentative in the calendar client: the provider follows each.
+3. The provider moves the event, changes its title, then cancels it: the client shows each change and the cancellation.
+4. A weekly series from the provider; decline one occurrence: the provider shows it declined.
+5. From the client, invite the provider's address: the invitation shows the provider's own buttons and no Stalwart buttons; record how the client shows `1.1`. Accept at the provider: the client shows accepted. Move, then delete, the event: the provider updates, then shows it cancelled.
+6. Open an invitation in Apple Mail and Thunderbird: record whether the mail client offers to add the event; the calendar ends with one copy.
+7. Invite the provider with a second key account: that account gets no email and sees the invitation in its calendar (release 2).
+8. An event created before release 5 with the provider as attendee (`5.3`): add an alarm, and the provider gets nothing; move the event, and the provider gets the invitation (spec 5.7).
+
+Server-side, after the run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests` passes against the same build, the SMTP queue is empty once the providers have accepted the mail, and the leak scanner's output shows the key account's items and events sealed.
+
+Native status for release 5: **pending**. No provider or native-client session was exercised by the plan 15 execution, so this checklist is not a completed acceptance record. Record any unavailable provider, device, credentials, DNS alignment or missing observation as pending.

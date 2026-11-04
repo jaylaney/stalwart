@@ -113,74 +113,10 @@ impl ItipIngest for Server {
         recipient: &str,
         itip_message: &str,
     ) -> Result<Option<ItipMessage<ICalendar>>, ItipIngestError> {
-        // Parse and validate the iTIP message
-        let mut itip = ICalendar::parse(itip_message)
-            .map_err(|_| ItipIngestError::Message(ItipError::ICalendarParseError))
-            .and_then(|ical| {
-                if ical.components.len() > 1
-                    && ical.components[0].component_type == ICalendarComponentType::VCalendar
-                {
-                    Ok(ical)
-                } else {
-                    Err(ItipIngestError::Message(ItipError::ICalendarParseError))
-                }
-            })?;
-
-        // Microsoft Exchange does not include the organizer in REPLY, assume it is the recipient.
-        // This will be validated against the stored event anyway.
-        if itip.components[0]
-            .property(&ICalendarProperty::Method)
-            .and_then(|v| v.values.first())
-            .is_some_and(|v| {
-                matches!(
-                    v,
-                    ICalendarValue::Method(ICalendarMethod::Reply | ICalendarMethod::Request)
-                )
-            })
-        {
-            for comp in &mut itip.components {
-                if comp.component_type.is_scheduling_object() {
-                    let mut has_organizer = false;
-                    let mut has_attendee = false;
-
-                    for entry in &comp.entries {
-                        match entry.name {
-                            ICalendarProperty::Organizer => has_organizer = true,
-                            ICalendarProperty::Attendee => has_attendee = true,
-                            _ => {}
-                        }
-                    }
-
-                    if has_attendee && !has_organizer {
-                        comp.entries.push(ICalendarEntry {
-                            name: ICalendarProperty::Organizer,
-                            params: vec![],
-                            values: [ICalendarValue::Text(format!("mailto:{recipient}"))].into(),
-                        });
-                    }
-                }
-            }
-        }
-
-        let itip_snapshots = itip_snapshot(&itip, account_info.addresses(), false)?;
-        match itip_method(&itip)? {
-            ICalendarMethod::Reply | ICalendarMethod::Refresh | ICalendarMethod::Counter => {
-                if !itip_snapshots.sender_is_organizer_or_attendee(sender) {
-                    return Err(ItipIngestError::Message(
-                        ItipError::SenderIsNotOrganizerNorAttendee,
-                    ));
-                }
-            }
-            ICalendarMethod::Request
-            | ICalendarMethod::Add
-            | ICalendarMethod::Cancel
-            | ICalendarMethod::Publish
-            | ICalendarMethod::Declinecounter => {
-                if itip_snapshots.organizer.email.email != sender {
-                    return Err(ItipIngestError::Message(ItipError::SenderIsNotOrganizer));
-                }
-            }
-        }
+        // Zero-access fork (iMIP spec 3.1 item 2): the parse with the
+        // Exchange fill, then the snapshot with the method's sender rule.
+        let itip = itip_parse_inbound(itip_message, recipient)?;
+        let itip_snapshots = itip_sender_snapshot(&itip, account_info.addresses(), sender)?;
 
         // Obtain changedBy
         let changed_by = if let Some(id) = self.account_id_from_email(sender, true).await? {
@@ -264,17 +200,13 @@ impl ItipIngest for Server {
             }
         } else {
             // Verify that auto-adding invitations is allowed
-            if !self.core.groupware.itip_auto_add
-                && !matches!(changed_by, ChangedBy::PrincipalId(_))
-                && !self
-                    .document_exists(
-                        account_id,
-                        Collection::ContactCard,
-                        ContactField::Email,
-                        sender.as_bytes(),
-                    )
-                    .await
-                    .caused_by(trc::location!())?
+            if !itip_auto_add_allowed(
+                self,
+                account_id,
+                matches!(changed_by, ChangedBy::PrincipalId(_)),
+                sender,
+            )
+            .await?
             {
                 return Err(ItipIngestError::Message(ItipError::AutoAddDisabled));
             } else if itip_method(&itip)? != &ICalendarMethod::Request {
@@ -640,6 +572,126 @@ impl ItipIngest for Server {
 
         Ok(RsvpResponse::recorded(&part_stat))
     }
+}
+
+// Zero-access fork (iMIP spec 3.1 item 2): the start of `itip_ingest` and its
+// auto-add predicate, as callable functions. `itip_ingest` calls them with
+// its own arguments; the fork's delivery and drain call them for key
+// accounts.
+
+/// Parses an inbound iTIP message as `itip_ingest` does (a VCALENDAR with at
+/// least one more component, else `ICalendarParseError`), then runs the
+/// Exchange fill (`itip_fill_organizer`) with `recipient`.
+pub fn itip_parse_inbound(text: &str, recipient: &str) -> Result<ICalendar, ItipError> {
+    // Parse and validate the iTIP message
+    let mut itip = ICalendar::parse(text)
+        .map_err(|_| ItipError::ICalendarParseError)
+        .and_then(|ical| {
+            if ical.components.len() > 1
+                && ical.components[0].component_type == ICalendarComponentType::VCalendar
+            {
+                Ok(ical)
+            } else {
+                Err(ItipError::ICalendarParseError)
+            }
+        })?;
+    itip_fill_organizer(&mut itip, recipient);
+    Ok(itip)
+}
+
+/// For a REPLY or REQUEST, adds `ORGANIZER:mailto:<recipient>` to each
+/// scheduling component that has ATTENDEEs and no ORGANIZER; any other
+/// method, or a tree without components, is left as it is.
+pub fn itip_fill_organizer(itip: &mut ICalendar, recipient: &str) {
+    // Microsoft Exchange does not include the organizer in REPLY, assume it is the recipient.
+    // This will be validated against the stored event anyway.
+    // (Zero-access fork: `first()` where upstream indexed `[0]`, which its
+    // parse had guaranteed; a caller's tree may have no component.)
+    if itip
+        .components
+        .first()
+        .and_then(|comp| comp.property(&ICalendarProperty::Method))
+        .and_then(|v| v.values.first())
+        .is_some_and(|v| {
+            matches!(
+                v,
+                ICalendarValue::Method(ICalendarMethod::Reply | ICalendarMethod::Request)
+            )
+        })
+    {
+        for comp in &mut itip.components {
+            if comp.component_type.is_scheduling_object() {
+                let mut has_organizer = false;
+                let mut has_attendee = false;
+
+                for entry in &comp.entries {
+                    match entry.name {
+                        ICalendarProperty::Organizer => has_organizer = true,
+                        ICalendarProperty::Attendee => has_attendee = true,
+                        _ => {}
+                    }
+                }
+
+                if has_attendee && !has_organizer {
+                    comp.entries.push(ICalendarEntry {
+                        name: ICalendarProperty::Organizer,
+                        params: vec![],
+                        values: [ICalendarValue::Text(format!("mailto:{recipient}"))].into(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// The snapshot of an inbound iTIP message and the method's sender rule:
+/// REPLY, REFRESH and COUNTER from the organizer or an attendee, the other
+/// methods from the organizer only.
+pub fn itip_sender_snapshot<'x>(
+    itip: &'x ICalendar,
+    addresses: &[String],
+    sender: &str,
+) -> Result<ItipSnapshots<'x>, ItipError> {
+    let itip_snapshots = itip_snapshot(itip, addresses, false)?;
+    match itip_method(itip)? {
+        ICalendarMethod::Reply | ICalendarMethod::Refresh | ICalendarMethod::Counter => {
+            if !itip_snapshots.sender_is_organizer_or_attendee(sender) {
+                return Err(ItipError::SenderIsNotOrganizerNorAttendee);
+            }
+        }
+        ICalendarMethod::Request
+        | ICalendarMethod::Add
+        | ICalendarMethod::Cancel
+        | ICalendarMethod::Publish
+        | ICalendarMethod::Declinecounter => {
+            if itip_snapshots.organizer.email.email != sender {
+                return Err(ItipError::SenderIsNotOrganizer);
+            }
+        }
+    }
+    Ok(itip_snapshots)
+}
+
+/// Whether an invitation for an unknown UID may be added: auto-add is on,
+/// the sender is a principal, or the account holds a contact card with the
+/// sender's address, evaluated in that order.
+pub async fn itip_auto_add_allowed(
+    server: &Server,
+    account_id: u32,
+    sender_is_principal: bool,
+    sender: &str,
+) -> trc::Result<bool> {
+    Ok(server.core.groupware.itip_auto_add
+        || sender_is_principal
+        || server
+            .document_exists(
+                account_id,
+                Collection::ContactCard,
+                ContactField::Email,
+                sender.as_bytes(),
+            )
+            .await
+            .caused_by(trc::location!())?)
 }
 
 async fn http_rsvp_sync_attendee_copy(

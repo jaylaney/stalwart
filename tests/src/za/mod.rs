@@ -27,6 +27,7 @@ pub mod expansion;
 pub mod external_directory;
 pub mod fanout;
 pub mod gating;
+pub mod imip;
 pub mod inbox;
 pub mod index_task;
 pub mod leak;
@@ -123,6 +124,9 @@ pub async fn za_tests() {
             &[Property::Require],
         )
         .await;
+    // Release 5: every recipient outside the local domains goes to the
+    // suite's SMTP sink (iMIP spec 8.2).
+    imip::route_outside_mail(&admin, &test.server).await;
     admin.reload_settings().await;
     test.insert_account(plain);
     test.insert_account(admin);
@@ -168,6 +172,10 @@ pub async fn za_tests() {
     drain::incoming_timezone_update_survives_seal(&mut test).await;
     drain_limits::test(&mut test).await;
     pinning::test(&mut test).await;
+    imip::inbound::test(&mut test).await;
+    imip::outbound::test(&mut test).await;
+    imip::oracle::test(&mut test).await;
+    imip::traces::test(&mut test).await;
     sharing_move_atomic::test(&mut test).await;
     sharing_tombstones::test(&mut test).await;
     sharing_review::test(&mut test).await;
@@ -193,6 +201,7 @@ pub async fn za_tests() {
     leak::test_drain(&mut test).await;
     leak::test_pins(&mut test).await;
     leak::test_mail(&mut test).await;
+    leak::test_imip(&mut test).await;
     leak::test(&mut test).await;
     leak::test_index_control(&mut test).await;
     index_task::test(&mut test).await;

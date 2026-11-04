@@ -55,12 +55,15 @@ use groupware::{
 use http::auth::authenticate::za_test::{self, Pause};
 use hyper::{Method, StatusCode};
 use mail_parser::MessageParser;
-use registry::schema::structs::Task;
+use registry::schema::{
+    enums::TaskStoreMaintenanceType,
+    structs::{Task, TaskStatus, TaskStoreMaintenance},
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{future::Future, sync::Arc, time::Duration};
 use store::{
-    Deserialize, IterateParams, Subspace, U32_LEN, ValueKey,
+    Deserialize, IterateParams, Subspace, U32_LEN, U64_LEN, ValueKey,
     write::{
         AnyKey, Archive, ArchiveBytes, ArchiveVersion, BatchBuilder, BlobLink, BlobOp,
         IndexPropertyClass, QueueDocumentId, SearchIndex, SearchIndexClass, TaskId, TaskQueueClass,
@@ -81,6 +84,7 @@ use tokio_rustls::{
         pki_types::{CertificateDer, ServerName, UnixTime},
     },
 };
+use types::blob_hash::{BLOB_HASH_LEN, BlobHash};
 use types::collection::{Collection, SyncCollection};
 use types::field::{CalendarEventField, CalendarNotificationField, EmailField, PrincipalField};
 use vault::{
@@ -995,6 +999,15 @@ pub async fn queued_recipients(test: &TestServer) -> Vec<String> {
 /// them panics, after ten seconds, naming what is still queued.
 pub async fn wait_for_delivery(test: &TestServer) {
     test.wait_for_tasks().await;
+    wait_for_queue(test).await;
+    // Ingest can queue index tasks of its own.
+    test.wait_for_tasks().await;
+}
+
+/// Waits until the SMTP queue is empty, without waiting for tasks: the
+/// iMIP modules read outbound mail at the sink once its delivery is done.
+/// Panics after ten seconds, naming what is still queued.
+pub async fn wait_for_queue(test: &TestServer) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let queued = queued_recipients(test).await;
@@ -1007,8 +1020,178 @@ pub async fn wait_for_delivery(test: &TestServer) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // Ingest can queue index tasks of its own.
+}
+
+/// The purge as the scheduler runs it, once every temporary link expired
+/// (shared by `mail::fence` and the leak modules).
+pub async fn expire_and_purge_blobs(test: &TestServer, admin: &Account) {
+    // At 1.0 a staged blob whose batch never committed has no commit entry,
+    // only its temporary link, which the purge reads to delete the blob: the
+    // links are expired in place (0.16's helper deleted them, which leaves
+    // such a blob unreachable at 1.0).
+    let from_key = ValueKey {
+        account_id: 0,
+        collection: 0,
+        document_id: 0,
+        class: ValueClass::Blob(BlobOp::Commit {
+            hash: BlobHash::default(),
+        }),
+    };
+    let to_key = ValueKey {
+        account_id: u32::MAX,
+        collection: u8::MAX,
+        document_id: u32::MAX,
+        class: ValueClass::Blob(BlobOp::Link {
+            hash: BlobHash::new_max(),
+            to: BlobLink::Document,
+        }),
+    };
+    let mut links = Vec::new();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(from_key, to_key).ascending(),
+            |key, value| {
+                if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN {
+                    links.push((
+                        BlobHash::try_from_hash_slice(&key[..BLOB_HASH_LEN]).unwrap(),
+                        key.deserialize_be_u32(BLOB_HASH_LEN)?,
+                        key.deserialize_be_u64(BLOB_HASH_LEN + U32_LEN)?,
+                        value.to_vec(),
+                    ));
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    let mut batch = BatchBuilder::new();
+    for (hash, account_id, until, value) in links {
+        batch
+            .with_account_id(account_id)
+            .clear(ValueClass::Blob(BlobOp::Link {
+                hash: hash.clone(),
+                to: BlobLink::Temporary { until },
+            }))
+            .set(
+                ValueClass::Blob(BlobOp::Link {
+                    hash,
+                    to: BlobLink::Temporary { until: 1 },
+                }),
+                value,
+            );
+    }
+    if !batch.is_empty() {
+        test.server.store().write_batch(&mut batch).await.unwrap();
+    }
+    admin
+        .registry_create_object(Task::StoreMaintenance(TaskStoreMaintenance {
+            maintenance_type: TaskStoreMaintenanceType::PurgeBlob,
+            shard_index: None,
+            status: TaskStatus::now(),
+        }))
+        .await;
     test.wait_for_tasks().await;
+}
+
+/// iMIP spec 8.5: what a plain account that outlives its module received
+/// from a key organizer's outbound mail: once the SMTP queue is empty, its
+/// messages, its scheduling inbox items and the calendars `itip_ingest`
+/// created (with their events).
+pub async fn clear_received_scheduling(test: &TestServer, account: &Account) {
+    clear_received_scheduling_as(test, account, account.id().document_id()).await;
+}
+
+/// `clear_received_scheduling` of `account_id`, through `actor`'s JMAP
+/// session: the account itself, or the admin for an account that cannot sign
+/// in (a group). A mailbox an earlier cleanup destroyed is not recreated
+/// until the account's mailbox cache is rebuilt, so a message delivered
+/// meanwhile went to the inbox's id with no inbox record (and in no mailbox
+/// the JMAP destroy lists), and that mailbox's UID counter outlives it: the
+/// messages go first, by id, and the system folders are written again when
+/// the account holds no mailbox, so the destroy takes them with their
+/// counters. Panics when anything of the kind remains.
+pub async fn clear_received_scheduling_as(test: &TestServer, actor: &Account, account_id: u32) {
+    use email::{mailbox::manage::MailboxFnc, message::delete::EmailDeletion};
+    wait_for_queue(test).await;
+    let messages = test
+        .server
+        .get_cached_messages(account_id)
+        .await
+        .unwrap()
+        .emails
+        .document_ids()
+        .collect::<store::roaring::RoaringBitmap>();
+    if !messages.is_empty() {
+        let changed_by = test
+            .server
+            .account_info(account_id)
+            .await
+            .unwrap()
+            .changed_by();
+        let mut batch = BatchBuilder::new();
+        test.server
+            .emails_delete(account_id, changed_by, &mut batch, messages)
+            .await
+            .unwrap();
+        test.server.commit_batch(batch).await.unwrap();
+        test.server.notify_task_queue();
+    }
+    if !test
+        .server
+        .za_has_documents(account_id, Collection::Mailbox)
+        .await
+        .unwrap()
+    {
+        test.server.create_system_folders(account_id).await.unwrap();
+    }
+    actor.destroy_all_mailboxes_for_account(account_id).await;
+    let account = types::id::Id::from(account_id).to_string();
+    for (typ, extra) in [
+        ("CalendarEventNotification", json!({})),
+        ("Calendar", json!({ "onDestroyRemoveEvents": true })),
+    ] {
+        let mut set = json!({
+            "accountId": account,
+            "#destroy": {
+                "resultOf": "R1",
+                "name": format!("{typ}/get"),
+                "path": "/list/*/id"
+            }
+        });
+        set.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        actor
+            .jmap_method_calls(json!([
+                [
+                    format!("{typ}/get"),
+                    { "accountId": account, "ids": (), "properties": ["id"] },
+                    "R1"
+                ],
+                [format!("{typ}/set"), set, "R2"]
+            ]))
+            .await;
+    }
+    for (collection, what) in [
+        (Collection::Email, "messages"),
+        (Collection::Mailbox, "mailboxes"),
+        (
+            Collection::CalendarEventNotification,
+            "scheduling inbox items",
+        ),
+        (Collection::CalendarEvent, "events"),
+        (Collection::Calendar, "calendars"),
+    ] {
+        assert!(
+            !test
+                .server
+                .za_has_documents(account_id, collection)
+                .await
+                .unwrap(),
+            "{what} of account {account_id} remain"
+        );
+    }
 }
 
 /// A scheduling inbox item as tests read it at 1.0: the notification row's
@@ -1135,6 +1318,17 @@ pub async fn new_inbox_items(
         .await
         .into_iter()
         .filter(|(id, _)| !before.contains(id))
+        .collect()
+}
+
+/// The account's mail-borne inbox items (iMIP spec 4.2, D4), pending or
+/// drained, by ascending document id: the rows whose `changed_by` is
+/// `CalendarAddress("")`.
+pub async fn mail_borne_items(test: &TestServer, account_id: u32) -> Vec<(u32, InboxItem)> {
+    inbox_items(test, account_id)
+        .await
+        .into_iter()
+        .filter(|(_, item)| item.changed_by == ChangedBy::CalendarAddress(String::new()))
         .collect()
 }
 
@@ -1610,6 +1804,7 @@ pub async fn plant_inbox_item(
                 &public,
                 pairs.as_ref(),
                 reply_token.as_ref(),
+                None,
             )
             .unwrap();
             fork_item = Some(true);

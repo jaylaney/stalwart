@@ -613,7 +613,7 @@ pub(crate) async fn za_lost_create_fence(
     calendar_id: u32,
     uid: &str,
 ) -> crate::Result<HttpResponse> {
-    za_finish_create_loss(
+    let Err(error) = za_finish_create_loss(
         server,
         resources,
         access_token,
@@ -623,7 +623,8 @@ pub(crate) async fn za_lost_create_fence(
         uid,
         CreateLoss::ConfirmedLease,
     )
-    .await
+    .await;
+    Err(error)
 }
 
 enum CreateLoss {
@@ -631,6 +632,9 @@ enum CreateLoss {
     OpaqueSecondCommit,
 }
 
+/// `za_lost_create_fence`'s body and the second commit's loss: its type
+/// cannot be `Ok` (final review, ledger 181), so the compiler keeps a lost
+/// create from reaching the mail submission (iMIP invariant 46).
 #[allow(clippy::too_many_arguments)]
 async fn za_finish_create_loss(
     server: &Server,
@@ -641,7 +645,7 @@ async fn za_finish_create_loss(
     calendar_id: u32,
     uid: &str,
     loss: CreateLoss,
-) -> crate::Result<HttpResponse> {
+) -> crate::Result<std::convert::Infallible> {
     trc::event!(
         Store(trc::StoreEvent::AssertValueFailed),
         AccountId = account_id,
@@ -704,18 +708,20 @@ pub(crate) async fn za_commit_create(
             lease.release().await;
             Ok(())
         }
-        Err(err) if err.is_assertion_failure() => za_finish_create_loss(
-            server,
-            resources,
-            access_token,
-            lease,
-            account_id,
-            calendar_id,
-            uid,
-            CreateLoss::OpaqueSecondCommit,
-        )
-        .await
-        .map(|_| ()),
+        Err(err) if err.is_assertion_failure() => {
+            let Err(error) = za_finish_create_loss(
+                server,
+                resources,
+                access_token,
+                lease,
+                account_id,
+                calendar_id,
+                uid,
+                CreateLoss::OpaqueSecondCommit,
+            )
+            .await;
+            Err(error)
+        }
         Err(err) => {
             lease.release().await;
             Err(err.caused_by(trc::location!()).into())

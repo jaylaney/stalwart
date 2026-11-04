@@ -165,6 +165,9 @@ impl NewKey for QueueRateLimiter {
 
 impl<T: SessionStream> Session<T> {
     pub async fn is_allowed(&mut self) -> bool {
+        if self.data.za_imip_submission {
+            return true;
+        }
         let throttles = if !self.data.rcpt_to.is_empty() {
             &self.server.core.smtp.queue.inbound_limiters.rcpt
         } else if self.data.mail_from.is_some() {

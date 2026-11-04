@@ -620,6 +620,19 @@
    {
     "from": {
      "file": "tests/src/za/mail/fence.rs",
+     "in": null,
+     "name": "expire_and_purge_blobs"
+    },
+    "to": {
+     "file": "tests/src/utils/za.rs",
+     "in": null,
+     "name": "expire_and_purge_blobs"
+    },
+    "evidence": "Plan 15 (release 5, iMIP) Task 7: `expire_and_purge_blobs` (every temporary blob link expired in place, then the scheduler's blob purge) moved unchanged to `utils::za`; only `mail/fence.rs` calls it (since the final fix wave's ruling C-1 the leak modules purge the queue blobs outbound iMIP mail leaves with the purge alone, `purge_blobs`, never expiring a temporary link first)."
+   },
+   {
+    "from": {
+     "file": "tests/src/za/mail/fence.rs",
      "in": "<impl SearchKeys>",
      "name": "holds_term"
     },
@@ -779,6 +792,21 @@
     "file": "crates/services/src/task_manager/tasks/grantee_cleanup/za.rs",
     "runtime_excluded": false,
     "evidence": "Part 6a (commit 6766311ec): the share-revocation cleanup skips key-account owners. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
+   },
+   {
+    "file": "crates/common/src/za/imip.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 15 (release 5, iMIP) Task 2 (commit 10216a8e5): the iMIP submission seam, the pending-mail guard `ZaImipPending`, the class of a scheduling address (PR review ruling P1) and the fixed iMIP trace strings. A fork runtime file added by release 5 (`git log --diff-filter=A -- crates/common/src/za/imip.rs`)."
+   },
+   {
+    "file": "crates/services/src/za_imip.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 15 (release 5, iMIP) Task 1 (commit c9ac0673f), the submitter since Task 2 (commit 10216a8e5): a local SMTP session on upstream's extracted composer. A fork runtime file added by release 5 (`git log --diff-filter=A -- crates/services/src/za_imip.rs`)."
+   },
+   {
+    "file": "crates/email/src/message/za/imip.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 15 (release 5, iMIP) Task 4 (commit fce064fea): a key account's inbound iMIP part at delivery (`za_imip_item`, `za_imip_uid_known`, `za_imip_sender`). A fork runtime file added by release 5 (`git log --diff-filter=A -- crates/email/src/message/za/imip.rs`)."
    }
   ],
   "excluded_additions": [

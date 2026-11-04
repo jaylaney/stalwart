@@ -23,6 +23,7 @@ use crate::{
         ObjectQuota,
         encryption::{EncryptionMethod, parse_public_key},
     },
+    za::imip::{ZaMailClass, za_mail_class_of},
 };
 // SPDX-SnippetBegin
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -735,6 +736,46 @@ impl Server {
     /// cache events that carry the address (invitations spec 10).
     pub async fn za_account_id_from_email(&self, address: &str) -> trc::Result<Option<u32>> {
         self.account_id_from_email_inner(address, true, true).await
+    }
+
+    /// iMIP PR review ruling P1: a scheduling address's class
+    /// (`za::imip::ZaMailClass`), as quiet as `za_account_id_from_email`. It
+    /// mirrors `account_id_from_email_inner`'s sub-addressing step and its
+    /// catch-all step (the catch-all only when the address has no entry),
+    /// keeping what that function drops: a list, and a disabled address. A
+    /// change to either step there needs the same change here. The
+    /// enterprise build's masked addresses are not resolved.
+    pub async fn za_mail_class(&self, address: &str) -> trc::Result<ZaMailClass> {
+        let address = address.to_canonical_address();
+        let Some((local_part, domain)) = address.split_once('@') else {
+            return Ok(ZaMailClass::NotLocal);
+        };
+        let Some(domain) = self.domain_inner(domain, true).await? else {
+            return Ok(ZaMailClass::NotLocal);
+        };
+        let mut local_part = Cow::Borrowed(local_part);
+        if domain.flags & DOMAIN_FLAG_SUB_ADDRESSING != 0 {
+            if let Some(sub_addressing) = &domain.sub_addressing_custom {
+                let mut arena = Bump::new();
+                let resolver = AddressResolver(local_part.as_ref());
+                if let Some(result) = self
+                    .za_eval_if::<String, _>(sub_addressing, &resolver, &mut arena, 0)
+                    .await
+                {
+                    local_part = Cow::Owned(result);
+                }
+            } else if let Some((new_local_part, _)) = address.split_once('+') {
+                local_part = Cow::Borrowed(new_local_part);
+            }
+        }
+        let entry = self
+            .rcpt_id_from_parts_inner(local_part.as_ref(), domain.id, true)
+            .await?;
+        let catch_all = match (&entry, &domain.catch_all) {
+            (None, Some(catch_all)) => Some(self.rcpt_id_from_email_inner(catch_all, true).await?),
+            _ => None,
+        };
+        Ok(za_mail_class_of(entry, catch_all))
     }
 
     /// Mail ruling R56: `domain(domain)` without the cache events that carry

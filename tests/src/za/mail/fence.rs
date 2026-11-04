@@ -25,11 +25,12 @@ use crate::{
         server::TestServer,
         smtp::SmtpConnection,
         za::{
-            Conn, HookParked, delete_event_records, hold_index_partition, index_search_documents,
-            internal_search, partition_status, plant_event, queue_entries, release_index_partition,
-            search_keys, stored_event, unindex_search_account, unindex_search_documents,
-            wait_for_delivery, wait_for_index_queue, write_stored_event, za_post_as, za_setup,
-            za_setup_token,
+            Conn, HookParked, delete_event_records, destroy_inbox_item, envelope_wrap,
+            expire_and_purge_blobs, hold_index_partition, inbox_items, index_search_documents,
+            internal_search, open_pending_item_as, partition_status, plant_event, queue_entries,
+            release_index_partition, search_keys, stored_event, unindex_search_account,
+            unindex_search_documents, wait_for_delivery, wait_for_index_queue, write_stored_event,
+            za_post_as, za_setup, za_setup_token,
         },
     },
     za::{
@@ -58,18 +59,17 @@ use email::{
     },
 };
 use groupware::calendar::{
-    CalendarEventData,
+    CalendarEventData, EVENT_NOTIFICATION_ZA_PENDING,
     seal::{WRAP_MK, WRAP_PK},
 };
 use mail_parser::MessageParser;
 use nlp::language::Language;
 use registry::{
     schema::{
-        enums::TaskStoreMaintenanceType,
         prelude::{Object, ObjectInner, ObjectType},
         structs::{
             self, Credential, PasswordCredential, SpamTrainingSample, Task, TaskMergeThreads,
-            TaskStatus, TaskStatusFailed, TaskStoreMaintenance,
+            TaskStatus, TaskStatusFailed,
         },
     },
     types::{datetime::UTCDateTime, id::ObjectId, map::Map},
@@ -523,77 +523,6 @@ async fn queued_blob(test: &TestServer, address: &str) -> Vec<u8> {
     stored_blob(test, &hash).await
 }
 
-/// The purge as the scheduler runs it, once every temporary link expired.
-async fn expire_and_purge_blobs(test: &TestServer, admin: &Account) {
-    // At 1.0 a staged blob whose batch never committed has no commit entry,
-    // only its temporary link, which the purge reads to delete the blob: the
-    // links are expired in place (0.16's helper deleted them, which leaves
-    // such a blob unreachable at 1.0).
-    let from_key = ValueKey {
-        account_id: 0,
-        collection: 0,
-        document_id: 0,
-        class: ValueClass::Blob(BlobOp::Commit {
-            hash: BlobHash::default(),
-        }),
-    };
-    let to_key = ValueKey {
-        account_id: u32::MAX,
-        collection: u8::MAX,
-        document_id: u32::MAX,
-        class: ValueClass::Blob(BlobOp::Link {
-            hash: BlobHash::new_max(),
-            to: BlobLink::Document,
-        }),
-    };
-    let mut links = Vec::new();
-    test.server
-        .store()
-        .iterate(
-            IterateParams::new(from_key, to_key).ascending(),
-            |key, value| {
-                if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN {
-                    links.push((
-                        BlobHash::try_from_hash_slice(&key[..BLOB_HASH_LEN]).unwrap(),
-                        key.deserialize_be_u32(BLOB_HASH_LEN)?,
-                        key.deserialize_be_u64(BLOB_HASH_LEN + U32_LEN)?,
-                        value.to_vec(),
-                    ));
-                }
-                Ok(true)
-            },
-        )
-        .await
-        .unwrap();
-    let mut batch = BatchBuilder::new();
-    for (hash, account_id, until, value) in links {
-        batch
-            .with_account_id(account_id)
-            .clear(ValueClass::Blob(BlobOp::Link {
-                hash: hash.clone(),
-                to: BlobLink::Temporary { until },
-            }))
-            .set(
-                ValueClass::Blob(BlobOp::Link {
-                    hash,
-                    to: BlobLink::Temporary { until: 1 },
-                }),
-                value,
-            );
-    }
-    if !batch.is_empty() {
-        test.server.store().write_batch(&mut batch).await.unwrap();
-    }
-    admin
-        .registry_create_object(Task::StoreMaintenance(TaskStoreMaintenance {
-            maintenance_type: TaskStoreMaintenanceType::PurgeBlob,
-            shard_index: None,
-            status: TaskStatus::now(),
-        }))
-        .await;
-    test.wait_for_tasks().await;
-}
-
 /// The blob hash of the account's message `document_id`.
 async fn message_hash(test: &TestServer, account_id: u32, document_id: u32) -> BlobHash {
     stored_hash(test, account_id, document_id).await
@@ -743,7 +672,9 @@ async fn forward_race_with_a_staged_blob(test: &TestServer, admin: &Account) -> 
 /// own; that batch takes the fence too, so provisioning in between leaves
 /// no plaintext calendar data. The invitation comes from a local organizer
 /// through authenticated submission, as upstream's iMIP gate requires (an
-/// authenticated sender; a local principal's invitation is auto-added).
+/// authenticated sender; a local principal's invitation is auto-added). The
+/// sealed retry writes a `pk`-sealed mail-borne pending item and no event
+/// (iMIP spec 4.1, 8.5), which the test deletes.
 async fn forward_race_imip_side_write(test: &TestServer, admin: &Account) -> (Account, Account) {
     println!("forward_race_imip_side_write");
     let account = passwordless(admin, FENCE10).await;
@@ -762,29 +693,54 @@ async fn forward_race_imip_side_write(test: &TestServer, admin: &Account) -> (Ac
     parked.finish().await;
 
     assert_first_attempt_lost(test, traced, FENCE10, id).await;
+    // The queue's retry may already have run, and from release 5 it writes
+    // a `pk`-sealed pending item (iMIP spec 4.1, 8.5), so this holds either
+    // way.
     assert_no_calendar_data(test, id, "the stale delivery's iMIP processing").await;
     wait_for_delivery(test).await;
     let ids = message_ids(test, id).await;
     assert_eq!(ids.len(), 1, "the queue's retry delivered the message");
     assert_sealed(test, id, ids[0], WRAP_PK).await;
     assert_no_plaintext(test, id).await;
-    assert_no_calendar_data(test, id, "the sealed retry").await;
+    // iMIP spec 4.1, 8.5: the sealed retry stores no event and one pending
+    // item sealed to the served key, the organizer in its carrier (before
+    // release 5, no calendar data at all).
+    assert!(
+        !test
+            .server
+            .za_has_documents(id, Collection::CalendarEvent)
+            .await
+            .unwrap(),
+        "the sealed retry stored an event"
+    );
+    let items = inbox_items(test, id).await;
+    assert_eq!(items.len(), 1, "the sealed retry's inbox items");
+    let (item_id, item) = &items[0];
+    assert_ne!(item.flags & EVENT_NOTIFICATION_ZA_PENDING, 0);
+    assert_eq!(envelope_wrap(&item.event), Some(WRAP_PK));
+    let (_, carriers) = open_pending_item_as(test, id, STRONG, *item_id).await;
+    assert_eq!(carriers.sender.as_deref(), Some(ORGANIZER));
+    destroy_inbox_item(test, id, *item_id).await;
     (account, organizer)
 }
 
-/// The account holds no calendar event and no scheduling inbox item.
+/// The account holds no calendar event, and every scheduling inbox item it
+/// holds is pending and sealed to the served key (`WRAP_PK`): a key
+/// account's mail-borne item (iMIP spec 4.1), never an ordinary ingest's.
 async fn assert_no_calendar_data(test: &TestServer, account_id: u32, after: &str) {
-    for collection in [
-        Collection::CalendarEvent,
-        Collection::CalendarEventNotification,
-    ] {
+    assert!(
+        !test
+            .server
+            .za_has_documents(account_id, Collection::CalendarEvent)
+            .await
+            .unwrap(),
+        "{after} stored a CalendarEvent document"
+    );
+    for (item_id, item) in inbox_items(test, account_id).await {
         assert!(
-            !test
-                .server
-                .za_has_documents(account_id, collection)
-                .await
-                .unwrap(),
-            "{after} stored a {collection:?} document"
+            item.flags & EVENT_NOTIFICATION_ZA_PENDING != 0
+                && envelope_wrap(&item.event) == Some(WRAP_PK),
+            "{after} stored inbox item {item_id} that is not a pending pk-sealed item"
         );
     }
 }

@@ -5,19 +5,25 @@
  */
 
 //! Invitations spec 5: a key account's own request delivers sealed pending
-//! items to internal key recipients instead of queueing mail. Plan 9 has no
+//! items to internal key recipients instead of queueing mail. A recipient of
+//! iMIP's mail class (iMIP spec 5.1: no local account, or a local account
+//! that is not a key account) records `1.1` instead and is handed to the
+//! mailer after the commit, never through the task queue. Plan 9 has no
 //! drain, so the tests read items at store level and open them with the
 //! recipient's private key (`open_pending_item_as`).
 
-use super::{STRONG, dav_seal::raw_event, user_permissions};
+use super::{STRONG, dav_seal::raw_event, imip::is_request_for, user_permissions};
 use crate::utils::{
+    http::{HttpRequest, HttpResponseFull},
     server::TestServer,
+    smtp_sink::sink,
     webdav::DummyWebDavClient,
     za::{
-        PlantedItem, destroy_inbox_item, envelope_wrap, hold_task_consumer, inbox_ids,
-        inbox_item_is_pending, item_attendees, item_method, item_sequence, itip_tasks_for,
-        mail_count, new_inbox_items, open_pending_item_as, plant_inbox_item, schedule_statuses,
-        wait_for_delivery, za_uid_leases, za_unlock,
+        PlantedItem, clear_received_scheduling, destroy_inbox_item, envelope_wrap,
+        hold_task_consumer, inbox_ids, inbox_item_is_pending, item_attendees, item_method,
+        item_sequence, itip_tasks_for, mail_borne_items, mail_count, new_inbox_items,
+        open_pending_item_as, plant_inbox_item, schedule_statuses, wait_for_delivery,
+        za_uid_leases, za_unlock,
     },
 };
 use ::registry::{
@@ -37,7 +43,7 @@ use groupware::calendar::{
     ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
     seal::{TOKEN_LEN, TokenPairs, event_token_pairs},
 };
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use serde_json::json;
 use types::{collection::Collection, field::CalendarEventField};
 use vault::session::SessionKeys;
@@ -120,6 +126,20 @@ pub fn invite(uid: &str, start: &str, attendees: &[&str]) -> String {
     ical
 }
 
+/// iMIP spec 5.4: key1's write whose fan-out mails more than one recipient
+/// after its commit, through the raw client (5 s) rather than the DAV
+/// client's 500 ms.
+async fn key1_mailing(method: Method, path: &str, body: Option<String>) -> HttpResponseFull {
+    HttpRequest::with_credentials(8899, "key1@example.com", STRONG)
+        .send_full(
+            method,
+            path,
+            body.map(String::into_bytes),
+            Some(CONTENT_TYPE.1),
+        )
+        .await
+}
+
 /// The token pairs of an account's stored event at `path` (`default/x.ics`).
 pub async fn stored_pairs(
     test: &TestServer,
@@ -183,37 +203,31 @@ pub async fn test(test: &mut TestServer) {
     let start5 = inbox_ids(test, key5.id).await;
 
     // 1. Invite with a mixed attendee list (spec 5.2, 5.3): key2 is
-    // internal; plain is a non-key account; outsider is external.
+    // internal; plain (a non-key account) and outsider (external) are of
+    // iMIP's mail class (iMIP spec 5.1).
     let plain_items = inbox_ids(test, plain_id).await;
     let plain_mail = mail_count(test, plain_id).await;
     let mixed = format!("{KEY1_CAL}fo-mixed.ics");
-    let response = key1
-        .client
-        .request_with_headers(
-            "PUT",
-            &mixed,
-            [CONTENT_TYPE],
-            invite(
-                "za-fo-mixed",
-                START_A,
-                &[
-                    "key2@example.com",
-                    "plain@example.com",
-                    "outsider@remote.test",
-                ],
-            ),
-        )
-        .await
-        .with_status(StatusCode::CREATED);
+    // iMIP spec 5.4: plain and outsider are mailed after the commit.
+    let response = key1_mailing(
+        Method::PUT,
+        &mixed,
+        Some(invite(
+            "za-fo-mixed",
+            START_A,
+            &[
+                "key2@example.com",
+                "plain@example.com",
+                "outsider@remote.test",
+            ],
+        )),
+    )
+    .await;
+    assert_eq!(response.status.as_u16(), 201, "{}", response.body);
     assert!(
-        response.headers.get("schedule-tag").is_some(),
+        response.header("schedule-tag").is_some(),
         "the schedule tag is set as upstream sets it: {:?}",
         response.headers
-    );
-    assert_eq!(
-        new_inbox_items(test, plain_id, &plain_items).await.len(),
-        0,
-        "plain's inbox received an item"
     );
     // Per-user event data (calendar spec, near line 717): the scheduling
     // write of the organizer's copy stores no preferences.
@@ -266,21 +280,42 @@ pub async fn test(test: &mut TestServer) {
         attendee_statuses(&key1.client, &mixed, "key2@example.com").await,
         ["1.2"]
     );
+    // iMIP spec 5.4: the mail class is handed to the mailer (`1.1`), where
+    // release 2 recorded not attempted (`5.3`).
     assert_eq!(
         attendee_statuses(&key1.client, &mixed, "plain@example.com").await,
-        ["5.3"]
+        ["1.1"]
     );
     assert_eq!(
         attendee_statuses(&key1.client, &mixed, "outsider@remote.test").await,
-        ["5.3"]
+        ["1.1"]
     );
-    // No mail (invariant 12). The task queue is read with the consumer held
-    // in `test_task_queue` (Task 5).
+    // iMIP spec 5.4, 8.5: plain and outsider are mailed once each, after the
+    // commit and never through the task queue (read with the consumer held
+    // in `test_task_queue`). plain's ingest is upstream's: its inbox gets
+    // upstream's notification, never a sealed fork item.
     wait_for_delivery(test).await;
     assert_eq!(
         mail_count(test, plain_id).await,
-        plain_mail,
-        "plain received mail"
+        plain_mail + 1,
+        "plain is mailed once"
+    );
+    let plain_new = new_inbox_items(test, plain_id, &plain_items).await;
+    assert!(
+        plain_new
+            .iter()
+            .all(|(_, item)| envelope_wrap(&item.event).is_none()
+                && item.flags & EVENT_NOTIFICATION_ZA_PENDING == 0),
+        "plain's inbox received a fork item"
+    );
+    assert_eq!(
+        sink()
+            .take_to("outsider@remote.test")
+            .iter()
+            .filter(|message| is_request_for(message, "za-fo-mixed"))
+            .count(),
+        1,
+        "outsider is mailed once"
     );
     assert_eq!(
         inbox_ids(test, key1.id).await,
@@ -365,23 +400,21 @@ pub async fn test(test: &mut TestServer) {
     // 2. Updates fan out (spec 5.5). key1 moves the event: a second REQUEST
     // with SEQUENCE 1 and the same token.
     let before2 = inbox_ids(test, key2.id).await;
-    key1.client
-        .request_with_headers(
-            "PUT",
-            &mixed,
-            [CONTENT_TYPE],
-            invite(
-                "za-fo-mixed",
-                START_B,
-                &[
-                    "key2@example.com",
-                    "plain@example.com",
-                    "outsider@remote.test",
-                ],
-            ),
-        )
-        .await
-        .with_status(StatusCode::NO_CONTENT);
+    let response = key1_mailing(
+        Method::PUT,
+        &mixed,
+        Some(invite(
+            "za-fo-mixed",
+            START_B,
+            &[
+                "key2@example.com",
+                "plain@example.com",
+                "outsider@remote.test",
+            ],
+        )),
+    )
+    .await;
+    assert_eq!(response.status.as_u16(), 204, "{}", response.body);
     let items = new_inbox_items(test, key2.id, &before2).await;
     assert_eq!(items.len(), 1, "the update reached key2 once");
     let (tree, carriers) = open_pending_item_as(test, key2.id, STRONG, items[0].0).await;
@@ -397,23 +430,21 @@ pub async fn test(test: &mut TestServer) {
     // key3 a REQUEST with a fresh one.
     let before2 = inbox_ids(test, key2.id).await;
     let before3 = inbox_ids(test, key3.id).await;
-    key1.client
-        .request_with_headers(
-            "PUT",
-            &mixed,
-            [CONTENT_TYPE],
-            invite(
-                "za-fo-mixed",
-                START_B,
-                &[
-                    "key3@example.com",
-                    "plain@example.com",
-                    "outsider@remote.test",
-                ],
-            ),
-        )
-        .await
-        .with_status(StatusCode::NO_CONTENT);
+    let response = key1_mailing(
+        Method::PUT,
+        &mixed,
+        Some(invite(
+            "za-fo-mixed",
+            START_B,
+            &[
+                "key3@example.com",
+                "plain@example.com",
+                "outsider@remote.test",
+            ],
+        )),
+    )
+    .await;
+    assert_eq!(response.status.as_u16(), 204, "{}", response.body);
     let items = new_inbox_items(test, key2.id, &before2).await;
     assert_eq!(items.len(), 1, "the removed attendee gets one CANCEL");
     let (tree, carriers) = open_pending_item_as(test, key2.id, STRONG, items[0].0).await;
@@ -442,24 +473,22 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(pairs.get("key3@example.com"), Some(&key3_token));
     // A re-added attendee gets a different token.
     let before2 = inbox_ids(test, key2.id).await;
-    key1.client
-        .request_with_headers(
-            "PUT",
-            &mixed,
-            [CONTENT_TYPE],
-            invite(
-                "za-fo-mixed",
-                START_B,
-                &[
-                    "key2@example.com",
-                    "key3@example.com",
-                    "plain@example.com",
-                    "outsider@remote.test",
-                ],
-            ),
-        )
-        .await
-        .with_status(StatusCode::NO_CONTENT);
+    let response = key1_mailing(
+        Method::PUT,
+        &mixed,
+        Some(invite(
+            "za-fo-mixed",
+            START_B,
+            &[
+                "key2@example.com",
+                "key3@example.com",
+                "plain@example.com",
+                "outsider@remote.test",
+            ],
+        )),
+    )
+    .await;
+    assert_eq!(response.status.as_u16(), 204, "{}", response.body);
     let items = new_inbox_items(test, key2.id, &before2).await;
     assert_eq!(items.len(), 1, "the re-added attendee gets one REQUEST");
     let (_, carriers) = open_pending_item_as(test, key2.id, STRONG, items[0].0).await;
@@ -481,16 +510,17 @@ pub async fn test(test: &mut TestServer) {
 
     // 2 (continued). key1 DELETEs the event: each internal attendee gets a
     // CANCEL built from the unsealed stored tree, with its pair (spec 5.5).
-    // Each CANCEL carries the stored SEQUENCE plus one; plain (5.3) gets no
-    // mail.
+    // Each CANCEL carries the stored SEQUENCE plus one; plain (the mail
+    // class) is mailed its CANCEL after the commit (iMIP spec 5.5), never
+    // through the task queue. The updates' emails are delivered first, so
+    // the count below moves by the CANCEL alone.
     let stored_sequence = stored_sequence(&key1.client, &mixed).await;
+    wait_for_delivery(test).await;
     let plain_mail = mail_count(test, plain_id).await;
     let before2 = inbox_ids(test, key2.id).await;
     let before3 = inbox_ids(test, key3.id).await;
-    key1.client
-        .request("DELETE", &mixed, "")
-        .await
-        .with_status(StatusCode::NO_CONTENT);
+    let response = key1_mailing(Method::DELETE, &mixed, None).await;
+    assert_eq!(response.status.as_u16(), 204, "{}", response.body);
     let items = new_inbox_items(test, key3.id, &before3).await;
     assert_eq!(items.len(), 1, "key3 gets one CANCEL");
     let (tree, carriers) = open_pending_item_as(test, key3.id, STRONG, items[0].0).await;
@@ -513,8 +543,8 @@ pub async fn test(test: &mut TestServer) {
     wait_for_delivery(test).await;
     assert_eq!(
         mail_count(test, plain_id).await,
-        plain_mail,
-        "the DELETE mailed plain"
+        plain_mail + 1,
+        "the DELETE mailed plain its CANCEL"
     );
 
     // A collection DELETE cancels each scheduled event in it.
@@ -618,10 +648,9 @@ pub async fn test(test: &mut TestServer) {
     key3.delete_items_since(test, &start3).await;
     key5.delete_items_since(test, &start5).await;
     wait_for_delivery(test).await;
-    // Counting plain's mail created its default mailboxes; plain outlives
-    // the suite.
-    test.destroy_all_mailboxes(test.account("plain@example.com"))
-        .await;
+    // iMIP spec 8.5: plain outlives the suite; what it received goes (its
+    // mail, the notifications and the calendar its ingest created).
+    clear_received_scheduling(test, test.account("plain@example.com")).await;
 }
 
 /// How many stored events of `account_id` carry `uid`.
@@ -1160,7 +1189,8 @@ const PLAIN_INVITE: &str = concat!(
 /// Spec 11, task queue: with the consumer held, a key organizer's PUT and
 /// DELETE queue no `CalendarItipMessage` task (they fan out instead); a
 /// plain organizer's PUT does (control), and its invitation reaches key2 as
-/// mail only (test 6).
+/// mail (test 6), which delivery turns into a mail-borne pending item (iMIP
+/// spec 4.1, 4.5, 8.5).
 pub async fn test_task_queue(test: &mut TestServer) {
     println!("Running zero-access task queue tests...");
     let key1 = Party::new(test, "key1@example.com");
@@ -1213,6 +1243,7 @@ pub async fn test_task_queue(test: &mut TestServer) {
         .with_status(StatusCode::CREATED);
     let key2_mail = mail_count(test, key2.id).await;
     let before2 = inbox_ids(test, key2.id).await;
+    let mail_borne2 = mail_borne_items(test, key2.id).await.len();
     let held = hold_task_consumer(test).await;
     plain_client
         .request_with_headers(
@@ -1235,11 +1266,21 @@ pub async fn test_task_queue(test: &mut TestServer) {
         key2_mail + 1,
         "the mail reached key2"
     );
+    // iMIP spec 4.1, 4.5, 8.5: the mail's invitation became one mail-borne
+    // pending item (it was "nothing in key2's inbox" before release 5), its
+    // sender the plain organizer, in the carrier only.
     assert_eq!(
-        inbox_ids(test, key2.id).await,
-        before2,
-        "nothing in key2's inbox"
+        mail_borne_items(test, key2.id).await.len(),
+        mail_borne2 + 1,
+        "one mail-borne item in key2's inbox"
     );
+    let items = new_inbox_items(test, key2.id, &before2).await;
+    assert_eq!(items.len(), 1, "one item in key2's inbox");
+    let (item_id, item) = &items[0];
+    assert_eq!(item.changed_by, ChangedBy::CalendarAddress(String::new()));
+    assert_ne!(item.flags & EVENT_NOTIFICATION_ZA_PENDING, 0);
+    let (_, carriers) = open_pending_item_as(test, key2.id, STRONG, *item_id).await;
+    assert_eq!(carriers.sender.as_deref(), Some("plain@example.com"));
     assert_eq!(
         uid_copies(test, key2.id, "za-fo-plain").await,
         0,
@@ -1265,10 +1306,30 @@ pub async fn test_task_queue(test: &mut TestServer) {
 
 const SHARED_PLAIN: &str = "/dav/cal/plain%40example.com/default/fo-shared.ics";
 
+/// The methods of the account's inbox items written since `before`,
+/// asserting that each is a mail-borne pending item (iMIP spec 4.2, D4).
+async fn new_mail_borne_methods(
+    test: &TestServer,
+    account_id: u32,
+    before: &[u32],
+) -> Vec<Option<ICalendarMethod>> {
+    new_inbox_items(test, account_id, before)
+        .await
+        .iter()
+        .map(|(_, item)| {
+            assert_eq!(item.changed_by, ChangedBy::CalendarAddress(String::new()));
+            assert_ne!(item.flags & EVENT_NOTIFICATION_ZA_PENDING, 0);
+            item_method(&item.event)
+        })
+        .collect()
+}
+
 /// Final review F1: the sending state follows the calendar owner's key
 /// status, not the authenticated account's. key1 (a key account) writes an
 /// invitation into plain's shared calendar: upstream's path, a task and then
-/// mail, for the PUT and for the DELETE; no item and no lease.
+/// mail, for the PUT and for the DELETE; no fan-out item and no lease. Each
+/// mail becomes a mail-borne pending item in key2's inbox at delivery (iMIP
+/// spec 4.1, 4.5, 8.5; plan 15's spec question 1), deleted before cleanup.
 pub async fn test_plain_owner(test: &mut TestServer) {
     println!("Running zero-access plain-owner scheduling tests...");
     let key1 = Party::new(test, "key1@example.com");
@@ -1341,6 +1402,14 @@ pub async fn test_plain_owner(test: &mut TestServer) {
         key2_mail + 1,
         "the invitation reached key2 as mail"
     );
+    // iMIP spec 4.1, 4.5, 8.5 (spec question 1): the mail's REQUEST became
+    // one mail-borne pending item at delivery.
+    assert_eq!(
+        new_mail_borne_methods(test, key2.id, &start2).await,
+        [Some(ICalendarMethod::Request)],
+        "the invitation's mail-borne item"
+    );
+    let after_request = inbox_ids(test, key2.id).await;
 
     // The DELETE (no `Schedule-Reply: F`) follows the owner too: upstream's
     // CANCEL task.
@@ -1356,7 +1425,7 @@ pub async fn test_plain_owner(test: &mut TestServer) {
     );
     assert_eq!(
         inbox_ids(test, key2.id).await,
-        start2,
+        after_request,
         "a plain calendar's CANCEL reached key2's inbox"
     );
     drop(held);
@@ -1366,6 +1435,14 @@ pub async fn test_plain_owner(test: &mut TestServer) {
         key2_mail + 2,
         "the CANCEL reached key2 as mail"
     );
+    // iMIP spec 4.1 step 5, D3, 8.5 (spec question 1): the CANCEL's UID is
+    // known by the pending REQUEST item, so it became a second one.
+    assert_eq!(
+        new_mail_borne_methods(test, key2.id, &after_request).await,
+        [Some(ICalendarMethod::Cancel)],
+        "the CANCEL's mail-borne item"
+    );
+    key2.delete_items_since(test, &start2).await;
 
     // Cleanup: revoke the grant; `plain` outlives the suite, so drop the
     // calendar.

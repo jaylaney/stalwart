@@ -64,25 +64,32 @@
 use super::{
     STRONG,
     dav_seal::{CANARIES, EVENT, mkcalendar_body, raw_event, raw_event_records},
-    fanout::{NO_REPLY, uid_copies},
+    fanout::{NO_REPLY, Party, stored_pairs, uid_copies},
+    imip::{deliver, event as imip_event, itip_mail},
     mail::{Traced, key_mail_account, message_ids, stored_metadata_bytes},
     pinning::{ALICE, drop_entries, forget, parties, refuse_once_at},
     raw_input::{SUBMISSION_PORT, strings},
+    uid_lease::put,
+    user_permissions,
 };
 use crate::{
     utils::{
+        account::Account,
+        http::HttpRequest,
         imap::{ImapConnection, Type},
         pop3::{Pop3Connection, ResponseType as Pop3Reply},
         server::TestServer,
         smtp::SmtpConnection,
+        smtp_sink::sink,
         webdav::DummyWebDavClient,
         za::{
-            Conn, IDS_ONLY_DOCUMENT, PlantedItem, copy_href, hold_index_partition,
-            hold_task_consumer, inbox_ids, internal_search, itip_tasks_for, new_inbox_items,
-            pending_ids, pin_record, plain_dav_container, plant_container, plant_event,
-            plant_inbox_item, plant_plain_message, plant_sealed_event, queued_recipients,
-            release_index_partition, substitute_public_key, trigger_drain, wait_for_delivery,
-            za_unlock,
+            Conn, IDS_ONLY_DOCUMENT, InboxItem, PlantedItem, copy_href, destroy_inbox_item,
+            envelope_wrap, hold_index_partition, hold_task_consumer, inbox_ids, inbox_items,
+            internal_search, itip_tasks_for, mail_borne_items, new_inbox_items,
+            open_pending_item_as, pending_ids, pin_record, plain_dav_container, plant_container,
+            plant_event, plant_inbox_item, plant_plain_message, plant_sealed_event,
+            queued_recipients, release_index_partition, substitute_public_key, trigger_drain,
+            wait_for_delivery, wait_for_queue, za_unlock,
         },
     },
     za::drain::{DrainOn, body, set_partstat},
@@ -101,22 +108,28 @@ use email::message::{
 use groupware::cache::GroupwareCache;
 use groupware::calendar::{
     Calendar, CalendarEvent, CalendarEventContent, CalendarEventNotification,
-    CalendarEventNotificationContent, EVENT_NOTIFICATION_ZA_PENDING, Timezone,
+    CalendarEventNotificationContent, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING, Timezone,
     seal::{
         TokenPairs, ZaEvent,
         collection::COLLECTION_MARKER,
         event_token_pairs, is_sealed_container,
-        item::{RSVP_TOKEN_PROP, item_message},
+        item::{
+            RSVP_TOKEN_PROP, SENDER_PROP, item_message, seal_drained_item, seal_pending_item,
+            sealed_item_record,
+        },
         policy::{is_visible_entry, is_visible_parameter},
-        tree::{EXTRA_PROP, KEY_PROP, SEALED_PROP},
+        tree::{EXTRA_PROP, FORMAT_V1, KEY_PROP, PAD, SEALED_PROP, text_entry},
     },
 };
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use imap_proto::ResponseType;
 use mail_parser::{DateTime, MessageParser};
 use registry::{
     pickle::{Pickle, PickledStream},
-    schema::structs::SpamTrainingSample,
+    schema::{
+        prelude::Property,
+        structs::{CalendarScheduling, SpamTrainingSample},
+    },
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -141,6 +154,10 @@ use types::{
     id::Id,
 };
 use utils::{cheeky_hash::CheekyHash, hash128::Hash128};
+use vault::{
+    keys::{NONCE_LEN, Secret, TAG_LEN, generate_keypair},
+    session::SessionKeys,
+};
 
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 const EVENT_PATH: &str = "/dav/cal/key2%40example.com/leak/e.ics";
@@ -198,6 +215,18 @@ const EXTRA_CANARIES: &[&str] = &[
     "mailhdrname-canary",
     "mailhdrval-canary",
     "mailpreview-canary",
+    // Release 5 (iMIP spec 8.4): `test_imip`'s inbound invitation (the
+    // summary, location, description, the attendees' names and address, the
+    // outside organizer's address, which is also the From header's display
+    // name) and its key organizer's invitation to an outside attendee.
+    "imipleak-sum-canary",
+    "imipleak-loc-canary",
+    "imipleak-desc-canary",
+    "imipleak-cn-canary",
+    "imipleak-addr-canary",
+    "imipleak-sender-canary",
+    "imipleak-out-sum-canary",
+    "imipleak-out-att-canary",
 ];
 
 /// Mail spec 5.6: a key account's keyword and mailbox names are visible by
@@ -210,13 +239,19 @@ const VISIBLE_CANARIES: &[&str] = &["mailkw-canary", "mailbox-canary"];
 const DRAIN_EVENT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:leak-drain\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990105T090000Z\r\nDTEND:20990105T100000Z\r\nSEQUENCE:0\r\nSUMMARY:draintitle-canary\r\nLOCATION:drainloc-canary\r\nDESCRIPTION:draindesc-canary\r\nORGANIZER:mailto:key1@example.com\r\nATTENDEE;CN=draincn-canary;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\nATTENDEE:mailto:drainaddr-canary@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
 /// A future invitation organized by the key account to a local non-key
-/// account: with iTIP gated it is stored sealed and nothing is sent.
+/// account, stored sealed. The attendee is `SCHEDULE-AGENT=CLIENT` (iMIP
+/// spec question 7): plain is of iMIP's mail class, and a mailed invitation
+/// would put `sched-canary` in plain's mailbox, calendar and search index in
+/// the clear (exposure the spec accepts for a plain local recipient), where
+/// the whole-store scan reports it; with the client scheduling, upstream's
+/// builder makes no message for it, so nothing is sent and the event still
+/// tests the organizer's sealed copy.
 const SCHED_EVENT: &str = concat!(
     "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\n",
     "UID:leak-sched\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\n",
     "DTEND:20990102T100000Z\r\nSUMMARY:sched-canary\r\n",
     "ORGANIZER:mailto:key2@example.com\r\n",
-    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:plain@example.com\r\n",
+    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;SCHEDULE-AGENT=CLIENT:mailto:plain@example.com\r\n",
     "END:VEVENT\r\nEND:VCALENDAR\r\n"
 );
 
@@ -317,6 +352,9 @@ pub struct Scan {
     pub items: usize,
     pub item_keys: usize,
     pub item_extras: usize,
+    /// Pending items whose root ends `X-ZA-SENDER` then `X-ZA-KEY`
+    /// (release 5: mail-borne items).
+    pub item_senders: usize,
     pub emails: usize,
     /// Message metadata rows of the account that are stubs.
     pub stubs: usize,
@@ -702,10 +740,13 @@ async fn check_metadata(
     }
 }
 
-/// Which of the three carriers `entry` is, if any.
+/// Which of the fork's carriers `entry` is, if any. `X-ZA-SENDER` (release 5,
+/// iMIP spec 4.2) is a pending inbox item's carrier: `check_tree` reports it
+/// anywhere else (an event, a timezone, a component other than the root) as
+/// misplaced, as it reports `X-ZA-EXTRA` there.
 fn carrier_kind(entry: &ICalendarEntry) -> Option<&'static str> {
     match &entry.name {
-        ICalendarProperty::Other(n) => [SEALED_PROP, KEY_PROP, EXTRA_PROP]
+        ICalendarProperty::Other(n) => [SEALED_PROP, KEY_PROP, EXTRA_PROP, SENDER_PROP]
             .into_iter()
             .find(|c| n.eq_ignore_ascii_case(c)),
         _ => None,
@@ -814,23 +855,61 @@ fn check_event(event: &ZaEvent, what: &str, violations: &mut Vec<String>) {
 }
 
 /// Whether the root's last two entries are `X-ZA-EXTRA` then `X-ZA-KEY`.
+/// Events keep this form (`X-ZA-SENDER` on an event is a stray carrier):
+/// `ends_carrier_then_key` is its general form, for an item's one carrier.
 fn ends_extra_then_key(tree: &ICalendar) -> bool {
+    ends_carrier_then_key(tree, EXTRA_PROP)
+}
+
+/// Whether the root's last two entries are `carrier` then `X-ZA-KEY`.
+fn ends_carrier_then_key(tree: &ICalendar, carrier: &str) -> bool {
     tree.components.first().is_some_and(|root| {
         matches!(
             root.entries.as_slice(),
-            [.., extra, key]
-                if carrier_kind(extra) == Some(EXTRA_PROP) && carrier_kind(key) == Some(KEY_PROP)
+            [.., entry, key]
+                if carrier_kind(entry) == Some(carrier) && carrier_kind(key) == Some(KEY_PROP)
         )
     })
+}
+
+/// A mail-borne item's `X-ZA-SENDER` bundle (iMIP spec 4.2): one format 1
+/// bundle, `format || nonce || ciphertext || tag` over the sender's address
+/// padded to one 256-byte unit (`seal_bytes`), so every sender's carrier has
+/// the same length and the carrier reveals nothing of the address. A sender
+/// of more than 252 bytes would take a second unit; no address the suite
+/// delivers does.
+const SENDER_BUNDLE_LEN: usize = 1 + NONCE_LEN + TAG_LEN + PAD;
+
+/// The carrier's shape: one text value of the standard base64 of a
+/// `SENDER_BUNDLE_LEN` bundle in format 1.
+fn check_sender_carrier(entry: &ICalendarEntry, what: &str, violations: &mut Vec<String>) {
+    let bundle = match entry.values.as_slice() {
+        [value] => value
+            .as_text()
+            .and_then(|text| STANDARD.decode(text.trim()).ok()),
+        _ => None,
+    };
+    match bundle {
+        Some(bundle) if bundle.len() == SENDER_BUNDLE_LEN && bundle[0] == FORMAT_V1 => {}
+        Some(bundle) => violations.push(format!(
+            "{what}: {SENDER_PROP} bundle is not one format 1 padding unit ({} bytes, format {:?})",
+            bundle.len(),
+            bundle.first()
+        )),
+        None => violations.push(format!("{what}: {SENDER_PROP} is not one base64 value")),
+    }
 }
 
 /// An inbox item (invitations spec 9) at 1.0: a row and a content record
 /// (ruling 13). The content is `Itip` with no plaintext snapshot
 /// (`item_message`), and its message tree ends with `X-ZA-KEY` and, before
-/// it, at most one of `X-ZA-RSVP-TOKEN` (visible, a pending reply) or
-/// `X-ZA-EXTRA`, and neither once drained (pending bit clear); the rest as
-/// `check_tree` checks any component. Returns whether the item carries its
-/// key envelope.
+/// it, at most one of `X-ZA-RSVP-TOKEN` (visible, a pending reply),
+/// `X-ZA-EXTRA` or `X-ZA-SENDER` (release 5, a mail-borne item's sealed
+/// sender, one padding unit), and none once drained (pending bit clear); the
+/// rest as `check_tree` checks any component. The row names no address
+/// (iMIP spec 4.2, D4): `CalendarAddress("")` is a mail-borne item, and a
+/// pending one carries `X-ZA-SENDER` exactly when its row says so. Returns
+/// whether the item carries its key envelope.
 fn check_item(
     item: &CalendarEventNotification,
     content: &CalendarEventNotificationContent,
@@ -844,6 +923,15 @@ fn check_item(
         return false;
     };
     let mut tree = message.clone();
+    let pending = item.flags & EVENT_NOTIFICATION_ZA_PENDING != 0;
+    // The row names no address (D4): a mail-borne item's `changed_by` is the
+    // empty address, a fan-out item's a principal id.
+    let mail_borne = item.changed_by == ChangedBy::CalendarAddress(String::new());
+    if let ChangedBy::CalendarAddress(address) = &item.changed_by
+        && !address.is_empty()
+    {
+        violations.push(format!("{what}: inbox row names an address"));
+    }
     let has_key = tree
         .components
         .first()
@@ -852,7 +940,6 @@ fn check_item(
     if !has_key {
         violations.push(format!("{what}: missing {KEY_PROP}"));
     } else {
-        let pending = item.flags & EVENT_NOTIFICATION_ZA_PENDING != 0;
         let expected = if pending { (2, 106) } else { (1, 74) };
         if !key_envelope(message)
             .is_some_and(|b| b.len() == expected.1 && b[..2] == [1, expected.0])
@@ -861,21 +948,30 @@ fn check_item(
         }
         let root = &mut tree.components[0].entries;
         root.pop();
-        let carrier = root.last().and_then(|e| {
-            if carrier_kind(e) == Some(EXTRA_PROP) {
-                Some(EXTRA_PROP)
-            } else if matches!(&e.name, ICalendarProperty::Other(n) if n.eq_ignore_ascii_case(RSVP_TOKEN_PROP))
-            {
+        let carrier = root.last().and_then(|e| match carrier_kind(e) {
+            Some(carrier @ (EXTRA_PROP | SENDER_PROP)) => Some(carrier),
+            _ if matches!(&e.name, ICalendarProperty::Other(n) if n.eq_ignore_ascii_case(RSVP_TOKEN_PROP)) => {
                 Some(RSVP_TOKEN_PROP)
-            } else {
-                None
             }
+            _ => None,
         });
         if let Some(carrier) = carrier {
             if !pending {
                 violations.push(format!("{what}: drained item carries {carrier}"));
             }
+            if carrier == SENDER_PROP {
+                check_sender_carrier(root.last().unwrap(), what, violations);
+            }
             root.pop();
+        }
+        // A pending mail-borne item carries exactly `X-ZA-SENDER`; no other
+        // pending item does (only mail delivery writes it, spec 4.2).
+        if pending && mail_borne != (carrier == Some(SENDER_PROP)) {
+            violations.push(if mail_borne {
+                format!("{what}: pending mail-borne item without {SENDER_PROP}")
+            } else {
+                format!("{what}: pending item with {SENDER_PROP} and a principal row")
+            });
         }
     }
     check_tree(&tree, what, false, violations);
@@ -1391,6 +1487,11 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                         if item_message(&content).is_some_and(ends_extra_then_key) {
                             scan.item_extras += 1;
                         }
+                        if item_message(&content)
+                            .is_some_and(|message| ends_carrier_then_key(message, SENDER_PROP))
+                        {
+                            scan.item_senders += 1;
+                        }
                     }
                     (Err(err), _) | (_, Err(err)) => scan
                         .violations
@@ -1649,6 +1750,11 @@ pub async fn test_drain(test: &mut TestServer) {
         shown.contains("draintitle-canary") && shown.contains("draincn-canary"),
         "{shown}"
     );
+    // iMIP spec 8.5: the invitation's email to the outside attendee is sunk
+    // and its queue blob purged before the scans; as the first leak module,
+    // this purge also removes the queue blobs that the earlier modules'
+    // outbound mail left.
+    sink_and_purge_held(test).await;
     let drained = scan(test, key2_id).await;
     assert!(
         drained.violations.is_empty(),
@@ -1681,6 +1787,7 @@ pub async fn test_drain(test: &mut TestServer) {
         !token_hits(test, &[token]).await.is_empty(),
         "the positive control: the pending reply's visible token"
     );
+    sink_and_purge_held(test).await;
     let pending_scan = scan(test, key1_id).await;
     assert!(
         pending_scan.violations.is_empty(),
@@ -1693,6 +1800,7 @@ pub async fn test_drain(test: &mut TestServer) {
         token_hits(test, &[token]).await.is_empty(),
         "the token in the clear after the organizer's drain"
     );
+    sink_and_purge_held(test).await;
     let after_reply = scan(test, key1_id).await;
     assert!(
         after_reply.violations.is_empty(),
@@ -1823,6 +1931,18 @@ fn mail_canary_message(n: u32) -> String {
          --za-leak--\r\n",
         STANDARD.encode("mailattach-canary")
     )
+}
+
+/// iMIP spec 8.5: once the outbound mail is at the sink, its queue blobs
+/// (which hold the canaries) are purged before a scan. While the task
+/// consumer is held the scheduler's purge task cannot run, so the purge
+/// runs in place. No temporary link is expired first (final review C-1): a
+/// delivered queue message's blob is unlinked and goes with the purge alone,
+/// while a blob held only by a temporary link stays for the scan's
+/// temporary-link check (mail spec 11) and its canary search.
+async fn sink_and_purge_held(test: &TestServer) {
+    wait_for_queue(test).await;
+    purge_blobs(test).await;
 }
 
 /// Deletes every unlinked blob, as the purge does: a delivered message's
@@ -2177,6 +2297,643 @@ pub async fn test_mail(test: &mut TestServer) {
     purge_blobs(test).await;
 }
 
+/// Release 5, iMIP spec 8.4: `test_imip`'s two key accounts. The first
+/// receives an outside organizer's invitations and organizes its own; the
+/// second is an attendee of the latter.
+const IMIP_KEY: &str = "imip-leak-key@example.com";
+const IMIP_KEY2: &str = "imip-leak-key2@example.com";
+/// The outside organizer (an address, so the canary is in the sender
+/// carrier, the sink's REPLY and the envelope) and the same canary as the
+/// From header's display name, so the row and blob checks keep their teeth.
+const IMIP_SENDER: &str = "imipleak-sender-canary@remote.test";
+const IMIP_FROM: &str = "\"imipleak-sender-canary\" <imipleak-sender-canary@remote.test>";
+/// The outside attendee of the key organizer's invitation.
+const IMIP_OUT_ATT: &str = "imipleak-out-att-canary@remote.test";
+/// The UIDs of the inbound invitation (delivered, drained and accepted), the
+/// outbound one (the key organizer's, refreshed and deleted) and the
+/// inbound one left pending for the scan. None holds a canary.
+const IMIP_IN: &str = "imipleak-in";
+const IMIP_OUT: &str = "imipleak-out";
+const IMIP_PENDING: &str = "imipleak-pending";
+/// Every canary this module introduces: each must be in the scan's list and
+/// in what the module sends, so a misspelled one cannot pass vacuously.
+const IMIP_CANARIES: [&str; 8] = [
+    "imipleak-sum-canary",
+    "imipleak-loc-canary",
+    "imipleak-desc-canary",
+    "imipleak-cn-canary",
+    "imipleak-addr-canary",
+    "imipleak-sender-canary",
+    "imipleak-out-sum-canary",
+    "imipleak-out-att-canary",
+];
+
+/// An outside organizer's invitation to `IMIP_KEY`, with a canary in the
+/// summary, location, description, the attendees' names and an attendee's
+/// address, organized by the sender canary.
+fn imip_invitation(uid: &str) -> String {
+    format!(
+        concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//imip leak//EN\r\nBEGIN:VEVENT\r\n",
+            "UID:{uid}\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20990112T090000Z\r\n",
+            "DTEND:20990112T100000Z\r\nSEQUENCE:0\r\nSUMMARY:imipleak-sum-canary\r\n",
+            "LOCATION:imipleak-loc-canary\r\nDESCRIPTION:imipleak-desc-canary\r\n",
+            "ORGANIZER;CN=imipleak-cn-canary:mailto:imipleak-sender-canary@remote.test\r\n",
+            "ATTENDEE;CN=imipleak-cn-canary;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:imip-leak-key@example.com\r\n",
+            "ATTENDEE;CN=imipleak-cn-canary:mailto:imipleak-addr-canary@remote.test\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ),
+        uid = uid
+    )
+}
+
+/// A key organizer's invitation to `IMIP_KEY2` and to an outside attendee
+/// whose address is a canary, with a canary in the summary.
+fn imip_outbound() -> String {
+    imip_event(IMIP_OUT, IMIP_KEY, &[IMIP_KEY2, IMIP_OUT_ATT], 0, "").replace(
+        &format!("SUMMARY:imip {IMIP_OUT}"),
+        "SUMMARY:imipleak-out-sum-canary",
+    )
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Every form a 16-byte token takes in mail or storage (iMIP spec 8.4):
+/// base64url without padding (the `X-ZA-RSVP-TOKEN` form), standard base64
+/// with and without padding, the standard base64 of a stream the token sits
+/// in at each of the three alignments (preceded by 0, 1 and 2 bytes: only the
+/// characters of the groups of three bytes that lie wholly inside the token,
+/// which do not depend on its neighbours), and lower and upper hex.
+fn token_forms(tokens: &[[u8; 16]]) -> Vec<Vec<u8>> {
+    let mut forms = Vec::new();
+    for token in tokens {
+        forms.push(URL_SAFE_NO_PAD.encode(token).into_bytes());
+        forms.push(STANDARD.encode(token).into_bytes());
+        forms.push(STANDARD_NO_PAD.encode(token).into_bytes());
+        for lead in 0..3usize {
+            let mut stream = vec![0u8; lead];
+            stream.extend_from_slice(token);
+            stream.resize(stream.len().div_ceil(3) * 3, 0);
+            let text = STANDARD.encode(&stream);
+            let (first, last) = (lead.div_ceil(3), (lead + token.len()) / 3);
+            forms.push(text.as_bytes()[first * 4..last * 4].to_vec());
+        }
+        let hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        forms.push(hex.to_uppercase().into_bytes());
+        forms.push(hex.into_bytes());
+    }
+    forms
+}
+
+/// `token_forms` finds a token in the standard base64 of any stream that
+/// holds it, whatever precedes it, and in hex, and not another token.
+fn token_form_controls() {
+    let token = *b"za-imipleak-tok!";
+    // Differs in every group of three bytes: the stable inner characters of a
+    // token's forms are a prefix or a middle slice of its bytes, so a token
+    // that shares them would match by design.
+    let other = *b"QRSTUVWXYZ012345";
+    let forms = token_forms(&[token]);
+    for lead in 0..6usize {
+        let mut stream = vec![0xC3u8; lead];
+        stream.extend_from_slice(&token);
+        stream.extend_from_slice(&[0xA7; 5]);
+        let text = STANDARD.encode(&stream);
+        assert!(
+            forms.iter().any(|form| contains(text.as_bytes(), form)),
+            "a token after {lead} bytes is not found in its base64"
+        );
+        let mut stream = vec![0xC3u8; lead];
+        stream.extend_from_slice(&other);
+        stream.extend_from_slice(&[0xA7; 5]);
+        let text = STANDARD.encode(&stream);
+        assert!(
+            !forms.iter().any(|form| contains(text.as_bytes(), form)),
+            "another token is found after {lead} bytes"
+        );
+    }
+    let hex: String = token.iter().map(|b| format!("{b:02X}")).collect();
+    assert!(forms.iter().any(|form| contains(hex.as_bytes(), form)));
+    assert!(
+        forms
+            .iter()
+            .any(|form| contains(URL_SAFE_NO_PAD.encode(token).as_bytes(), form))
+    );
+}
+
+/// The scanner's controls for release 5's carrier (iMIP spec 4.2): items
+/// built in memory and given to `check_item`. A mail-borne pending item is
+/// accepted, and so are the carriers of releases 2 and 3; everything the
+/// scanner refused before it still refuses (two carriers in either order, a
+/// carrier out of place, a carrier on a drained item), and so does a sender
+/// carrier of another size or format, or beside a row that does not say
+/// "mail-borne".
+fn carrier_controls() {
+    const ITEM: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:imipleak-control\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSEQUENCE:0\r\nSUMMARY:control\r\nORGANIZER:mailto:org@remote.test\r\nATTENDEE:mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let plain = || {
+        ICalendar::parse(ITEM)
+            .ok()
+            .expect("the control item parses")
+    };
+    let pending = |pair: Option<&TokenPairs>, token: Option<&[u8; 16]>, sender: Option<&str>| {
+        let (public, _) = generate_keypair();
+        let mut ical = plain();
+        seal_pending_item(&mut ical, 9, &public, pair, token, sender).unwrap();
+        ical
+    };
+    let mail_borne = || ChangedBy::CalendarAddress(String::new());
+    let check = |ical: ICalendar, changed_by: ChangedBy, is_pending: bool| {
+        let (row, content) = sealed_item_record(ical, changed_by, None, is_pending);
+        let mut violations = Vec::new();
+        assert!(check_item(&row, &content, "control", &mut violations));
+        violations
+    };
+    let flagged = |violations: Vec<String>, needle: &str, case: &str| {
+        assert!(
+            violations.iter().any(|v| v.contains(needle)),
+            "{case}: expected {needle:?} in {violations:?}"
+        );
+    };
+
+    // Accepted: a mail-borne pending item, the carriers of the earlier
+    // releases, and a drained mail-borne item (the row keeps its empty
+    // address once drained, D4).
+    let sender = pending(None, None, Some("imipleak-control@remote.test"));
+    assert!(ends_carrier_then_key(&sender, SENDER_PROP) && !ends_extra_then_key(&sender));
+    assert_eq!(
+        check(sender.clone(), mail_borne(), true),
+        Vec::<String>::new()
+    );
+    let mut pairs = TokenPairs::new();
+    pairs.insert("att@example.com", [5; 16]);
+    let extra = pending(Some(&pairs), None, None);
+    assert!(ends_extra_then_key(&extra) && !ends_carrier_then_key(&extra, SENDER_PROP));
+    assert_eq!(
+        check(extra.clone(), ChangedBy::PrincipalId(3), true),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        check(
+            pending(None, Some(&[6; 16]), None),
+            ChangedBy::PrincipalId(3),
+            true
+        ),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        check(pending(None, None, None), ChangedBy::PrincipalId(3), true),
+        Vec::<String>::new()
+    );
+    let keys = SessionKeys::new(9, 1, Secret::random());
+    let mut drained = plain();
+    seal_drained_item(&mut drained, &keys, 9).unwrap();
+    assert_eq!(
+        check(drained.clone(), mail_borne(), false),
+        Vec::<String>::new()
+    );
+
+    // Refused: the row. An address in it, a principal beside the sender
+    // carrier, an empty address without one.
+    flagged(
+        check(
+            sender.clone(),
+            ChangedBy::CalendarAddress(IMIP_SENDER.into()),
+            true,
+        ),
+        "inbox row names an address",
+        "an address in the row",
+    );
+    flagged(
+        check(sender.clone(), ChangedBy::PrincipalId(3), true),
+        "pending item with X-ZA-SENDER and a principal row",
+        "a principal beside the sender",
+    );
+    flagged(
+        check(pending(None, None, None), mail_borne(), true),
+        "pending mail-borne item without X-ZA-SENDER",
+        "a mail-borne item without its sender",
+    );
+    flagged(
+        check(extra.clone(), mail_borne(), true),
+        "pending mail-borne item without X-ZA-SENDER",
+        "a mail-borne item with a pair",
+    );
+
+    // Refused: two carriers, in either order and with the reply token; a
+    // carrier out of place; a carrier on a drained item.
+    let sender_entry = sender.components[0].entries[sender.components[0].entries.len() - 2].clone();
+    for (case, carrier) in [
+        (
+            "an extra before the sender",
+            text_entry(EXTRA_PROP, "AAAA".into()),
+        ),
+        (
+            "a reply token before the sender",
+            text_entry(RSVP_TOKEN_PROP, "AAAA".into()),
+        ),
+    ] {
+        let mut two = sender.clone();
+        let at = two.components[0].entries.len() - 2;
+        two.components[0].entries.insert(at, carrier);
+        assert!(
+            !check(two, mail_borne(), true).is_empty(),
+            "{case} is accepted"
+        );
+    }
+    let mut two = extra.clone();
+    let at = two.components[0].entries.len() - 1;
+    two.components[0].entries.insert(at, sender_entry.clone());
+    assert!(
+        !check(two, mail_borne(), true).is_empty(),
+        "a sender after an extra is accepted"
+    );
+    let mut misplaced = sender.clone();
+    let at = misplaced.components[0].entries.len() - 2;
+    let entry = misplaced.components[0].entries.remove(at);
+    misplaced.components[0].entries.insert(0, entry);
+    assert!(
+        !check(misplaced, mail_borne(), true).is_empty(),
+        "a sender carrier out of place is accepted"
+    );
+    let mut on_drained = drained.clone();
+    let at = on_drained.components[0].entries.len() - 1;
+    on_drained.components[0]
+        .entries
+        .insert(at, sender_entry.clone());
+    flagged(
+        check(on_drained, mail_borne(), false),
+        "drained item carries X-ZA-SENDER",
+        "a sender carrier on a drained item",
+    );
+
+    // Refused: a sender bundle of another size or format.
+    for (case, text) in [
+        (
+            "two padding units",
+            STANDARD.encode(vec![FORMAT_V1; SENDER_BUNDLE_LEN + PAD]),
+        ),
+        ("a short bundle", STANDARD.encode(vec![FORMAT_V1; 10])),
+        ("format 2", STANDARD.encode(vec![2u8; SENDER_BUNDLE_LEN])),
+        ("not base64", "!!!".to_string()),
+    ] {
+        let mut bad = sender.clone();
+        let at = bad.components[0].entries.len() - 2;
+        bad.components[0].entries[at] = text_entry(SENDER_PROP, text);
+        flagged(check(bad, mail_borne(), true), SENDER_PROP, case);
+    }
+}
+
+/// Sets `CalendarScheduling::auto_add_invitations`, reloaded. An outside
+/// party's invitation for a new UID needs auto-add or a ContactCard of the
+/// sender; a card would hold the sender canary in the clear (key accounts
+/// keep address books in the clear), so the module turns auto-add on for its
+/// own run.
+async fn set_auto_add(admin: &Account, on: bool) {
+    admin
+        .registry_update_setting(
+            CalendarScheduling {
+                auto_add_invitations: on,
+                ..Default::default()
+            },
+            &[Property::AutoAddInvitations],
+        )
+        .await;
+    admin.reload_settings().await;
+}
+
+/// Every inbox item of `accounts`, keyed by (account id, document id).
+async fn all_inbox_items(test: &TestServer, accounts: &[u32]) -> Vec<((u32, u32), InboxItem)> {
+    let mut all = Vec::new();
+    for &account_id in accounts {
+        for (document_id, item) in inbox_items(test, account_id).await {
+            all.push(((account_id, document_id), item));
+        }
+    }
+    all
+}
+
+/// A DELETE through the raw client (5 s), which waits for the fan-out and
+/// the mail submission; resolves to the status.
+async fn delete_with_mail(name: &str, secret: &str, path: &str) -> u16 {
+    HttpRequest::with_credentials(8899, name, secret)
+        .send_full(Method::DELETE, path, None, None)
+        .await
+        .status
+        .as_u16()
+}
+
+/// Release 5, iMIP spec 8.4: iMIP flows in both directions leave no canary,
+/// token or fork carrier outside the sink. Two key accounts: `IMIP_KEY`
+/// receives an outside organizer's invitation (delivered, drained, accepted
+/// by a REPLY mailed back), organizes its own invitation to `IMIP_KEY2` and
+/// an outside attendee, has it refreshed by that attendee (the drain answers
+/// by mail) and deletes it (a CANCEL mailed), and receives one more
+/// invitation that stays pending for the scan. The task consumer is held
+/// across every outbound path; then:
+///
+/// - no task for either account (invariant 41: mail goes to the SMTP queue in
+///   the request, never to the task queue);
+/// - the SMTP queue is empty and the sink holds the mail (the positive
+///   control: its copies carry the outbound canaries);
+/// - the rows name no address (a principal id or the empty address, D4), the
+///   pending mail-borne item is `pk`-sealed with neither ORGANIZER nor
+///   ATTENDEE visible and opens to the sender;
+/// - after the queue's blobs are purged, the whole-store scan finds no
+///   canary, and the scanner reads the new carrier (`check_item`);
+/// - no token of the organizer's pairs is in the store or in the mail, and
+///   no fork carrier is in the mail.
+pub async fn test_imip(test: &mut TestServer) {
+    println!("Running zero-access leak test of iMIP...");
+    carrier_controls();
+    token_form_controls();
+    let inputs = [
+        imip_invitation(IMIP_IN),
+        imip_outbound(),
+        IMIP_FROM.to_string(),
+        IMIP_OUT_ATT.to_string(),
+    ]
+    .join("\n");
+    let listed = all_canaries();
+    for canary in IMIP_CANARIES {
+        assert!(
+            listed.contains(&canary),
+            "{canary} is not in the scan's list"
+        );
+        assert!(
+            inputs.contains(canary),
+            "{canary} is not in what the module sends"
+        );
+    }
+
+    let admin = test.account("admin@example.com").clone();
+    for (name, description) in [
+        (IMIP_KEY, "iMIP leak key"),
+        (IMIP_KEY2, "iMIP leak key two"),
+    ] {
+        let account = admin
+            .create_key_user_account(name, STRONG, description, &[], user_permissions())
+            .await;
+        test.insert_account(account);
+    }
+    let key = Party::new(test, IMIP_KEY);
+    let key2 = Party::new(test, IMIP_KEY2);
+    let starts = [
+        inbox_ids(test, key.id).await,
+        inbox_ids(test, key2.id).await,
+    ];
+    let keys = za_unlock(test, key.id, STRONG).await;
+    set_auto_add(&admin, true).await;
+    let _drain = DrainOn::new();
+    sink().clear();
+    let held = hold_task_consumer(test).await;
+
+    // An outside organizer's invitation: delivered (one pending mail-borne
+    // item beside the sealed mail), drained (the event imported) and
+    // accepted (the REPLY mailed to the organizer).
+    let before = inbox_ids(test, key.id).await;
+    deliver(
+        "dmarc-imipleak@remote.test",
+        IMIP_KEY,
+        &itip_mail(IMIP_FROM, IMIP_KEY, "REQUEST", &imip_invitation(IMIP_IN)),
+    )
+    .await;
+    wait_for_queue(test).await;
+    assert_eq!(new_inbox_items(test, key.id, &before).await.len(), 1);
+    assert_eq!(trigger_drain(IMIP_KEY, STRONG).await, 207);
+    let copy = copy_href(test, key.id, IMIP_IN).await;
+    set_partstat(&key.client, &copy, IMIP_KEY, "ACCEPTED").await;
+    wait_for_queue(test).await;
+    assert_eq!(
+        sink().count_to(IMIP_SENDER),
+        1,
+        "the REPLY to the organizer"
+    );
+
+    // The key account's own invitation to IMIP_KEY2 and an outside
+    // attendee: the pairs are read before the event goes.
+    let out_path = format!(
+        "/dav/cal/{}/default/{IMIP_OUT}.ics",
+        IMIP_KEY.replace('@', "%40")
+    );
+    assert_eq!(
+        put(IMIP_KEY, STRONG, out_path.clone(), imip_outbound()).await,
+        201
+    );
+    wait_for_queue(test).await;
+    assert_eq!(
+        sink().count_to(IMIP_OUT_ATT),
+        1,
+        "the REQUEST to the attendee"
+    );
+    let pairs = stored_pairs(test, &keys, key.id, &format!("default/{IMIP_OUT}.ics"))
+        .await
+        .expect("the organizer's pairs");
+    let tokens: Vec<[u8; 16]> = [IMIP_KEY2, IMIP_OUT_ATT]
+        .iter()
+        .map(|address| *pairs.get(address).expect("a pair for each attendee"))
+        .collect();
+
+    // The attendee's REFRESH, answered by the drain with a REQUEST by mail.
+    let before = inbox_ids(test, key.id).await;
+    deliver(
+        "dmarc-imipleak-att@remote.test",
+        IMIP_KEY,
+        &itip_mail(
+            IMIP_OUT_ATT,
+            IMIP_KEY,
+            "REFRESH",
+            &imip_event(IMIP_OUT, IMIP_KEY, &[IMIP_OUT_ATT], 0, ""),
+        ),
+    )
+    .await;
+    wait_for_queue(test).await;
+    let refresh = new_inbox_items(test, key.id, &before).await;
+    assert_eq!(refresh.len(), 1, "the REFRESH item");
+    assert_eq!(trigger_drain(IMIP_KEY, STRONG).await, 207);
+    wait_for_queue(test).await;
+    assert!(
+        !inbox_ids(test, key.id).await.contains(&refresh[0].0),
+        "the REFRESH item outlived its answer"
+    );
+    assert_eq!(sink().count_to(IMIP_OUT_ATT), 2, "the REFRESH's answer");
+
+    // The DELETE: a CANCEL mailed, a CANCEL item for IMIP_KEY2.
+    assert_eq!(delete_with_mail(IMIP_KEY, STRONG, &out_path).await, 204);
+    wait_for_queue(test).await;
+    assert_eq!(sink().count_to(IMIP_OUT_ATT), 3, "the CANCEL");
+
+    // One more invitation, left pending: no DAV request of IMIP_KEY follows
+    // before the scan.
+    deliver(
+        "dmarc-imipleak@remote.test",
+        IMIP_KEY,
+        &itip_mail(
+            IMIP_FROM,
+            IMIP_KEY,
+            "REQUEST",
+            &imip_invitation(IMIP_PENDING),
+        ),
+    )
+    .await;
+    wait_for_queue(test).await;
+    let pending = pending_ids(test, key.id).await;
+    assert_eq!(pending.len(), 1, "the pending mail-borne item");
+
+    // Invariant 41: no iMIP task for either account, with the consumer held
+    // across every path above.
+    for (account_id, name) in [(key.id, IMIP_KEY), (key2.id, IMIP_KEY2)] {
+        assert_eq!(
+            itip_tasks_for(test, account_id).await,
+            0,
+            "a task for the key account {name}"
+        );
+    }
+    drop(held);
+    test.wait_for_tasks().await;
+    wait_for_queue(test).await;
+    assert!(queued_recipients(test).await.is_empty());
+
+    // The sink holds the mail: the positive control (the outbound canaries)
+    // and the four messages by recipient. No token and no fork carrier in
+    // any message, raw or decoded.
+    let sunk = sink().messages();
+    assert!(
+        sunk.iter().any(|m| m
+            .decoded_parts()
+            .iter()
+            .any(|part| contains(part, b"imipleak-out-sum-canary"))),
+        "the positive control: the outbound canary at the sink"
+    );
+    assert_eq!(
+        sunk.len(),
+        4,
+        "the REPLY, the REQUEST, the REFRESH's REQUEST and the CANCEL"
+    );
+    let forms = token_forms(&tokens);
+    for message in &sunk {
+        let mut texts = message.decoded_parts();
+        texts.push(message.data.clone());
+        for text in &texts {
+            assert!(
+                forms.iter().all(|form| !contains(text, form)),
+                "a token left in mail"
+            );
+            assert!(!contains(text, b"X-ZA-"), "a fork carrier left in mail");
+        }
+    }
+
+    // Purge the queue's blobs (they hold the canaries until then), then the
+    // rows: no address (a principal id or the empty address), no decoded
+    // row with the sender canary. The purge alone, no temporary link expired
+    // (final review C-1; spec 8.4's erratum in the plan 15 outcome note).
+    purge_blobs(test).await;
+    let rows = all_inbox_items(test, &[key.id, key2.id]).await;
+    assert!(
+        rows.len() >= 4,
+        "the items of both accounts: {}",
+        rows.len()
+    );
+    for ((account_id, document_id), item) in &rows {
+        assert!(
+            matches!(&item.changed_by, ChangedBy::PrincipalId(_))
+                || item.changed_by == ChangedBy::CalendarAddress(String::new()),
+            "inbox item {account_id}/{document_id}: a row that names an address"
+        );
+        assert!(
+            !format!("{:?}", item.changed_by).contains("imipleak-sender-canary"),
+            "inbox item {account_id}/{document_id}: the sender in the row"
+        );
+    }
+    // The mail-borne items of IMIP_KEY: the drained invitation and the
+    // pending one, whose tree is `pk`-sealed (wrap 2) with neither ORGANIZER
+    // nor ATTENDEE visible and which opens to the sender and the invitation.
+    let mail_borne = mail_borne_items(test, key.id).await;
+    assert_eq!(
+        mail_borne.len(),
+        2,
+        "the drained and the pending mail-borne item"
+    );
+    let (pending_item, drained): (Vec<_>, Vec<_>) = mail_borne
+        .iter()
+        .partition(|(_, item)| item.flags & EVENT_NOTIFICATION_ZA_PENDING != 0);
+    assert_eq!((pending_item.len(), drained.len()), (1, 1));
+    let (id, item) = pending_item[0];
+    assert_eq!(*id, pending[0]);
+    assert_eq!(envelope_wrap(&item.event), Some(2));
+    assert!(
+        item.event
+            .components
+            .iter()
+            .flat_map(|component| &component.entries)
+            .all(|entry| !matches!(
+                entry.name,
+                ICalendarProperty::Organizer | ICalendarProperty::Attendee
+            )),
+        "an ORGANIZER or ATTENDEE is visible on the pending item"
+    );
+    let (opened, carriers) = open_pending_item_as(test, key.id, STRONG, *id).await;
+    assert_eq!(carriers.sender.as_deref(), Some(IMIP_SENDER));
+    assert!(
+        opened.to_string().contains("imipleak-sum-canary"),
+        "the positive control: the invitation is in the sealed item"
+    );
+
+    // The whole-store scan, once the queue's blobs are purged: no canary in
+    // any subspace, blob, task or search record, the scanner not blind, the
+    // mail-borne item read through `X-ZA-SENDER`.
+    for (account_id, name) in [(key.id, IMIP_KEY), (key2.id, IMIP_KEY2)] {
+        let found = scan(test, account_id).await;
+        assert!(
+            found.violations.is_empty(),
+            "iMIP leaks in {name}:\n{}",
+            found.violations.join("\n")
+        );
+        assert!(
+            found.undelivered.is_empty(),
+            "held or queued after delivery in {name}:\n{}",
+            found.undelivered.join("\n")
+        );
+        assert!(found.items >= 2, "{found:?}");
+        assert_eq!(found.item_keys, found.items, "{found:?}");
+        if account_id == key.id {
+            assert_eq!(found.item_senders, 1, "{found:?}");
+            assert!(found.stubs >= 3 && found.events >= 1, "{found:?}");
+        }
+    }
+
+    // Tokens: none in the store, in any form.
+    assert!(
+        token_hits(test, &tokens).await.is_empty(),
+        "a token in the store"
+    );
+
+    // Cleanup: the pending items go at store level (a DAV request would
+    // drain and import them), then the imported copy, then the drained
+    // items.
+    for account_id in [key.id, key2.id] {
+        for id in pending_ids(test, account_id).await {
+            destroy_inbox_item(test, account_id, id).await;
+        }
+    }
+    key.client
+        .request_with_headers("DELETE", &copy, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    key.delete_items_since(test, &starts[0]).await;
+    key2.delete_items_since(test, &starts[1]).await;
+    assert!(
+        mail_borne_items(test, key.id).await.is_empty(),
+        "a mail-borne item outlived the module"
+    );
+    assert_eq!(uid_copies(test, key.id, IMIP_IN).await, 0);
+    assert_eq!(uid_copies(test, key.id, IMIP_OUT).await, 0);
+    set_auto_add(&admin, false).await;
+    sink().clear();
+    test.wait_for_tasks().await;
+}
+
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access leak regression test...");
     test_shared_structure(test).await;
@@ -2339,6 +3096,9 @@ pub async fn test(test: &mut TestServer) {
         "key1's invitation reached key2 once"
     );
     let fan_out_item = fan_out_items[0].0;
+    // iMIP spec 8.5: the email to the outside attendee is sunk and its queue
+    // blob purged before the scan.
+    sink_and_purge_held(test).await;
     let pending = scan(test, id).await;
     assert!(
         pending.violations.is_empty(),
@@ -2493,6 +3253,11 @@ pub async fn test(test: &mut TestServer) {
     )
     .await;
 
+    // iMIP spec 8.5: every email sunk and the queue blobs purged first, by
+    // the purge alone (final review C-1: a blob held by a temporary link
+    // stays for the scan).
+    wait_for_queue(test).await;
+    purge_blobs(test).await;
     let result = scan(test, id).await;
     println!(
         "Leak scan: {} records, {} archives, {} blobs, {} search index records ({} of the account, none calendar), {} events, {} calendars, {} items, {} emails",

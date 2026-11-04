@@ -2438,6 +2438,7 @@ dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
  "bytecount",
+ "calcard",
  "cbc 0.2.1",
  "chacha20poly1305",
  "common",

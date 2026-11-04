@@ -60,6 +60,17 @@
 //! The lease fences the item's commit and, for a delegating merge, each
 //! delegate item the fan-out writes: a holder whose lease was taken over
 //! delivers nothing more and defers, as on a lost commit fence.
+//!
+//! A mail-borne item (iMIP spec 4.3, the sender in `X-ZA-SENDER`) is opened,
+//! its UID read and checked against the skipped items like any other, then
+//! goes to the mail arm (`apply_mail`): delivery's checks repeated on the
+//! opened tree with the carrier's sender, then upstream's import or merge
+//! with that sender, untokened, through the commits above. ADD and REFRESH
+//! come only by mail. It ends as upstream's ingest leaves the inbox (D7): an
+//! applied import or merge rewrites it drained; any other outcome deletes
+//! it, a REFRESH after mailing nothing until its deletion commits (D14).
+//! Mail never adopts, replaces or removes a pair, and only a REPLY into the
+//! account's own organizer copy runs the delegating fan-out (D15).
 
 use crate::{
     DestroyArchive, SizeWriter,
@@ -69,9 +80,10 @@ use crate::{
         CalendarEventNotificationContent, ChangedBy, EVENT_NOTIFICATION_IS_CHANGE,
         alerts::{DefaultAlerts, DefaultAlertsResolver},
         fanout::{
-            ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaScheduleStatus, ZaSource,
-            za_set_schedule_status,
+            ITIP_STATUS_KEY_REFUSED, ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaScheduleStatus,
+            ZaSource, za_imip_mail, za_mail_reachable, za_mail_withheld, za_set_schedule_status,
         },
+        itip::{itip_auto_add_allowed, itip_fill_organizer, itip_sender_snapshot},
         privacy::{EventPrivacy, ICalendarPrivacy},
         schedule::{AlarmTasks, EventAlarmScheduler, EventAlarmUsers},
         seal::{
@@ -84,7 +96,7 @@ use crate::{
         sharing::resolve::{za_owned_calendar_context, za_owned_event_contexts},
     },
     scheduling::{
-        Attendee, InstanceId, ItipError, ItipSnapshots,
+        Attendee, InstanceId, ItipError, ItipMessage, ItipSnapshots,
         inbound::{
             MergeAction, MergeResult, itip_import_message, itip_merge_changes, itip_method,
             itip_process_message,
@@ -104,7 +116,13 @@ use common::{
     DavName, Server,
     auth::AccountInfo,
     storage::index::SplitUpdate,
-    za::lease::{ZaUidLease, ZaUidLeaseGuard},
+    za::{
+        imip::{
+            ZA_IMIP_ITEM_DELETED, ZA_IMIP_KEY_SENDER, ZA_IMIP_LOOKUP_FAILED, ZaImipPending,
+            ZaMailClass, za_imip_trace_unrouted, za_imip_trace_withheld,
+        },
+        lease::{ZaUidLease, ZaUidLeaseGuard},
+    },
 };
 use registry::schema::enums::StorageQuota;
 use std::{future::Future, sync::Arc};
@@ -516,6 +534,10 @@ struct ItemCtx<'a> {
     document_id: u32,
     changed_by: ChangedBy,
     created: i64,
+    /// A mail-borne item (iMIP spec 4.2: it carried `X-ZA-SENDER`), set
+    /// from the opened carriers before any write. Its iTIP-level rejections
+    /// and a merge that changes nothing delete it (D7, `delete_mail`).
+    mail: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -523,6 +545,10 @@ enum Method {
     Request,
     Cancel,
     Reply,
+    /// iMIP spec D5: accepted from a mail-borne item only.
+    Add,
+    /// iMIP spec D5: accepted from a mail-borne item only.
+    Refresh,
 }
 
 /// What a merge applies.
@@ -532,6 +558,11 @@ enum Incoming {
     Cancel,
     /// The replier's token (spec 3.3, "Verification").
     Reply(Zeroizing<[u8; TOKEN_LEN]>),
+    /// A mail-borne item of any method, applied with the carrier's sender
+    /// (iMIP spec 4.3, D5): no token, no pair.
+    Mail {
+        sender: String,
+    },
 }
 
 /// Spec 6.4 steps 1-5 for one item. An error carries the item's UID once
@@ -576,7 +607,7 @@ async fn drain_item(
         .deserialize::<CalendarEventNotificationContent>()
         .caused_by(trc::location!())
         .map_err(no_uid)?;
-    let ctx = ItemCtx {
+    let mut ctx = ItemCtx {
         server,
         account_info,
         keys,
@@ -585,6 +616,7 @@ async fn drain_item(
         document_id,
         changed_by: item.changed_by.clone(),
         created: item.created,
+        mail: false,
     };
     // A pending row the fan-out did not write (any other content shape)
     // cannot be opened: permanent, as an undecodable item.
@@ -593,18 +625,34 @@ async fn drain_item(
     };
     // Step 1: open. A failure is permanent (spec 6.5): the private key
     // never changes, so nothing will ever read this item.
-    let carriers = match open_pending_item(&mut tree, account_id, private_key) {
+    let mut carriers = match open_pending_item(&mut tree, account_id, private_key) {
         Ok(carriers) => carriers,
         Err(err) => return item_outcome(ctx.delete_undecodable(seal_reason(&err)).await, None),
     };
+    ctx.mail = carriers.sender.is_some();
     // An unknown or missing METHOD cannot come from the fan-out: permanent.
+    // ADD and REFRESH come only by mail (iMIP spec D5).
     let method = match itip_method(&tree) {
         Ok(ICalendarMethod::Request) => Method::Request,
         Ok(ICalendarMethod::Cancel) => Method::Cancel,
         Ok(ICalendarMethod::Reply) => Method::Reply,
+        Ok(ICalendarMethod::Add) if ctx.mail => Method::Add,
+        Ok(ICalendarMethod::Refresh) if ctx.mail => Method::Refresh,
         Ok(_) => return item_outcome(ctx.delete_undecodable("UnsupportedMethod").await, None),
         Err(_) => return item_outcome(ctx.delete_undecodable("MissingMethod").await, None),
     };
+    // iMIP spec D5 step 1: a mail-borne REQUEST or REPLY gets upstream's
+    // Exchange fill again, before its first snapshot as upstream's parse
+    // fills before its snapshot. Delivery filled with the envelope
+    // recipient, which the item does not carry, so the repeat names the
+    // account's first address (spec question 2); on every item delivery
+    // wrote it adds nothing.
+    if ctx.mail
+        && matches!(method, Method::Request | Method::Reply)
+        && let Some(address) = account_info.addresses().first()
+    {
+        itip_fill_organizer(&mut tree, address);
+    }
     let (uid, candidates) = match itip_snapshot(&tree, account_info.addresses(), false) {
         Ok(snapshots) => (
             snapshots.uid.to_string(),
@@ -617,7 +665,12 @@ async fn drain_item(
     if pass.blocks_uid(&uid) {
         return Ok(ItemOutcome::Waiting);
     }
-    let result = apply(&ctx, tree, carriers, method, &uid, candidates).await;
+    // iMIP spec 4.3: only now, on the carrier, so a mail-borne item waits
+    // behind a skipped one and counts toward the failure limit as any.
+    let result = match carriers.sender.take() {
+        Some(sender) => apply_mail(&ctx, tree, sender, method, &uid).await,
+        None => apply(&ctx, tree, carriers, method, &uid, candidates).await,
+    };
     item_outcome(result, Some(uid))
 }
 
@@ -715,7 +768,16 @@ async fn apply(
     // takes the first hit.
     let existing = find_event(server, account_id, uid).await?;
     match (method, existing) {
-        (Method::Request, None) => import(ctx, tree, carriers.pair, uid, sender_addresses).await,
+        (Method::Request, None) => {
+            import(
+                ctx,
+                tree,
+                Incoming::Request(carriers.pair),
+                uid,
+                sender_addresses,
+            )
+            .await
+        }
         (Method::Request, Some(event_id)) => {
             merge(
                 ctx,
@@ -747,7 +809,100 @@ async fn apply(
         (Method::Cancel | Method::Reply, None) => {
             ctx.reject(tree, None, &ItipError::EventNotFound).await
         }
+        // `drain_item` reads ADD and REFRESH only from a mail-borne item,
+        // which never comes here; a fan-out item never carries them.
+        (Method::Add | Method::Refresh, _) => ctx.delete_undecodable("UnsupportedMethod").await,
     }
+}
+
+/// iMIP spec 4.3 (D5, D7): a mail-borne item, applied as `itip_ingest`
+/// applies the mail, with the carrier's sender. Delivery's checks are
+/// repeated on the opened tree (4.1 steps 2-4; the Exchange fill ran in
+/// `drain_item`), the UID looked up, then upstream's import (a REQUEST, no
+/// event, under the auto-add predicate again, D2) or merge (an event
+/// exists) through the drain's commits. Every outcome upstream's ingest
+/// leaves no inbox item for deletes the item (`delete_mail`). A store error
+/// from a lookup keyed by the sender's address is the item's own failure,
+/// kept to its type (section 7).
+async fn apply_mail(
+    ctx: &ItemCtx<'_>,
+    tree: ICalendar,
+    sender: String,
+    method: Method,
+    uid: &str,
+) -> trc::Result<bool> {
+    let server = ctx.server;
+    let account_id = ctx.keys.account_id;
+    // 4.1 step 2: the snapshot and the method's sender rule.
+    if let Err(err) = itip_sender_snapshot(&tree, ctx.account_info.addresses(), &sender).map(|_| ())
+    {
+        return ctx.reject(tree, None, &err).await;
+    }
+    // 4.1 step 4: key accounts reach each other only through the fan-out.
+    let principal = server
+        .za_account_id_from_email(&sender)
+        .await
+        .map_err(sender_lookup_error)?;
+    if let Some(principal_id) = principal
+        && server
+            .za_is_key_account(principal_id)
+            .await
+            .map_err(sender_lookup_error)?
+    {
+        return ctx.delete_mail(ZA_IMIP_KEY_SENDER).await;
+    }
+    match (method, find_event(server, account_id, uid).await?) {
+        (Method::Request, None) => {
+            if !itip_auto_add_allowed(server, account_id, principal.is_some(), &sender)
+                .await
+                .map_err(sender_lookup_error)?
+            {
+                return ctx
+                    .delete_mail(itip_reason(&ItipError::AutoAddDisabled))
+                    .await;
+            }
+            import(
+                ctx,
+                tree,
+                Incoming::Mail {
+                    sender: sender.clone(),
+                },
+                uid,
+                vec![sender],
+            )
+            .await
+        }
+        (_, Some(event_id)) => {
+            // Spec question 3: holds one session while another drains the
+            // same item (the two-session REFRESH case); `import` keeps its
+            // own pause point.
+            #[cfg(feature = "test_mode")]
+            common::za::test_hooks::drain_lookup_pause_point(account_id).await;
+            merge(
+                ctx,
+                event_id,
+                tree,
+                Incoming::Mail {
+                    sender: sender.clone(),
+                },
+                vec![sender],
+            )
+            .await
+        }
+        (_, None) => {
+            ctx.delete_mail(itip_reason(&ItipError::EventNotFound))
+                .await
+        }
+    }
+}
+
+/// iMIP spec section 7: a store error from a lookup keyed by the sender's
+/// address keeps only its type (the pass adds the account id where it
+/// traces it), so no key it looked up reaches a trace.
+fn sender_lookup_error(err: trc::Error) -> trc::Error {
+    trc::Error::new(err.event_type())
+        .details(ZA_IMIP_LOOKUP_FAILED)
+        .caused_by(trc::location!())
 }
 
 async fn find_event(server: &Server, account_id: u32, uid: &str) -> trc::Result<Option<u32>> {
@@ -784,8 +939,8 @@ fn sender_candidates(snapshots: &ItipSnapshots<'_>, method: Method) -> Vec<ZaSen
     for snapshot in snapshots.components.values() {
         for entry in &snapshot.comp.entries {
             let property = match method {
-                Method::Reply => ICalendarProperty::Attendee,
-                Method::Request | Method::Cancel => ICalendarProperty::Organizer,
+                Method::Reply | Method::Refresh => ICalendarProperty::Attendee,
+                Method::Request | Method::Cancel | Method::Add => ICalendarProperty::Organizer,
             };
             if entry.name != property {
                 continue;
@@ -887,12 +1042,13 @@ fn governing_instance(instance: InstanceKey, instances: &AHashSet<InstanceKey>) 
 }
 
 /// Spec 6.4, REQUEST with no event: upstream's import (`itip_ingest`) with
-/// the commit replaced, under the creation lease (6.3). A local sender
-/// always adds, so `itip_auto_add` does not apply.
+/// the commit replaced, under the creation lease (6.3). `incoming` is
+/// `Request` with the item's pair, or `Mail` (iMIP spec 4.3). A local sender
+/// always adds, so `itip_auto_add` does not apply; the mail arm checked it.
 async fn import(
     ctx: &ItemCtx<'_>,
     tree: ICalendar,
-    pair: Option<TokenPairs>,
+    incoming: Incoming,
     uid: &str,
     sender_addresses: Vec<String>,
 ) -> trc::Result<bool> {
@@ -926,15 +1082,14 @@ async fn import(
     // or PUT): merge instead.
     if let Some(event_id) = find_event(server, account_id, uid).await? {
         lease.release().await;
-        return merge(
-            ctx,
-            event_id,
-            tree,
-            Incoming::Request(pair),
-            sender_addresses,
-        )
-        .await;
+        return merge(ctx, event_id, tree, incoming, sender_addresses).await;
     }
+    // Spec 3.3, "Attendee side": the copy takes the pair the item carried;
+    // mail carries none (iMIP spec 4.3 point 4).
+    let pair = match incoming {
+        Incoming::Request(pair) => pair,
+        Incoming::Cancel | Incoming::Reply(_) | Incoming::Mail { .. } => None,
+    };
     let mut event_tree = tree.clone();
     if let Err(err) = itip_import_message(&mut event_tree) {
         lease.release().await;
@@ -1048,6 +1203,64 @@ enum Step {
     Reject(ItipError),
     Merge(Vec<MergeAction>),
     Nothing,
+    /// A mail-borne REFRESH's answer, upstream's one message to the sender.
+    Answer(ItipMessage<ICalendar>),
+}
+
+/// iMIP spec D14: a REFRESH is answered by mail only after the item's
+/// deletion commits; its archive assertion admits one session, so one
+/// answer goes out per REFRESH. No item, pin or status is written for it.
+/// PR review ruling P1 (fail closed): a recipient that is not of the mail
+/// class (`za_mail_reachable`, the fan-out's classification) gets no answer,
+/// traced without the address. Final review ruling A-2 (fail closed): nor
+/// does a recipient that holds a contact pin in the account's pin record,
+/// or any when no usable record decides it (`za_mail_withheld`). The item
+/// is deleted all the same. A store error reading the pin state or a
+/// recipient's class is returned (ruling O-4: section 7's transient class),
+/// so the item stays pending and counts toward `DRAIN_ITEM_FAILURE_LIMIT`.
+/// The answers are held by the abandonment guard from before the deletion's
+/// commit (rulings A-3 and A-4): submitted after it returns `Ok`, traced as
+/// dropped after an error and as abandoned when the request ends first;
+/// each submission is traced by `za_imip_submit`.
+async fn answer_refresh(
+    ctx: &ItemCtx<'_>,
+    event_id: u32,
+    message: ItipMessage<ICalendar>,
+) -> trc::Result<bool> {
+    let account_id = ctx.keys.account_id;
+    // `za_pin_state` answers an unusable record as a state (no record, its
+    // mark read), so its error is a store error.
+    let state = ctx
+        .server
+        .za_pin_state(ctx.keys)
+        .await
+        .caused_by(trc::location!())?;
+    let mut answers = ZaImipPending::default();
+    for to in &message.to {
+        if !za_mail_reachable(ctx.server, account_id, to)
+            .await
+            .caused_by(trc::location!())?
+        {
+            za_imip_trace_unrouted(account_id, event_id);
+            continue;
+        }
+        match za_mail_withheld(Some(&state), to) {
+            Some(status) => {
+                za_imip_trace_withheld(account_id, event_id, status == ITIP_STATUS_KEY_REFUSED)
+            }
+            None => answers.push(za_imip_mail(account_id, event_id, &message, to)),
+        }
+    }
+    match answers.on_err(ctx.delete_mail("Refresh").await)? {
+        true => {
+            answers.submit(ctx.server).await;
+            Ok(true)
+        }
+        false => {
+            answers.dropped();
+            Ok(false)
+        }
+    }
 }
 
 /// An instance's identity across two snapshots of one event: `None` for
@@ -1064,10 +1277,12 @@ pub fn instance_key(instance: &InstanceId) -> InstanceKey {
 
 /// An event's attendance before a merge, per instance (spec 6.4,
 /// "Delegates"): for each attendee's lowercased address, the lowercased
-/// addresses of its DELEGATED-FROM.
+/// addresses of its DELEGATED-FROM; and, for the mail arm, every
+/// lowercased address that attended any instance.
 struct Attendance {
     instances: AHashSet<InstanceKey>,
     attendees: AHashMap<(InstanceKey, String), AHashSet<String>>,
+    addresses: AHashSet<String>,
 }
 
 impl Attendance {
@@ -1075,6 +1290,7 @@ impl Attendance {
         let mut attendance = Attendance {
             instances: AHashSet::new(),
             attendees: AHashMap::new(),
+            addresses: AHashSet::new(),
         };
         for (instance, snapshot) in &snapshots.components {
             let instance = instance_key(instance);
@@ -1082,9 +1298,11 @@ impl Attendance {
             // An address listed twice in one instance keeps the union of
             // its DELEGATED-FROM sets.
             for attendee in &snapshot.attendees {
+                let address = attendee.email.email.to_ascii_lowercase();
+                attendance.addresses.insert(address.clone());
                 attendance
                     .attendees
-                    .entry((instance, attendee.email.email.to_ascii_lowercase()))
+                    .entry((instance, address))
                     .or_default()
                     .extend(delegators(attendee));
             }
@@ -1093,21 +1311,82 @@ impl Attendance {
     }
 
     /// Whether `attendee`, as `instance` of the merged event lists it, is
-    /// new to that instance: it did not attend it before, or its
+    /// new. On release 2's token-authenticated path (`mail` false): new to
+    /// that instance, because it did not attend it before or its
     /// DELEGATED-FROM gained an address (a new delegation to an existing
     /// attendee). An override the merge created inherits the attendance
     /// of the instance that governs it (`governing_instance`: the latest
     /// range override at or before it, else the master), so a delegator's
     /// own per-occurrence delegation does not make the delegator new.
-    fn is_new(&self, instance: InstanceKey, attendee: &Attendee<'_>) -> bool {
-        match self.attendees.get(&(
-            governing_instance(instance, &self.instances),
-            attendee.email.email.to_ascii_lowercase(),
-        )) {
+    /// PR review rulings P2 and P2-R: a mail-borne merge (`mail`) counts
+    /// only an address absent from every instance of the event before.
+    /// Per instance is not enough on mail: the delegating fan-out keeps
+    /// its recipients by address, and upstream's full build and the split
+    /// per recipient give each one every instance it attends. So an
+    /// address new to one instance would also be re-sent the instances it
+    /// already attended, and its own line there would be whatever the
+    /// outside attendee's mail had reset it to, without its token or an
+    /// organizer edit. The cost: an attendee that the mail adds to an
+    /// instance it did not attend, or whose DELEGATED-FROM gained an
+    /// address, learns it at the organizer's next update, as upstream's
+    /// plain path. This string rule is the mail arm's first filter; ruling
+    /// P2-R2 then compares by account (`za_drop_attended_accounts`).
+    fn is_new(&self, instance: InstanceKey, attendee: &Attendee<'_>, mail: bool) -> bool {
+        let address = attendee.email.email.to_ascii_lowercase();
+        if mail {
+            return !self.addresses.contains(&address);
+        }
+        match self
+            .attendees
+            .get(&(governing_instance(instance, &self.instances), address))
+        {
             Some(before) => !delegators(attendee).is_subset(before),
             None => true,
         }
     }
+}
+
+/// PR review ruling P2-R2, the mail arm's second filter after
+/// `Attendance::is_new`: drops from `candidates`, the new delegates by
+/// address, every address that resolves to an account some address of
+/// `before` resolves to. The string rule alone is not enough on mail:
+/// internal delivery is per account, and `Server::za_mail_class` folds a
+/// sub-address (on by default), an alias and a second domain name into one
+/// account, so a co-attendee's second address would re-open the reset
+/// rulings P2 and P2-R closed. Only an account counts; any other class is
+/// left as it is, since the fan-out's `internal_only` already keeps it
+/// from being mailed. The resolver is the quiet one (invariant 47: no
+/// cache event carries an address); a lookup error is returned, so the
+/// item stays pending and counts as its failure (as ruling O-4). The
+/// cost: a few registry lookups per mail-borne REPLY into a key
+/// organizer's copy, and a delegate who shares an account with an earlier
+/// attendee learns of it at the organizer's next update.
+async fn za_drop_attended_accounts(
+    server: &Server,
+    before: &Attendance,
+    candidates: &mut AHashSet<String>,
+) -> trc::Result<()> {
+    let mut attended = AHashSet::new();
+    for address in &before.addresses {
+        if let ZaMailClass::Account(account_id) = server.za_mail_class(address).await? {
+            attended.insert(account_id);
+        }
+    }
+    if attended.is_empty() {
+        return Ok(());
+    }
+    let mut dropped = Vec::new();
+    for candidate in candidates.iter() {
+        if let ZaMailClass::Account(account_id) = server.za_mail_class(candidate).await?
+            && attended.contains(&account_id)
+        {
+            dropped.push(candidate.clone());
+        }
+    }
+    for candidate in dropped {
+        candidates.remove(&candidate);
+    }
+    Ok(())
 }
 
 /// An attendee's DELEGATED-FROM addresses, lowercased.
@@ -1203,8 +1482,11 @@ async fn merge(
             }
         }
         Incoming::Request(_) | Incoming::Cancel => sender_addresses[0].clone(),
+        // iMIP spec 4.3: the carrier's address, as upstream's ingest takes
+        // the mail's sender; no token is read or required.
+        Incoming::Mail { sender } => sender.clone(),
     };
-    let (step, is_organizer_update, before, event_uid) = {
+    let (step, is_organizer_update, before, event_uid, mail_delegates) = {
         let snapshots = match itip_snapshot(&event.content.data.event, addresses, false) {
             Ok(snapshots) => snapshots,
             Err(err) => return ctx.reject(tree, Some(event_id), &err).await,
@@ -1215,6 +1497,12 @@ async fn merge(
         };
         let is_organizer_update = !itip_snapshots.organizer.email.is_local;
         let event_uid = snapshots.uid.to_string();
+        // iMIP spec D15's gate: a mail-borne merge fans out to delegates only
+        // for a REPLY into the account's own organizer copy (the stored
+        // ORGANIZER is one of its addresses).
+        let mail_delegates = matches!(incoming, Incoming::Mail { .. })
+            && snapshots.organizer.email.is_local
+            && matches!(itip_method(&tree), Ok(ICalendarMethod::Reply));
         // The attendance before the merge, per instance: an attendee the
         // merge adds to an instance is a delegate (spec 6.4, "Delegates").
         let before = Attendance::of(&snapshots);
@@ -1233,19 +1521,27 @@ async fn merge(
             ) {
                 Ok(MergeResult::Actions(changes)) => Step::Merge(changes),
                 Ok(MergeResult::None) => Step::Nothing,
-                // Only REFRESH yields a message; it cannot come from the
-                // fan-out (spec 6.4 step 3).
+                // Only REFRESH yields a message. By mail it is answered
+                // (iMIP spec D14); it cannot come from the fan-out (spec
+                // 6.4 step 3).
+                Ok(MergeResult::Message(message)) if matches!(incoming, Incoming::Mail { .. }) => {
+                    Step::Answer(message)
+                }
                 Ok(MergeResult::Message(_)) => {
                     Step::Reject(ItipError::UnsupportedMethod(ICalendarMethod::Refresh))
                 }
                 Err(err) => Step::Reject(err),
             }
         };
-        (step, is_organizer_update, before, event_uid)
+        (step, is_organizer_update, before, event_uid, mail_delegates)
     };
     let changes = match step {
         Step::Reject(err) => return ctx.reject(tree, Some(event_id), &err).await,
+        // iMIP spec D7: upstream's ingest writes no inbox item when the
+        // merge changes nothing.
+        Step::Nothing if ctx.mail => return ctx.delete_mail("NothingToMerge").await,
         Step::Nothing => return ctx.rewrite_only(tree, Some(event_id), 0).await,
+        Step::Answer(message) => return answer_refresh(ctx, event_id, message).await,
         Step::Merge(changes) => changes,
     };
     // 1.0.1's `commit_itip_merge`: the stored classification is kept when
@@ -1302,28 +1598,42 @@ async fn merge(
             }
         }
         Incoming::Request(None) | Incoming::Cancel => {}
+        // iMIP spec 4.3 point 4: mail takes `Request(None)`'s rule, the
+        // copy's pairs as stored, except a REPLY into the account's own
+        // organizer copy, which fans out to its new delegates below (D15).
+        Incoming::Mail { .. } if !mail_delegates => {}
         // Delegates the merge added get their token from the organizer,
         // whose session this is, through the same fan-out a PUT uses:
         // upstream's organizer request builder on the merged tree,
         // restricted to the new attendees (spec 6.4, "Delegates").
-        Incoming::Reply(_) => {
+        Incoming::Reply(_) | Incoming::Mail { .. } => {
             // Upgrade ruling 154: the new delegates whose invitation's split
             // failed, for their `5.1`.
             let mut split_failed: Vec<String> = Vec::new();
+            let mail = matches!(incoming, Incoming::Mail { .. });
             let new_attendees = match itip_snapshot(&event.content.data.event, addresses, false) {
                 Ok(after) => {
-                    // Compared per instance, so a delegate who already
-                    // attends another instance is new to this one, and an
-                    // attendee that became a delegate is new too; the set
-                    // dedups the addresses for delivery.
+                    // On release 2's token path, compared per instance, so
+                    // a delegate who already attends another instance is
+                    // new to this one, and an attendee that became a
+                    // delegate is new too. On the mail arm only an address
+                    // absent from every instance before is new (rulings P2
+                    // and P2-R), and then only if its account attended no
+                    // instance either (ruling P2-R2). The set dedups the
+                    // addresses for delivery.
                     let mut new_attendees: AHashSet<String> = AHashSet::new();
                     for (instance, snapshot) in &after.components {
                         let instance = instance_key(instance);
                         for attendee in &snapshot.attendees {
-                            if before.is_new(instance, attendee) {
+                            if before.is_new(instance, attendee, mail) {
                                 new_attendees.insert(attendee.email.email.to_ascii_lowercase());
                             }
                         }
+                    }
+                    if mail && !new_attendees.is_empty() {
+                        za_drop_attended_accounts(server, &before, &mut new_attendees)
+                            .await
+                            .caused_by(trc::location!())?;
                     }
                     if new_attendees.is_empty() {
                         Ok(None)
@@ -1411,6 +1721,9 @@ async fn merge(
                                 uid: &event_uid,
                             },
                             ZaFanOutKind::Change,
+                            // iMIP spec 5.5 (D15): internal delegates only,
+                            // in the release 2 arm and the mail arm alike.
+                            true,
                             RecipientPolicy::new(&server.core.groupware, event.meta.flags),
                             reply_lease.as_ref().map(|lease| lease.lease()),
                             None,
@@ -1703,12 +2016,17 @@ impl ItemCtx<'_> {
 
     /// Spec 6.4 step 4: an iTIP-level rejection leaves the calendar
     /// unchanged; the item is kept as history. The reason is a fixed name.
+    /// A mail-borne item is deleted instead (iMIP spec D7: upstream's ingest
+    /// writes no inbox item then).
     async fn reject(
         &self,
         tree: ICalendar,
         event_id: Option<u32>,
         err: &ItipError,
     ) -> trc::Result<bool> {
+        if self.mail {
+            return self.delete_mail(itip_reason(err)).await;
+        }
         trc::event!(
             Calendar(trc::CalendarEvent::ItipMessageError),
             AccountId = self.keys.account_id,
@@ -1741,6 +2059,27 @@ impl ItemCtx<'_> {
             Details = "zero-access: undecodable inbox item deleted",
         );
         self.delete().await
+    }
+
+    /// iMIP spec D7, section 7: a mail-borne item whose outcome upstream's
+    /// ingest leaves no inbox item for (an iTIP-level rejection, the
+    /// key-account sender, `AutoAddDisabled`, `EventNotFound`, a merge that
+    /// changes nothing, a REFRESH) is deleted. `reason` is a fixed name.
+    /// Traced once the deletion committed (final review, ledger 142): a
+    /// session that loses the item's assertion, or a store error, traces no
+    /// deletion.
+    async fn delete_mail(&self, reason: &'static str) -> trc::Result<bool> {
+        let deleted = self.delete().await?;
+        if deleted {
+            trc::event!(
+                Calendar(trc::CalendarEvent::ItipMessageError),
+                AccountId = self.keys.account_id,
+                DocumentId = self.document_id,
+                Reason = reason,
+                Details = ZA_IMIP_ITEM_DELETED,
+            );
+        }
+        Ok(deleted)
     }
 
     /// Spec 6.5, token mismatch: a traced drop of a forgery, a REPLY from
@@ -1827,7 +2166,7 @@ impl ItemCtx<'_> {
     }
 }
 
-/// Only a quota limit is "over quota", as `fanout::write_item_inner`
+/// Only a quota limit is "over quota", as `fanout::za_write_pending_item`
 /// classifies it; any other error of the quota check is a store error.
 fn is_over_quota(err: &trc::Error) -> bool {
     err.matches(trc::EventType::Limit(trc::LimitEvent::Quota))
@@ -2321,8 +2660,144 @@ mod tests {
                 .find(|attendee| attendee.email.email == "del@example.com")
                 .unwrap();
             assert!(
-                !before.is_new(None, del),
+                !before.is_new(None, del, false),
                 "the union lost delegator {delegator}"
+            );
+        }
+    }
+
+    /// PR review ruling P2: a DELEGATED-FROM gain makes an existing attendee
+    /// new on release 2's token-authenticated path, never on the mail arm;
+    /// an attendee absent before is new on both.
+    #[test]
+    fn mail_counts_only_attendees_absent_before() {
+        fn attendee<'x>(tree: &'x ICalendar, address: &str) -> Attendee<'x> {
+            itip_snapshot(tree, &organizer(), false)
+                .unwrap()
+                .components
+                .get(&InstanceId::Main)
+                .unwrap()
+                .attendees
+                .iter()
+                .find(|attendee| attendee.email.email == address)
+                .unwrap()
+                .clone()
+        }
+        let org = organizer();
+        // `del` attends without a delegator, then gains one.
+        let before = parse(concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\n",
+            "UID:stale-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\n",
+            "DTEND:20990102T100000Z\r\nSEQUENCE:0\r\nORGANIZER:mailto:org@example.com\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:del@example.com\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ));
+        let before = Attendance::of(&itip_snapshot(&before, &org, false).unwrap());
+        let gained = delegated_by(&["a@example.com"]);
+        let del = attendee(&gained, "del@example.com");
+        assert!(
+            before.is_new(None, &del, false),
+            "the gain on release 2's path"
+        );
+        assert!(!before.is_new(None, &del, true), "the gain on the mail arm");
+        // `del` did not attend before (only att@example.com did).
+        let absent = Attendance::of(&itip_snapshot(&event(None), &org, false).unwrap());
+        assert!(absent.is_new(None, &del, false), "absent, release 2's path");
+        assert!(absent.is_new(None, &del, true), "absent, the mail arm");
+    }
+
+    /// A daily master listing `master` and an override of the 3rd listing
+    /// `overridden`, each address on a NEEDS-ACTION line.
+    fn attended(master: &[&str], overridden: &[&str]) -> ICalendar {
+        fn lines(addresses: &[&str]) -> String {
+            addresses
+                .iter()
+                .map(|address| format!("ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:{address}\r\n"))
+                .collect()
+        }
+        parse(&format!(
+            concat!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\n",
+                "UID:stale-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\n",
+                "DTEND:20990102T100000Z\r\nRRULE:FREQ=DAILY;COUNT=5\r\nSEQUENCE:0\r\n",
+                "ORGANIZER:mailto:org@example.com\r\n{}END:VEVENT\r\nBEGIN:VEVENT\r\n",
+                "UID:stale-1\r\nRECURRENCE-ID:20990103T090000Z\r\nDTSTAMP:20240101T000000Z\r\n",
+                "DTSTART:20990103T100000Z\r\nDTEND:20990103T110000Z\r\nSEQUENCE:0\r\n",
+                "ORGANIZER:mailto:org@example.com\r\n{}END:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+            lines(master),
+            lines(overridden)
+        ))
+    }
+
+    /// PR review ruling P2-R: on the mail arm an address that attended any
+    /// instance before is never new, in whichever instance the merge lists
+    /// it; release 2's token-authenticated path stays per instance.
+    #[test]
+    fn mail_counts_only_addresses_absent_from_every_instance() {
+        /// The instance and the attendee `address` of `tree`'s master
+        /// (`overridden` false) or of its override.
+        fn listed<'x>(
+            tree: &'x ICalendar,
+            overridden: bool,
+            address: &str,
+        ) -> (InstanceKey, Attendee<'x>) {
+            let snapshots = itip_snapshot(tree, &organizer(), false).unwrap();
+            let (instance, snapshot) = snapshots
+                .components
+                .iter()
+                .find(|(instance, _)| matches!(instance, InstanceId::Main) != overridden)
+                .unwrap();
+            let attendee = snapshot
+                .attendees
+                .iter()
+                .find(|attendee| attendee.email.email == address)
+                .unwrap()
+                .clone();
+            (instance_key(instance), attendee)
+        }
+        let org = organizer();
+        let (att, del) = ("att@example.com", "del@example.com");
+        // `del` attends the master, not the override; the merge lists it in
+        // the override too.
+        let before = attended(&[att, del], &[att]);
+        let before = Attendance::of(&itip_snapshot(&before, &org, false).unwrap());
+        let after = attended(&[att, del], &[att, del]);
+        let (instance, listed_del) = listed(&after, true, del);
+        assert!(instance.is_some(), "the override's instance");
+        assert!(
+            before.is_new(instance, &listed_del, false),
+            "master to override, release 2's path"
+        );
+        assert!(
+            !before.is_new(instance, &listed_del, true),
+            "master to override, the mail arm"
+        );
+        // `del` attends the override only; the merge lists it in the master.
+        let before = attended(&[att], &[att, del]);
+        let before = Attendance::of(&itip_snapshot(&before, &org, false).unwrap());
+        let (instance, listed_del) = listed(&after, false, del);
+        assert!(instance.is_none(), "the master's instance");
+        assert!(
+            before.is_new(instance, &listed_del, false),
+            "override to master, release 2's path"
+        );
+        assert!(
+            !before.is_new(instance, &listed_del, true),
+            "override to master, the mail arm"
+        );
+        // `del` attends no instance before: new in either, on both paths.
+        let before = attended(&[att], &[att]);
+        let before = Attendance::of(&itip_snapshot(&before, &org, false).unwrap());
+        for overridden in [false, true] {
+            let (instance, listed_del) = listed(&after, overridden, del);
+            assert!(
+                before.is_new(instance, &listed_del, false),
+                "absent from every instance, release 2's path ({overridden})"
+            );
+            assert!(
+                before.is_new(instance, &listed_del, true),
+                "absent from every instance, the mail arm ({overridden})"
             );
         }
     }
@@ -2471,5 +2946,70 @@ mod tests {
                 .contains(canary),
             "the control: upstream's text carries the address"
         );
+    }
+
+    // iMIP spec 3.1 item 2: the start of `itip_ingest`, extracted. The
+    // fixtures are of the `imip-*` family (spec 8.2).
+    const REPLY_WITHOUT_ORGANIZER: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\nUID:imip-fill-1\r\nDTSTAMP:20260101T000000Z\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:imip-att@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const CANCEL_WITHOUT_ORGANIZER: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:CANCEL\r\nBEGIN:VEVENT\r\nUID:imip-fill-2\r\nDTSTAMP:20260101T000000Z\r\nATTENDEE:mailto:imip-att@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const REQUEST_FROM_ORG: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:imip-rule-1\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSEQUENCE:0\r\nORGANIZER:mailto:imip-org@remote.test\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:imip-key@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const REPLY_FROM_ATT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\nUID:imip-rule-2\r\nDTSTAMP:20260101T000000Z\r\nSEQUENCE:0\r\nORGANIZER:mailto:imip-key@example.com\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:imip-att@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    /// The ORGANIZER values of every component, in order.
+    fn organizers(ical: &ICalendar) -> Vec<String> {
+        ical.components
+            .iter()
+            .flat_map(|comp| comp.entries.iter())
+            .filter(|entry| entry.name == ICalendarProperty::Organizer)
+            .filter_map(|entry| entry.values.first().and_then(|v| v.as_text()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn the_exchange_fill_adds_an_organizer_only_where_missing() {
+        use crate::calendar::itip::{itip_fill_organizer, itip_parse_inbound};
+        let mut reply = parse(REPLY_WITHOUT_ORGANIZER); // ATTENDEE imip-att, no ORGANIZER
+        itip_fill_organizer(&mut reply, "imip-key@example.com");
+        assert_eq!(organizers(&reply), ["mailto:imip-key@example.com"]);
+        itip_fill_organizer(&mut reply, "other@example.com");
+        assert_eq!(
+            organizers(&reply),
+            ["mailto:imip-key@example.com"],
+            "idempotent"
+        );
+        let mut cancel = parse(CANCEL_WITHOUT_ORGANIZER);
+        itip_fill_organizer(&mut cancel, "imip-key@example.com");
+        assert!(organizers(&cancel).is_empty(), "REPLY and REQUEST only");
+        assert!(matches!(
+            itip_parse_inbound("not ical", "x@example.com"),
+            Err(ItipError::ICalendarParseError)
+        ));
+        // The parse runs the fill, in `itip_ingest`'s order.
+        let parsed = itip_parse_inbound(REPLY_WITHOUT_ORGANIZER, "imip-key@example.com")
+            .unwrap_or_else(|_| panic!("the reply parses"));
+        assert_eq!(organizers(&parsed), ["mailto:imip-key@example.com"]);
+    }
+
+    #[test]
+    fn the_sender_rule_follows_the_method() {
+        use crate::calendar::itip::itip_sender_snapshot;
+        let own = vec!["imip-key@example.com".to_string()];
+        let request = parse(REQUEST_FROM_ORG); // ORGANIZER imip-org, ATTENDEE imip-key
+        assert!(itip_sender_snapshot(&request, &own, "imip-org@remote.test").is_ok());
+        assert!(matches!(
+            itip_sender_snapshot(&request, &own, "imip-att@remote.test"),
+            Err(ItipError::SenderIsNotOrganizer)
+        ));
+        let reply = parse(REPLY_FROM_ATT); // ORGANIZER imip-key, ATTENDEE imip-att
+        assert!(itip_sender_snapshot(&reply, &own, "imip-att@remote.test").is_ok());
+        assert!(
+            itip_sender_snapshot(&reply, &own, "imip-key@example.com").is_ok(),
+            "3.2 item 12"
+        );
+        assert!(matches!(
+            itip_sender_snapshot(&reply, &own, "imip-stranger@remote.test"),
+            Err(ItipError::SenderIsNotOrganizerNorAttendee)
+        ));
     }
 }

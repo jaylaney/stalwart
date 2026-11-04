@@ -7,9 +7,11 @@
 //! Zero-access helpers shared by the request paths and the background
 //! services: the UID creation lease (invitations spec 6.3), the mail login
 //! gate, the mail protocols' fixed client texts and trace details (mail
-//! spec 4, 8, 10) and, in test builds, the pause and failure hooks of spec
-//! 11.
+//! spec 4, 8, 10), release 5's iMIP submission seam (iMIP spec 5.3: the
+//! submitter `services` registers and `za_imip_submit`) and, in test builds,
+//! the pause and failure hooks of spec 11.
 
+pub mod imip;
 pub mod lease;
 pub mod mail;
 pub mod metadata;

@@ -111,6 +111,10 @@ pub struct SessionData {
     /// Mail spec 10: a recipient of the current transaction is a key account;
     /// the DATA and BDAT reads are redacted.
     pub za_key_rcpt: bool,
+    /// iMIP PR review ruling O-1: the release 5 submitter's own local
+    /// session (`ImipComposer::submit` for a key account), exempt from the
+    /// inbound rate limiters (`Session::is_allowed`).
+    pub za_imip_submission: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +195,7 @@ impl SessionData {
             dnsbl_error: None,
             za_answers_334: false,
             za_key_rcpt: false,
+            za_imip_submission: false,
         }
     }
 
@@ -338,6 +343,7 @@ impl SessionData {
             dnsbl_error: None,
             za_answers_334: false,
             za_key_rcpt: false,
+            za_imip_submission: false,
         }
     }
 }

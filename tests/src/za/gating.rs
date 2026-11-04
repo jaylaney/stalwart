@@ -7,22 +7,28 @@
 use super::{
     STRONG,
     dav_seal::{raw_event, raw_event_records},
-    fanout::NO_REPLY,
+    drain::DrainOn,
+    fanout::{NO_REPLY, uid_copies},
 };
 use crate::utils::{
+    http::HttpRequest,
     jmap::{JmapResponse, JmapUtils},
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::{SERVER_URL, mail_count, plant_event, wait_for_delivery},
+    za::{
+        SERVER_URL, clear_received_scheduling, copy_href, delete_inbox_item, inbox_ids,
+        inbox_items, mail_count, new_inbox_items, pending_ids, plant_event, trigger_drain,
+        wait_for_delivery,
+    },
 };
 use common::auth::oauth::GrantType;
 use dav_proto::schema::property::{DavProperty, PrincipalProperty};
 use groupware::cache::GroupwareCache;
 use groupware::calendar::{
-    CalendarEvent, CalendarEventContent,
+    CalendarEvent, CalendarEventContent, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
     itip::{ItipIngest, RsvpError, RsvpRequest, RsvpResponse},
 };
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use serde_json::{Value, json};
 use std::time::Duration;
 use types::collection::SyncCollection;
@@ -522,35 +528,38 @@ pub async fn test_scheduling(test: &mut TestServer) {
     let plain_inbox = "/dav/itip/plain%40example.com/inbox/";
     let plain_id = plain.id().document_id();
     // Mail counts before anything is sent. iMIP email is delivered to the
-    // recipient's mailbox (mail is not sealed in this release), so a count
-    // that does not move shows the sender sent nothing.
+    // recipient's mailbox, so a count shows what the sender sent.
     let plain_mail = mail_count(test, plain_id).await;
     let key_mail = mail_count(test, key1_id).await;
+    // key1's inbox items before this test, so it deletes only its own.
+    let key_items = inbox_ids(test, key1_id).await;
 
     // Organizer is a key account (invitations spec 5.1, `SendSealed`): the
     // schedule tag is set as upstream sets it. plain is a non-key account,
-    // so the fan-out does not attempt it and no mail is sent.
-    let response = key_client
-        .request_with_headers(
-            "PUT",
+    // of iMIP's mail class: mailed after the commit (iMIP spec 5.4, 8.5).
+    // The PUT mails plain: the raw client (5 s, PR review T-2).
+    let response = HttpRequest::with_credentials(8899, "key1@example.com", STRONG)
+        .send_full(
+            Method::PUT,
             &format!("{key_cal}invite.ics"),
-            [CONTENT_TYPE],
-            KEY_INVITE,
+            Some(KEY_INVITE.as_bytes().to_vec()),
+            Some(CONTENT_TYPE.1),
         )
-        .await
-        .with_status(StatusCode::CREATED);
+        .await;
+    assert_eq!(response.status.as_u16(), 201, "{}", response.body);
     assert!(
-        response.headers.get("schedule-tag").is_some(),
+        response.header("schedule-tag").is_some(),
         "{:?}",
         response.headers
     );
     wait_for_delivery(test).await;
-    // Sender side: nothing left the key organizer.
-    assert_eq!(mail_count(test, plain_id).await, plain_mail);
-    assert_eq!(
-        members(&plain_client, plain_inbox).await,
-        Vec::<String>::new()
-    );
+    // iMIP spec 5.6, 8.5: the invitation reached plain once; its ingest
+    // (upstream's) lists one notification and imports one copy. Its lack of
+    // RSVP links is read from a plain local attendee's delivered copy in
+    // `imip::outbound`'s `mailed_once` (final review C-10).
+    assert_eq!(mail_count(test, plain_id).await, plain_mail + 1);
+    assert_eq!(members(&plain_client, plain_inbox).await.len(), 1);
+    assert_eq!(uid_copies(test, plain_id, "za-invite-1").await, 1);
 
     // RSVP page: a token for a key account's event is refused as an invalid
     // link, before the event is read.
@@ -619,8 +628,8 @@ pub async fn test_scheduling(test: &mut TestServer) {
 
     // A legacy plaintext event with a schedule tag and a visible attendee:
     // a key account's DELETE builds its CANCEL (invitations spec 5.5), and
-    // the fan-out does not attempt plain, a non-key account, so no mail
-    // leaves.
+    // the fan-out hands plain, a non-key account, to the mailer after the
+    // commit (iMIP spec 5.5, 8.5).
     plant_event(
         test,
         key1_id,
@@ -637,18 +646,22 @@ pub async fn test_scheduling(test: &mut TestServer) {
     wait_for_delivery(test).await;
     assert_eq!(
         mail_count(test, plain_id).await,
-        plain_mail,
-        "a CANCEL left the key organizer"
+        plain_mail + 2,
+        "the CANCEL did not reach plain"
     );
-    assert_eq!(
-        members(&plain_client, plain_inbox).await,
-        Vec::<String>::new()
-    );
+    // What plain received from the key organizer, set aside from the RSVP
+    // reply counted below.
+    let plain_received = members(&plain_client, plain_inbox).await;
 
     // Attendee is a key account: the invitation (and its cancellation) never
-    // reaches its scheduling inbox or calendar. The email itself lands in its
-    // mailbox (mail is not sealed in this release), as the mail-count asserts
-    // below show.
+    // reaches its calendar or the DAV listing of its scheduling inbox. The
+    // email itself lands in its mailbox, as the mail-count asserts below
+    // show, and delivery turns it into a mail-borne pending item, which the
+    // listing hides (iMIP spec 4.1, 4.5, 8.5).
+    let (key_before, key_pending) = (
+        inbox_ids(test, key1_id).await,
+        pending_ids(test, key1_id).await,
+    );
     plain_client
         .request(
             "MKCALENDAR",
@@ -667,11 +680,55 @@ pub async fn test_scheduling(test: &mut TestServer) {
         .await
         .with_status(StatusCode::CREATED);
     wait_for_delivery(test).await;
-    // The invitation email itself was delivered, so the empty inbox and
-    // calendar below are the ingest gate's doing, not timing.
+    // The invitation email itself was delivered, so the empty listing and
+    // calendar below are not timing.
     assert_eq!(mail_count(test, key1_id).await, key_mail + 1);
+    // iMIP spec 4.1, 4.5, 8.5: at store level, one more pending item, a
+    // mail-borne one (the drain is skipped, so nothing imports it).
+    assert_eq!(
+        pending_ids(test, key1_id).await.len(),
+        key_pending.len() + 1,
+        "the plain organizer's invitation left no pending item"
+    );
+    let invited = new_inbox_items(test, key1_id, &key_before).await;
+    assert!(
+        invited.len() == 1
+            && invited[0].1.changed_by == ChangedBy::CalendarAddress(String::new())
+            && invited[0].1.flags & EVENT_NOTIFICATION_ZA_PENDING != 0,
+        "the new item is not one mail-borne pending item"
+    );
     assert_eq!(members(&key_client, key_inbox).await, Vec::<String>::new());
     assert_eq!(members(&key_client, key_cal).await, Vec::<String>::new());
+    // iMIP spec 4.3, 4.5, 8.5: key1's drain imports the item as a copy and
+    // keeps the item, drained, as the mail-borne history upstream's ingest
+    // writes. The copy and the item go before the RSVP block below plants
+    // its own copy of the same UID.
+    {
+        let _drain = DrainOn::new();
+        assert_eq!(trigger_drain("key1@example.com", STRONG).await, 207);
+        assert_eq!(
+            pending_ids(test, key1_id).await,
+            key_pending,
+            "the drain left the invitation pending"
+        );
+        let copy = copy_href(test, key1_id, "za-invite-2").await;
+        let drained = inbox_items(test, key1_id)
+            .await
+            .into_iter()
+            .find(|(id, _)| *id == invited[0].0)
+            .map(|(_, item)| item)
+            .expect("the drained item");
+        assert!(
+            drained.changed_by == ChangedBy::CalendarAddress(String::new())
+                && drained.flags & EVENT_NOTIFICATION_ZA_PENDING == 0,
+            "the item is not one drained mail-borne item"
+        );
+        key_client
+            .request_with_headers("DELETE", &copy, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+        delete_inbox_item(test, &key_client, key1_id, invited[0].0).await;
+    }
 
     // RSVP from the key attendee on the non-key organizer's page: the
     // organizer's copy records it, and the key attendee's own copy is never
@@ -759,8 +816,13 @@ pub async fn test_scheduling(test: &mut TestServer) {
         .await
         .with_status(StatusCode::NO_CONTENT);
     // The RSVP reply reaches the organizer's scheduling inbox directly, not
-    // through the mail queue: exactly one notification.
-    let replies = members(&plain_client, plain_inbox).await;
+    // through the mail queue: exactly one notification beside what the key
+    // organizer mailed plain (iMIP spec 8.5).
+    let replies = members(&plain_client, plain_inbox)
+        .await
+        .into_iter()
+        .filter(|member| !plain_received.contains(member))
+        .collect::<Vec<_>>();
     assert_eq!(replies.len(), 1, "{replies:?}");
     for member in replies {
         plain_client
@@ -769,22 +831,37 @@ pub async fn test_scheduling(test: &mut TestServer) {
             .with_status(StatusCode::NO_CONTENT);
     }
 
+    let before_cancel = inbox_ids(test, key1_id).await;
     plain_client
         .request("DELETE", &format!("{plain_cal}invite.ics"), "")
         .await
         .with_status(StatusCode::NO_CONTENT);
     wait_for_delivery(test).await;
-    // The CANCEL email was delivered too; the ingest gate dropped it.
+    // The CANCEL email was delivered too, and makes no item: the drain
+    // consumed the invitation's item and its copy is gone, so the UID is
+    // unknown at delivery (iMIP spec 4.1 step 5: `EventNotFound`).
     assert_eq!(mail_count(test, key1_id).await, key_mail + 2);
+    assert_eq!(
+        inbox_ids(test, key1_id).await,
+        before_cancel,
+        "the CANCEL of an unknown UID made an item"
+    );
     assert_eq!(members(&key_client, key_inbox).await, Vec::<String>::new());
     assert_eq!(members(&key_client, key_cal).await, Vec::<String>::new());
+    // iMIP spec 8.5: this test's mail-borne items go with it.
+    for id in inbox_ids(test, key1_id).await {
+        if !key_items.contains(&id) {
+            delete_inbox_item(test, &key_client, key1_id, id).await;
+        }
+    }
     plain_client
         .request("DELETE", plain_cal, "")
         .await
         .with_status(StatusCode::NO_CONTENT);
-    // Counting `plain`'s mail created its default mailboxes; `plain` outlives
-    // the suite, so remove them for the final emptiness check.
-    test.destroy_all_mailboxes(&plain).await;
+    // iMIP spec 8.5: `plain` outlives the suite, so what it received goes
+    // for the final emptiness check (its mail, the notifications and the
+    // calendar its ingest created).
+    clear_received_scheduling(test, &plain).await;
 }
 
 /// `test_metadata`'s accounts.

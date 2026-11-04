@@ -27,6 +27,21 @@
 //! - `COMMIT_FAIL_ONCE`: the commit of a key account's PUT create fails once
 //!   with an internal error after its fan-out, keyed by the account
 //!   (`dav::calendar::za_commit_create`).
+//! - `UPDATE_COMMIT_FAIL_ONCE`: the first commit of a key account's PUT
+//!   update fails once with an internal error after its fan-out, in place of
+//!   `commit_batch`'s result, keyed by the event owner
+//!   (`dav::calendar::update`, iMIP spec 8.2).
+//! - `DELETE_COMMIT_FAIL_ONCE`: the commit of a key account's event or
+//!   collection DELETE fails once with an internal error after its
+//!   fan-outs, in place of `commit_batch`'s result, keyed by the event owner
+//!   (`dav::calendar::delete`, iMIP spec 8.2).
+//! - `IMIP_SUBMIT_FAIL_ONCE`: the account's next iMIP submission answers
+//!   `Failed` without reaching the submitter, keyed by the event's account
+//!   (`common::za::imip::za_imip_submit`, iMIP spec 5.3).
+//! - `PIN_READ_FAIL_ONCE`: the account's next pin-state read
+//!   (`Server::za_pin_state`) fails once with a store error, keyed by the
+//!   session's account (`common::auth::vault`; the drain's REFRESH answer,
+//!   iMIP spec 7's transient class, PR review ruling O-4).
 //! - `TASK_CONSUMER_PAUSE`: the task manager's consumer loop takes no task
 //!   while it is held; global (`services::task_manager::manager`).
 //! - The lease-duration override: stands in for `ZA_UID_LEASE_SECS`, which
@@ -35,8 +50,10 @@
 //!   entries one `contacts/pin` call attempts (`http::api::contacts`,
 //!   through `common::za::redeliver_batch_override`).
 //! - `DRAIN_LOOKUP_PAUSE`: in the drain's import, after the first UID
-//!   lookup found nothing and before the creation lease, keyed by the
-//!   draining account (`groupware::calendar::drain`).
+//!   lookup found nothing and before the creation lease, and in its mail
+//!   arm after the UID lookup found the event and before the merge (iMIP
+//!   spec question 3), keyed by the draining account
+//!   (`groupware::calendar::drain`).
 //! - `DRAIN_LEASE_PAUSE`: in the drain's import, holding the lease, after
 //!   the second lookup and immediately before the commit, keyed by the
 //!   draining account.
@@ -104,6 +121,10 @@
 //!   `store::za_test`; set it through `ForceCommitSplit`, whose drop clears
 //!   it, so a test that panics while it is set does not leave every later
 //!   batch splitting.
+//! - `SECOND_CHUNK_FAIL_ONCE` (iMIP spec 8.2): `Store::write_batch` fails a
+//!   batch whose current account is the named account before its second
+//!   commit chunk, after the first is written; one-shot. Defined in
+//!   `store::za_test`; its setter is re-exported here.
 //! - `PROPFIND_ADMITTED_PAUSE` (upgrade ruling 142): in a foreign key
 //!   account's calendar PROPFIND, after `foreign_calendar_contexts` admitted
 //!   the calendars and before any item is read, keyed by the requesting
@@ -113,7 +134,9 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
-pub use store::za_test::{FORCE_COMMIT_SPLIT, Pause, set_index_chunk_pause};
+pub use store::za_test::{
+    FORCE_COMMIT_SPLIT, Pause, set_index_chunk_pause, set_second_chunk_fail_once,
+};
 
 /// Sets `FORCE_COMMIT_SPLIT` to `account_id` for the guard's lifetime; the
 /// drop clears it, also when the test panics.
@@ -146,6 +169,18 @@ pub static TASK_CONSUMER_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// The account whose next key-account PUT create fails its commit.
 pub static COMMIT_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// The account whose next key-account PUT update fails its first commit.
+pub static UPDATE_COMMIT_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// The account whose next key-account DELETE fails its commit.
+pub static DELETE_COMMIT_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// The account whose next iMIP submission fails.
+pub static IMIP_SUBMIT_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// The account whose next pin-state read fails.
+pub static PIN_READ_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 
 pub static DRAIN_LOOKUP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
@@ -228,6 +263,28 @@ pub fn set_task_consumer_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_commit_fail_once(account_id: Option<u32>) {
     *COMMIT_FAIL_ONCE.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_update_commit_fail_once(account_id: Option<u32>) {
+    *UPDATE_COMMIT_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_delete_commit_fail_once(account_id: Option<u32>) {
+    *DELETE_COMMIT_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_imip_submit_fail_once(account_id: Option<u32>) {
+    *IMIP_SUBMIT_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_pin_read_fail_once(account_id: Option<u32>) {
+    *PIN_READ_FAIL_ONCE.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
 }
 
 pub fn set_lease_secs_override(secs: Option<u64>) {
@@ -467,6 +524,27 @@ pub fn take_drain_fail(account_id: u32) -> bool {
 /// Whether the commit of `account_id` must fail now; clears the flag.
 pub fn take_commit_fail(account_id: u32) -> bool {
     take_flag(&COMMIT_FAIL_ONCE, account_id)
+}
+
+/// Whether the PUT update commit of `account_id` must fail now; clears the
+/// flag.
+pub fn take_update_commit_fail(account_id: u32) -> bool {
+    take_flag(&UPDATE_COMMIT_FAIL_ONCE, account_id)
+}
+
+/// Whether the DELETE commit of `account_id` must fail now; clears the flag.
+pub fn take_delete_commit_fail(account_id: u32) -> bool {
+    take_flag(&DELETE_COMMIT_FAIL_ONCE, account_id)
+}
+
+/// Whether the iMIP submission of `account_id` must fail now; clears the flag.
+pub fn take_imip_submit_fail(account_id: u32) -> bool {
+    take_flag(&IMIP_SUBMIT_FAIL_ONCE, account_id)
+}
+
+/// Whether the account's pin-state read must fail now; clears the flag.
+pub fn take_pin_read_fail(account_id: u32) -> bool {
+    take_flag(&PIN_READ_FAIL_ONCE, account_id)
 }
 
 /// Whether the account's next private-key unwrap must fail; clears the flag.

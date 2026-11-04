@@ -13,6 +13,7 @@ jmap_proto = { path = "../jmap-proto" }
 jmap-tools = { path = "../jmap-tools" }
 common = { path =  "../common" }
 groupware = { path =  "../groupware" }
+calcard = { path = "../calcard" }
 registry = { path =  "../registry" }
 vault = { path = "../vault" }
 text-extract = { path = "../text-extract" }
