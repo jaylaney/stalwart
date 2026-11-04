@@ -1,10 +1,10 @@
 # Building and testing the zero-access fork
 
-See the [release policy](../../releases.md) for independent versioning, tags, upstream
+See the [release policy](releases.md) for independent versioning, tags, upstream
 provenance, and the release checklist. Record fork release changes in the
-[fork changelog](../../../CHANGELOG-fork.md); the root `CHANGELOG.md` remains upstream history.
+[fork changelog](../CHANGELOG-fork.md); the root `CHANGELOG.md` remains upstream history.
 
-- Base: upstream Stalwart `v1.0.1` (commit `23b69755cb3cd8ecd952fe0443c5ac067a506184`). The fork's own version, now `0.2.0-beta.1`, is independent of it: `fork-release.toml` records both, the shipping `stalwart` package carries the fork version, and the internal crates keep upstream's `1.0.1` (the fork-owned `vault` crate keeps `0.16.25`). `stalwart --version` prints the fork version, the upstream tag and commit, and the source commit.
+- Base: upstream Stalwart `v1.0.1` (commit `23b69755cb3cd8ecd952fe0443c5ac067a506184`). The fork's own version is independent of it: `fork-release.toml` records both, the shipping `stalwart` package carries the fork version, and the internal crates keep upstream's `1.0.1` (the fork-owned `vault` crate keeps `0.16.25`). `stalwart --version` prints the fork version, the upstream tag and commit, and the source commit.
 - Fresh stores only. A 1.0-based build cannot open a store written by upstream 0.16 or by the fork's 0.16-based releases (`0.1.x`), and there is no conversion: the server stamps a new store with its schema version and edition and refuses any other. Old stores are unsupported; move an installation by provisioning a fresh store (new setup tokens, new enrolment), keeping the old store and binary for rollback. The local-server scripts default to `.run-1.0/` for this reason.
 - Package names: `-p http` is ambiguous (the dependency graph also holds the crates.io `http` crate, through hyper, reqwest, axum and others); select the fork's with `-p http@1.0.1`. `cargo fmt` rejects that form, so format it with `cargo fmt --manifest-path crates/http/Cargo.toml`.
 - Toolchain: stable Rust via rustup. Xcode command line tools for RocksDB.
@@ -39,10 +39,9 @@ provenance, and the release checklist. Record fork release changes in the
 ## Merging upstream
 
 The current integrated upstream base is Stalwart `v1.0.1`, commit
-`23b69755cb3cd8ecd952fe0443c5ac067a506184`, on fresh stores only; the fork preview is
-`0.2.0-beta.1`. The fork moved from `v0.16.27` by the plan
-[`2026-10-27-stalwart-1-upgrade.md`](2026-10-27-stalwart-1-upgrade.md); its
-[outcome note](2026-10-27-stalwart-1-upgrade-outcome.md) records the merge, the hook
+`23b69755cb3cd8ecd952fe0443c5ac067a506184`, on fresh stores only; the fork version is recorded in `fork-release.toml`. The fork moved from `v0.16.27` by the plan
+[`2026-10-27-stalwart-1-upgrade.md`](superpowers/plans/2026-10-27-stalwart-1-upgrade.md); its
+[outcome note](superpowers/plans/2026-10-27-stalwart-1-upgrade-outcome.md) records the merge, the hook
 inventory, the conflict ledger and the qualification. The 0.16-based line (`0.1.x`) is not
 maintained, and its stores do not open on 1.0.
 
@@ -127,7 +126,7 @@ own tests against sealed data.
 
 Two setup-complete key accounts can share an owner calendar at `view` or `edit` through
 `POST /api/vault/shares`, `/api/vault/shares/grant` and `/api/vault/shares/revoke`.
-See [the sharing API](../../zero-access/calendar-sharing-api.md) for request bodies, pinning,
+See [the sharing API](zero-access/calendar-sharing-api.md) for request bodies, pinning,
 exact refusals, measurement conditions and the privacy boundary. The owner pins the grantee's
 current public key before granting; a first-use pin is accepted, with out-of-band comparison
 recommended when confirming it. Revoke by the stable grant id because aliases can move.
@@ -156,7 +155,7 @@ STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests jmap
 cargo build --release -p stalwart --no-default-features --features rocks
 ```
 
-The [plan 14 outcome](2026-10-23-zero-access-plan14-outcome.md) records actual automated
+The [plan 14 outcome](superpowers/plans/2026-10-23-zero-access-plan14-outcome.md) records actual automated
 results, temporary measurement instrumentation, limitations and pending native/review gates.
 No passing automated suite establishes native client behavior, SQL or multi-node execution.
 

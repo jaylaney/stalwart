@@ -121,7 +121,7 @@ The existing approved designs remain the source of product behaviour:
 - [Mail](2026-10-20-zero-access-mail-design.md), including its resolved implementation items.
 - [Sharing revision 14](2026-10-22-zero-access-sharing-design.md) and the accepted
   [implementation interpretations](../plans/2026-10-23-zero-access-plan14-outcome.md).
-- [Release policy](../../releases.md) and [developer merge gates](../plans/README-dev.md).
+- [Release policy](../../releases.md) and [developer merge gates](../../README-dev.md).
 
 The contracts below are acceptance criteria, not an opportunity to redesign those features.
 

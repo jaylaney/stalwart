@@ -981,7 +981,7 @@ git commit -m "Add the zero-access leak regression test and run it in CI"
 
 **Files:**
 - Create: `docs/zero-access/manual-checklist.md`
-- Modify: `docs/superpowers/plans/README-dev.md`
+- Modify: `docs/README-dev.md`
 
 - [ ] **Step 1: Write the manual checklist (spec 11)**
 
@@ -1015,7 +1015,7 @@ can read nothing meaningful in the stored records (spot-check with the leak scan
 
 - [ ] **Step 2: Final notes**
 
-Append to `docs/superpowers/plans/README-dev.md`:
+Append to `docs/README-dev.md`:
 
 ```markdown
 - Full verification: `cargo test -p vault -p groupware -p common`, then `za::za_tests`, then `webdav::webdav_tests` in both modes.

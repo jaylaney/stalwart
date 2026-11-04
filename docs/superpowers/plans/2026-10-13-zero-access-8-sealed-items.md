@@ -41,7 +41,7 @@ Section 9's associated-data rows for inbox items were amended alongside this pla
 
 `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` (release 1) also binds: sections 6, 7 and 12 for the sealing policy, the carriers and invariants 1-10.
 
-Project rules: `CLAUDE.md`, `docs/superpowers/plans/README-dev.md`, `docs/superpowers/plans/2026-10-06-zero-access-plan3-outcome.md`.
+Project rules: `CLAUDE.md`, `docs/README-dev.md`, `docs/superpowers/plans/2026-10-06-zero-access-plan3-outcome.md`.
 
 ## Global Constraints
 

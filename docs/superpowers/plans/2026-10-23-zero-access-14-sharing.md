@@ -1330,7 +1330,7 @@ grouped only for readability):
 **Files:** Create `docs/zero-access/calendar-sharing-api.md` and
 `docs/superpowers/plans/2026-10-23-zero-access-plan14-outcome.md`.
 Update `docs/zero-access/manual-checklist.md`, `CLAUDE.md`,
-`docs/superpowers/plans/README-dev.md` and the root `README.md` sharing capability summary.
+`docs/README-dev.md` and the root `README.md` sharing capability summary.
 The outcome file is written from actual execution results.
 
 **Interfaces:** The API handoff reproduces §4's request/response fields, status bodies,

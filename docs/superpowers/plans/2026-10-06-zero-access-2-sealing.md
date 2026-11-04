@@ -2062,7 +2062,7 @@ git commit -m "Seal key-account collections on MKCALENDAR and PROPPATCH"
 
 **Files:**
 - Modify: `tests/src/webdav/mod.rs`
-- Modify: `docs/superpowers/plans/README-dev.md`
+- Modify: `docs/README-dev.md`
 
 **Interfaces:**
 - Produces: `ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav::webdav_tests` runs `basic`, `put_get`, `mkcol`, `prop`, `multiget`, `sync`, `lock`, `principals`, `card_query`, `cal_query` and `cal_itip` unchanged against key accounts; `copy_move`, `acl`, `cal_alarm` and `cal_scheduling` are skipped in that mode until plan 3 adds their variants.
@@ -2105,7 +2105,7 @@ Expected: all `test result: ok`. `put_get` in key mode is the byte-exact fidelit
 Append to `README-dev.md`: `- In ZA_KEY_ACCOUNTS=1 mode the acl, cal_alarm, cal_scheduling and copy_move modules are skipped until plan 3 (variants).`
 
 ```bash
-git add tests docs/superpowers/plans/README-dev.md
+git add tests docs/README-dev.md
 git commit -m "Run the CalDAV suite against sealed key accounts"
 ```
 

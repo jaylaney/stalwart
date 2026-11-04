@@ -44,7 +44,7 @@ The fork diff stays narrow:
 
 `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` (release 1) also binds: sections 8 (write paths), 9 (session keys on every DAV request) and 12 (invariants 1-10).
 
-Project rules: `CLAUDE.md`, `docs/superpowers/plans/README-dev.md`, `docs/superpowers/plans/2026-10-06-zero-access-plan3-outcome.md`. Plan 8's outcome note (`docs/superpowers/plans/2026-10-13-zero-access-plan8-outcome.md`) gives the interfaces this plan calls.
+Project rules: `CLAUDE.md`, `docs/README-dev.md`, `docs/superpowers/plans/2026-10-06-zero-access-plan3-outcome.md`. Plan 8's outcome note (`docs/superpowers/plans/2026-10-13-zero-access-plan8-outcome.md`) gives the interfaces this plan calls.
 
 ## Global Constraints
 

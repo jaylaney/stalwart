@@ -29,7 +29,7 @@ The fork diff stays narrow: one new module (`drain.rs`), additions to the fork's
 
 `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` (release 1) also binds: section 9 (session keys on every DAV request), section 10 (traces and unseal failures), section 12 (invariants 1-10).
 
-Project rules: `CLAUDE.md`, `docs/superpowers/plans/README-dev.md`, `docs/superpowers/plans/2026-10-06-zero-access-plan3-outcome.md`. The plan 8 outcome note (`docs/superpowers/plans/2026-10-13-zero-access-plan8-outcome.md`, "Facts for plans 9 and 10") and the plan 9 outcome note (`docs/superpowers/plans/2026-10-14-zero-access-plan9-outcome.md`, "Facts for plan 10") give the interfaces this plan calls; their facts are restated in the tasks that need them.
+Project rules: `CLAUDE.md`, `docs/README-dev.md`, `docs/superpowers/plans/2026-10-06-zero-access-plan3-outcome.md`. The plan 8 outcome note (`docs/superpowers/plans/2026-10-13-zero-access-plan8-outcome.md`, "Facts for plans 9 and 10") and the plan 9 outcome note (`docs/superpowers/plans/2026-10-14-zero-access-plan9-outcome.md`, "Facts for plan 10") give the interfaces this plan calls; their facts are restated in the tasks that need them.
 
 ## Global Constraints
 

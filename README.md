@@ -1,69 +1,69 @@
-# Stalwart: personal zero-access fork
+# Stalwart: zero-access email and calendars
 
-This is a fork of [Stalwart](https://github.com/stalwartlabs/stalwart) for personal
-exploration. The goal is a version of Stalwart that offers server-side zero-access
-encryption, starting with calendar data and compatibility with existing CalDAV clients.
+A personal, experimental fork of [Stalwart](https://github.com/stalwartlabs/stalwart)
+for self-hosted email and calendars, with server-side zero-access encryption for stored
+mail and private calendar content. Use existing mail and CalDAV clients; no client
+extensions are required.
 
-Development is independent of the original project. There is no intention to open a pull
-request against upstream or merge these changes into the original Stalwart branch.
+## Current support
 
-## Goal and current scope
+- **Email:** SMTP delivery and submission, with IMAP, POP3 and JMAP mail access. Stored
+  messages and their private metadata are encrypted for zero-access accounts, including
+  mail delivered while the user is logged out.
+- **Calendars:** CalDAV events, tasks and journals, with private content and calendar
+  names, descriptions, colours and custom time zones encrypted at rest.
+- **Invitations by email:** invite people on other servers and receive their invitations,
+  replies, updates and cancellations through ordinary invitation email (iMIP). Incoming
+  invitations are processed at the next authenticated CalDAV sync, subject to the account's
+  scheduling settings.
+- **Local scheduling and sharing:** invitations between zero-access accounts on this server
+  use sealed internal delivery. View/edit calendar grants use pinned recipient keys and the
+  [sharing API](docs/zero-access/calendar-sharing-api.md); an editor can also schedule on
+  the owner's behalf.
+- **Account security:** passwords, recovery keys, TOTP and app passwords. An administrator
+  issues a setup token; the user completes enrolment on a separate account web app.
 
-The fork explores encrypting private calendar content at rest with per-user keys unlocked
-by the user's credentials. The current work focuses on:
+Ordinary accounts retain upstream behavior. Contacts and files retain upstream storage
+behavior and are outside this fork's zero-access encryption scope.
 
-- Zero-access accounts with password, recovery key, TOTP and app-password support.
-- Encryption of private event, task and journal content, plus calendar names, descriptions, colours and custom time zones.
-- Decryption during authenticated CalDAV requests so clients can use ordinary calendar data.
-- Local invitations and scheduling between key accounts, with delegated `SENT-BY` delivery
-  when an edit grantee schedules from the owner's calendar.
-- View/edit calendar grants to another setup-complete key account on this server, using
-  pinned recipient keys and the [vault sharing API](docs/zero-access/calendar-sharing-api.md).
-  CalDAV access uses the grantee's own credentials: view grants read, edit grants also write.
-- JMAP calendars, calendar re-sharing, free/busy-only grants, cross-server sharing and
-  key-account mail sharing remain refused or deferred. Calendar full-text search stays gated.
+For zero-access accounts, server-side searches and sorts that need sealed mail content are
+refused, and calendar full-text search stays gated. JMAP calendars, calendar re-sharing,
+free/busy-only grants, cross-server calendar sharing and mail sharing remain deferred or
+refused. Off-server invitations exchange event copies; they do not grant access to a calendar.
 
-Ordinary accounts continue to use Stalwart's existing behavior. The fork also encrypts
-key-account mail at rest (release 3); contacts and files retain upstream storage behavior.
-Calendar sharing native-client qualification remains pending; see the
-[outcome](docs/superpowers/plans/2026-10-23-zero-access-plan14-outcome.md).
-
-An account becomes zero-access through a setup token issued by an administrator, completed on
-an account web page that lives in a separate repository and is not part of this one.
+Native-client and real-provider qualification for email invitations remain pending; see the
+[manual checklist](docs/zero-access/manual-checklist.md) for current client verification status.
 
 ## What zero access means here
 
-The design aims to make sealed calendar fields unreadable from stored data alone without
-user credentials or an unlocked key. This includes database dumps, disks and backups.
+Stored mailbox content and sealed calendar fields are designed to be unreadable from
+database dumps, disks and backups without user credentials or an unlocked key.
 
 Encryption and decryption happen on the server. The running server receives credentials and
 handles plaintext while serving requests, and unlocked keys remain in a bounded in-memory
-cache. A compromised running server can capture those credentials or keys, so this model does
-not provide end-to-end encryption against the server itself.
+cache. A compromised running server can capture those credentials or keys, so this is not
+end-to-end encryption against the server. Logout does not promise immediate key erasure.
 
-The fork redacts authentication exchanges in mail-protocol raw traces and keeps key-account
-IMAP/POP3 sessions redacted. Sharing request/response bodies and key material are not traced;
-existing authentication account-name metadata remains. These trace controls do not protect
-against a compromised running server. Logout alone does not promise immediate key erasure:
-bounded cache residency and its hard cap still apply.
+**Mail in transit is outside this guarantee.** Ordinary email and emailed invitations exist
+in plaintext in SMTP queues until delivery or relay, with queue blobs retained until purge.
+Relays and external recipients can read their copies. SMTP logs record who sent mail to whom
+and when. Invitations between local zero-access accounts use sealed delivery instead.
 
-Removing a grantee stops fresh authorized access and rotates keys for future writes. Existing
-events are not resealed, and material the grantee could already read may have been copied.
-Cluster pubsub is required for prompt invalidation; a missed broadcast is not synchronous
-eviction of already resident keys.
+Some metadata remains visible, including sizes, event times, recurrence rules, identifiers,
+standard event classifications, filenames and sync history. Revoking a calendar grant stops
+fresh authorized access and rotates keys for future writes; it does not reseal existing
+events or retract copies. Prompt cache invalidation across nodes requires cluster pubsub.
 
-Some metadata remains visible, including event times, recurrence rules, identifiers, plaintext sizes,
-filenames and sync history. Each event's standard classification (`CLASS` PUBLIC, PRIVATE
-or CONFIDENTIAL) is visible too, so that sharers can hide events; any other `CLASS` value
-stays sealed. The
-[design and threat model](docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md)
-describes the sealed fields, visible metadata, key lifetime and security boundaries in detail.
+See the [calendar threat model](docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md),
+[mail design](docs/superpowers/specs/2026-10-20-zero-access-mail-design.md) and
+[email invitation design](docs/superpowers/specs/2026-11-02-zero-access-imip-design.md)
+for sealed fields, visible metadata and security boundaries.
 
 ## Development
 
-The fork is based on upstream Stalwart `v1.0.1`. Its own release version (currently
-`0.2.0-beta.1`, recorded in `fork-release.toml`) is independent of upstream's version;
-`stalwart --version` prints both, with the source commit.
+The fork is based on upstream Stalwart `v1.0.1` and has an independent release version,
+recorded in [fork-release.toml](fork-release.toml). `stalwart --version` prints both
+versions and the source commit. See the [fork changelog](CHANGELOG-fork.md) for releases.
 
 Fresh stores only: a build on the 1.0 base cannot open a store written by upstream 0.16 or
 by the fork's earlier 0.16-based releases (`0.1.x`), and there is no conversion. Those stores
@@ -76,25 +76,14 @@ Build the fork from source with stable Rust:
 cargo build --release -p stalwart --no-default-features --features rocks
 ```
 
-On macOS with Homebrew's keg-only rustup, first run:
-
-```sh
-export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
-```
-
-RocksDB needs the Xcode command line tools on macOS. The dependency graph holds two packages named
-`http` (the server's and the crates.io crate that hyper, reqwest and others use), so select
-the server's as `-p http@1.0.1`.
-
 The product build excludes enterprise features. Do not deploy builds with the `test_mode`
 feature, which weakens password hashing for tests.
 
-- [Developer notes](docs/superpowers/plans/README-dev.md): build, test and account setup details,
-  and the upstream-merge procedure (fetch a verified release tag by URL, pin it for the
-  release verifier, run the gates).
-- [Release policy](docs/releases.md): independent versions, upstream provenance and release checks.
-- [Fork changelog](CHANGELOG-fork.md): changes and upgrade notes for fork releases.
-- [Manual client checklist](docs/zero-access/manual-checklist.md): CalDAV client verification.
+- [Developer guide](docs/README-dev.md): prerequisites, builds, tests, account setup and
+  upstream integration.
+- [Local server scripts](scripts/local-server/README.md): run a local development server.
+- [Release policy](docs/releases.md): versioning, provenance and release checks.
+- [Manual client checklist](docs/zero-access/manual-checklist.md): client and provider verification.
 - [Designs](docs/superpowers/specs/) and [plans and outcomes](docs/superpowers/plans/): scope,
   decisions and implementation records.
 
@@ -104,7 +93,7 @@ Stalwart provides the underlying mail and collaboration server. Credit for that 
 to Stalwart Labs and its contributors. The upstream website and documentation are at
 [stalw.art](https://stalw.art).
 
-This repository has its own experimental scope and development direction. Fork-specific bugs
+Development is independent, with no plan to submit these changes upstream. Fork-specific bugs
 and questions belong here; upstream's support channels and roadmap do not cover this work.
 The inherited [CONTRIBUTING.md](CONTRIBUTING.md) describes upstream's contribution policy,
 not a requirement or plan to submit this fork upstream.

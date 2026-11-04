@@ -43,7 +43,7 @@ Inputs the spec implies but no task's tests fully exercise, most likely to bite 
 ### Task 1: Toolchain, baseline build and baseline test run
 
 **Files:**
-- Create: `docs/superpowers/plans/README-dev.md` (how to build and run the suites)
+- Create: `docs/README-dev.md` (how to build and run the suites)
 - No source changes.
 
 **Interfaces:**
@@ -90,7 +90,7 @@ Expected: `Finished`. This is the configuration the product ships in: no `enterp
 
 - [ ] **Step 5: Write the developer note**
 
-Create `docs/superpowers/plans/README-dev.md`:
+Create `docs/README-dev.md`:
 
 ```markdown
 # Building and testing the zero-access fork
@@ -108,7 +108,7 @@ Create `docs/superpowers/plans/README-dev.md`:
 - [ ] **Step 6: Commit**
 
 ```bash
-git add docs/superpowers/plans/README-dev.md
+git add docs/README-dev.md
 git commit -m "Add developer build and test notes for the zero-access fork"
 ```
 
@@ -4307,7 +4307,7 @@ git commit -m "Add zero-access totp endpoint and refuse registry credential edit
 - Modify: `tests/src/webdav/mod.rs`
 - Create: `tests/src/za/caches.rs`
 - Modify: `tests/src/za/mod.rs`
-- Modify: `docs/superpowers/plans/README-dev.md`
+- Modify: `docs/README-dev.md`
 
 **Interfaces:**
 - Produces: `ZA_KEY_ACCOUNTS=1` runs `webdav_tests` with every test user provisioned through the account API. With plan 1 only (no sealing yet), the whole upstream suite must pass in that mode.
@@ -4431,7 +4431,7 @@ Expected: all `test result: ok`.
 
 - [ ] **Step 4: Update the developer note and commit**
 
-Append to `docs/superpowers/plans/README-dev.md`:
+Append to `docs/README-dev.md`:
 
 ```markdown
 - Zero-access account API tests: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests`
@@ -4440,7 +4440,7 @@ Append to `docs/superpowers/plans/README-dev.md`:
 ```
 
 ```bash
-git add tests docs/superpowers/plans/README-dev.md
+git add tests docs/README-dev.md
 git commit -m "Run the CalDAV suite against key accounts and check cache behaviour"
 ```
 

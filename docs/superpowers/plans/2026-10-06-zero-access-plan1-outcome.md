@@ -15,7 +15,7 @@ a fact the next plans need; none of it is derivable from the code alone.
   `-p http@0.16.25 --features test_mode` (6), `za_tests` (integration suite
   for the account API and caches), `webdav_tests` in baseline and in
   `ZA_KEY_ACCOUNTS=1` mode, `system_tests`.
-- Developer and operator notes: `README-dev.md` in this directory.
+- Developer and operator notes: [developer guide](../../README-dev.md).
 - Nothing has been pushed; the branch exists only on this machine.
 
 ## Deviations from the plan that later plans must know

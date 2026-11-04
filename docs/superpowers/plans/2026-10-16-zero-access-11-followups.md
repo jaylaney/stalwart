@@ -25,7 +25,7 @@ The fork diff stays narrow: edits inside the fork's own modules (`drain.rs`, `se
 - 10: a recorded private-key failure skips the drain for the rest of the session.
 Sections that bind unchanged: 3.3, 6.3, 6.4, 12. Release 1's spec (`docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md`) sections 10 and 12 bind too.
 
-Project rules: `CLAUDE.md`, `docs/superpowers/plans/README-dev.md`, `docs/superpowers/plans/2026-10-06-zero-access-plan3-outcome.md`. The plan 10 outcome note's "Deferred findings", "Follow-up list" and "PR #36 review" sections are this plan's input; its "Facts for release 3" section is not touched.
+Project rules: `CLAUDE.md`, `docs/README-dev.md`, `docs/superpowers/plans/2026-10-06-zero-access-plan3-outcome.md`. The plan 10 outcome note's "Deferred findings", "Follow-up list" and "PR #36 review" sections are this plan's input; its "Facts for release 3" section is not touched.
 
 ## Global Constraints
 

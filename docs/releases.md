@@ -73,7 +73,7 @@ its upstream updates during merges; do not insert fork release entries there.
 - Check the candidate's package versions, version output, tag handling, artifact names, and
   release-note generation against this policy.
 - Run the applicable release qualification in
-  [the developer guide](superpowers/plans/README-dev.md), including the upstream merge checks
+  [the developer guide](README-dev.md), including the upstream merge checks
   when relevant. Record exact commands, results, and outstanding gates for the candidate.
 - Record automated results separately from native client verification in
   [the manual checklist](zero-access/manual-checklist.md). Passing automated tests alone does

@@ -7,7 +7,7 @@ This Rust 2024 Cargo workspace forks Stalwart for zero-access calendars. `crates
 primarily in `crates/vault`, `crates/groupware`, `crates/dav`, and `crates/http`.
 Integration suites and fixtures live in `tests/src` and `tests/resources`; templates, locales,
 and deployment assets live in `resources`. Read `CLAUDE.md` and
-`docs/superpowers/plans/README-dev.md` before changing fork behavior; approved designs and
+`docs/README-dev.md` before changing fork behavior; approved designs and
 outcome records live under `docs/superpowers/`.
 
 ## Build, Test, and Development Commands

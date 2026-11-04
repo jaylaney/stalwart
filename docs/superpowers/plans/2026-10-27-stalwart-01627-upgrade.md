@@ -68,7 +68,7 @@ explicit permission/capacity, and serialize Cargo runs sharing output or test po
 
 ## Task 1: Prepare the isolated integration and source inventory
 
-**Files:** Read `CLAUDE.md`, `docs/superpowers/plans/README-dev.md`, approved feature outcomes
+**Files:** Read `CLAUDE.md`, `docs/README-dev.md`, approved feature outcomes
 and `docs/releases.md`. Create the execution record at
 `docs/superpowers/plans/2026-10-27-stalwart-01627-upgrade-outcome.md` during implementation.
 
@@ -185,7 +185,7 @@ and fork tests remain active. No stored-format, crypto, authorization or key-lif
 
 **Files:** `fork-release.toml`, `crates/main/Cargo.toml`, `Cargo.lock`;
 `scripts/tests/test_release_metadata.py`; read/test `scripts/release/test_verify_product.py`;
-`CHANGELOG-fork.md`, `docs/releases.md`, `CLAUDE.md`, `docs/superpowers/plans/README-dev.md`.
+`CHANGELOG-fork.md`, `docs/releases.md`, `CLAUDE.md`, `docs/README-dev.md`.
 Keep the existing build helper/verifier interfaces unless a regression proves a change needed.
 
 **Interfaces:** Proposed fork preview `0.1.0-beta.2`; upstream tag `v0.16.27` and full target
