@@ -5,8 +5,10 @@
  */
 
 use crate::utils::{jmap::JmapUtils, server::TestServer, smtp::SmtpConnection};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use crypto::{
-    EncryptOptions, KeyError, KeyKind, Protection, is_ciphertext, parse_public_keys, protection,
+    EncryptOptions, KeyError, KeyKind, Profile, Protection, RecipientIds, RecipientSet,
+    is_ciphertext, parse_public_keys, protection,
 };
 use mail_parser::MessageParser;
 use registry::schema::{
@@ -99,7 +101,13 @@ pub async fn test(test: &mut TestServer) {
         .recipients(now())
         .unwrap();
     assert_eq!(recipients.kind(), KeyKind::OpenPgp);
-    assert_eq!(recipients.key_type(), certs_parsed[1].set.key_type());
+    let expected_recipients = &certs_parsed[1].set;
+    assert_eq!(recipients.key_type(), expected_recipients.key_type());
+    assert_eq!(
+        openpgp_recipient_ids(recipients),
+        openpgp_recipient_ids(expected_recipients),
+        "cached recipients must match the registered OpenPGP fixture"
+    );
 
     // Send a new message, which should be encrypted
     let mut lmtp = SmtpConnection::connect().await;
@@ -201,6 +209,69 @@ pub async fn test(test: &mut TestServer) {
         .destroy_account(account)
         .await;
     test.cleanup().await;
+}
+
+// The fixture check observes the actual keys used to wrap a session key. PKESK
+// recipient IDs are visible even though the message and session key are encrypted.
+fn openpgp_recipient_ids(recipients: &RecipientSet) -> Vec<Vec<u8>> {
+    let message = MessageParser::new()
+        .parse(b"Subject: recipient check\r\n\r\nfixture")
+        .unwrap();
+    let encrypted = recipients
+        .encrypt(
+            &message,
+            &EncryptOptions {
+                // Modern includes all usable keys, including post-quantum keys
+                // that Compatible can omit when a certificate also has a classical key.
+                profile: Profile::Modern,
+                recipient_ids: RecipientIds::Real,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let encrypted = MessageParser::new().parse(&encrypted.message).unwrap();
+    let armor = encrypted.part(2).unwrap().decoded();
+    let armor = std::str::from_utf8(&armor).unwrap().trim_ascii();
+    let encoded: String = armor
+        .strip_prefix("-----BEGIN PGP MESSAGE-----\r\n\r\n")
+        .unwrap()
+        .strip_suffix("-----END PGP MESSAGE-----")
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with('='))
+        .collect();
+    let bytes = STANDARD.decode(encoded).unwrap();
+
+    // Read only the leading Public-Key Encrypted Session Key (PKESK)
+    // packets. Stalwart writes them with new-format packet headers.
+    const PKESK: u8 = 0xc1;
+    const SEIPD: u8 = 0xd2;
+    let mut packets = bytes.as_slice();
+    let mut ids = Vec::new();
+    while let [PKESK, length @ ..] = packets {
+        let (len, rest) = match length {
+            [a, rest @ ..] if *a < 192 => (usize::from(*a), rest),
+            [a, b, rest @ ..] if *a < 224 => {
+                (((usize::from(*a) - 192) << 8) + usize::from(*b) + 192, rest)
+            }
+            [255, a, b, c, d, rest @ ..] => (u32::from_be_bytes([*a, *b, *c, *d]) as usize, rest),
+            _ => panic!("unexpected PKESK packet length"),
+        };
+        let (body, rest) = rest.split_at_checked(len).unwrap();
+        let id = match body {
+            [3, recipient @ ..] => recipient.get(..8),
+            [6, len @ (21 | 33), recipient @ ..] => recipient.get(..usize::from(*len)),
+            _ => None,
+        }
+        .expect("PKESK must carry a real key ID or fingerprint");
+        assert!(id.iter().any(|byte| *byte != 0));
+        ids.push(id.to_vec());
+        packets = rest;
+    }
+    assert!(!ids.is_empty(), "OpenPGP message has no recipient packets");
+    assert_eq!(packets.first(), Some(&SEIPD));
+    ids.sort_unstable();
+    ids
 }
 
 pub fn import_certs_and_encrypt() {
