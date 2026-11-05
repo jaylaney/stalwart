@@ -1,13 +1,14 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 2, for approval. Revision 2 answers
-the builder check of the same day: the thread map loads on its own and
-every keyed request uses it as loaded (4.1, 4.3, 5.2, 7.4); the pass's
-log entry is an item update, since the change log folds a delete and an
-insert of one id into one (6.3); the thread history is stamped with the
-change id the pass consumed, so a segment is sealed before the batch
-that publishes it (5.1); the keyless-route question is section 13's
-open question 1. Scope: release 7 of the zero-access fork
+Date: 2026-11-04. Status: revision 3 (2026-11-05), approved by Jay.
+Revision 2 answered the builder check of 2026-11-04: the thread map
+loads on its own and every keyed request uses it as loaded (4.1, 4.3,
+5.2, 7.4); the pass's log entry is an item update, since the change log
+folds a delete and an insert of one id into one (6.3); the thread
+history is stamped with the change id the pass consumed, so a segment is
+sealed before the batch that publishes it (5.1). Revision 3 records
+Jay's decision on keyless sessions and the WebSocket (section 13,
+decision 1). Scope: release 7 of the zero-access fork
 (jaylaney/stalwart), item 5 of the release 1 spec's section 1.2 and
 GitHub issue #23 ("Search for key accounts"). Release 6 (JMAP calendars
 and the web client) and this release do not depend on each other; the
@@ -113,8 +114,8 @@ only those sessions hold.
 - A session's keys are resident as release 1 and mail spec 3.3 say: on
   HTTP for the request, from the key cache (idle 15 minutes, 1 hour at
   most); on IMAP and POP3 for the life of the connection; never on
-  WebSocket, EventSource, ManageSieve or SMTP sessions, pending section
-  13's open question 1.
+  WebSocket, EventSource, ManageSieve or SMTP sessions (section 13,
+  decision 1).
 - `mk` never rotates: setup is its only generation
   (`crates/http/src/api/vault.rs:1123`); a password change, a recovery
   and a recovery-key regeneration rewrap it. A key derived from it is
@@ -686,8 +687,8 @@ updates, all gated with `za_assert_mail_route` only
 the web client state-driven sync over the WebSocket. Every one of these
 emits or takes Email ids, so a keyless session would see singleton
 prefixes where a keyed one sees mapped ones: two representations of one
-account's ids for one client. Which way this resolves is section 13's
-open question 1; the design is written for its recommended answer:
+account's ids for one client. Jay decided this on 2026-11-05 (section
+13, decision 1):
 
 - the methods that emit a thread id or a thread-prefixed Email id are
   gated on keys for a key account, like `Email/get` (`za_assert_mail_keys`,
@@ -949,8 +950,7 @@ and `plainmail41` onwards:
   pass's log entry is an item update of the singleton and nothing else;
   a client-supplied id with the old prefix is `notFound` on `Email/get`
   and served on a keyless `Email/set` flag update; a keyless token is
-  refused on every gated method of 6.2 (or, if open question 1 answers
-  otherwise, served as that answer says); `Mailbox/get` thread counts
+  refused on every gated method of 6.2; `Mailbox/get` thread counts
   match the control; a keyed APPEND's response carries the final id.
 - `mail::index`: persistence (a second session serves a search without
   opening a message blob, by a new test-mode counter of opened message
@@ -985,8 +985,9 @@ outcomes, with a keyed pass run where upstream's body waits on the index
 queue (the variant's wait replaces the queue wait), plus the keyless
 refusal on a keyless token. Where a variant becomes upstream's body plus
 that difference, it says so and mirrors the body (plan 13 R44).
-`tests/src/za/websocket.rs` and `mail::gates` gain the cases open
-question 1's answer implies.
+`tests/src/za/websocket.rs` and `mail::gates` gain the keyless-refusal
+cases of 6.2: a key account's WebSocket session and a Bearer token are
+refused on each gated method and still get `StateChange` pushes.
 
 ### 9.4 Leak coverage
 
@@ -1047,10 +1048,11 @@ Mail spec invariants 24 to 32 hold, with these amendments:
 - Mail spec 5.4's "clients thread by headers themselves" and section 8's
   refusals are superseded by sections 6 and 7; the refusal text stays for
   the keyless case and the unavailable case.
-- Mail spec 3.3's keyless-route contract is amended as section 13's open
-  question 1 resolves; under the recommended answer, the methods of 6.2
-  that emit a thread id or a thread-prefixed Email id require keys for a
-  key account.
+- Mail spec 3.3's keyless-route contract is amended (section 13,
+  decision 1): the methods of 6.2 that emit a thread id or a
+  thread-prefixed Email id require keys for a key account; a key
+  account's WebSocket and EventSource sessions and its Bearer tokens get
+  push and nothing else of mail.
 
 Added:
 
@@ -1173,7 +1175,8 @@ account's current Email change id.
 - **A keyless singleton representation alongside the mapped one** (the
   keyless methods keep serving singletons). Rejected: a client that
   learns ids over the WebSocket and fetches over HTTP would hold two ids
-  for one message; see open question 1 for the two tenable answers.
+  for one message; section 13's decision 1 records the two tenable
+  answers and the one taken.
 - **A session-scoped background task holding keys** to index after
   login, so the first search never waits. Rejected: it is background code
   holding a key (release 1 invariant 6), and the request-time pass with a
@@ -1201,15 +1204,16 @@ account's current Email change id.
   index; splitting the sections keeps mail readable under the account cap
   and the budget.
 
-## 13. Open questions for Jay, and calls made
+## 13. Decisions and calls made
 
-**Open question 1: keyless sessions and the WebSocket.** Mail spec 3.3
-promises a key account's keyless tokens the methods that need no
-content, and the web client state-driven sync over the WebSocket, which
-the HTTP layer strips of keys. With mapped ids (6.2) a keyless session
-would see different ids from a keyed one. Two answers are tenable:
+**Decision 1 (Jay, 2026-11-05): keyless sessions and the WebSocket
+stay keyless.** Mail spec 3.3 promises a key account's keyless tokens
+the methods that need no content, and the web client state-driven sync
+over the WebSocket, which the HTTP layer strips of keys. With mapped ids
+(6.2) a keyless session would see different ids from a keyed one. Two
+answers were tenable:
 
-- (a) **Recommended.** The methods of 6.2 are gated on keys for a key
+- (a) **Taken.** The methods of 6.2 are gated on keys for a key
   account; a keyless token (Bearer, OAuth, WebSocket, EventSource) gets
   the keyless refusal on them. The web client does its method calls over
   HTTP, where the key cache serves every request, and uses the WebSocket
@@ -1217,19 +1221,18 @@ would see different ids from a keyed one. Two answers are tenable:
   OAuth sessions of a key account, which cannot read mail today, lose
   the keyless list and sync calls. `Email/set` flag and mailbox updates
   stay keyless with the prefix unchecked. This amends mail spec 3.3 and
-  what release 6 may assume, and adds no key-holding session type.
-- (b) A WebSocket session authenticated with a credential that yields
-  keys (a password or an app password) holds `SessionKeys` for its life,
-  as IMAP does (mail spec 3.3's reasoning for mail connections), and is
-  then a keyed session for every method; Bearer-authenticated WebSockets
-  and the other keyless tokens are as in (a). This amends release 1
-  invariant 5 and mail spec 3.3's "WebSocket, EventSource, ManageSieve
-  and SMTP sessions still never do", and brings the IMAP-style questions
-  of key residency after a credential change (mail spec R48) to the
-  WebSocket.
-
-The design is written for (a); (b) adds a session type and its tests
-(`tests/src/za/websocket.rs`) and changes nothing else in it.
+  what release 6 may assume, and adds no key-holding session type: keys
+  live on HTTP requests under the key cache's limits, and the server
+  never holds a key tied to a long-lived browser connection.
+- (b) Not taken, kept for the record: a WebSocket session authenticated
+  with a credential that yields keys (a password or an app password)
+  holds `SessionKeys` for its life, as IMAP does, and is then a keyed
+  session for every method. It would have amended release 1 invariant 5
+  and mail spec 3.3's "WebSocket, EventSource, ManageSieve and SMTP
+  sessions still never do", and brought the IMAP-style limit of key
+  residency after a credential change (mail spec R48) to a browser tab
+  left open, for a convenience the web client does not need. "For now":
+  a later release may revisit it with socket invalidation plumbing.
 
 **Calls made in this document**, each reversible at plan time:
 
@@ -1254,8 +1257,8 @@ The design is written for (a); (b) adds a session type and its tests
 Supersedes, in the mail spec: section 1.1's "until release 7" clause and
 1.2's "search of sealed content: release 7"; section 5.4's last sentence;
 section 8 as a whole (its refusals become 7.4's fallback); section 14's
-"keyed thread index" note; section 15's release 7 line; and, as open
-question 1 resolves, section 3.3's keyless-route contract. Section 5.5's
+"keyed thread index" note; section 15's release 7 line; and section
+3.3's keyless-route contract (section 13, decision 1). Section 5.5's
 "arrival time and size" was already superseded by upgrade ruling 64 (ids
 only). The plan 13 outcome's open question 2 (`emailQuerySortOptions`)
 closes: the sorts are served. The `Threading` key's harmless clear at
