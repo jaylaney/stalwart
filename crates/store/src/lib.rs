@@ -16,7 +16,6 @@ pub mod write;
 #[cfg(feature = "test_mode")]
 pub mod za_test;
 
-use ::registry::schema::enums::CompressionAlgo;
 pub use ahash;
 pub use blake3;
 pub use parking_lot;
@@ -458,6 +457,7 @@ pub struct RegistryStoreInner {
     pub(crate) store: Store,
     pub(crate) node_id: u16,
     pub(crate) env_recovery_mode: bool,
+    pub(crate) env_update_role_permissions: bool,
     pub(crate) env_recovery_admin: Option<(String, String)>,
     pub(crate) env_cluster_role: Option<String>,
     pub(crate) env_push_shard_id: u32,

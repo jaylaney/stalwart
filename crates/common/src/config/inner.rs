@@ -42,7 +42,12 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
 };
+<<<<<<< HEAD
 use store::{LookupStores, rand, registry::bootstrap::Bootstrap};
+=======
+use store::{LookupStores, registry::bootstrap::Bootstrap};
+use tokio::sync::Semaphore;
+>>>>>>> v1.0.3
 use types::collection::SyncCollection;
 use utils::{
     UnwrapFailure,
@@ -50,6 +55,8 @@ use utils::{
     snowflake::{MAX_NODE_ID, SnowflakeIdGenerator},
     tls::build_tls_connector,
 };
+
+const MAX_HARVEST_TASKS: usize = 8;
 
 impl Data {
     pub async fn parse(bp: &mut Bootstrap) -> Self {
@@ -108,6 +115,7 @@ impl Data {
             logos: Default::default(),
             smtp_connectors: TlsConnectors::try_new().failed("Failed to build TLS connectors"),
             memory_budget: Default::default(),
+            harvest_tasks: Arc::new(Semaphore::new(MAX_HARVEST_TASKS)),
             asn_geo_data: Default::default(),
             password_verifier: Default::default(),
         }
@@ -251,6 +259,7 @@ impl Caches {
                 (std::mem::size_of::<SpamLookup>() + 255 * 2) as u64,
             ),
             directory_recipients: CacheWithTtl::new(cache.directory_recipients, 255u64),
+            external_public_keys: CacheWithTtl::new(cache.external_public_keys, 4096u64),
             directory_recipients_ttl: cache.directory_recipients_ttl.into_inner(),
             negative_cache_ttl: cache.negative_ttl.into_inner(),
             swap,
@@ -309,6 +318,7 @@ impl Default for Data {
             logos: Default::default(),
             smtp_connectors: TlsConnectors::try_new().unwrap(),
             memory_budget: Default::default(),
+            harvest_tasks: Arc::new(Semaphore::new(MAX_HARVEST_TASKS)),
             asn_geo_data: Default::default(),
             password_verifier: Default::default(),
             lookup_stores: Default::default(),
