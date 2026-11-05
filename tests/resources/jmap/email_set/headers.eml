@@ -32,7 +32,6 @@ MIME-Version: 1.0
 Content-Type: multipart/alternative;
  boundary="boundary_0"
 
-
 --boundary_0
 Content-Language: en
 Content-Type: text/plain; charset="us-ascii"
