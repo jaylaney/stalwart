@@ -17,9 +17,9 @@ use http::{api::vault::MAX_APP_PASSWORD_DESCRIPTION, auth::authenticate::za_test
 use hyper::StatusCode;
 use registry::{
     schema::{
-        enums::OAuthGrantType,
+        enums::{OAuthClientKind, OAuthGrantType},
         prelude::{Object, ObjectInner, ObjectType},
-        structs::{self, Credential, OAuthClient, OAuthGrant},
+        structs::{self, Application, Credential, OAuthClient, OAuthGrant},
     },
     types::id::ObjectId,
 };
@@ -28,6 +28,7 @@ use std::time::Duration;
 use store::{
     registry::{
         RegistryQuery,
+        bootstrap::Bootstrap,
         write::{RegistryWrite, RegistryWriteResult},
     },
     write::now,
@@ -535,24 +536,46 @@ pub async fn test(test: &mut TestServer) {
 
 async fn oauth_sign_in_refuses_vault_app_password(test: &TestServer) {
     println!("oauth_sign_in_refuses_vault_app_password");
-    const CLIENT_ID: &str = "stalwart-webui";
+    const WEBUI_CLIENT: &str = "stalwart-webui";
+    const DEVICE_CLIENT: &str = "za-app-password-device";
     const REDIRECT: &str = "https://example.org/account/";
     const PKCE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     let admin = test.account("admin@example.com");
     let key = test.account(NAME);
     let id = key.id().document_id();
-    let client_id = admin
+    let webui_client_id = admin
         .registry_create_object(OAuthClient {
-            client_id: CLIENT_ID.to_owned(),
+            client_id: WEBUI_CLIENT.to_owned(),
             redirect_uris: vec![REDIRECT.to_owned()].into(),
-            grant_types: vec![
-                OAuthGrantType::AuthorizationCode,
-                OAuthGrantType::DeviceCode,
-            ]
-            .into(),
+            grant_types: vec![OAuthGrantType::AuthorizationCode].into(),
             ..Default::default()
         })
         .await;
+    let device_client_id = admin
+        .registry_create_object(OAuthClient {
+            client_id: DEVICE_CLIENT.to_owned(),
+            grant_types: vec![OAuthGrantType::DeviceCode].into(),
+            ..Default::default()
+        })
+        .await;
+    let application_id = admin
+        .registry_create_object(Application {
+            enable: true,
+            description: "OAuth sign-in test WebUI".to_owned(),
+            resource_url: "file:///unused-za-oauth-webui.zip".to_owned(),
+            url_prefix: vec!["/account".to_owned()].into(),
+            oauth_client_id: Some(WEBUI_CLIENT.to_owned()),
+            ..Default::default()
+        })
+        .await;
+    // Registered first-party recognition uses the enabled application metadata
+    // loaded by reload(), so this fixture never fetches or unpacks a bundle.
+    let apps = &test.server.inner.data.applications;
+    let mut bootstrap = Bootstrap::new_uninitialized(test.server.registry().clone());
+    apps.reload(&mut bootstrap).await;
+    assert!(bootstrap.errors.is_empty());
+    assert!(apps.is_application_client_id(WEBUI_CLIENT));
+
     let (app_password, credential_id) = create("OAuth refusal").await;
     caldav(&app_password, StatusCode::MULTI_STATUS).await;
     test.server
@@ -601,7 +624,7 @@ async fn oauth_sign_in_refuses_vault_app_password(test: &TestServer) {
             "consent": true,
         })
     };
-    let codes = post_form("device", &[("client_id", CLIENT_ID)]).await;
+    let codes = post_form("device", &[("client_id", DEVICE_CLIENT)]).await;
     let device_code = codes["device_code"].as_str().unwrap();
     let user_code = codes["user_code"].as_str().unwrap();
     let auth_device = |secret: &str| {
@@ -616,7 +639,7 @@ async fn oauth_sign_in_refuses_vault_app_password(test: &TestServer) {
     let device_form = [
         ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ("device_code", device_code),
-        ("client_id", CLIENT_ID),
+        ("client_id", DEVICE_CLIENT),
     ];
 
     for (flow, request) in [
@@ -671,7 +694,7 @@ async fn oauth_sign_in_refuses_vault_app_password(test: &TestServer) {
         "token",
         &[
             ("grant_type", "authorization_code"),
-            ("client_id", CLIENT_ID),
+            ("client_id", WEBUI_CLIENT),
             ("redirect_uri", REDIRECT),
             ("code", code.as_ref()),
             ("code_verifier", PKCE_VERIFIER),
@@ -697,16 +720,39 @@ async fn oauth_sign_in_refuses_vault_app_password(test: &TestServer) {
         .registry_get_all::<OAuthGrant>()
         .await
         .into_iter()
-        .filter(|(_, grant)| grant.client_id == CLIENT_ID)
-        .map(|(id, _)| id)
+        .filter(|(_, grant)| matches!(grant.client_id.as_str(), WEBUI_CLIENT | DEVICE_CLIENT))
         .collect::<Vec<_>>();
     assert_eq!(grants.len(), 2, "the controls' grants");
+    let client_kind = |client_id: &str| {
+        grants
+            .iter()
+            .find_map(|(_, grant)| (grant.client_id == client_id).then_some(grant.client_kind))
+    };
+    assert_eq!(
+        client_kind(WEBUI_CLIENT),
+        Some(OAuthClientKind::FirstParty),
+        "the WebUI authorization control must issue a first-party grant"
+    );
+    assert_eq!(
+        client_kind(DEVICE_CLIENT),
+        Some(OAuthClientKind::Registered)
+    );
+    let grants = grants.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
     key.registry_destroy(ObjectType::OAuthGrant, &grants)
         .await
         .assert_destroyed(&grants);
     admin
-        .registry_destroy(ObjectType::OAuthClient, [client_id])
+        .registry_destroy(ObjectType::Application, [application_id])
         .await
-        .assert_destroyed(&[client_id]);
+        .assert_destroyed(&[application_id]);
+    let mut bootstrap = Bootstrap::new_uninitialized(test.server.registry().clone());
+    apps.reload(&mut bootstrap).await;
+    assert!(bootstrap.errors.is_empty());
+    assert!(!apps.is_application_client_id(WEBUI_CLIENT));
+    let client_ids = [webui_client_id, device_client_id];
+    admin
+        .registry_destroy(ObjectType::OAuthClient, client_ids)
+        .await
+        .assert_destroyed(&client_ids);
     revoke(credential_id).await.expect(200);
 }
