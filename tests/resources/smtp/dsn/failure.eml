@@ -6,7 +6,6 @@ MIME-Version: 1.0
 Content-Type: multipart/report; report-type="delivery-status";
  boundary="mime_boundary"
 
-
 --mime_boundary
 Content-Type: text/plain; charset="utf-8"
 Content-Transfer-Encoding: quoted-printable
