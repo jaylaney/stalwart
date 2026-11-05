@@ -553,18 +553,12 @@ pub async fn test(test: &TestServer) {
     }
     let [(submission_id_1, draft_id_1), (submission_id_2, draft_id_2)] =
         <[_; 2]>::try_from(held).unwrap();
-    let mut found_filler = false;
+    // Email/get checks the thread prefix as well as the document ID. Find
+    // the collision by document ID and keep the full ID returned by import.
+    let submission_document_id = submission_id_1.parse::<Id>().unwrap().document_id();
+    let mut filler_id = None;
     for _ in 0..64 {
-        if client
-            .email_get(&submission_id_1, None::<Vec<_>>)
-            .await
-            .unwrap()
-            .is_some()
-        {
-            found_filler = true;
-            break;
-        }
-        client
+        let imported_id = client
             .email_import(
                 b"From: jdoe@example.com\r\nSubject: filler\r\n\r\ntest".to_vec(),
                 [&mailbox_id_2],
@@ -572,10 +566,16 @@ pub async fn test(test: &TestServer) {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .take_id();
+        if imported_id.parse::<Id>().unwrap().document_id() == submission_document_id {
+            filler_id = Some(imported_id);
+            break;
+        }
     }
-    assert!(found_filler, "No email shares the submission document id");
-    assert_email_properties(&client, &submission_id_1, &[&mailbox_id_2], &[]).await;
+    let filler_id =
+        filler_id.expect("No filler shares the submission document id after 64 imports");
+    assert_email_properties(&client, &filler_id, &[&mailbox_id_2], &[]).await;
 
     let mut request = client.build();
     let set_request = request.set_email_submission();
@@ -593,7 +593,7 @@ pub async fn test(test: &TestServer) {
             .unwrap()
             .is_none()
     );
-    assert_email_properties(&client, &submission_id_1, &[&mailbox_id_2], &[]).await;
+    assert_email_properties(&client, &filler_id, &[&mailbox_id_2], &[]).await;
 
     // onSuccessUpdateEmail is skipped for a submission whose update failed
     let mut request = client.build();
@@ -615,7 +615,7 @@ pub async fn test(test: &TestServer) {
         .mailbox_id(&mailbox_id, false)
         .mailbox_id(&mailbox_id_2, true);
     request.send().await.unwrap().unwrap_method_responses();
-    assert_email_properties(&client, &submission_id_1, &[&mailbox_id_2], &[]).await;
+    assert_email_properties(&client, &filler_id, &[&mailbox_id_2], &[]).await;
     assert_email_properties(&client, &draft_id_2, &[&mailbox_id_2], &["$draft"]).await;
 
     // onSuccessDestroyEmail keyed by a destroyed submission id
@@ -633,7 +633,7 @@ pub async fn test(test: &TestServer) {
             .unwrap()
             .is_none()
     );
-    assert_email_properties(&client, &submission_id_1, &[&mailbox_id_2], &[]).await;
+    assert_email_properties(&client, &filler_id, &[&mailbox_id_2], &[]).await;
     smtp_settings.lock().do_stop = true;
 
     // Identities are created and destroyed as the account's addresses change
