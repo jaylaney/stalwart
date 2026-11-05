@@ -2027,7 +2027,8 @@ pub(super) async fn retire_blob_codec_key(
     if let Some(email) = restore_email {
         admin.registry_update_setting(email, CODEC_SETTINGS).await;
     }
-    admin
+    // Symmetric key destruction is excluded from the default system role.
+    test.account("admin")
         .registry_destroy(ObjectType::SymmetricKey, [key_id])
         .await
         .assert_destroyed(&[key_id]);
