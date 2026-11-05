@@ -19,11 +19,8 @@ spam-filter = { path = "../spam-filter" }
 email = { path = "../email" }
 groupware = { path = "../groupware" }
 registry = { path = "../registry" }
-<<<<<<< HEAD
 vault = { path = "../vault" }
-=======
 crypto = { path = "../crypto" }
->>>>>>> v1.0.3
 calcard = { path = "../calcard" }
 smtp-proto = { path = "../smtp-proto" }
 mail-parser = { version = "1.0", features = ["full_encoding"] } 

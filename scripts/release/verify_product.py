@@ -23,6 +23,8 @@ COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 PINNED_UPSTREAM_TAGS = {
     "v0.16.27": "aa47d8ef7bfba7200d3293198ac2592747b20e73",
     "v1.0.1": "23b69755cb3cd8ecd952fe0443c5ac067a506184",
+    "v1.0.2": "1d66d65daf4828d7a6b38214873cab02274fd55b",
+    "v1.0.3": "8b32686532d34623e9ce8e1237cf2bed9554af38",
 }
 
 

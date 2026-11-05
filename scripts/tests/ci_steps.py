@@ -37,7 +37,7 @@ WORKFLOW = REPO / ".github" / "workflows" / "test.yml"
 
 # Every gated job sets these for all its steps.
 BASE_ENV = {"STORE": "RocksDb", "RUST_MIN_STACK": "16777216"}
-SPAM_URL = ("https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.3/"
+SPAM_URL = ("https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.4/"
             "spam-filter-rules.json.gz")
 # The workspace unit step's features: test.yml's workflow-level variable, which the gates job's
 # listing capture reads from its environment too.
@@ -121,7 +121,7 @@ STEPS = [
          "SMTP Unit Tests (without enterprise)",
          "cargo test -p smtp --lib --bins --features test_mode", when=None),
     Step("test.yml__unit-tests__http-unit-tests", "unit-tests", "HTTP Unit Tests",
-         "cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise", when=None),
+         "cargo test -p http@1.0.3 --lib --bins --features test_mode,enterprise", when=None),
     # upstream-suites
     Step("test.yml__upstream-suites__caldav-query-expansion-tests", "upstream-suites",
          "CalDAV Query Expansion Tests", "cargo test -p tests 'webdav::cal_query::' -- --nocapture",

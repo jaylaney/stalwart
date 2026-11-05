@@ -37,11 +37,8 @@ members = [
     "crates/sieve",
     "crates/jmap-tools",
     "crates/s3",
-<<<<<<< HEAD
-    "tests",
-=======
     "crates/crypto",
->>>>>>> v1.0.3
+    "tests",
 ]
 default-members = [
     "crates/main",
@@ -66,7 +63,6 @@ default-members = [
     "crates/store",
     "crates/coordinator",
     "crates/directory",
-    "crates/vault",
     "crates/registry",
     "crates/services",
     "crates/utils",

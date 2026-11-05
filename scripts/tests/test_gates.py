@@ -730,8 +730,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_a_dropped_feature_fails(self):
         problems = self.edited(
-            "run: cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise",
-            "run: cargo test -p http@1.0.1 --lib --bins --features test_mode")
+            "run: cargo test -p http@1.0.3 --lib --bins --features test_mode,enterprise",
+            "run: cargo test -p http@1.0.3 --lib --bins --features test_mode")
         self.assertReports(problems, "'HTTP Unit Tests'", "command is")
         problems = self.edited("run: cargo test -p smtp --lib --bins --features test_mode",
                                "run: cargo test -p smtp --lib --bins")
@@ -757,9 +757,9 @@ class WorkflowTests(unittest.TestCase):
                                "          BLOB_STORE: FileSystem\n          ZA_ONLY: setup\n")
         self.assertReports(problems, "filesystem blob store", "ZA_ONLY")
         problems = self.edited("SPAM_RULES_URL: https://github.com/stalwartlabs/spam-filter/"
-                               "releases/download/v3.0.3/",
+                               "releases/download/v3.0.4/",
                                "SPAM_RULES_URL: https://github.com/stalwartlabs/spam-filter/"
-                               "releases/download/v3.0.2/")
+                               "releases/download/v3.0.3/")
         self.assertReports(problems, "'SMTP Tests'", "SPAM_RULES_URL")
         problems = self.edited("    timeout-minutes: 120\n\n    env:\n      STORE: RocksDb\n",
                                "    timeout-minutes: 120\n\n    env:\n      STORE: Sqlite\n")
