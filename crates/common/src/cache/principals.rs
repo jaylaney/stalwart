@@ -7,21 +7,10 @@
 use crate::{
     Server,
     auth::{
-<<<<<<< HEAD
-        ACCOUNT_FLAG_ENCRYPT_ALGO_AES128, ACCOUNT_FLAG_ENCRYPT_ALGO_AES256,
-        ACCOUNT_FLAG_ENCRYPT_ALGO_AES256_GCM, ACCOUNT_FLAG_ENCRYPT_ALGO_CHACHA20_POLY1305,
-        ACCOUNT_FLAG_ENCRYPT_APPEND, ACCOUNT_FLAG_ENCRYPT_METHOD_PGP,
-        ACCOUNT_FLAG_ENCRYPT_METHOD_SMIME, ACCOUNT_FLAG_ENCRYPT_TRAIN_SPAM_FILTER,
         ACCOUNT_IS_KEY_ACCOUNT, ACCOUNT_IS_USER, AccountCache, AccountInfo, AccountStorage,
         ChangedBy, DOMAIN_FLAG_RELAY, DOMAIN_FLAG_SUB_ADDRESSING, DomainCache, EmailAddress,
-        EmailAddressRef, EmailCache, EncryptionKeys, MailingListCache, PermissionsGroup,
-        RECOVERY_ADMIN_ID, RoleCache, permissions::BuildPermissions, vault::is_vault_unusable,
-=======
-        ACCOUNT_IS_USER, AccountCache, AccountInfo, AccountStorage, ChangedBy, DOMAIN_FLAG_RELAY,
-        DOMAIN_FLAG_SUB_ADDRESSING, DomainCache, EmailAddress, EmailAddressRef, EmailCache,
-        MailingListCache, PermissionsGroup, RECOVERY_ADMIN_ID, RoleCache,
-        permissions::BuildPermissions,
->>>>>>> v1.0.3
+        EmailAddressRef, EmailCache, MailingListCache, PermissionsGroup, RECOVERY_ADMIN_ID,
+        RoleCache, permissions::BuildPermissions, vault::is_vault_unusable,
     },
     config::smtp::auth::DkimSigners,
     expr::{Bump, if_block::BootstrapExprExt},
@@ -514,15 +503,11 @@ impl Server {
                             }
                         }
 
-<<<<<<< HEAD
                         let mut flags = ACCOUNT_IS_USER;
                         if is_key_account {
                             flags |= ACCOUNT_IS_KEY_ACCOUNT;
                         }
-                        let encryption_settings = match account.encryption_at_rest {
-=======
                         let encryption = match account.encryption_at_rest {
->>>>>>> v1.0.3
                             EncryptionAtRest::Disabled => None,
                             EncryptionAtRest::Enabled(settings) => Some(Arc::new(
                                 self.build_account_encryption(account_id, settings)
@@ -563,18 +548,14 @@ impl Server {
                                 .collect(),
                             quota_disk,
                             description: account.description.map(Into::into),
-<<<<<<< HEAD
                             storage: AccountStorage::za_boxed(
                                 quota_objects,
-                                encryption_key,
+                                encryption,
                                 za_generation,
                                 za_public_key,
                             ),
-=======
-                            storage: AccountStorage::boxed(quota_objects, encryption),
->>>>>>> v1.0.3
                             locale: account.locale,
-                            flags: ACCOUNT_IS_USER,
+                            flags,
                             active_script: Default::default(),
                         }
                     }

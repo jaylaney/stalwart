@@ -42,12 +42,8 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
 };
-<<<<<<< HEAD
 use store::{LookupStores, rand, registry::bootstrap::Bootstrap};
-=======
-use store::{LookupStores, registry::bootstrap::Bootstrap};
 use tokio::sync::Semaphore;
->>>>>>> v1.0.3
 use types::collection::SyncCollection;
 use utils::{
     UnwrapFailure,

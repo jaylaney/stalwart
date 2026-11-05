@@ -18,6 +18,7 @@ use registry::{
     },
     types::{id::ObjectId, list::List},
 };
+use std::sync::atomic::Ordering;
 use store::{registry::RegistryQuery, roaring::RoaringBitmap, write::AssignedIds};
 use types::{
     collection::{Collection, SyncCollection},
@@ -716,6 +717,7 @@ impl Server {
         // SPDX-SnippetEnd
 
         if default_role_changed {
+            cache.account_epoch.fetch_add(1, Ordering::SeqCst);
             cache.access_tokens.clear();
             cache.http_auth.retain(|_| false);
         } else {

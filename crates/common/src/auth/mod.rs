@@ -116,17 +116,13 @@ pub struct AccountCache {
 #[derive(Debug, Clone, Default)]
 pub struct AccountStorage {
     pub quota_objects: Option<ObjectQuota>,
-<<<<<<< HEAD
-    pub encryption_key: Option<EncryptionKeys>,
+    pub encryption: Option<Arc<AccountEncryption>>,
     /// Zero-access fork (ruling 12): authentication generation (vault
     /// record revision); 0 for non-key accounts. Kept here, boxed, so
     /// `AccountCache` stays within its size assertion.
     pub za_generation: u64,
     /// Zero-access fork: X25519 public key of a key account.
     pub za_public_key: Option<[u8; 32]>,
-=======
-    pub encryption: Option<Arc<AccountEncryption>>,
->>>>>>> v1.0.3
 }
 
 const _: () = assert!(size_of::<AccountCache>() <= 112);
@@ -139,31 +135,16 @@ impl AccountStorage {
         (quota_objects.is_some() || encryption.is_some()).then(|| {
             Box::new(AccountStorage {
                 quota_objects,
-<<<<<<< HEAD
-                encryption_key,
-                ..Default::default()
-=======
                 encryption,
->>>>>>> v1.0.3
+                ..Default::default()
             })
         })
     }
 }
 
 pub const ACCOUNT_IS_USER: u64 = 1;
-<<<<<<< HEAD
-pub const ACCOUNT_FLAG_ENCRYPT_TRAIN_SPAM_FILTER: u64 = 1 << 1;
-pub const ACCOUNT_FLAG_ENCRYPT_METHOD_SMIME: u64 = 1 << 2;
-pub const ACCOUNT_FLAG_ENCRYPT_METHOD_PGP: u64 = 1 << 3;
-pub const ACCOUNT_FLAG_ENCRYPT_ALGO_AES256: u64 = 1 << 4;
-pub const ACCOUNT_FLAG_ENCRYPT_ALGO_AES128: u64 = 1 << 5;
-pub const ACCOUNT_FLAG_ENCRYPT_APPEND: u64 = 1 << 6;
-pub const ACCOUNT_FLAG_ENCRYPT_ALGO_AES256_GCM: u64 = 1 << 7;
-pub const ACCOUNT_FLAG_ENCRYPT_ALGO_CHACHA20_POLY1305: u64 = 1 << 8;
 /// The registry password credential holds `vault::ZA_MARKER` (spec 3.2).
 pub const ACCOUNT_IS_KEY_ACCOUNT: u64 = 1 << 9;
-=======
->>>>>>> v1.0.3
 
 #[derive(Debug, Clone)]
 pub struct RoleCache {
@@ -519,16 +500,16 @@ impl AccountStorage {
     /// so the generation fence has a value to compare.
     pub fn za_boxed(
         quota_objects: Option<ObjectQuota>,
-        encryption_key: Option<EncryptionKeys>,
+        encryption: Option<Arc<AccountEncryption>>,
         za_generation: u64,
         za_public_key: Option<[u8; 32]>,
     ) -> Option<Box<Self>> {
         if za_generation == 0 && za_public_key.is_none() {
-            return AccountStorage::boxed(quota_objects, encryption_key);
+            return AccountStorage::boxed(quota_objects, encryption);
         }
         Some(Box::new(AccountStorage {
             quota_objects,
-            encryption_key,
+            encryption,
             za_generation,
             za_public_key,
         }))

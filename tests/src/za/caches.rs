@@ -7,12 +7,17 @@
 use super::{
     STRONG,
     tracing::{ws_call, ws_close, ws_connect},
+    user_permissions,
 };
 use crate::utils::{
+    account::Account,
     imap::{ImapConnection, Type},
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::{Parked, SERVER_URL, assert_nothing_cached, za_grant_token, za_revoke_grant},
+    za::{
+        Parked, SERVER_URL, assert_nothing_cached, caldav_from, za_grant_token, za_post,
+        za_revoke_grant,
+    },
 };
 use common::{
     BuildServer, Caches, HttpAuthCache,
@@ -22,6 +27,11 @@ use common::{
 use http::auth::authenticate::za_test;
 use hyper::StatusCode;
 use imap_proto::ResponseType;
+use registry::schema::{
+    enums::Permission,
+    prelude::{ObjectType, Property},
+    structs::Role,
+};
 use serde_json::{Value, json};
 use std::{
     net::IpAddr,
@@ -54,6 +64,21 @@ pub async fn test(test: &mut TestServer) {
     impersonated_websocket_refresh(test).await;
     account_invalidation_drops_http_auth(test).await;
     fingerprint_key_is_drawn(test);
+
+    let admin = test.account(ADMIN);
+    let key = admin
+        .create_key_user_account(
+            "key-cache-role@example.com",
+            STRONG,
+            "Key Cache Role",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    key_flag_survives_the_loader(test, &key).await;
+    default_role_edit_reverifies_key_sessions(test, admin, &key).await;
+    admin.destroy_account(key).await;
+    test.wait_for_tasks().await;
 }
 
 /// Whether the HTTP authentication cache holds an entry of the account.
@@ -67,6 +92,101 @@ fn http_auth_holds(caches: &Caches, account_id: u32) -> bool {
         true
     });
     cached.into_inner()
+}
+
+async fn key_flag_survives_the_loader(test: &TestServer, key: &Account) {
+    println!("key_flag_survives_the_loader");
+    test.server.invalidate_all_local_caches();
+    let key_id = key.id().document_id();
+    let plain_id = test.account(PLAIN).id().document_id();
+    assert!(test.server.account(key_id).await.unwrap().is_key_account());
+    assert!(
+        !test
+            .server
+            .account(plain_id)
+            .await
+            .unwrap()
+            .is_key_account()
+    );
+}
+
+async fn default_role_edit_reverifies_key_sessions(
+    test: &TestServer,
+    admin: &Account,
+    key: &Account,
+) {
+    println!("default_role_edit_reverifies_key_sessions");
+    const FAIL_IP: &str = "10.0.9.14";
+    let id = key.id().document_id();
+    let name = key.name();
+    let caches = &test.server.inner.cache;
+    let role_id = test.server.core.network.security.default_role_ids_user[0];
+    let role = admin.registry_get::<Role>(role_id).await;
+    let mut disabled = role.disabled_permissions.clone();
+    assert!(!disabled.contains(&Permission::SysRoleCreate));
+    disabled.push(Permission::SysRoleCreate);
+
+    caldav_from(FAIL_IP, name, STRONG, StatusCode::MULTI_STATUS).await;
+    assert!(
+        http_auth_holds(caches, id),
+        "control: the CalDAV login is cached"
+    );
+    let authorization = basic(name, STRONG);
+    let fingerprint = caches.za_fingerprint(authorization.strip_prefix("Basic ").unwrap());
+    let previous_keys = caches.za_keys.get(&fingerprint, Instant::now()).unwrap();
+
+    admin
+        .registry_update_object(
+            ObjectType::Role,
+            role_id,
+            json!({ Property::DisabledPermissions: disabled }),
+        )
+        .await;
+    assert!(
+        !http_auth_holds(caches, id),
+        "the role edit kept a cached login"
+    );
+    assert!(
+        Arc::ptr_eq(
+            &caches.za_keys.get(&fingerprint, Instant::now()).unwrap(),
+            &previous_keys
+        ),
+        "a role edit must leave resident keys until re-verification"
+    );
+
+    caldav_from(FAIL_IP, name, STRONG, StatusCode::MULTI_STATUS).await;
+    assert!(
+        http_auth_holds(caches, id),
+        "the next request is cached again"
+    );
+    let generation = test.server.account(id).await.unwrap().za_generation();
+    let keys = caches.za_keys.get(&fingerprint, Instant::now()).unwrap();
+    assert_eq!(keys.account_id, id);
+    assert_eq!(keys.generation, generation);
+    assert!(
+        !Arc::ptr_eq(&keys, &previous_keys),
+        "the request re-verified"
+    );
+
+    za_post(
+        "password",
+        &json!({
+            "username": name,
+            "password": STRONG,
+            "new_password": "a new passphrase with 3 numbers",
+        }),
+    )
+    .await
+    .expect(200);
+    caldav_from(FAIL_IP, name, STRONG, StatusCode::UNAUTHORIZED).await;
+
+    admin
+        .registry_update_object(
+            ObjectType::Role,
+            role_id,
+            json!({ Property::DisabledPermissions: role.disabled_permissions }),
+        )
+        .await;
 }
 
 /// Ruling 135 (mutation a013): an `Account` invalidation alone drops the

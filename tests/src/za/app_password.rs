@@ -4,11 +4,11 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{STRONG, user_permissions};
+use super::{STRONG, mail::Traced, user_permissions};
 use crate::utils::{
     server::TestServer,
     za::{
-        Parked, VaultReply, assert_nothing_cached, caldav_from, park_login, za_post,
+        Parked, SERVER_URL, VaultReply, assert_nothing_cached, caldav_from, park_login, za_post,
         za_post_concurrent, za_post_from,
     },
 };
@@ -17,16 +17,23 @@ use http::{api::vault::MAX_APP_PASSWORD_DESCRIPTION, auth::authenticate::za_test
 use hyper::StatusCode;
 use registry::{
     schema::{
+        enums::OAuthGrantType,
         prelude::{Object, ObjectInner, ObjectType},
-        structs::{self, Credential},
+        structs::{self, Credential, OAuthClient, OAuthGrant},
     },
     types::id::ObjectId,
 };
 use serde_json::{Value, json};
+use std::time::Duration;
 use store::{
-    registry::write::{RegistryWrite, RegistryWriteResult},
+    registry::{
+        RegistryQuery,
+        write::{RegistryWrite, RegistryWriteResult},
+    },
     write::now,
 };
+use trc::{EventType, Key, SecurityEvent};
+use types::id::Id;
 use vault::record::{AppWrap, PENDING_WRAP_MAX_AGE_SECS, WrapState};
 
 const STRONG2: &str = "another long passphrase with 2 numbers";
@@ -523,4 +530,183 @@ pub async fn test(test: &mut TestServer) {
     // Neither a wrap nor a registry credential: unknown.
     revoke(dangling_id).await.expect(409);
     caldav(STRONG, StatusCode::MULTI_STATUS).await;
+    oauth_sign_in_refuses_vault_app_password(test).await;
+}
+
+async fn oauth_sign_in_refuses_vault_app_password(test: &TestServer) {
+    println!("oauth_sign_in_refuses_vault_app_password");
+    const CLIENT_ID: &str = "stalwart-webui";
+    const REDIRECT: &str = "https://example.org/account/";
+    const PKCE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let admin = test.account("admin@example.com");
+    let key = test.account(NAME);
+    let id = key.id().document_id();
+    let client_id = admin
+        .registry_create_object(OAuthClient {
+            client_id: CLIENT_ID.to_owned(),
+            redirect_uris: vec![REDIRECT.to_owned()].into(),
+            grant_types: vec![
+                OAuthGrantType::AuthorizationCode,
+                OAuthGrantType::DeviceCode,
+            ]
+            .into(),
+            ..Default::default()
+        })
+        .await;
+    let (app_password, credential_id) = create("OAuth refusal").await;
+    caldav(&app_password, StatusCode::MULTI_STATUS).await;
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)]);
+    assert_nothing_cached(test, id);
+
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let api_auth = async |body: Value| -> Value {
+        http.post(format!("{SERVER_URL}/api/auth"))
+            .header("X-Forwarded-For", FAIL_IP)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    };
+    let post_form = async |path: &str, form: &[(&str, &str)]| -> Value {
+        http.post(format!("{SERVER_URL}/auth/{path}"))
+            .form(form)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    };
+    let auth_code = |secret: &str| {
+        json!({
+            "type": "authCode",
+            "accountName": NAME,
+            "accountSecret": secret,
+            "query": concat!(
+                "response_type=code&client_id=stalwart-webui",
+                "&redirect_uri=https%3A%2F%2Fexample.org%2Faccount%2F",
+                "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                "&code_challenge_method=S256&state=za-app-password",
+            ),
+            "consent": true,
+        })
+    };
+    let codes = post_form("device", &[("client_id", CLIENT_ID)]).await;
+    let device_code = codes["device_code"].as_str().unwrap();
+    let user_code = codes["user_code"].as_str().unwrap();
+    let auth_device = |secret: &str| {
+        json!({
+            "type": "authDevice",
+            "accountName": NAME,
+            "accountSecret": secret,
+            "code": user_code,
+            "consent": true,
+        })
+    };
+    let device_form = [
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ("device_code", device_code),
+        ("client_id", CLIENT_ID),
+    ];
+
+    for (flow, request) in [
+        ("authorization code", auth_code(&app_password)),
+        ("device approval", auth_device(&app_password)),
+    ] {
+        let traced = Traced::start(EventType::variants());
+        let reply = api_auth(request).await;
+        let events = traced.finish().await;
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.text.contains(&app_password)),
+            "{flow} exposed the app password in a trace"
+        );
+        assert_eq!(reply, json!({ "type": "failure" }), "{flow}");
+        let unauthorized = events
+            .iter()
+            .filter(|event| {
+                event.typ == EventType::Security(SecurityEvent::Unauthorized)
+                    && event.account_id == Some(u64::from(id))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(unauthorized.len(), 1, "{flow}");
+        assert!(unauthorized[0].keys.iter().any(|(key, value)| {
+            matches!((key, value), (Key::Id, trc::Value::UInt(id)) if *id == u64::from(credential_id))
+        }), "{flow} did not identify the rejected credential");
+        assert_nothing_cached(test, id);
+        assert!(
+            test.server
+                .registry()
+                .query::<Vec<Id>>(RegistryQuery::new(ObjectType::OAuthGrant).with_account(id))
+                .await
+                .unwrap()
+                .is_empty(),
+            "{flow} created an OAuth grant"
+        );
+    }
+    assert_eq!(
+        post_form("token", &device_form).await["error"],
+        "authorization_pending"
+    );
+
+    let code_reply = api_auth(auth_code(STRONG)).await;
+    assert_eq!(code_reply["type"], "authenticated");
+    let redirect = reqwest::Url::parse(code_reply["location"].as_str().unwrap()).unwrap();
+    let (_, code) = redirect
+        .query_pairs()
+        .find(|(name, _)| name == "code")
+        .unwrap();
+    let tokens = post_form(
+        "token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", CLIENT_ID),
+            ("redirect_uri", REDIRECT),
+            ("code", code.as_ref()),
+            ("code_verifier", PKCE_VERIFIER),
+        ],
+    )
+    .await;
+    assert!(
+        tokens["access_token"].is_string(),
+        "authorization code exchange"
+    );
+    assert_eq!(
+        api_auth(auth_device(STRONG)).await,
+        json!({ "type": "verified" })
+    );
+    let tokens = post_form("token", &device_form).await;
+    assert!(tokens["access_token"].is_string(), "device code exchange");
+    assert_eq!(
+        post_form("token", &device_form).await["error"],
+        "expired_token"
+    );
+
+    let grants = key
+        .registry_get_all::<OAuthGrant>()
+        .await
+        .into_iter()
+        .filter(|(_, grant)| grant.client_id == CLIENT_ID)
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    assert_eq!(grants.len(), 2, "the controls' grants");
+    key.registry_destroy(ObjectType::OAuthGrant, &grants)
+        .await
+        .assert_destroyed(&grants);
+    admin
+        .registry_destroy(ObjectType::OAuthClient, [client_id])
+        .await
+        .assert_destroyed(&[client_id]);
+    revoke(credential_id).await.expect(200);
 }
