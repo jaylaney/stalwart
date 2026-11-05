@@ -607,7 +607,7 @@ async fn restore_is_refused(test: &TestServer, key_id: u32) {
     let raw = message_with("restored", "restore-canary");
     let (hash, _) = test
         .server
-        .put_temporary_blob(key_id, raw.as_bytes(), 3600)
+        .put_temporary_blob(key_id, raw.as_bytes(), 3600, &test.server.core.blob.email)
         .await
         .unwrap();
     let mut batch = BatchBuilder::new();

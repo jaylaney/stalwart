@@ -61,7 +61,11 @@ use registry::schema::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use store::{
     Deserialize, IterateParams, Subspace, U32_LEN, U64_LEN, ValueKey,
     write::{
@@ -896,6 +900,7 @@ pub async fn plant_plain_message(test: &TestServer, account_id: u32, raw: &str) 
             types::blob_hash::BlobHash::generate(raw.as_bytes()),
             raw.as_bytes(),
             60,
+            &server.core.blob.email,
         )
         .await
         .unwrap();

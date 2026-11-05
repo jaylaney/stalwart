@@ -1518,12 +1518,7 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
         // A link record can briefly outlive its blob around purge, so a
         // missing blob stays silent; a blob that fails to read or
         // decompress must not go unscanned unnoticed.
-        match test
-            .server
-            .blob_store()
-            .get_blob(&hash, 0..usize::MAX)
-            .await
-        {
+        match test.server.get_blob(&hash, 0..usize::MAX).await {
             Ok(Some(blob)) => {
                 scan.blobs += 1;
                 find_canaries(&blob, &what, "decoded blob", &mut scan);
@@ -1564,7 +1559,6 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
         };
         let contents = match test
             .server
-            .blob_store()
             .get_blob(metadata.blob_hash().as_slice(), 0..usize::MAX)
             .await
         {
@@ -1686,12 +1680,7 @@ pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(Subspace
     blob_hashes.dedup();
     for hash in blob_hashes {
         // A missing blob stays silent, as in `scan`.
-        match test
-            .server
-            .blob_store()
-            .get_blob(&hash, 0..usize::MAX)
-            .await
-        {
+        match test.server.get_blob(&hash, 0..usize::MAX).await {
             Ok(Some(blob)) => hits.extend(
                 find(&blob)
                     .into_iter()

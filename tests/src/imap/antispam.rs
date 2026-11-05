@@ -200,7 +200,6 @@ pub async fn test(test: &TestServer) {
 
 pub async fn spam_classifier_model(server: &Server) -> SpamTrainer {
     server
-        .blob_store()
         .get_blob(SPAM_TRAINER_KEY, 0..usize::MAX)
         .await
         .and_then(|archive| match archive {

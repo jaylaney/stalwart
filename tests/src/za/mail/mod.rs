@@ -185,7 +185,6 @@ pub fn row_is_stub(row: &MetadataRow) -> bool {
 /// The blob `hash`, decoded as readers decode it.
 pub async fn stored_blob(test: &TestServer, hash: &BlobHash) -> Vec<u8> {
     test.server
-        .blob_store()
         .get_blob(hash.as_slice(), 0..usize::MAX)
         .await
         .unwrap()
@@ -373,7 +372,7 @@ pub async fn corrupt_blob(test: &TestServer, hash: &BlobHash) {
         .unwrap();
     test.server
         .blob_store()
-        .put_blob(hash.as_slice(), &blob, test.server.core.email.compression)
+        .put_blob(hash.as_slice(), &blob, &test.server.core.blob.email)
         .await
         .unwrap();
 }

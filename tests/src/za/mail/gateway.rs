@@ -16,6 +16,7 @@ use crate::{
     utils::{
         account::Account,
         imap::{ImapConnection, Type},
+        jmap::JmapUtils,
         server::TestServer,
         smtp::SmtpConnection,
         smtp_sink::sink,
@@ -34,7 +35,7 @@ use email::mailbox::INBOX_ID;
 use groupware::calendar::seal::{WRAP_MK, WRAP_PK};
 use hyper::StatusCode;
 use imap_proto::ResponseType;
-use mail_parser::{Message, MessageParser, MimeHeaders};
+use mail_parser::{Message, MessageParser};
 use registry::{
     schema::{
         prelude::{ObjectType, Property},
@@ -600,8 +601,7 @@ fn assert_encrypted_message(message: &Message<'_>) {
     assert!(
         message
             .root_part()
-            .content_type()
-            .is_some_and(|ct| { ct.ctype() == "multipart" && ct.subtype() == Some("encrypted") }),
+            .is_content_type("multipart", "encrypted"),
         "message was not OpenPGP encrypted"
     );
 }
@@ -682,7 +682,7 @@ async fn gateway_events_carry_no_content(test: &TestServer, admin: &Account, key
                 "unexpected field in gateway event: {event:?}"
             );
         }
-        let text = trace_content(event);
+        let text = trace_content(&event);
         for canary in [
             "gateway-calendar-subject-canary",
             "gateway-calendar-body-canary",

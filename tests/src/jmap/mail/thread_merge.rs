@@ -224,10 +224,11 @@ async fn test_multi_thread(test: &TestServer) {
         handles.push(tokio::task::spawn(async move {
             let mut retry_count = 0;
             loop {
+                let parsed_message = MessageParser::new().parse(message.contents());
                 match server
                     .email_ingest(IngestEmail {
                         raw_message: message.contents(),
-                        message: MessageParser::new().parse(message.contents()),
+                        message: parsed_message.as_ref(),
                         blob_hash: None,
                         access_token: &AccessToken::from_id_maybe_invalid(account_id),
                         mailbox_ids: vec![mailbox_id],

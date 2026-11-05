@@ -584,7 +584,6 @@ impl TestServer {
             .unwrap()
             .blob_hash();
         self.server
-            .blob_store()
             .get_blob(blob_hash.as_slice(), 0..usize::MAX)
             .await
             .unwrap()

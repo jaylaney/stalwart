@@ -1685,7 +1685,6 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
 
     let readable = async |hash: &BlobHash| {
         test.server
-            .blob_store()
             .get_blob(hash.as_slice(), 0..usize::MAX)
             .await
             .unwrap()

@@ -23,6 +23,7 @@ store = { path = "../crates/store", features = ["test_mode", "enterprise"] }
 nlp = { path = "../crates/nlp" }
 directory = { path = "../crates/directory", features = ["enterprise"] }
 coordinator = { path = "../crates/coordinator", features = ["enterprise"] }
+crypto = { path = "../crates/crypto" }
 jmap = { path = "../crates/jmap", features = ["test_mode", "enterprise"] }
 jmap_proto = { path = "../crates/jmap-proto" }
 imap = { path = "../crates/imap" }

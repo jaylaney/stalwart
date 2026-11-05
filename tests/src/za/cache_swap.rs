@@ -810,7 +810,6 @@ async fn raw_artifacts(
                     ] {
                         if let Some(bytes) = test
                             .server
-                            .blob_store()
                             .get_blob(hash.as_slice(), 0..usize::MAX)
                             .await
                             .unwrap()
