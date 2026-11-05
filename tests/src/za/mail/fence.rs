@@ -42,7 +42,10 @@ use calcard::common::timezone::Tz;
 use common::{
     Server,
     auth::AccessToken,
-    za::{ZA_MAIL_KEYLESS, test_hooks},
+    za::{
+        ZA_MAIL_KEYLESS,
+        test_hooks::{self, ForceCommitSplit},
+    },
 };
 use email::{
     cache::MessageCacheFetch,
@@ -825,6 +828,8 @@ async fn forward_race_imip_merge(test: &TestServer, admin: &Account) -> Account 
     let mails = message_ids(test, id).await;
 
     let update = invitation(FENCE12, "za-fence-merge", 1, "fence merge v2");
+    // The small merge otherwise keeps all four fences in one transaction.
+    let split = ForceCommitSplit::new(id);
     let parked = HookParked::start(id, test_hooks::set_ingest_pause, async move {
         submit(ORGANIZER, FENCE12, &update).await;
     })
@@ -863,6 +868,7 @@ async fn forward_race_imip_merge(test: &TestServer, admin: &Account) -> Account 
         merged[0].1, events[0].1,
         "control: the retry merged the update"
     );
+    drop(split);
     account
 }
 

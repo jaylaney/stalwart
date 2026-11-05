@@ -81,6 +81,7 @@ pub async fn test(test: &mut TestServer) {
     case_10_replay(test).await;
     case_11_ordinary_delivery(test).await;
     case_12_partial_changes(test).await;
+    full_update_drops_an_override_only_at_or_below_the_master(test).await;
     case_13_stated_losses(test).await;
     case_14_delegates(test).await;
     case_15_pre_pin(test).await;
@@ -2107,6 +2108,93 @@ async fn case_12_partial_changes(test: &TestServer) {
         delete_event(&alice, &path).await;
         clear_recipient(test, &bob, &bob_start, uid).await;
         clear_recipient(test, &carol, &carol_start, uid).await;
+    }
+}
+
+async fn full_update_drops_an_override_only_at_or_below_the_master(test: &TestServer) {
+    const ORGANIZER: &str = "pin-override-org@example.com";
+    const KEY: &str = "pin-override-key@example.com";
+    const PLAIN: &str = "pin-override-plain@example.com";
+    const UID: &str = "pin-override";
+    const X_V1: &str = "20990302T110000Z";
+    const X_V2: &str = "20990302T120000Z";
+    const MASTER_MOVED: &str = "20990301T090000Z";
+
+    let admin = test.account("admin@example.com");
+    let accounts = [
+        admin
+            .create_key_user_account(ORGANIZER, STRONG, ORGANIZER, &[], user_permissions())
+            .await,
+        admin
+            .create_key_user_account(KEY, STRONG, KEY, &[], user_permissions())
+            .await,
+        admin
+            .create_user_account(PLAIN, STRONG, PLAIN, &[], user_permissions())
+            .await,
+    ];
+    let [organizer, key, plain] = accounts.each_ref().map(|account| {
+        let id = account.id().document_id();
+        let name = account.name();
+        Party {
+            id,
+            name,
+            client: DummyWebDavClient::new(id, name, STRONG, name),
+        }
+    });
+
+    let href = event_path(&organizer, UID);
+    let attendees = [KEY, PLAIN];
+    let invite = recurring_invite(UID, &attendees, &attendees).replace(
+        "ORGANIZER:mailto:key1@example.com",
+        &format!("ORGANIZER:mailto:{ORGANIZER}"),
+    );
+    assert_eq!(put_raw(ORGANIZER, &href, invite).await, 201);
+
+    let check_copies = async |master: &str, instance: &str| {
+        // The organizer's PUT submits the plain attendee's iMIP to SMTP.
+        wait_for_queue(test).await;
+        assert_eq!(pending_ids(test, key.id).await.len(), 1);
+        assert_eq!(trigger_drain(KEY, STRONG).await, 207);
+        assert!(pending_ids(test, key.id).await.is_empty());
+        for attendee in [&key, &plain] {
+            let copy = body(&attendee.client, &copy_href(test, attendee.id, UID).await).await;
+            assert!(
+                instance_of(&parse(&copy), Some(X)).is_some(),
+                "{} lost X: {copy}",
+                attendee.name
+            );
+            // A rejected REQUEST would leave the prior DTSTART in place.
+            assert!(
+                copy.contains(&format!("DTSTART:{master}"))
+                    && copy.contains(&format!("DTSTART:{instance}")),
+                "{} did not apply the REQUEST: {copy}",
+                attendee.name
+            );
+        }
+    };
+    check_copies(START_A, X).await;
+
+    // The two partial REQUESTs put X two sequences ahead of the master.
+    for (before, after) in [(X, X_V1), (X_V1, X_V2)] {
+        let updated = body(&organizer.client, &href)
+            .await
+            .replace(&format!("DTSTART:{before}"), &format!("DTSTART:{after}"));
+        assert_eq!(put_raw(ORGANIZER, &href, updated).await, 204);
+        check_copies(START_A, after).await;
+    }
+
+    // A full REQUEST supersedes the per-instance CANCEL, but its master is
+    // still below X's SEQUENCE on both copies.
+    let updated = without_override(&body(&organizer.client, &href).await, X).replace(
+        &format!("DTSTART:{START_A}"),
+        &format!("DTSTART:{MASTER_MOVED}"),
+    );
+    assert_eq!(put_raw(ORGANIZER, &href, updated).await, 204);
+    check_copies(MASTER_MOVED, X_V2).await;
+
+    for account in accounts {
+        wait_for_index_queue(test, account.id().document_id(), Duration::from_secs(30)).await;
+        admin.destroy_account(account).await;
     }
 }
 

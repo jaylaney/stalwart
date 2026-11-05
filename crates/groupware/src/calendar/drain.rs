@@ -1544,7 +1544,7 @@ async fn merge(
         Step::Answer(message) => return answer_refresh(ctx, event_id, message).await,
         Step::Merge(changes) => changes,
     };
-    // 1.0.1's `commit_itip_merge`: the stored classification is kept when
+    // 1.0.3's `commit_itip_merge`: the stored classification is kept when
     // the merge would change it. Upstream reads it from the row's flags,
     // which it derives from the stored tree (`refresh_from_content`); here
     // it is read from the unsealed stored tree itself, because a sealed

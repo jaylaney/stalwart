@@ -246,7 +246,11 @@ fn raise_sequence(comp: &mut ICalendarComponent, sequence: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduling::ItipSummary;
+    use crate::scheduling::{
+        ItipSummary,
+        inbound::{MergeAction, MergeResult, itip_process_message},
+        recipient::{AttendeeVisibility, RecipientPolicy},
+    };
     use calcard::{Entry, Parser};
 
     const MASTER: InstanceKey = None;
@@ -492,6 +496,67 @@ mod tests {
             ours.contains(&Some((4_076_388_000, true))),
             "RANGE=THISANDFUTURE"
         );
+    }
+
+    #[test]
+    fn full_request_keeps_a_newer_override() {
+        let x = Some(":20990303T100000Z");
+        let y = Some(":20990304T100000Z");
+        let stored = calendar(
+            None,
+            &[
+                by_alice(None, Some(1)),
+                by_alice(x, Some(3)),
+                by_alice(y, Some(1)),
+            ],
+        );
+        let attendee = [BOB.to_string()];
+        let policy = RecipientPolicy {
+            visibility: AttendeeVisibility::All,
+            max_recipients: 10,
+            max_instances: 10,
+        };
+        let stored_snapshots = itip_snapshot(&stored, &attendee, false).unwrap();
+        let component_id = |key| {
+            stored_snapshots
+                .components
+                .iter()
+                .find_map(|(instance, snapshot)| {
+                    (instance_key(instance) == key).then_some(snapshot.comp_id)
+                })
+                .unwrap()
+        };
+        let x_id = component_id(X);
+        let y_id = component_id(Y);
+
+        for (request, expected) in [
+            (by_alice(None, Some(2)), vec![y_id]),
+            (by_alice(None, Some(3)), vec![x_id, y_id]),
+            (by_alice(x, Some(4)), vec![]),
+        ] {
+            let itip = calendar(Some("REQUEST"), &[request]);
+            let result = itip_process_message(
+                &stored,
+                itip_snapshot(&stored, &attendee, false).unwrap(),
+                &itip,
+                itip_snapshot(&itip, &attendee, false).unwrap(),
+                ALICE.to_string(),
+                policy,
+            )
+            .expect("the organizer's REQUEST merges");
+            let MergeResult::Actions(actions) = result else {
+                panic!("expected merge actions");
+            };
+            let mut removed: Vec<_> = actions
+                .into_iter()
+                .filter_map(|action| match action {
+                    MergeAction::RemoveComponent { component_id } => Some(component_id),
+                    _ => None,
+                })
+                .collect();
+            removed.sort_unstable();
+            assert_eq!(removed, expected, "{itip}");
+        }
     }
 
     /// stored: master 4, X 9 (TZID form), Y 5, R 1, organized by

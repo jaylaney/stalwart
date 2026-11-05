@@ -161,12 +161,6 @@ impl ItipIngest for Server {
         recipient: &str,
         itip_message: &str,
     ) -> Result<Option<ItipMessage<ICalendar>>, ItipIngestError> {
-<<<<<<< HEAD
-        // Zero-access fork (iMIP spec 3.1 item 2): the parse with the
-        // Exchange fill, then the snapshot with the method's sender rule.
-        let itip = itip_parse_inbound(itip_message, recipient)?;
-        let itip_snapshots = itip_sender_snapshot(&itip, account_info.addresses(), sender)?;
-=======
         let mut attempt = 1;
         loop {
             match self
@@ -228,6 +222,13 @@ impl ItipIngest for Server {
             Ok(rsvp) => rsvp,
             Err(reason) => return Ok(RsvpResponse::error(reason, language)),
         };
+        if self
+            .za_is_key_account(rsvp.account_id)
+            .await
+            .caused_by(trc::location!())?
+        {
+            return Ok(RsvpResponse::error(RsvpError::InvalidLink, language));
+        }
 
         let part_stat = match request.part_stat() {
             Ok(part_stat) => part_stat,
@@ -420,75 +421,10 @@ impl ItipIngest for Server {
         recipient: &str,
         itip_message: &str,
     ) -> Result<Option<ItipMessage<ICalendar>>, ItipIngestError> {
-        // Parse and validate the iTIP message
-        let mut itip = ICalendar::parse(itip_message)
-            .map_err(|_| ItipIngestError::Message(ItipError::ICalendarParseError))
-            .and_then(|ical| {
-                if ical.components.len() > 1
-                    && ical.components[0].component_type == ICalendarComponentType::VCalendar
-                {
-                    Ok(ical)
-                } else {
-                    Err(ItipIngestError::Message(ItipError::ICalendarParseError))
-                }
-            })?;
-
-        // Microsoft Exchange does not include the organizer in REPLY, assume it is the recipient.
-        // This will be validated against the stored event anyway.
-        if itip.components[0]
-            .property(&ICalendarProperty::Method)
-            .and_then(|v| v.values.first())
-            .is_some_and(|v| {
-                matches!(
-                    v,
-                    ICalendarValue::Method(ICalendarMethod::Reply | ICalendarMethod::Request)
-                )
-            })
-        {
-            for comp in &mut itip.components {
-                if comp.component_type.is_scheduling_object() {
-                    let mut has_organizer = false;
-                    let mut has_attendee = false;
-
-                    for entry in &comp.entries {
-                        match entry.name {
-                            ICalendarProperty::Organizer => has_organizer = true,
-                            ICalendarProperty::Attendee => has_attendee = true,
-                            _ => {}
-                        }
-                    }
-
-                    if has_attendee && !has_organizer {
-                        comp.entries.push(ICalendarEntry {
-                            name: ICalendarProperty::Organizer,
-                            params: vec![],
-                            values: [ICalendarValue::Text(format!("mailto:{recipient}"))].into(),
-                        });
-                    }
-                }
-            }
-        }
-
-        let itip_snapshots = itip_snapshot(&itip, account_info.addresses(), false)?;
-        match itip_method(&itip)? {
-            ICalendarMethod::Reply | ICalendarMethod::Refresh | ICalendarMethod::Counter => {
-                if !itip_snapshots.sender_is_organizer_or_attendee(sender) {
-                    return Err(ItipIngestError::Message(
-                        ItipError::SenderIsNotOrganizerNorAttendee,
-                    ));
-                }
-            }
-            ICalendarMethod::Request
-            | ICalendarMethod::Add
-            | ICalendarMethod::Cancel
-            | ICalendarMethod::Publish
-            | ICalendarMethod::Declinecounter => {
-                if itip_snapshots.organizer.email.email != sender {
-                    return Err(ItipIngestError::Message(ItipError::SenderIsNotOrganizer));
-                }
-            }
-        }
->>>>>>> v1.0.3
+        // Zero-access fork (iMIP spec 3.1 item 2): the parse with the
+        // Exchange fill, then the snapshot with the method's sender rule.
+        let itip = itip_parse_inbound(itip_message, recipient)?;
+        let itip_snapshots = itip_sender_snapshot(&itip, account_info.addresses(), sender)?;
 
         // Obtain changedBy
         let changed_by = if let Some(id) = self.account_id_from_email(sender, true).await? {
@@ -783,37 +719,6 @@ impl ItipIngest for Server {
         }
         // SPDX-SnippetEnd
 
-<<<<<<< HEAD
-    async fn http_rsvp_handle(
-        &self,
-        request: RsvpRequest,
-        language: &str,
-        remote_ip: IpAddr,
-    ) -> trc::Result<RsvpResponse> {
-        let rsvp = match decode_rsvp_token(self, &request.token).await {
-            Ok(rsvp) => rsvp,
-            Err(reason) => return Ok(RsvpResponse::error(reason, language)),
-        };
-        if self
-            .za_is_key_account(rsvp.account_id)
-            .await
-            .caused_by(trc::location!())?
-        {
-            return Ok(RsvpResponse::error(RsvpError::InvalidLink, language));
-        }
-
-        let part_stat = match request.part_stat() {
-            Ok(part_stat) => part_stat,
-            Err(reason) => return Ok(RsvpResponse::error(reason, language)),
-        };
-
-        let (Some(archive), Some(content_archive)) = self
-            .archive_and_field(
-                rsvp.account_id,
-                Collection::CalendarEvent,
-                rsvp.document_id,
-                CalendarEventField::Content.field(),
-=======
         // Build event
         let now = now() as i64;
         let mut resolver = DefaultAlertsResolver::default();
@@ -824,7 +729,6 @@ impl ItipIngest for Server {
                 account_id,
                 &content,
                 event.names.iter().map(DavName::parent_id),
->>>>>>> v1.0.3
             )
             .await?;
         let calendar_ids = event
@@ -884,20 +788,274 @@ impl ItipIngest for Server {
             current: Some(current),
         };
 
-<<<<<<< HEAD
-                return Ok(RsvpResponse::error(RsvpError::ServerError, language));
+        // Prepare write batch
+        let mut batch = BatchBuilder::new();
+        batch.with_account_id(account_id);
+        self.limit_disk_quota(&mut batch, &account);
+        // Mail spec 6.1: as the import's batch in `itip_ingest`, in every commit
+        // chunk; the RSVP handler, the other caller, refuses key accounts' links
+        // before this.
+        self.za_provisioning_fence(&mut batch, account_id);
+        event
+            .update_full(
+                content,
+                account_info.changed_by(),
+                event_,
+                content_.inner,
+                account_id,
+                document_id,
+                None,
+                &mut batch,
+            )
+            .caused_by(trc::location!())?;
+        self.replace_event_alarms(
+            account_id,
+            document_id,
+            prev_email_alarms,
+            next_email_alarms,
+            &mut AlarmTasks::None,
+            &mut batch,
+        )
+        .await?;
+        self.za_provisioning_fence(&mut batch, account_id);
+        if NotificationQuota::default()
+            .reserve(
+                self,
+                account_id,
+                notification_content.stored_size(),
+                &mut batch,
+            )
+            .await
+            .caused_by(trc::location!())?
+        {
+            self.za_provisioning_fence(&mut batch, account_id);
+            let itip_document_id =
+                batch.reserve_document_id(account_id, Collection::CalendarEventNotification);
+            notification
+                .insert(
+                    notification_content,
+                    account_info.changed_by(),
+                    account_id,
+                    itip_document_id,
+                    None,
+                    &mut batch,
+                )
+                .caused_by(trc::location!())?;
+        }
+        #[cfg(stalwart_tests)]
+        {
+            let barrier = ITIP_MERGE_BARRIER.lock().ok().and_then(|slot| slot.clone());
+            if let Some(barrier) = barrier
+                && barrier.wait().await.is_leader()
+                && let Ok(mut slot) = ITIP_MERGE_BARRIER.lock()
+            {
+                *slot = None;
             }
-            Err(ItipIngestError::Internal(err)) => {
-                return Err(err.caused_by(trc::location!()));
+        }
+        self.za_provisioning_fence(&mut batch, account_id);
+        self.commit_batch(batch).await.caused_by(trc::location!())?;
+
+        Ok(())
+    }
+
+    async fn http_rsvp_sync_attendee_copy(
+        &self,
+        target: RsvpTarget,
+        attendee: &str,
+        part_stat: &ICalendarParticipationStatus,
+    ) -> trc::Result<()> {
+        let event = target
+            .archive
+            .to_unarchived::<CalendarEvent>()
+            .caused_by(trc::location!())?;
+        let content = target
+            .content_archive
+            .to_unarchived::<CalendarEventContent>()
+            .caused_by(trc::location!())?;
+        let new_event = event
+            .deserialize::<CalendarEvent>()
+            .caused_by(trc::location!())?;
+        let mut new_content = content
+            .deserialize::<CalendarEventContent>()
+            .caused_by(trc::location!())?;
+        let mut did_change = false;
+
+        for component in &mut new_content.data.event.components {
+            if !component.component_type.is_scheduling_object() {
+                continue;
+            }
+
+            for entry in &mut component.entries {
+                if entry.name != ICalendarProperty::Attendee
+                    || !entry
+                        .calendar_address()
+                        .is_some_and(|v| v.eq_ignore_ascii_case(attendee))
+                {
+                    continue;
+                }
+
+                let mut has_partstat = false;
+                for param in &mut entry.params {
+                    if let (
+                        ICalendarParameterName::Partstat,
+                        ICalendarParameterValue::Partstat(current),
+                    ) = (&param.name, &mut param.value)
+                    {
+                        has_partstat = true;
+                        if *current != *part_stat {
+                            *current = part_stat.clone();
+                            did_change = true;
+                        }
+                    }
+                }
+
+                if !has_partstat {
+                    entry
+                        .params
+                        .push(ICalendarParameter::partstat(part_stat.clone()));
+                    did_change = true;
+                }
             }
         }
 
-        // Only once the organizer holds the reply is the attendee's own copy brought in line
-        if let Some(target) = attendee_copy {
-            http_rsvp_sync_attendee_copy(self, target, &rsvp.attendee, &part_stat).await?;
+        if did_change {
+            let attendee_info = self
+                .account_info(target.account_id)
+                .await
+                .caused_by(trc::location!())?;
+            let mut batch = BatchBuilder::new();
+            new_event
+                .update_full(
+                    new_content,
+                    attendee_info.changed_by(),
+                    event,
+                    content.inner,
+                    target.account_id,
+                    target.document_id,
+                    None,
+                    &mut batch,
+                )
+                .caused_by(trc::location!())?;
+            self.commit_batch(batch).await.caused_by(trc::location!())?;
         }
 
-        Ok(RsvpResponse::recorded(&part_stat))
+        Ok(())
+    }
+
+    async fn http_rsvp_attendee_copy(
+        &self,
+        rsvp: &RsvpToken,
+        uid: &str,
+        remote_ip: IpAddr,
+    ) -> trc::Result<Option<RsvpTarget>> {
+        if !self.core.groupware.itip_enabled {
+            return Ok(None);
+        }
+
+        let Some(account_id) = self
+            .account_id_from_email(&rsvp.attendee, true)
+            .await
+            .caused_by(trc::location!())?
+            .filter(|account_id| *account_id != rsvp.account_id)
+        else {
+            return Ok(None);
+        };
+
+        // A key account's copy is sealed: it is never rewritten without its keys.
+        if self
+            .za_is_key_account(account_id)
+            .await
+            .caused_by(trc::location!())?
+        {
+            return Ok(None);
+        }
+
+        let can_send = match self.access_token(account_id).await {
+            Ok(access_token) => {
+                AccessToken::new(access_token, remote_ip).is_ok_and(|access_token| {
+                    access_token.has_permission(Permission::CalendarSchedulingSend)
+                })
+            }
+            Err(err) => {
+                trc::error!(
+                    err.account_id(account_id)
+                        .caused_by(trc::location!())
+                        .details("Failed to obtain access token for RSVP attendee")
+                );
+                false
+            }
+        };
+        if !can_send {
+            return Ok(None);
+        }
+
+        let Some(document_id) = self
+            .document_ids_matching(
+                account_id,
+                Collection::CalendarEvent,
+                CalendarEventField::Uid,
+                uid.as_bytes(),
+            )
+            .await
+            .caused_by(trc::location!())?
+            .iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+
+        let (Some(archive), Some(content_archive)) = self
+            .archive_and_field(
+                account_id,
+                Collection::CalendarEvent,
+                document_id,
+                CalendarEventField::Content.field(),
+            )
+            .await
+            .caused_by(trc::location!())?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(RsvpTarget {
+            account_id,
+            document_id,
+            archive,
+            content_archive,
+        }))
+    }
+
+    async fn decode_rsvp_token(&self, token: &str) -> Result<RsvpToken, RsvpError> {
+        if token.is_empty() {
+            return Err(RsvpError::InvalidLink);
+        }
+
+        let token = self
+            .validate_access_token(GrantType::Rsvp.into(), token)
+            .await
+            .map_err(|err| {
+                if err.matches(trc::EventType::Auth(trc::AuthEvent::TokenExpired)) {
+                    RsvpError::Expired
+                } else {
+                    RsvpError::InvalidLink
+                }
+            })?;
+
+        token
+            .claims
+            .as_deref()
+            .and_then(|claims| claims.rsplit_once(';'))
+            .and_then(|(attendee, document_id)| {
+                document_id
+                    .parse::<u32>()
+                    .ok()
+                    .map(|document_id| RsvpToken {
+                        account_id: token.account_id,
+                        document_id,
+                        attendee: attendee.to_string(),
+                    })
+            })
+            .ok_or(RsvpError::InvalidLink)
     }
 }
 
@@ -1019,661 +1177,6 @@ pub async fn itip_auto_add_allowed(
             )
             .await
             .caused_by(trc::location!())?)
-}
-
-async fn http_rsvp_sync_attendee_copy(
-    server: &Server,
-    target: RsvpTarget,
-    attendee: &str,
-    part_stat: &ICalendarParticipationStatus,
-) -> trc::Result<()> {
-    let event = target
-        .archive
-        .to_unarchived::<CalendarEvent>()
-        .caused_by(trc::location!())?;
-    let content = target
-        .content_archive
-        .to_unarchived::<CalendarEventContent>()
-        .caused_by(trc::location!())?;
-    let new_event = event
-        .deserialize::<CalendarEvent>()
-        .caused_by(trc::location!())?;
-    let mut new_content = content
-        .deserialize::<CalendarEventContent>()
-        .caused_by(trc::location!())?;
-    let mut did_change = false;
-
-    for component in &mut new_content.data.event.components {
-        if !component.component_type.is_scheduling_object() {
-            continue;
-        }
-
-        for entry in &mut component.entries {
-            if entry.name != ICalendarProperty::Attendee
-                || !entry
-                    .calendar_address()
-                    .is_some_and(|v| v.eq_ignore_ascii_case(attendee))
-            {
-                continue;
-            }
-
-            let mut has_partstat = false;
-            for param in &mut entry.params {
-                if let (
-                    ICalendarParameterName::Partstat,
-                    ICalendarParameterValue::Partstat(current),
-                ) = (&param.name, &mut param.value)
-                {
-                    has_partstat = true;
-                    if *current != *part_stat {
-                        *current = part_stat.clone();
-                        did_change = true;
-                    }
-                }
-            }
-
-            if !has_partstat {
-                entry
-                    .params
-                    .push(ICalendarParameter::partstat(part_stat.clone()));
-                did_change = true;
-            }
-        }
-    }
-
-    if did_change {
-        let attendee_info = server
-            .account_info(target.account_id)
-            .await
-            .caused_by(trc::location!())?;
-=======
-        // Prepare write batch
->>>>>>> v1.0.3
-        let mut batch = BatchBuilder::new();
-        batch.with_account_id(account_id);
-        self.limit_disk_quota(&mut batch, &account);
-        event
-            .update_full(
-                content,
-                account_info.changed_by(),
-                event_,
-                content_.inner,
-                account_id,
-                document_id,
-                None,
-                &mut batch,
-            )
-            .caused_by(trc::location!())?;
-<<<<<<< HEAD
-        server
-            .commit_batch(batch)
-            .await
-            .caused_by(trc::location!())?;
-    }
-
-    Ok(())
-}
-
-struct RsvpTarget {
-    account_id: u32,
-    document_id: u32,
-    archive: Archive<ArchiveBytes>,
-    content_archive: Archive<ArchiveBytes>,
-}
-
-async fn http_rsvp_attendee_copy(
-    server: &Server,
-    rsvp: &RsvpToken,
-    uid: &str,
-    remote_ip: IpAddr,
-) -> trc::Result<Option<RsvpTarget>> {
-    if !server.core.groupware.itip_enabled {
-        return Ok(None);
-    }
-
-    let Some(account_id) = server
-        .account_id_from_email(&rsvp.attendee, true)
-        .await
-        .caused_by(trc::location!())?
-        .filter(|account_id| *account_id != rsvp.account_id)
-    else {
-        return Ok(None);
-    };
-
-    // A key account's copy is sealed: it is never rewritten without its keys.
-    if server
-        .za_is_key_account(account_id)
-        .await
-        .caused_by(trc::location!())?
-    {
-        return Ok(None);
-    }
-
-    let can_send = match server.access_token(account_id).await {
-        Ok(access_token) => AccessToken::new(access_token, remote_ip).is_ok_and(|access_token| {
-            access_token.has_permission(Permission::CalendarSchedulingSend)
-        }),
-        Err(err) => {
-            trc::error!(
-                err.account_id(account_id)
-                    .caused_by(trc::location!())
-                    .details("Failed to obtain access token for RSVP attendee")
-            );
-            false
-        }
-    };
-    if !can_send {
-        return Ok(None);
-    }
-
-    let Some(document_id) = server
-        .document_ids_matching(
-            account_id,
-            Collection::CalendarEvent,
-            CalendarEventField::Uid,
-            uid.as_bytes(),
-        )
-        .await
-        .caused_by(trc::location!())?
-        .iter()
-        .next()
-    else {
-        return Ok(None);
-    };
-
-    let (Some(archive), Some(content_archive)) = server
-        .archive_and_field(
-            account_id,
-            Collection::CalendarEvent,
-            document_id,
-            CalendarEventField::Content.field(),
-        )
-        .await
-        .caused_by(trc::location!())?
-    else {
-        return Ok(None);
-    };
-
-    Ok(Some(RsvpTarget {
-        account_id,
-        document_id,
-        archive,
-        content_archive,
-    }))
-}
-
-struct RsvpToken {
-    account_id: u32,
-    document_id: u32,
-    attendee: String,
-}
-
-async fn decode_rsvp_token(server: &Server, token: &str) -> Result<RsvpToken, RsvpError> {
-    if token.is_empty() {
-        return Err(RsvpError::InvalidLink);
-    }
-
-    let token = server
-        .validate_access_token(GrantType::Rsvp.into(), token)
-        .await
-        .map_err(|err| {
-            if err.matches(trc::EventType::Auth(trc::AuthEvent::TokenExpired)) {
-                RsvpError::Expired
-            } else {
-                RsvpError::InvalidLink
-            }
-        })?;
-
-    token
-        .claims
-        .as_deref()
-        .and_then(|claims| claims.rsplit_once(';'))
-        .and_then(|(attendee, document_id)| {
-            document_id
-                .parse::<u32>()
-                .ok()
-                .map(|document_id| RsvpToken {
-                    account_id: token.account_id,
-                    document_id,
-                    attendee: attendee.to_string(),
-                })
-        })
-        .ok_or(RsvpError::InvalidLink)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn commit_itip_merge(
-    server: &Server,
-    account_info: &AccountInfo,
-    account_id: u32,
-    document_id: u32,
-    archive: &Archive<ArchiveBytes>,
-    content_archive: &Archive<ArchiveBytes>,
-    mut event: CalendarEvent,
-    mut content: CalendarEventContent,
-    changes: Vec<MergeAction>,
-    itip: ICalendar,
-    changed_by: ChangedBy,
-    is_organizer_update: bool,
-) -> Result<(), ItipIngestError> {
-    let event_ = archive
-        .to_unarchived::<CalendarEvent>()
-        .caused_by(trc::location!())?;
-    let content_ = content_archive
-        .to_unarchived::<CalendarEventContent>()
-        .caused_by(trc::location!())?;
-
-    // Merge changes
-    let privacy = EventPrivacy::from_flags(event_.inner.flags.to_native());
-    let previous = content.data.event.clone();
-    itip_merge_changes(&mut content.data.event, &itip, changes)?;
-    if content
-        .data
-        .event
-        .components
-        .iter()
-        .filter(|component| component.component_type.is_scheduling_object())
-        .any(|component| {
-            component
-                .entries
-                .iter()
-                .filter(|entry| entry.name == ICalendarProperty::Class)
-                .filter_map(|entry| entry.values.first())
-                .map(EventPrivacy::from_value)
-                .max()
-                .unwrap_or_default()
-                != privacy
-        })
-    {
-        content.data.event.set_privacy(privacy);
-    }
-    let current = content.data.event.clone();
-
-    // Calculate the new ical size
-    let new_size = SizeWriter::ical(&content.data.event) as u32;
-    if new_size > server.core.groupware.max_ical_size as u32 {
-        return Err(ItipIngestError::Message(ItipError::EventTooLarge));
-    }
-
-    let account = server.account(account_id).await?;
-    // SPDX-SnippetBegin
-    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
-    // SPDX-License-Identifier: LicenseRef-SEL
-    // Validate quota
-    #[cfg(feature = "enterprise")]
-    let extra_bytes = (new_size as u64).saturating_sub(event_.inner.size.to_native() as u64);
-    #[cfg(feature = "enterprise")]
-    if extra_bytes > 0
-        && server
-            .has_available_tenant_quota(&account, extra_bytes)
-            .await
-            .is_err()
-    {
-        return Err(ItipIngestError::Message(ItipError::QuotaExceeded));
-    }
-    // SPDX-SnippetEnd
-
-    // Build event
-    let now = now() as i64;
-    let mut resolver = DefaultAlertsResolver::default();
-    let default_alerts = resolver
-        .resolve_for_content(
-            server,
-            account_id,
-            account_id,
-            &content,
-            event.names.iter().map(DavName::parent_id),
-        )
-        .await?;
-    let calendar_ids = event
-        .names
-        .iter()
-        .map(DavName::parent_id)
-        .collect::<Vec<_>>();
-    let prev_email_alarms = server
-        .next_event_alarms(
-            account_id,
-            &EventAlarmUsers::new(account_id, content_.inner)?
-                .with_event_flags(event_.inner.flags.to_native()),
-            &content_.inner.data,
-            &calendar_ids,
-            now,
-            &mut resolver,
-        )
-        .await?;
-    content.data = CalendarEventData::new_with_default_alerts(
-        content.data.event,
-        Tz::Floating,
-        server.core.groupware.max_ical_instances,
-        &default_alerts,
-    );
-    let next_email_alarms = server
-        .next_event_alarms(
-            account_id,
-            &EventAlarmUsers::new(account_id, &content)?.with_event_flags(event.flags),
-            &content.data,
-            &calendar_ids,
-            now,
-            &mut resolver,
-        )
-        .await?;
-    if is_organizer_update {
-        if let Some(schedule_tag) = &mut event.schedule_tag {
-            *schedule_tag += 1;
-        } else {
-            event.schedule_tag = Some(1);
-        }
-    }
-
-    // Build event for schedule inbox
-    let notification = CalendarEventNotification {
-        changed_by,
-        event_id: Some(document_id),
-        calendar_ids: calendar_ids.clone(),
-        flags: EVENT_NOTIFICATION_IS_CHANGE
-            | NotificationAudience::of_event(event.flags | event_.inner.flags.to_native())
-                .with_privacy(privacy.is_public())
-                .flags(),
-        ..Default::default()
-    };
-    let notification_content = CalendarEventNotificationContent::Itip {
-        message: itip,
-        previous: Some(previous),
-        current: Some(current),
-    };
-
-    // Prepare write batch
-    let mut batch = BatchBuilder::new();
-    batch.with_account_id(account_id);
-    server.limit_disk_quota(&mut batch, &account);
-    // Mail spec 6.1: as the import's batch in `itip_ingest`, in every commit
-    // chunk; the RSVP handler, the other caller, refuses key accounts' links
-    // before this.
-    server.za_provisioning_fence(&mut batch, account_id);
-    event
-        .update_full(
-            content,
-            account_info.changed_by(),
-            event_,
-            content_.inner,
-            account_id,
-            document_id,
-            None,
-            &mut batch,
-        )
-        .caused_by(trc::location!())?;
-    server
-        .replace_event_alarms(
-=======
-        self.replace_event_alarms(
->>>>>>> v1.0.3
-            account_id,
-            document_id,
-            prev_email_alarms,
-            next_email_alarms,
-            &mut AlarmTasks::None,
-            &mut batch,
-        )
-        .await?;
-<<<<<<< HEAD
-    server.za_provisioning_fence(&mut batch, account_id);
-    if NotificationQuota::default()
-        .reserve(
-            server,
-            account_id,
-            notification_content.stored_size(),
-            &mut batch,
-        )
-        .await
-        .caused_by(trc::location!())?
-    {
-        server.za_provisioning_fence(&mut batch, account_id);
-        let itip_document_id =
-            batch.reserve_document_id(account_id, Collection::CalendarEventNotification);
-        notification
-            .insert(
-                notification_content,
-                account_info.changed_by(),
-=======
-        if NotificationQuota::default()
-            .reserve(
-                self,
->>>>>>> v1.0.3
-                account_id,
-                notification_content.stored_size(),
-                &mut batch,
-            )
-<<<<<<< HEAD
-            .caused_by(trc::location!())?;
-    }
-    server.za_provisioning_fence(&mut batch, account_id);
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
-=======
-            .await
-            .caused_by(trc::location!())?
-        {
-            let itip_document_id =
-                batch.reserve_document_id(account_id, Collection::CalendarEventNotification);
-            notification
-                .insert(
-                    notification_content,
-                    account_info.changed_by(),
-                    account_id,
-                    itip_document_id,
-                    None,
-                    &mut batch,
-                )
-                .caused_by(trc::location!())?;
-        }
-        #[cfg(stalwart_tests)]
-        {
-            let barrier = ITIP_MERGE_BARRIER.lock().ok().and_then(|slot| slot.clone());
-            if let Some(barrier) = barrier
-                && barrier.wait().await.is_leader()
-                && let Ok(mut slot) = ITIP_MERGE_BARRIER.lock()
-            {
-                *slot = None;
-            }
-        }
-        self.commit_batch(batch).await.caused_by(trc::location!())?;
->>>>>>> v1.0.3
-
-        Ok(())
-    }
-
-    async fn http_rsvp_sync_attendee_copy(
-        &self,
-        target: RsvpTarget,
-        attendee: &str,
-        part_stat: &ICalendarParticipationStatus,
-    ) -> trc::Result<()> {
-        let event = target
-            .archive
-            .to_unarchived::<CalendarEvent>()
-            .caused_by(trc::location!())?;
-        let content = target
-            .content_archive
-            .to_unarchived::<CalendarEventContent>()
-            .caused_by(trc::location!())?;
-        let new_event = event
-            .deserialize::<CalendarEvent>()
-            .caused_by(trc::location!())?;
-        let mut new_content = content
-            .deserialize::<CalendarEventContent>()
-            .caused_by(trc::location!())?;
-        let mut did_change = false;
-
-        for component in &mut new_content.data.event.components {
-            if !component.component_type.is_scheduling_object() {
-                continue;
-            }
-
-            for entry in &mut component.entries {
-                if entry.name != ICalendarProperty::Attendee
-                    || !entry
-                        .calendar_address()
-                        .is_some_and(|v| v.eq_ignore_ascii_case(attendee))
-                {
-                    continue;
-                }
-
-                let mut has_partstat = false;
-                for param in &mut entry.params {
-                    if let (
-                        ICalendarParameterName::Partstat,
-                        ICalendarParameterValue::Partstat(current),
-                    ) = (&param.name, &mut param.value)
-                    {
-                        has_partstat = true;
-                        if *current != *part_stat {
-                            *current = part_stat.clone();
-                            did_change = true;
-                        }
-                    }
-                }
-
-                if !has_partstat {
-                    entry
-                        .params
-                        .push(ICalendarParameter::partstat(part_stat.clone()));
-                    did_change = true;
-                }
-            }
-        }
-
-        if did_change {
-            let attendee_info = self
-                .account_info(target.account_id)
-                .await
-                .caused_by(trc::location!())?;
-            let mut batch = BatchBuilder::new();
-            new_event
-                .update_full(
-                    new_content,
-                    attendee_info.changed_by(),
-                    event,
-                    content.inner,
-                    target.account_id,
-                    target.document_id,
-                    None,
-                    &mut batch,
-                )
-                .caused_by(trc::location!())?;
-            self.commit_batch(batch).await.caused_by(trc::location!())?;
-        }
-
-        Ok(())
-    }
-
-    async fn http_rsvp_attendee_copy(
-        &self,
-        rsvp: &RsvpToken,
-        uid: &str,
-        remote_ip: IpAddr,
-    ) -> trc::Result<Option<RsvpTarget>> {
-        if !self.core.groupware.itip_enabled {
-            return Ok(None);
-        }
-
-        let Some(account_id) = self
-            .account_id_from_email(&rsvp.attendee, true)
-            .await
-            .caused_by(trc::location!())?
-            .filter(|account_id| *account_id != rsvp.account_id)
-        else {
-            return Ok(None);
-        };
-
-        let can_send = match self.access_token(account_id).await {
-            Ok(access_token) => {
-                AccessToken::new(access_token, remote_ip).is_ok_and(|access_token| {
-                    access_token.has_permission(Permission::CalendarSchedulingSend)
-                })
-            }
-            Err(err) => {
-                trc::error!(
-                    err.account_id(account_id)
-                        .caused_by(trc::location!())
-                        .details("Failed to obtain access token for RSVP attendee")
-                );
-                false
-            }
-        };
-        if !can_send {
-            return Ok(None);
-        }
-
-        let Some(document_id) = self
-            .document_ids_matching(
-                account_id,
-                Collection::CalendarEvent,
-                CalendarEventField::Uid,
-                uid.as_bytes(),
-            )
-            .await
-            .caused_by(trc::location!())?
-            .iter()
-            .next()
-        else {
-            return Ok(None);
-        };
-
-        let (Some(archive), Some(content_archive)) = self
-            .archive_and_field(
-                account_id,
-                Collection::CalendarEvent,
-                document_id,
-                CalendarEventField::Content.field(),
-            )
-            .await
-            .caused_by(trc::location!())?
-        else {
-            return Ok(None);
-        };
-
-        Ok(Some(RsvpTarget {
-            account_id,
-            document_id,
-            archive,
-            content_archive,
-        }))
-    }
-
-    async fn decode_rsvp_token(&self, token: &str) -> Result<RsvpToken, RsvpError> {
-        if token.is_empty() {
-            return Err(RsvpError::InvalidLink);
-        }
-
-        let token = self
-            .validate_access_token(GrantType::Rsvp.into(), token)
-            .await
-            .map_err(|err| {
-                if err.matches(trc::EventType::Auth(trc::AuthEvent::TokenExpired)) {
-                    RsvpError::Expired
-                } else {
-                    RsvpError::InvalidLink
-                }
-            })?;
-
-        token
-            .claims
-            .as_deref()
-            .and_then(|claims| claims.rsplit_once(';'))
-            .and_then(|(attendee, document_id)| {
-                document_id
-                    .parse::<u32>()
-                    .ok()
-                    .map(|document_id| RsvpToken {
-                        account_id: token.account_id,
-                        document_id,
-                        attendee: attendee.to_string(),
-                    })
-            })
-            .ok_or(RsvpError::InvalidLink)
-    }
 }
 
 pub struct RsvpTarget {
