@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::ingest::{EmailIngest, IngestEmail, IngestSource};
+use super::{
+    ingest::{EmailIngest, IngestEmail, IngestSource},
+    za::harvest::za_harvest_allowed,
+};
 use crate::{mailbox::INBOX_ID, sieve::ingest::SieveScriptIngest};
 use common::{
     Server,
@@ -202,8 +205,6 @@ impl MailDelivery for Server {
                     .assert_has_permission(Permission::EmailReceive)
             }) {
                 Ok(access_token) => {
-                    harvest_message |= harvest && !rcpt.is_spam();
-
                     // Check if there is an active sieve script
                     match self.sieve_script_get_active(account_id).await {
                         Ok(None) => {
@@ -250,6 +251,9 @@ impl MailDelivery for Server {
 
                 Err(err) => Err(err),
             };
+
+            harvest_message |=
+                harvest && !rcpt.is_spam() && za_harvest_allowed(self, account_id, &status).await;
 
             let status = match status {
                 Ok(ingested_message) => {

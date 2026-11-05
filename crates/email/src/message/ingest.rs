@@ -356,8 +356,7 @@ impl EmailIngest for Server {
         })?;
 
         // Obtain message references and thread name
-<<<<<<< HEAD
-        let fields = ThreadFields::scan(&message);
+        let fields = ThreadFields::scan(message);
         let mut thread_result = if za_key {
             // Mail spec 5.4: no thread lookup and no threading key; the
             // message gets a thread of its own, whatever its group.
@@ -373,12 +372,6 @@ impl EmailIngest for Server {
             self.find_thread_id(account_id, fields.subject, &fields.message_ids)
                 .await?
         };
-=======
-        let fields = ThreadFields::scan(message);
-        let mut thread_result = self
-            .find_thread_id(account_id, fields.subject, &fields.message_ids)
-            .await?;
->>>>>>> v1.0.3
         let group_slot = match group_thread {
             _ if za_key => None,
             Some(PendingId::Slot(slot)) if thread_result.thread_id.is_none() => Some(slot),
@@ -553,7 +546,7 @@ impl EmailIngest for Server {
                                     &itip_message,
                                     sender_authentication,
                                     envelope_from,
-                                    &message,
+                                    message,
                                     deliver_to,
                                     params.session_id,
                                 ))
@@ -678,29 +671,11 @@ impl EmailIngest for Server {
             _ => false,
         };
 
-<<<<<<< HEAD
         // Mail spec 6.1 step 4: no training sample for a key account.
         if za_key {
             train_spam = None;
         }
 
-        // Encrypt message
-        let do_encrypt = match params.source {
-            IngestSource::Jmap { .. } if params.keywords.contains(&Keyword::Draft) => false,
-            IngestSource::Jmap { .. } | IngestSource::Imap { .. } => {
-                self.core.email.encrypt
-                    && self.core.email.encrypt_append
-                    && account.flags.encrypt_on_append()
-            }
-            IngestSource::Smtp { .. } => self.core.email.encrypt,
-            IngestSource::Restore => false,
-        };
-        // Mail spec 6.1 step 5: a key account's message is sealed instead.
-        let do_encrypt = do_encrypt && !za_key;
-        let is_encrypted = if do_encrypt
-            && !message.is_encrypted()
-            && let Some(encrypt_keys) = account.encryption_key()
-=======
         let encryption = match params.source {
             IngestSource::Jmap { .. } if params.keywords.contains(&Keyword::Draft) => None,
             IngestSource::Jmap { .. } | IngestSource::Imap { .. } => account
@@ -709,10 +684,11 @@ impl EmailIngest for Server {
             IngestSource::Smtp { .. } => account.encryption().filter(|_| self.core.email.encrypt),
             IngestSource::Restore => None,
         };
+        // Mail spec 6.1 step 5: a key account's message is sealed instead.
+        let encryption = encryption.filter(|_| !za_key);
         let encrypted_message;
         let is_encrypted = if let Some(encryption) = encryption
             && crypto::protection(message) != Protection::Encrypted
->>>>>>> v1.0.3
         {
             match encryption.encrypt(message, now()) {
                 Ok(encrypted) => {
@@ -909,7 +885,7 @@ impl EmailIngest for Server {
             // merge or recheck, no iTIP; the index entry as for any message
             // (the worker indexes the visible fields only). The Message-ID
             // stays out of the ingest event.
-            za_index_stub(batch, sealed, &message, &extra_headers, data)
+            za_index_stub(batch, sealed, message, &extra_headers, data)
                 .caused_by(trc::location!())?;
             batch.queue_document_index(SearchIndex::Email, account_id, QueueDocumentId::Current);
             if let Some(blob_hold) = blob_hold {
@@ -925,6 +901,7 @@ impl EmailIngest for Server {
                 thread_recheck: None,
                 private_commit: PrivateMetadataCommit::default(),
                 event: ingest_event(params.source, is_spam),
+                encrypted: false,
                 mailbox_ids: std::mem::take(&mut params.mailbox_ids),
                 message_id: Some("[redacted]".into()),
                 session_id: params.session_id,
@@ -1032,22 +1009,8 @@ impl EmailIngest for Server {
             size: raw_message_len,
             thread_recheck,
             private_commit,
-<<<<<<< HEAD
             event: ingest_event(params.source, is_spam),
-=======
-            event: match params.source {
-                IngestSource::Smtp { .. } => {
-                    if !is_spam {
-                        MessageIngestEvent::Ham
-                    } else {
-                        MessageIngestEvent::Spam
-                    }
-                }
-                IngestSource::Jmap { .. } | IngestSource::Restore => MessageIngestEvent::JmapAppend,
-                IngestSource::Imap { .. } => MessageIngestEvent::ImapAppend,
-            },
             encrypted: is_encrypted,
->>>>>>> v1.0.3
             mailbox_ids: std::mem::take(&mut params.mailbox_ids),
             message_id,
             session_id: params.session_id,
@@ -1257,14 +1220,10 @@ impl EmailIngest for Server {
             prepared,
         } = samples;
         batch.with_account_id(account_id);
-<<<<<<< HEAD
         // Mail ruling R55: the account was read as ordinary, so every commit
         // chunk of its samples asserts that it holds no vault record.
         self.za_provisioning_fence(batch, account_id);
-        for sample in prepared {
-=======
         for sample in prepared.into_iter().filter(|sample| !sample.encrypted) {
->>>>>>> v1.0.3
             self.add_spam_sample(
                 account_id,
                 batch,
@@ -1284,20 +1243,6 @@ impl EmailIngest for Server {
 
         self.message_metadata(account_id, &documents, |document_id, bytes| {
             let sample = SpamSample::from_metadata(bytes, spam.contains(document_id))?;
-<<<<<<< HEAD
-            self.add_spam_sample(
-                account_id,
-                batch,
-                sample.hash,
-                sample.size,
-                sample.from,
-                sample.subject,
-                sample.is_spam,
-                true,
-                span_id,
-            );
-            za_training_commit_point(self, batch, account_id);
-=======
             if !sample.encrypted {
                 self.add_spam_sample(
                     account_id,
@@ -1310,9 +1255,8 @@ impl EmailIngest for Server {
                     true,
                     span_id,
                 );
-                batch.commit_point();
+                za_training_commit_point(self, batch, account_id);
             }
->>>>>>> v1.0.3
             Ok(true)
         })
         .await

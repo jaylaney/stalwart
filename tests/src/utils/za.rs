@@ -990,6 +990,31 @@ pub async fn queued_recipients(test: &TestServer) -> Vec<String> {
         .collect()
 }
 
+/// Whether the queue holds a message for `address` whose last attempt
+/// failed temporarily.
+pub async fn temporarily_failed(test: &TestServer, address: &str) -> bool {
+    test.read_queued_messages()
+        .await
+        .into_iter()
+        .flat_map(|m| m.message.recipients)
+        .any(|r| {
+            &*r.address == address && matches!(r.status, smtp::queue::Status::TemporaryFailure(_))
+        })
+}
+
+/// Waits until the queue holds a message for `address` whose last attempt
+/// failed temporarily.
+pub async fn wait_for_temporary_failure(test: &TestServer, address: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !temporarily_failed(test, address).await {
+        assert!(
+            Instant::now() < deadline,
+            "no temporary failure queued for {address}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Waits until everything the server has queued is delivered. A task that
 /// sends mail (iMIP, alarms) waits for the local SMTP session to accept the
 /// message, so once the task queue is empty every such message is in the

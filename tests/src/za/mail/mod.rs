@@ -50,6 +50,7 @@ use utils::hash128::Hash128;
 pub mod delivery;
 pub mod fence;
 pub mod gates;
+pub mod gateway;
 pub mod login;
 pub mod reads;
 pub mod search;
@@ -383,7 +384,7 @@ pub async fn corrupt_blob(test: &TestServer, hash: &BlobHash) {
 /// batch after).
 pub fn append_params<'x>(
     raw: &'x str,
-    message: Option<Message<'x>>,
+    message: Option<&'x Message<'x>>,
     access_token: &'x AccessToken,
 ) -> IngestEmail<'x> {
     IngestEmail {
@@ -415,7 +416,11 @@ pub async fn group_ingest(
     let message = MessageParser::new().parse(raw.as_bytes());
     let key = message.as_ref().map(ThreadKey::new).unwrap_or_default();
     group
-        .ingest(server, append_params(raw, message, access_token), key)
+        .ingest(
+            server,
+            append_params(raw, message.as_ref(), access_token),
+            key,
+        )
         .await
 }
 

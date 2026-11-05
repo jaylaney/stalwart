@@ -764,6 +764,11 @@
     "evidence": "Part 4b (commit 4beb2ae0f): the sealed calendar PROPFIND paths; 0.16's `dav/src/common/propfind.rs` became upstream's `propfind/` directory (Task 1, 'Deleted paths and their disposition'). A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
    },
    {
+    "file": "crates/email/src/message/za/harvest.rs",
+    "runtime_excluded": false,
+    "evidence": "Upstream v1.0.3 merge plan, Task 5: upstream's key harvest takes only a delivery that committed a message as an ordinary account. A fork runtime file added by the merge (git log --diff-filter=A -- crates/email/src/message/za/harvest.rs)."
+   },
+   {
     "file": "crates/groupware/src/calendar/seal/container.rs",
     "runtime_excluded": false,
     "evidence": "Rulings 16, 23 and 29 (part 4a, commit a92064a43): the sealed dead-property container. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."

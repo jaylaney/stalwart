@@ -24,8 +24,11 @@ use common::{
     storage::{blob::BlobHold, index::ObjectIndexBuilder},
     za::{ZA_TRACE_MAIL_KEYLESS, mail::za_keyless_refusal},
 };
+use registry::schema::enums::CompressionAlgo;
 use std::sync::Arc;
-use store::write::{BatchBuilder, BlobLink, BlobOp, PendingId, blob::BlobLinkValue};
+use store::write::{
+    BatchBuilder, BlobLink, BlobOp, PendingId, blob::BlobLinkValue, blob_codec::BlobOpts,
+};
 use trc::AddContext;
 use types::{blob_hash::BlobHash, field::EmailField};
 use vault::{
@@ -166,7 +169,16 @@ pub async fn za_stage_sealed(
         .map_err(|err| za_sealing_error(err, account_id))?;
     let sealed = seal_mail_blob(&dek, &envelope, account_id, raw_message);
     let (blob_hash, hold) = server
-        .hold_blob(account_id, BlobHash::generate(&sealed), &sealed, 60)
+        .hold_blob(
+            account_id,
+            BlobHash::generate(&sealed),
+            &sealed,
+            60,
+            &BlobOpts::new(
+                CompressionAlgo::None,
+                server.core.blob.email.encryption.clone(),
+            ),
+        )
         .await
         .caused_by(trc::location!())?;
     Ok((

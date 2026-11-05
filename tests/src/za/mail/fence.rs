@@ -14,7 +14,7 @@
 
 use super::{
     Traced, append_params, assert_no_plaintext, assert_sealed, deliver,
-    delivery::{configure, temporarily_failed, unconfigure},
+    delivery::{configure, unconfigure},
     group_ingest, keyed_token, keyless_token, message_ids, message_with, metadata_key,
     metadata_rows, open_message, reply_to, row_is_stub, stored_blob, stored_hash, stored_metadata,
 };
@@ -28,9 +28,10 @@ use crate::{
             Conn, HookParked, delete_event_records, destroy_inbox_item, envelope_wrap,
             expire_and_purge_blobs, hold_index_partition, inbox_items, index_search_documents,
             internal_search, open_pending_item_as, partition_status, plant_event, queue_entries,
-            release_index_partition, search_keys, stored_event, unindex_search_account,
-            unindex_search_documents, wait_for_delivery, wait_for_index_queue, write_stored_event,
-            za_post_as, za_setup, za_setup_token,
+            release_index_partition, search_keys, stored_event, temporarily_failed,
+            unindex_search_account, unindex_search_documents, wait_for_delivery,
+            wait_for_index_queue, wait_for_temporary_failure, write_stored_event, za_post_as,
+            za_setup, za_setup_token,
         },
     },
     za::{
@@ -355,19 +356,6 @@ async fn passwordless(admin: &Account, name: &'static str) -> Account {
     admin
         .create_passwordless_user_account(name, STRONG, "Fence", &[], user_permissions())
         .await
-}
-
-/// Waits until the queue holds a message for `address` whose last attempt
-/// failed temporarily.
-async fn wait_for_temporary_failure(test: &TestServer, address: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !temporarily_failed(test, address).await {
-        assert!(
-            Instant::now() < deadline,
-            "no temporary failure queued for {address}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 /// The first attempt of a delivery to `address` whose ingest held a stale
@@ -1566,11 +1554,12 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
         let ingest = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(ingest_delay)).await;
             let message = message_with("stress", "stress-body");
+            let parsed_message = MessageParser::new().parse(message.as_bytes());
             let access_token = AccessToken::from_id_maybe_invalid(account_id);
             let result = server
                 .email_ingest(IngestEmail {
                     raw_message: message.as_bytes(),
-                    message: MessageParser::new().parse(message.as_bytes()),
+                    message: parsed_message.as_ref(),
                     blob_hash: None,
                     access_token: &access_token,
                     mailbox_ids: vec![INBOX_ID],
