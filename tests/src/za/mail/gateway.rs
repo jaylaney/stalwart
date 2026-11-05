@@ -9,8 +9,8 @@
 //! encryption events preserve the protected content boundary.
 
 use super::{
-    Traced, TracedEvent, assert_sealed, deliver, key_mail_account, message_ids, message_with,
-    new_message, open_message, stored_blob, stored_hash,
+    Traced, TracedEvent, assert_sealed, deliver, delivery::assert_received_as, key_mail_account,
+    message_ids, message_with, new_message, open_message, stored_blob, stored_hash,
 };
 use crate::{
     utils::{
@@ -49,7 +49,7 @@ use registry::{
 use serde_json::json;
 use std::time::{Duration, Instant};
 use store::write::now;
-use trc::{EncryptionEvent, EventType, Key, StoreEvent};
+use trc::{EncryptionEvent, EventType, Key, StoreEvent, Value};
 use types::id::Id;
 use vault::record::VaultRecord;
 
@@ -188,13 +188,36 @@ fn trace_content(event: &TracedEvent) -> String {
 }
 
 fn assert_no_harvest_trace(events: &[TracedEvent]) {
+    fn contains_bytes(value: &Value, fingerprint: &[u8]) -> bool {
+        match value {
+            Value::Bytes(bytes) => bytes
+                .windows(fingerprint.len())
+                .any(|part| part == fingerprint),
+            Value::Array(items) => items.iter().any(|value| contains_bytes(value, fingerprint)),
+            Value::Event(event) => event
+                .keys()
+                .iter()
+                .any(|(_, value)| contains_bytes(value, fingerprint)),
+            _ => false,
+        }
+    }
+
+    let fingerprint = FINGERPRINT
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect::<Vec<_>>();
     for event in events {
         assert!(
             !matches!(event.typ, EventType::Encryption(_)),
             "unexpected encryption trace: {event:?}"
         );
         assert!(
-            !trace_content(event).contains(FINGERPRINT),
+            !trace_content(event).contains(FINGERPRINT)
+                && !event
+                    .keys
+                    .iter()
+                    .any(|(_, value)| contains_bytes(value, &fingerprint)),
             "fingerprint reached a trace: {event:?}"
         );
     }
@@ -481,8 +504,7 @@ async fn at_rest_encryption_is_inert_for_key_accounts(
     let document_id = new_message(test, key_id, &before).await;
     assert_sealed(test, key_id, document_id, WRAP_PK).await;
     let (_, opened) = open_message(test, key_id, STRONG, document_id).await;
-    // LMTP adds transport headers and the DATA terminator's CRLF.
-    assert!(opened.ends_with(format!("{raw}\r\n").as_bytes()));
+    assert_received_as(&opened, &raw);
     assert_clear_message(&opened);
 
     let raw = message_with("At-rest append", "Original IMAP body");

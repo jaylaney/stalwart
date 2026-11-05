@@ -34,6 +34,7 @@ use base64::{
 };
 use common::{
     auth::AccessToken,
+    ipc::PushNotification,
     za::{ZA_MAIL_KEYLESS, ZA_MAIL_SEARCH_REFUSED, ZA_MAIL_UNREADABLE, test_hooks},
 };
 use email::{
@@ -57,7 +58,7 @@ use trc::{
     Collector, EventType, Key, StoreEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
-use types::{blob::BlobClass, collection::Collection, id::Id};
+use types::{blob::BlobClass, collection::Collection, id::Id, type_state::StateChange};
 
 const KEY: &str = "keymail5@example.com";
 const PLAIN: &str = "plainmail3@example.com";
@@ -1314,12 +1315,54 @@ async fn pushes_within(rx: &mut mpsc::Receiver<Value>, wait: Duration) -> Vec<Va
 async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
     println!("push_is_state_only");
     let (mut rx, push) = spawn_mock_push_server(test).await;
+    let admin = test.account("admin@example.com");
+    // The push manager removes the last subscription from its delivery table,
+    // but the router can keep the account's registration flag. Give each
+    // filter case its own account so readiness measures its own activation.
+    let no_email_push = admin
+        .create_key_user_account(
+            "keymail-push-none@example.com",
+            STRONG,
+            "Push filter test",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let mailbox_only = admin
+        .create_key_user_account(
+            "keymail-push-mailbox@example.com",
+            STRONG,
+            "Push filter test",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    // Initialize the inboxes before subscribing so the Mailbox case
+    // observes delivery to an existing inbox.
+    for account in [&no_email_push, &mailbox_only] {
+        let mailboxes = account.jmap_get("Mailbox", ["role"], [] as [&str; 0]).await;
+        assert!(
+            mailboxes
+                .list()
+                .iter()
+                .any(|mailbox| mailbox["role"] == "inbox")
+        );
+    }
     for (account, email_push, types) in [
         (key, true, json!([])),
+        (&no_email_push, false, json!([])),
+        (&mailbox_only, true, json!(["Mailbox"])),
         (plain, true, json!([])),
-        (key, false, json!([])),
-        (key, true, json!(["Mailbox"])),
     ] {
+        let subscribers = &test.server.inner.ipc.push_subscribers;
+        // An empty change matches no local subscription types and dispatch
+        // alone does not queue a web push.
+        let probe = PushNotification::StateChange(StateChange::new(account.id().document_id()));
+        assert!(
+            !subscribers.dispatch(&probe),
+            "{}: already registered",
+            account.name()
+        );
         let mut create = json!({
             "deviceClientId": "za-mail-reads",
             "url": format!("{PUSH_ORIGIN}/push?skip_checks=true"),
@@ -1364,6 +1407,13 @@ async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
             .await;
 
         verified.updated(&subscription_id);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !subscribers.dispatch(&probe) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{}: push registration did not activate", account.name()));
 
         deliver(
             test,
@@ -1396,16 +1446,29 @@ async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
             }
 
             let mut imap = imap_session(account, b"_push ").await;
+            let before_append = account.jmap_get("Email", ["id"], [] as [&str; 0]).await;
             let subject = "append push canary";
             imap.append("INBOX", &message_with(subject, "append push body canary"))
                 .await;
             imap.send_ok("LOGOUT").await;
-            let (emails, _) = email_get(account, None, &["id", "subject"]).await;
-            let appended = emails
+            let after_append = account
+                .jmap_get("Email", ["id", "subject"], [] as [&str; 0])
+                .await;
+            assert_ne!(after_append.state(), before_append.state(), "APPEND state");
+            let appended = after_append
+                .list()
                 .iter()
                 .find(|email| email["subject"] == subject)
                 .expect("the appended message");
-            assert_message_push(&mut rx, account, is_key, &appended["id"], subject).await;
+            assert_message_push(
+                &mut rx,
+                account,
+                is_key,
+                &appended["id"],
+                subject,
+                after_append.state(),
+            )
+            .await;
 
             let subject = "import push canary";
             let blob_id = account
@@ -1434,7 +1497,9 @@ async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
             let imported_id = imported
                 .pointer("/methodResponses/0/1/created/i/id")
                 .expect("the imported message");
-            assert_message_push(&mut rx, account, is_key, imported_id, subject).await;
+            let import_state = imported.new_state();
+            assert_ne!(import_state, after_append.state(), "import state");
+            assert_message_push(&mut rx, account, is_key, imported_id, subject, import_state).await;
         }
 
         let destroyed = account
@@ -1471,6 +1536,12 @@ async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
     drop(push);
     clear_messages(key).await;
     clear_messages(plain).await;
+    // The ordinary fixture's verification is processed after both filter
+    // subscriptions' removal updates, so the filter accounts can be deleted.
+    for account in [no_email_push, mailbox_only] {
+        test.destroy_all_mailboxes(&account).await;
+        admin.destroy_account(account).await;
+    }
 }
 
 fn assert_state_only(pushes: &[Value], account: &Account, types: &[&str]) {
@@ -1499,10 +1570,18 @@ async fn assert_message_push(
     is_key: bool,
     email_id: &Value,
     subject: &str,
+    expected_state: &str,
 ) {
     let pushes = pushes_within(rx, Duration::from_secs(5)).await;
     if is_key {
         assert_state_only(&pushes, account, &["Email", "Mailbox"]);
+        assert!(
+            pushes.iter().any(|push| {
+                let changed = &push["changed"][account.id_string()];
+                changed["Email"] == expected_state && changed.get("Mailbox").is_some()
+            }),
+            "no Email state {expected_state} for {email_id}: {pushes:?}"
+        );
     } else {
         assert!(
             pushes.iter().any(|push| {

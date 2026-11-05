@@ -224,7 +224,7 @@ const PREPENDED: &[&str] = &[
 
 /// `raw` is the delivered bytes behind a prefix made only of `PREPENDED`
 /// header fields (folded lines included).
-fn assert_received_as(raw: &[u8], message: &str) {
+pub(super) fn assert_received_as(raw: &[u8], message: &str) {
     let prefix = raw
         .strip_suffix(received(message).as_bytes())
         .unwrap_or_else(|| {

@@ -2158,9 +2158,13 @@ async fn full_update_drops_an_override_only_at_or_below_the_master(test: &TestSe
         assert!(pending_ids(test, key.id).await.is_empty());
         for attendee in [&key, &plain] {
             let copy = body(&attendee.client, &copy_href(test, attendee.id, UID).await).await;
-            assert!(
-                instance_of(&parse(&copy), Some(X)).is_some(),
-                "{} lost X: {copy}",
+            let calendar = parse(&copy);
+            let component = instance_of(&calendar, Some(X))
+                .unwrap_or_else(|| panic!("{} lost X: {copy}", attendee.name));
+            assert_ne!(
+                component.status(),
+                Some(&ICalendarStatus::Cancelled),
+                "{} cancelled X: {copy}",
                 attendee.name
             );
             // A rejected REQUEST would leave the prior DTSTART in place.
