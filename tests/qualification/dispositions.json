@@ -821,6 +821,10 @@
   ],
   "excluded_additions": [
    {
+    "file": "crates/store/src/write/blob_codec_za_tests.rs",
+    "reason": "fork unit tests of upstream's blob codec (upstream v1.0.3 merge plan, Task 8), a test module in its own file: not runtime code"
+   },
+   {
     "file": "crates/email/src/message/ingest/group/za_tests.rs",
     "reason": "fork unit tests (ruling 59; Task 5 fix round, commit 3c88a4ffb), a test module in its own file: not runtime code"
    },

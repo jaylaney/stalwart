@@ -8,15 +8,19 @@ use crate::utils::{cleanup::store_destroy, server::TestServerBuilder};
 use ahash::AHashMap;
 use email::message::metadata::{MessageMetadata, MetadataRow};
 use registry::{
-    schema::{enums::CompressionAlgo, structs::Jmap},
+    schema::{
+        enums::{CompressionAlgo, SymmetricCipher},
+        structs::Jmap,
+    },
     types::duration::Duration,
 };
 use services::task_manager::tasks::destroy_account::destroy_account_blobs;
+use std::sync::Arc;
 use store::{
     BlobStore, SerializeInfallible, Store, ValueKey,
     write::{
         BatchBuilder, BlobLink, BlobOp, ValueClass,
-        blob_codec::{BlobKeyring, BlobOpts},
+        blob_codec::{BlobEncryption, BlobFormat, BlobKey, BlobKeyring, BlobOpts},
         now,
     },
 };
@@ -51,7 +55,28 @@ pub async fn blob_tests() {
     assert!(test.server.blob_has_quota(0, 1024).await.unwrap().allowed);
 
     // Test and reset store
-    test_store(blob_store.clone()).await;
+    let empty_keyring = BlobKeyring::default();
+    let key = Arc::new(BlobKey::new(7, SymmetricCipher::Aes256Gcm, &[7; 32]));
+    let keyring = BlobKeyring::new(vec![key.clone()]);
+    for (opts, keyring, key_id) in [
+        (
+            BlobOpts::compressed(CompressionAlgo::Lz4),
+            &empty_keyring,
+            None,
+        ),
+        (
+            BlobOpts::compressed(CompressionAlgo::Zstd),
+            &empty_keyring,
+            None,
+        ),
+        (
+            BlobOpts::new(CompressionAlgo::Zstd, BlobEncryption::Key(key.clone())),
+            &keyring,
+            Some(key.id()),
+        ),
+    ] {
+        test_store(&blob_store, &opts, keyring, key_id).await;
+    }
     store_destroy(&store).await;
 
     // Blob hash exists
@@ -449,23 +474,16 @@ pub async fn blob_tests() {
     test.temp_dir.delete();
 }
 
-async fn test_store(store: BlobStore) {
+async fn test_store(store: &BlobStore, opts: &BlobOpts, keys: &BlobKeyring, key_id: Option<u32>) {
     // Test small blob
     const DATA: &[u8] = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Fusce erat nisl, dignissim a porttitor id, varius nec arcu. Sed mauris.";
     let hash = BlobHash::generate(DATA);
 
-    store
-        .put_blob(
-            hash.as_slice(),
-            DATA,
-            &BlobOpts::compressed(CompressionAlgo::Lz4),
-        )
-        .await
-        .unwrap();
+    store.put_blob(hash.as_slice(), DATA, opts).await.unwrap();
     assert_eq!(
         String::from_utf8(
             store
-                .get_blob(hash.as_slice(), 0..usize::MAX, &BlobKeyring::default())
+                .get_blob(hash.as_slice(), 0..usize::MAX, keys)
                 .await
                 .unwrap()
                 .unwrap()
@@ -476,7 +494,7 @@ async fn test_store(store: BlobStore) {
     assert_eq!(
         String::from_utf8(
             store
-                .get_blob(hash.as_slice(), 11..57, &BlobKeyring::default())
+                .get_blob(hash.as_slice(), 11..57, keys)
                 .await
                 .unwrap()
                 .unwrap()
@@ -487,7 +505,7 @@ async fn test_store(store: BlobStore) {
     assert!(store.delete_blob(hash.as_slice()).await.unwrap());
     assert!(
         store
-            .get_blob(hash.as_slice(), 0..usize::MAX, &BlobKeyring::default())
+            .get_blob(hash.as_slice(), 0..usize::MAX, keys)
             .await
             .unwrap()
             .is_none()
@@ -501,18 +519,19 @@ async fn test_store(store: BlobStore) {
         data.extend_from_slice(marker.as_bytes());
     }
     let hash = BlobHash::generate(&data);
-    store
-        .put_blob(
-            hash.as_slice(),
-            &data,
-            &BlobOpts::compressed(CompressionAlgo::Lz4),
-        )
-        .await
-        .unwrap();
+    store.put_blob(hash.as_slice(), &data, opts).await.unwrap();
+    let encoded = store.get_raw_blob(hash.as_slice()).await.unwrap().unwrap();
+    assert_eq!(
+        BlobFormat::of(&encoded),
+        Some(BlobFormat {
+            compression: opts.compression,
+            key_id
+        })
+    );
     assert_eq!(
         String::from_utf8(
             store
-                .get_blob(hash.as_slice(), 0..usize::MAX, &BlobKeyring::default())
+                .get_blob(hash.as_slice(), 0..usize::MAX, keys)
                 .await
                 .unwrap()
                 .unwrap()
@@ -524,7 +543,7 @@ async fn test_store(store: BlobStore) {
     assert_eq!(
         String::from_utf8(
             store
-                .get_blob(hash.as_slice(), 3000111..4000999, &BlobKeyring::default())
+                .get_blob(hash.as_slice(), 3000111..4000999, keys)
                 .await
                 .unwrap()
                 .unwrap()
@@ -535,7 +554,7 @@ async fn test_store(store: BlobStore) {
     assert!(store.delete_blob(hash.as_slice()).await.unwrap());
     assert!(
         store
-            .get_blob(hash.as_slice(), 0..usize::MAX, &BlobKeyring::default())
+            .get_blob(hash.as_slice(), 0..usize::MAX, keys)
             .await
             .unwrap()
             .is_none()

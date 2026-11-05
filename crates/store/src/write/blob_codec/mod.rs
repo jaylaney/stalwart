@@ -242,3 +242,7 @@ impl BlobKeyring {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/store/src/write/blob_codec/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../blob_codec_za_tests.rs"]
+mod za_tests;

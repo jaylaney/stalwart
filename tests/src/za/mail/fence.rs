@@ -73,10 +73,11 @@ use mail_parser::MessageParser;
 use nlp::language::Language;
 use registry::{
     schema::{
+        enums::TaskBlobRecodeCompression,
         prelude::{Object, ObjectInner, ObjectType},
         structs::{
-            self, Credential, PasswordCredential, SpamTrainingSample, Task, TaskMergeThreads,
-            TaskStatus, TaskStatusFailed,
+            self, Credential, PasswordCredential, SpamTrainingSample, Task, TaskBlobRecode,
+            TaskExternalPublicKeyMaintenance, TaskMergeThreads, TaskStatus, TaskStatusFailed,
         },
     },
     types::{datetime::UTCDateTime, id::ObjectId, map::Map},
@@ -264,6 +265,7 @@ pub async fn test(test: &mut TestServer) {
     let in_flight = setup_refuses_an_in_flight_index_write(test, &admin).await;
     let in_flight_event = setup_refuses_an_in_flight_calendar_index_write(test, &admin).await;
     let failed_merge = setup_refuses_a_failed_merge_task(test, &admin).await;
+    let server_wide_tasks = server_wide_tasks_do_not_block_setup(&admin).await;
     let (superseded, superseded_control) = superseded_index_write_loses_to_provisioning(
         test,
         &admin,
@@ -345,6 +347,7 @@ pub async fn test(test: &mut TestServer) {
         in_flight,
         in_flight_event,
         failed_merge,
+        server_wide_tasks,
         superseded,
         superseded_control,
         superseded_attachment,
@@ -379,6 +382,39 @@ async fn passwordless(admin: &Account, name: &'static str) -> Account {
     admin
         .create_passwordless_user_account(name, STRONG, "Fence", &[], user_permissions())
         .await
+}
+
+async fn server_wide_tasks_do_not_block_setup(admin: &Account) -> Account {
+    println!("server_wide_tasks_do_not_block_setup");
+    const NAME: &str = "keymail44@example.com";
+    let account = passwordless(admin, NAME).await;
+    // Both tasks must still exist at issuance. In particular, an external
+    // key maintenance task due now finishes immediately with the gateway off.
+    let due = now() + 3600;
+    let recode = admin
+        .registry_create_object(Task::BlobRecode(TaskBlobRecode {
+            compression: TaskBlobRecodeCompression::Zstd,
+            shard_index: Some(0),
+            status: TaskStatus::at(due as i64),
+            ..Default::default()
+        }))
+        .await;
+    let external = admin
+        .registry_create_object(Task::ExternalPublicKeyMaintenance(
+            TaskExternalPublicKeyMaintenance {
+                status: TaskStatus::at(due as i64),
+            },
+        ))
+        .await;
+    for id in [recode, external] {
+        assert_eq!(admin.registry_get::<Task>(id).await.due_timestamp(), due);
+    }
+    za_setup_token(admin, NAME).await;
+    admin
+        .registry_destroy(ObjectType::Task, [recode, external])
+        .await
+        .assert_destroyed(&[recode, external]);
+    account
 }
 
 /// The first attempt of a delivery to `address` whose ingest held a stale

@@ -66,7 +66,7 @@ use super::{
     dav_seal::{CANARIES, EVENT, mkcalendar_body, raw_event, raw_event_records},
     fanout::{NO_REPLY, Party, stored_pairs, uid_copies},
     imip::{deliver, event as imip_event, itip_mail},
-    mail::{Traced, key_mail_account, message_ids, stored_metadata_bytes},
+    mail::{Traced, key_mail_account, message_ids, stored_hash, stored_metadata_bytes},
     pinning::{ALICE, drop_entries, forget, parties, refuse_once_at},
     raw_input::{SUBMISSION_PORT, strings},
     uid_lease::put,
@@ -84,12 +84,12 @@ use crate::{
         webdav::DummyWebDavClient,
         za::{
             Conn, IDS_ONLY_DOCUMENT, InboxItem, PlantedItem, copy_href, destroy_inbox_item,
-            envelope_wrap, hold_index_partition, hold_task_consumer, inbox_ids, inbox_items,
-            internal_search, itip_tasks_for, mail_borne_items, new_inbox_items,
-            open_pending_item_as, pending_ids, pin_record, plain_dav_container, plant_container,
-            plant_event, plant_inbox_item, plant_plain_message, plant_sealed_event,
-            queued_recipients, release_index_partition, substitute_public_key, trigger_drain,
-            wait_for_delivery, wait_for_queue, za_unlock,
+            envelope_wrap, expire_and_purge_blobs, hold_index_partition, hold_task_consumer,
+            inbox_ids, inbox_items, internal_search, itip_tasks_for, mail_borne_items,
+            new_inbox_items, open_pending_item_as, pending_ids, pin_record, plain_dav_container,
+            plant_container, plant_event, plant_inbox_item, plant_plain_message,
+            plant_sealed_event, queued_recipients, release_index_partition, substitute_public_key,
+            trigger_drain, wait_for_delivery, wait_for_index_queue, wait_for_queue, za_unlock,
         },
     },
     za::drain::{DrainOn, body, set_partstat},
@@ -127,18 +127,24 @@ use mail_parser::{DateTime, MessageParser};
 use registry::{
     pickle::{Pickle, PickledStream},
     schema::{
-        prelude::Property,
-        structs::{CalendarScheduling, SpamTrainingSample},
+        enums::{CompressionAlgo, SymmetricCipher, TaskBlobRecodeCompression},
+        prelude::{ObjectType, Property},
+        structs::{
+            CalendarScheduling, Email, SecretKey, SecretKeyValue, SpamTrainingSample, SymmetricKey,
+            Task, TaskBlobRecode, TaskBlobRecodeEncryption, TaskStatus,
+        },
     },
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 use store::{
-    Deserialize as _, IterateParams, Serialize as _, Subspace, U32_LEN, U64_LEN, ValueKey,
-    ZA_UID_LEASE_PREFIX,
+    BlobStore, Deserialize as _, IterateParams, Serialize as _, Subspace, U32_LEN, U64_LEN,
+    ValueKey, ZA_UID_LEASE_PREFIX,
     write::{
         AnyKey, Archive, ArchiveBytes, Archiver, BatchBuilder, IndexPropertyClass, QueueDocumentId,
         SearchIndex, SearchIndexClass, ValueClass,
+        blob_codec::BlobFormat,
         metadata::{MetadataClass, ViewerState},
         serialize::RawValue,
     },
@@ -1966,6 +1972,278 @@ fn event_text(keys: &[(trc::Key, trc::Value)]) -> String {
         strings(value, &mut out);
     }
     out.join(" ").to_lowercase()
+}
+
+pub(super) async fn create_blob_codec_key(admin: &Account) -> Id {
+    admin
+        .registry_create_object(SymmetricKey {
+            description: "Blob codec test key".into(),
+            cipher: SymmetricCipher::Aes256Gcm,
+            key: SecretKey::Value(SecretKeyValue {
+                secret: STANDARD.encode(store::rand::random::<[u8; 32]>()),
+            }),
+            ..Default::default()
+        })
+        .await
+}
+
+pub(super) async fn recode_blobs(
+    test: &TestServer,
+    admin: &Account,
+    compression: TaskBlobRecodeCompression,
+    encryption: TaskBlobRecodeEncryption,
+) {
+    test.wait_for_tasks().await;
+    admin
+        .registry_create_object(Task::BlobRecode(TaskBlobRecode {
+            compression,
+            encryption,
+            shard_index: None,
+            status: TaskStatus::now(),
+        }))
+        .await;
+    tokio::time::timeout(Duration::from_secs(120), test.wait_for_tasks())
+        .await
+        .expect("every blob recode shard must drain");
+}
+
+const CODEC_SETTINGS: &[Property] = &[Property::CompressionAlgorithm, Property::BlobEncryptionKey];
+
+pub(super) async fn retire_blob_codec_key(
+    test: &mut TestServer,
+    admin: &Account,
+    key_id: Id,
+    restore_email: Option<Email>,
+) {
+    // The recoder never selects temporary-only links. Expire those for
+    // the entire suite store and purge while the keyring still has the key.
+    expire_and_purge_blobs(test, admin).await;
+    assert_all_blobs_decode(test).await;
+    let key = u32::try_from(key_id.id()).unwrap();
+    assert!(test.server.core.blob.keys.get(key).is_some());
+
+    // The registry refuses to destroy a referenced key. Restore the fields
+    // here, keeping the running keyring loaded until the key is destroyed.
+    if let Some(email) = restore_email {
+        admin.registry_update_setting(email, CODEC_SETTINGS).await;
+    }
+    admin
+        .registry_destroy(ObjectType::SymmetricKey, [key_id])
+        .await
+        .assert_destroyed(&[key_id]);
+    admin.reload_settings().await;
+    test.reload_core();
+    assert!(test.server.core.blob.keys.get(key).is_none());
+    assert_all_blobs_decode(test).await;
+}
+
+async fn assert_all_blobs_decode(test: &TestServer) {
+    let mut hashes = BTreeMap::new();
+    for (key, _) in subspace_records(test, Subspace::Blobs).await {
+        hashes.insert(key, true);
+    }
+    for (link, _) in subspace_records(test, Subspace::BlobLink).await {
+        hashes
+            .entry(link[..BLOB_HASH_LEN].to_vec())
+            .or_insert(false);
+    }
+    let mut decoded = 0;
+    for (hash, stored) in hashes {
+        let blob = test
+            .server
+            .get_blob(&hash, 0..usize::MAX)
+            .await
+            .unwrap_or_else(|err| panic!("blob {hash:?} does not decode: {err:?}"));
+        assert!(blob.is_some() || !stored, "stored blob {hash:?} is missing");
+        decoded += usize::from(blob.is_some());
+    }
+    if matches!(test.server.blob_store(), BlobStore::Fs(_)) {
+        // The FS harness stores each blob in two one-byte hex directories
+        // below its temp directory. Count physical files too, so an orphan
+        // with no BlobLink cannot be silently omitted from the decode pass.
+        fn hex_dirs(path: &std::path::Path) -> impl Iterator<Item = std::path::PathBuf> + use<> {
+            std::fs::read_dir(path).unwrap().filter_map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                (entry.file_type().unwrap().is_dir()
+                    && (1..=2).contains(&name.len())
+                    && name.as_encoded_bytes().iter().all(u8::is_ascii_hexdigit))
+                .then(|| entry.path())
+            })
+        }
+        let physical = hex_dirs(std::path::Path::new(test.tmp_dir()))
+            .flat_map(|path| hex_dirs(&path))
+            .flat_map(|path| std::fs::read_dir(path).unwrap())
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .count();
+        assert_eq!(
+            decoded, physical,
+            "a filesystem blob was missed by the decode sweep"
+        );
+    }
+}
+
+pub async fn test_codec(test: &mut TestServer) {
+    println!("Running zero-access leak test with the encrypted blob codec...");
+    const KEY: &str = "codec-leak-key@example.com";
+    const PLAIN: &str = "codec-leak-plain@example.com";
+    let admin = test.account("admin@example.com").clone();
+    let key = admin
+        .create_key_user_account(KEY, STRONG, "Codec leak", &[], user_permissions())
+        .await;
+    let plain = admin
+        .create_user_account(PLAIN, STRONG, "Codec leak control", &[], user_permissions())
+        .await;
+    let (id, plain_id) = (key.id().document_id(), plain.id().document_id());
+
+    let original = admin.registry_get::<Email>(Id::singleton()).await;
+    let key_id = create_blob_codec_key(&admin).await;
+    admin
+        .registry_update_setting(
+            Email {
+                compression_algorithm: CompressionAlgo::Zstd,
+                blob_encryption_key: Some(key_id),
+                ..original.clone()
+            },
+            CODEC_SETTINGS,
+        )
+        .await;
+    admin.reload_settings().await;
+    test.reload_core();
+    assert_eq!(
+        test.server.core.blob.email.compression,
+        CompressionAlgo::Zstd
+    );
+    let codec_key = u32::try_from(key_id.id()).unwrap();
+    assert!(test.server.core.blob.keys.get(codec_key).is_some());
+
+    SmtpConnection::connect()
+        .await
+        .ingest("sender@example.org", &[KEY], &mail_canary_message(4))
+        .await;
+    wait_for_delivery(test).await;
+    let mut imap = ImapConnection::connect(b"_codec ").await;
+    imap.authenticate(KEY, STRONG).await;
+    imap.append("INBOX", &mail_canary_message(5)).await;
+    imap.send_ok("LOGOUT").await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+
+    let documents = message_ids(test, id).await;
+    assert_eq!(documents.len(), 2, "the delivery and the APPEND");
+    let mut hashes = Vec::new();
+    for document in documents {
+        let hash = stored_hash(test, id, document).await;
+        let encoded = test
+            .server
+            .blob_store()
+            .get_raw_blob(hash.as_slice())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(BlobFormat::of(&encoded).unwrap().key_id, Some(codec_key));
+        hashes.push(hash);
+    }
+    let result = scan(test, id).await;
+    assert!(
+        result.blobs > 0 && result.violations.is_empty(),
+        "{result:?}"
+    );
+    assert_eq!(result.stubs, 2);
+
+    let body = "mailbody-canary in the clear. ".repeat(64);
+    let planted = plant_plain_message(
+        test,
+        id,
+        &format!("From: Planted <planted@example.org>\r\nSubject: planted codec control\r\n\r\n{body}\r\n"),
+    )
+    .await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+    let planted_hash = stored_hash(test, id, planted).await;
+    let encoded = test
+        .server
+        .blob_store()
+        .get_raw_blob(planted_hash.as_slice())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        BlobFormat::of(&encoded),
+        Some(BlobFormat {
+            compression: CompressionAlgo::Zstd,
+            key_id: Some(codec_key)
+        }),
+    );
+    let result = scan(test, id).await;
+    assert!(
+        result.violations.contains(&format!(
+            "blob {:?}: decoded blob contains mailbody-canary",
+            planted_hash.as_slice()
+        )),
+        "{result:?}"
+    );
+    assert!(
+        result
+            .violations
+            .contains(&format!("email {planted}: plaintext message blob"))
+    );
+    hashes.push(planted_hash);
+
+    // The whole-store recode must leave this temporary-only blob for purge.
+    let (temporary, _) = test
+        .server
+        .put_temporary_blob(
+            plain_id,
+            b"codec retirement temporary blob",
+            3600,
+            &test.server.core.blob.email,
+        )
+        .await
+        .unwrap();
+    wait_for_index_queue(test, plain_id, Duration::from_secs(10)).await;
+    recode_blobs(
+        test,
+        &admin,
+        TaskBlobRecodeCompression::Lz4,
+        TaskBlobRecodeEncryption::Disable,
+    )
+    .await;
+    for hash in hashes {
+        let encoded = test
+            .server
+            .blob_store()
+            .get_raw_blob(hash.as_slice())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(BlobFormat::of(&encoded).unwrap().key_id, None);
+    }
+    let encoded = test
+        .server
+        .blob_store()
+        .get_raw_blob(temporary.as_slice())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(BlobFormat::of(&encoded).unwrap().key_id, Some(codec_key));
+
+    test.destroy_all_mailboxes(&key).await;
+    for account_id in [id, plain_id] {
+        wait_for_index_queue(test, account_id, Duration::from_secs(10)).await;
+        assert!(message_ids(test, account_id).await.is_empty());
+    }
+    test.wait_for_tasks().await;
+    retire_blob_codec_key(test, &admin, key_id, Some(original)).await;
+    assert!(
+        test.server
+            .get_blob(temporary.as_slice(), 0..usize::MAX)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    admin.destroy_account(key).await;
+    admin.destroy_account(plain).await;
+    test.wait_for_tasks().await;
 }
 
 /// Mail spec 11, the leak test's mail extension: a key account receives a
