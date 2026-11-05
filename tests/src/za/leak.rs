@@ -2128,6 +2128,9 @@ pub async fn test_codec(test: &mut TestServer) {
     imap.append("INBOX", &mail_canary_message(5)).await;
     imap.send_ok("LOGOUT").await;
     wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+    // Delivery unlinks the SMTP queue's plaintext payload. Purge it
+    // before the whole-store scan, which also reads unlinked blobs.
+    purge_blobs(test).await;
 
     let documents = message_ids(test, id).await;
     assert_eq!(documents.len(), 2, "the delivery and the APPEND");
