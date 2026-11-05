@@ -15,13 +15,10 @@ use crate::{
 };
 use common::storage::blob::FetchedBlob;
 use common::{
-<<<<<<< HEAD
-    MAX_RECEIVED_AT, Server, auth::AccessToken, ipc::PushNotification, za::mail::za_keyless_refusal,
-=======
     MAX_RECEIVED_AT, Server,
     auth::AccessToken,
     ipc::{EmailPush, PushNotification},
->>>>>>> v1.0.3
+    za::mail::za_keyless_refusal,
 };
 use email::{
     cache::{MessageCacheFetch, mailbox::MailboxCacheAccess},

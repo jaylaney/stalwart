@@ -110,7 +110,7 @@ const ATTACH_TOKEN: &str = "zzattachcanary";
 /// each carry a token, with an RTF attachment too, so the plaintext row has
 /// an extractable attachment (`has_extractable_attachments`) and the builder
 /// takes its blocking extraction path.
-fn attachment_message(n: u32) -> String {
+pub(super) fn attachment_message(n: u32) -> String {
     padded_attachment_message(n, 0)
 }
 

@@ -32,18 +32,14 @@ pub(crate) async fn build_email_document(
     account_id: u32,
     document_id: u32,
     row: MetadataRow,
-<<<<<<< HEAD
-) -> trc::Result<IndexDocument> {
+) -> trc::Result<Option<IndexDocument>> {
     #[cfg(feature = "test_mode")]
     za::test_hooks::index_build_fault(account_id)?;
     // Mail spec 5.5: a key account's message is indexed from its stub, with
     // no blob read.
     if let Some(document) = za::za_email_document(server, account_id, document_id, &row).await? {
-        return Ok(document);
+        return Ok(Some(document));
     }
-=======
-) -> trc::Result<Option<IndexDocument>> {
->>>>>>> v1.0.3
     let metadata = row.unarchive().caused_by(trc::location!())?;
     let Some(raw_message) = server
         .get_blob(metadata.blob_hash().as_slice(), 0..usize::MAX)
@@ -64,12 +60,8 @@ pub(crate) async fn build_email_document(
 
     // Mail ruling R58: the plain returns carry the vault-absence assertion.
     if !metadata.has_extractable_attachments() {
-<<<<<<< HEAD
         return email_document(&server.core, &row, account_id, document_id, &raw_message)
-            .map(|document| server.za_index_fence(document, account_id));
-=======
-        return email_document(&server.core, &row, account_id, document_id, &raw_message).map(Some);
->>>>>>> v1.0.3
+            .map(|document| Some(server.za_index_fence(document, account_id)));
     }
 
     let core = server.core.clone();
@@ -83,11 +75,7 @@ pub(crate) async fn build_email_document(
             .details("Email indexing task failed")
             .caused_by(trc::location!())
     })?
-<<<<<<< HEAD
-    .map(|document| server.za_index_fence(document, account_id))
-=======
-    .map(Some)
->>>>>>> v1.0.3
+    .map(|document| Some(server.za_index_fence(document, account_id)))
 }
 
 fn email_document(

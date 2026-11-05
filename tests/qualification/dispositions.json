@@ -794,6 +794,11 @@
     "evidence": "Part 6a (commit c8e4d78de): the index queue's key-account gates (rulings 18, 19 and 22; R58). Its test_mode hooks count as runtime, as in-file hooks did at 0.16.27. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
    },
    {
+    "file": "crates/services/src/state_manager/za.rs",
+    "runtime_excluded": false,
+    "evidence": "Upstream v1.0.3 merge plan, Task 6: state-only replacement for a key account's EmailPush with an emailPush subscription. A fork runtime file added by the merge (git log --diff-filter=A -- crates/services/src/state_manager/za.rs)."
+   },
+   {
     "file": "crates/services/src/task_manager/tasks/grantee_cleanup/za.rs",
     "runtime_excluded": false,
     "evidence": "Part 6a (commit 6766311ec): the share-revocation cleanup skips key-account owners. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."

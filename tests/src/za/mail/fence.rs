@@ -35,7 +35,10 @@ use crate::{
         },
     },
     za::{
-        STRONG, index_task::emulate_superseding_node, raw_input::SUBMISSION_PORT, user_permissions,
+        STRONG,
+        index_task::{attachment_message, emulate_superseding_node},
+        raw_input::SUBMISSION_PORT,
+        user_permissions,
     },
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -150,6 +153,9 @@ const FAILED_MERGE: &str = "keymail18@example.com";
 const SUPERSEDED: &str = "keymail20@example.com";
 /// Its ordinary control, whose index write passes the fence.
 const SUPERSEDED_CONTROL: &str = "plainmail17@example.com";
+/// The same race through the blocking attachment extractor.
+const SUPERSEDED_ATTACHMENT: &str = "keymail40@example.com";
+const SUPERSEDED_ATTACHMENT_CONTROL: &str = "plainmail45@example.com";
 /// `setup_refuses_orphaned_search_terms`'s account (ruling R62).
 const ORPHANED_TERMS: &str = "keymail22@example.com";
 /// `unindex_between_index_chunks_leaves_no_terms`'s account (ruling R62).
@@ -258,8 +264,23 @@ pub async fn test(test: &mut TestServer) {
     let in_flight = setup_refuses_an_in_flight_index_write(test, &admin).await;
     let in_flight_event = setup_refuses_an_in_flight_calendar_index_write(test, &admin).await;
     let failed_merge = setup_refuses_a_failed_merge_task(test, &admin).await;
-    let (superseded, superseded_control) =
-        superseded_index_write_loses_to_provisioning(test, &admin).await;
+    let (superseded, superseded_control) = superseded_index_write_loses_to_provisioning(
+        test,
+        &admin,
+        SUPERSEDED,
+        SUPERSEDED_CONTROL,
+        false,
+    )
+    .await;
+    let (superseded_attachment, superseded_attachment_control) =
+        superseded_index_write_loses_to_provisioning(
+            test,
+            &admin,
+            SUPERSEDED_ATTACHMENT,
+            SUPERSEDED_ATTACHMENT_CONTROL,
+            true,
+        )
+        .await;
     let orphaned_terms = setup_refuses_orphaned_search_terms(test, &admin).await;
     let chunked = unindex_between_index_chunks_leaves_no_terms(test, &admin).await;
     let chunked_event = unindex_between_calendar_index_chunks_leaves_no_terms(test, &admin).await;
@@ -326,6 +347,8 @@ pub async fn test(test: &mut TestServer) {
         failed_merge,
         superseded,
         superseded_control,
+        superseded_attachment,
+        superseded_attachment_control,
         orphaned_terms,
         chunked,
         chunked_event,
@@ -2214,25 +2237,44 @@ async fn wait_for_retry_state(test: &TestServer, index: SearchIndex, account_id:
 async fn superseded_index_write_loses_to_provisioning(
     test: &TestServer,
     admin: &Account,
+    name: &'static str,
+    control_name: &'static str,
+    extractable: bool,
 ) -> (Account, Account) {
-    println!("superseded_index_write_loses_to_provisioning");
+    println!("superseded_index_write_loses_to_provisioning (extractable: {extractable})");
     test.wait_for_tasks().await;
-    let account = passwordless(admin, SUPERSEDED).await;
+    let account = passwordless(admin, name).await;
     let id = account.id().document_id();
-    let control = passwordless(admin, SUPERSEDED_CONTROL).await;
+    let control = passwordless(admin, control_name).await;
     let control_id = control.id().document_id();
-    let message = message_with("superseded", "superseded-body");
+    let (message, control_message) = if extractable {
+        (attachment_message(1), attachment_message(2))
+    } else {
+        (
+            message_with("superseded", "superseded-body"),
+            message_with("superseded control", "superseded-control-body"),
+        )
+    };
     // A: the delivery commits; its index pass classifies the account as
     // ordinary, builds the full document and parks before the write.
     let parked = HookParked::start(id, test_hooks::set_index_write_pause, async move {
         SmtpConnection::connect()
             .await
-            .ingest(SENDER, &[SUPERSEDED], &message)
+            .ingest(SENDER, &[name], &message)
             .await;
     })
     .await;
     let ids = message_ids(test, id).await;
     assert_eq!(ids.len(), 1, "{ids:?}");
+    assert_eq!(
+        stored_metadata(test, id, ids[0])
+            .await
+            .unarchive()
+            .unwrap()
+            .has_extractable_attachments(),
+        extractable,
+        "the parked write selected the wrong index builder branch"
+    );
 
     admin.destroy_all_mailboxes_for_account(id).await;
     // B, after A's lease expired.
@@ -2245,8 +2287,8 @@ async fn superseded_index_write_loses_to_provisioning(
 
     // Every term passes: no message, no metadata row, no entry, no sample,
     // no search key.
-    let token = za_setup_token(admin, SUPERSEDED).await;
-    za_setup(SUPERSEDED, &token, STRONG).await;
+    let token = za_setup_token(admin, name).await;
+    za_setup(name, &token, STRONG).await;
     assert_eq!(
         test.server
             .za_vault_record(id)
@@ -2274,13 +2316,18 @@ async fn superseded_index_write_loses_to_provisioning(
     );
 
     // The control's document passes the fence.
-    deliver(
-        test,
-        SENDER,
-        SUPERSEDED_CONTROL,
-        &message_with("superseded control", "superseded-control-body"),
-    )
-    .await;
+    deliver(test, SENDER, control_name, &control_message).await;
+    let control_ids = message_ids(test, control_id).await;
+    assert_eq!(control_ids.len(), 1, "{control_ids:?}");
+    assert_eq!(
+        stored_metadata(test, control_id, control_ids[0])
+            .await
+            .unarchive()
+            .unwrap()
+            .has_extractable_attachments(),
+        extractable,
+        "the control selected the wrong index builder branch"
+    );
     assert!(
         test.server
             .za_has_email_search_documents(control_id)

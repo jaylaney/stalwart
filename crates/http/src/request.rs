@@ -281,7 +281,7 @@ impl ParseHttp for Server {
                             access_token.assert_allows_oauth_scopes(OAuthScopes::INTEROPERABLE)?;
 
                         if let Some(account_id) = path.next().and_then(|p| Id::from_str(p).ok()) {
-<<<<<<< HEAD
+                            access_token.assert_is_member(account_id)?;
                             // Mail spec 4, 5.7: an upload into a key account
                             // is sealed with its keys; a token without them
                             // is refused before the body is read.
@@ -323,9 +323,6 @@ impl ParseHttp for Server {
                                     None => Err(trc::LimitEvent::SizeUpload.into_err()),
                                 };
                             }
-=======
-                            access_token.assert_is_member(account_id)?;
->>>>>>> v1.0.3
 
                             return match fetch_body(
                                 &mut req,
@@ -1023,6 +1020,7 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                 async move {
                     let server = inner.build_server();
                     let has_body = !req.body().is_end_stream();
+                    let is_vault_path = za_is_vault_path(req.uri().path());
 
                     let response = 'response: {
                         // Obtain remote IP
@@ -1094,68 +1092,6 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                                 .into_http_response();
                         }
 
-<<<<<<< HEAD
-                    // Check if the remote IP has been blocked
-                    if server.is_ip_blocked(remote_ip) {
-                        trc::event!(
-                            Security(trc::SecurityEvent::IpBlocked),
-                            ListenerId = instance.id.clone(),
-                            RemoteIp = remote_ip,
-                            SpanId = session.session_id,
-                        );
-
-                        return Ok::<_, hyper::Error>(
-                            JsonProblemResponse(StatusCode::FORBIDDEN)
-                                .into_http_response()
-                                .build(),
-                        );
-                    }
-
-                    // Vault responses keep their own allowed origin (below).
-                    let is_vault_path = za_is_vault_path(req.uri().path());
-
-                    // Parse HTTP request
-                    let challenge_uri = req.uri().clone();
-                    let challenge_host = req.headers().get(HOST).cloned();
-                    let response = match server
-                        .parse_http_request(
-                            req,
-                            HttpSessionData {
-                                instance,
-                                local_ip: session.local_ip,
-                                local_port: session.local_port,
-                                remote_ip,
-                                remote_port: session.remote_port,
-                                is_tls,
-                                session_id: session.session_id,
-                            },
-                        )
-                        .await
-                    {
-                        Ok(response) => response,
-                        Err(err) => {
-                            let response =
-                                err.into_http_response(AuthChallenge::BearerAndBasic, || {
-                                    resource_metadata_url(
-                                        &server,
-                                        RequestOrigin {
-                                            is_tls,
-                                            authority: challenge_host
-                                                .as_ref()
-                                                .and_then(|host| host.to_str().ok())
-                                                .or_else(|| {
-                                                    challenge_uri
-                                                        .authority()
-                                                        .map(|authority| authority.as_str())
-                                                })
-                                                .unwrap_or_default(),
-                                        },
-                                        challenge_uri.path(),
-                                    )
-                                });
-                            trc::error!(err.span_id(session.session_id));
-                            response
-=======
                         // Parse HTTP request
                         let challenge_uri = req.uri().clone();
                         let challenge_host = req.headers().get(HOST).cloned();
@@ -1198,7 +1134,6 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                                 trc::error!(err.span_id(session.session_id));
                                 response
                             }
->>>>>>> v1.0.3
                         }
                     };
 
