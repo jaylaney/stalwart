@@ -451,6 +451,7 @@ async fn harvest_skips_discarding_sieve(test: &TestServer, admin: &Account, plai
     wait_for_harvest(test, baseline).await;
     assert!(harvested_rows(admin, DISCARD_SENDER).await.is_empty());
     assert!(message_ids(test, plain.id().document_id()).await.is_empty());
+    client.sieve_script_deactivate().await.unwrap();
     client.sieve_script_destroy(&script).await.unwrap();
 }
 
