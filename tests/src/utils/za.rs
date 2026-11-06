@@ -896,6 +896,7 @@ pub async fn plant_plain_message(test: &TestServer, account_id: u32, raw: &str) 
             types::blob_hash::BlobHash::generate(raw.as_bytes()),
             raw.as_bytes(),
             60,
+            &server.core.blob.email,
         )
         .await
         .unwrap();

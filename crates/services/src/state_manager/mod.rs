@@ -9,6 +9,7 @@ pub mod email_push;
 pub mod http;
 pub mod manager;
 pub mod push;
+mod za;
 
 use common::ipc::{PushNotification, ViewerStateChange};
 use email::push::PushSubscription;

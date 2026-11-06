@@ -171,9 +171,10 @@ fn za_cancel_only(component: &mut ICalendarComponent) {
 /// Upgrade ruling 132 (spec 5.1 item 1): the removals a full state cannot
 /// express. An organizer-side entry records the instance keys of the
 /// per-instance CANCELs the fan-out refused for its address (spec 4.1).
-/// After the address's slice, which carries only the instances it attends
-/// (and no master when it does not attend the master, so upstream's REQUEST
-/// merge removes nothing), one CANCEL from the organizer to `to` carries a
+/// The address's slice carries only the instances it attends. In 1.0.3 a
+/// full REQUEST removes an omitted override only when its stored SEQUENCE
+/// is at or below the master's. A slice without the master removes nothing.
+/// After the slice, one CANCEL from the organizer to `to` carries a
 /// component for each recorded instance the committed `tree` no longer has
 /// the address attend, built by upstream's cancel builder
 /// (`CancelScope::Instance` over the address forms of `to`, so the

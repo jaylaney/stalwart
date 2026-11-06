@@ -113,10 +113,12 @@ pub async fn test(test: &mut TestServer) {
 
     imap_served_keys(&key, &plain).await;
     imap_refused_keys(&key, &plain).await;
+    nested_search_refused(&key).await;
     jmap_served_filters_and_sorts(&mut key, &mut plain).await;
     jmap_refused_filters_and_sorts(&key, &plain).await;
     wait_for_delivery(test).await;
     visible_field_document(test, key_id, plain_id).await;
+    query_changes_collapse_threads(&key.account).await;
 
     for account in [&key.account, &plain.account] {
         test.destroy_all_mailboxes(account).await;
@@ -156,14 +158,19 @@ fn mailbox_ids() -> Value {
 
 /// Email/import of one seeded message into the INBOX; returns its JMAP id.
 async fn import(account: &Account, seed: &Seed) -> String {
+    import_message(
+        account,
+        message_with(seed.subject, &"z".repeat(seed.pad)),
+        seed,
+    )
+    .await
+}
+
+async fn import_message(account: &Account, message: String, seed: &Seed) -> String {
     let blob = account
         .jmap_client()
         .await
-        .upload(
-            None,
-            message_with(seed.subject, &"z".repeat(seed.pad)).into_bytes(),
-            None,
-        )
+        .upload(None, message.into_bytes(), None)
         .await
         .unwrap()
         .take_blob_id();
@@ -239,6 +246,48 @@ async fn imap_session(account: &Account, tag: &'static [u8]) -> ImapConnection {
     imap.authenticate(account.name(), account.secret()).await;
     imap.send_ok("SELECT INBOX").await;
     imap
+}
+
+/// The deepest filter is subject to the same policy as a top-level filter.
+async fn nested_search_refused(key: &Fixture) {
+    let mut imap = imap_session(&key.account, b"_nested ").await;
+    let nested = |depth, leaf| {
+        let mut command = String::from("SEARCH ");
+        for level in 0..depth {
+            command.push_str(if level % 2 == 0 { "OR SEEN " } else { "NOT " });
+        }
+        command.push_str(leaf);
+        command
+    };
+
+    imap.send(&nested(20, "BODY nested-canary")).await;
+    let lines = imap.assert_read(Type::Tagged, ResponseType::No).await;
+    assert!(
+        lines
+            .last()
+            .unwrap()
+            .contains(&format!("NO [CANNOT] {ZA_MAIL_SEARCH_REFUSED}")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("* SEARCH") || line.starts_with("* ESEARCH")),
+        "{lines:?}"
+    );
+
+    assert_eq!(
+        served(&mut imap, &nested(20, "FLAGGED"), "* SEARCH").await,
+        "* SEARCH 1"
+    );
+
+    imap.send(&nested(33, "FLAGGED")).await;
+    let lines = imap.assert_read(Type::Tagged, ResponseType::Bad).await;
+    assert!(
+        lines.last().unwrap().contains("Too many nested filters"),
+        "{lines:?}"
+    );
+    imap.send_ok("LOGOUT").await;
 }
 
 /// The answer line of a command the server served (`* SEARCH ..`,
@@ -708,6 +757,61 @@ async fn jmap_served_filters_and_sorts(key: &mut Fixture, plain: &mut Fixture) {
         assert_eq!(added.len(), 1, "{name}: {response}");
         assert_eq!(added[0]["id"], fixture.fifth, "{name}: {response}");
         assert_eq!(response["removed"], json!([]), "{name}: {response}");
+    }
+}
+
+/// A reply and its parent still occupy distinct threads in a key account.
+async fn query_changes_collapse_threads(account: &Account) {
+    let seed = Seed {
+        subject: "collapse related",
+        ..fifth()
+    };
+    let parent = message_with(seed.subject, "parent");
+    let reference = parent
+        .lines()
+        .find_map(|line| line.strip_prefix("Message-ID: "))
+        .unwrap();
+    let child = message_with("Re: collapse related", "reply").replacen(
+        "Message-ID: ",
+        &format!("References: {reference}\r\nMessage-ID: "),
+        1,
+    );
+
+    let removed = import_message(account, parent, &seed).await;
+    let args = query_args(account, Some(json!({ "inMailbox": inbox() })), None, true);
+    let initial = account.jmap_method_call("Email/query", args.clone()).await;
+    assert!(initial.ids().any(|id| id == removed));
+    let mut args = args;
+    args["sinceQueryState"] = initial.method_response()["queryState"].clone();
+
+    let added = import_message(account, child, &seed).await;
+    let collapsed = account
+        .jmap_method_call(
+            "Email/query",
+            query_args(account, Some(json!({ "inMailbox": inbox() })), None, true),
+        )
+        .await;
+    let ids = collapsed.ids().collect::<Vec<_>>();
+    assert!(
+        ids.contains(&removed.as_str()) && ids.contains(&added.as_str()),
+        "{ids:?}"
+    );
+
+    let destroyed = account
+        .jmap_destroy("Email", [&removed], Vec::<(&str, &str)>::new())
+        .await;
+    assert_eq!(destroyed.destroyed().collect::<Vec<_>>(), [&removed]);
+
+    let changes = account.jmap_method_call("Email/queryChanges", args).await;
+    assert_eq!(changes.name_at(0), "Email/queryChanges", "{:?}", changes.0);
+    let response = changes.method_response();
+    let added_items = response["added"].as_array().unwrap();
+    assert_eq!(added_items.len(), 1, "{response}");
+    assert_eq!(added_items[0]["id"], added, "{response}");
+    assert_eq!(response["removed"], json!([removed]), "{response}");
+    for id in [&added_items[0]["id"], &response["removed"][0]] {
+        let id = id.as_str().unwrap().parse::<Id>().unwrap();
+        assert_eq!(id.prefix_id(), id.document_id(), "non-singleton id {id}");
     }
 }
 

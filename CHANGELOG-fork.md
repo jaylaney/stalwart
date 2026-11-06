@@ -6,6 +6,55 @@ The inherited [CHANGELOG.md](CHANGELOG.md) records upstream Stalwart history.
 
 ## Unreleased
 
+## 0.4.0-beta.1 — 2026-11-05
+
+Limited prerelease candidate `55bb9ca67d91fe84e9b7122681f71c5746c86214`. Fully integrated upstream Stalwart `v1.0.3`, commit
+`8b32686532d34623e9ce8e1237cf2bed9554af38`. Release identity is fork `0.4.0-beta.1`. CI on
+the final documentation head, Linux ELF inspection and publication remain pending.
+
+### Operator actions
+
+Qualification covers fresh stores only. If an operator carries over an existing store,
+previously enabled per-account encryption at rest resets to `Disabled`. Reselect the public
+key in each affected account's encryption settings to resume encrypting new mail. Start once
+with `STALWART_UPDATE_ROLE_PERMISSIONS=true` to add missing default-role permissions, then
+remove the variable. Third-party clients that manage app passwords, API keys or account
+settings need the applicable new OAuth scopes. See the [upstream changelog](CHANGELOG.md).
+
+### User-visible changes
+
+- Only a committed ordinary delivery contributes to key harvest, as decided after each
+  recipient's outcome. Key accounts, refused or failed deliveries, no-write Sieve outcomes
+  and duplicates never contribute. An ordinary co-recipient with a committed delivery still
+  contributes its own correspondent information.
+- Per-account encryption-at-rest settings are inert for key-account ingest. Ordinary ingest
+  that fails during provisioning can leave the upstream `sample_blob` staged. Sealed staging
+  uses no compression and the Email profile's encryption. The operator-held blob key remains
+  outside the guarantee. Backups carry decoded payloads and swap snapshots use plain codec
+  settings.
+- Key-account `EmailPush` becomes a content-free `StateChange`. For configured `EmailPush`
+  subscribers, that converted notification is delivered regardless of subscription `types`,
+  including an empty list. Generic state changes still use type filtering.
+- iTIP gates now cover trait entry points. Full REQUEST pinning removes omitted overrides only
+  up to the master SEQUENCE. Explicit CANCEL keeps its existing sequence rules.
+- Upload checks membership before the keyless refusal, hiding key-account classification from
+  nonmembers. The configured outbound gateway recipient-key fingerprint is traced beside queue
+  event addresses.
+- Default-role edits bump the permission epoch. The inherited narrow spill-cache publication
+  race remains. The epoch bump narrows stale reuse.
+- The leak scanner now reports physical matching files and current decoded matching blob
+  values separately. Stop the local server first. Compatible `ldb` and Python 3.14+ are
+  required, and encrypted or undecodable logical values make the check fail.
+
+The local matrix spans several tested commits. Unit rows U1–U4 (598, 16, 6 and 238 tests),
+zero-access Z1–Z4 including cache swap, and protocol rows D1–D3, I1/I2, J1/J2, S1–S4, T1 and Y1
+passed. The final SMTP aggregate on `55bb9ca67` recorded 75 passed, 1 failed and 3 ignored.
+One exact-name retry of `smtp::reporting::analyze::report_analyze` passed. The failure cause
+is undetermined. Ten mutations each failed at the intended assertion. Product build, identity,
+CalDAV (plain 68 passed, 1 skipped and 3 xfailed, key 74 passed, 1 skipped and 2 xfailed) and
+all nine fresh-store restart readbacks passed on `55bb9ca67`. See
+[merge outcome](docs/superpowers/plans/2026-11-05-upstream-1.0.3-merge-outcome.md).
+
 ## 0.3.0-beta.1 — 2026-11-04
 
 Immutable tag: `fork-v0.3.0-beta.1`. A limited prerelease on upstream Stalwart `v1.0.1`, and
@@ -252,9 +301,8 @@ Gates beyond the automated runs, recorded after publication:
 - the release 5 real-provider round, the Gmail, Outlook.com and iCloud section
   ("Invitations by email (release 5)") of the
   [manual checklist](docs/zero-access/manual-checklist.md): pending;
-- native client verification of release 5's flows: pending. The native Calendar and Mail
-  checklist passed on `0.2.0-beta.1`'s deployed build (2026-11-02, per Jay) and has not
-  been run on this release;
+- native client verification of release 5's flows: pending, with no recorded results on
+  this release or on `0.2.0-beta.1`;
 - a clean-context whole-branch review, carried over from `0.2.0-beta.1`: pending.
 
 Not qualified: SQL and FoundationDB stores, multi-node execution, platforms other than the
@@ -379,10 +427,8 @@ Gates beyond the automated runs, recorded after publication:
   ([run 41485088188](https://github.com/jaylaney/stalwart/actions/runs/41485088188)). The
   published release notes record the checksums, the attestation and the measured GLIBC
   requirement of the real artifact;
-- the native Apple Calendar (macOS and iOS), Thunderbird, DAVx5 and mail-client checklist
-  under the [manual checklist](docs/zero-access/manual-checklist.md): passed on the deployed
-  `fork-v0.2.0-beta.1` build, 2026-11-02, per Jay, with no per-client breakdown recorded;
-  results from the `0.1.x` base are not evidence for this release;
+- the native client [manual checklist](docs/zero-access/manual-checklist.md): no recorded
+  results; pending. Results from the `0.1.x` base are not evidence for this release;
 - a clean-context whole-branch review: pending. The final review's four lenses were given
   the execution ledger and its rulings, which is not the clean context the plan specifies.
 

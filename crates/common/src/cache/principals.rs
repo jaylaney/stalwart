@@ -7,21 +7,17 @@
 use crate::{
     Server,
     auth::{
-        ACCOUNT_FLAG_ENCRYPT_ALGO_AES128, ACCOUNT_FLAG_ENCRYPT_ALGO_AES256,
-        ACCOUNT_FLAG_ENCRYPT_ALGO_AES256_GCM, ACCOUNT_FLAG_ENCRYPT_ALGO_CHACHA20_POLY1305,
-        ACCOUNT_FLAG_ENCRYPT_APPEND, ACCOUNT_FLAG_ENCRYPT_METHOD_PGP,
-        ACCOUNT_FLAG_ENCRYPT_METHOD_SMIME, ACCOUNT_FLAG_ENCRYPT_TRAIN_SPAM_FILTER,
         ACCOUNT_IS_KEY_ACCOUNT, ACCOUNT_IS_USER, AccountCache, AccountInfo, AccountStorage,
         ChangedBy, DOMAIN_FLAG_RELAY, DOMAIN_FLAG_SUB_ADDRESSING, DomainCache, EmailAddress,
-        EmailAddressRef, EmailCache, EncryptionKeys, MailingListCache, PermissionsGroup,
-        RECOVERY_ADMIN_ID, RoleCache, permissions::BuildPermissions, vault::is_vault_unusable,
+        EmailAddressRef, EmailCache, MailingListCache, PermissionsGroup, RECOVERY_ADMIN_ID,
+        RoleCache, permissions::BuildPermissions, vault::is_vault_unusable,
     },
     config::smtp::auth::DkimSigners,
     expr::{Bump, if_block::BootstrapExprExt},
     network::mta::AddressResolver,
     storage::{
         ObjectQuota,
-        encryption::{EncryptionMethod, parse_public_key},
+        encryption::{AccountEncryption, EncryptionKeys},
     },
     za::imip::{ZaMailClass, za_mail_class_of},
 };
@@ -42,8 +38,8 @@ use registry::{
         enums::{DkimRotationStage, Locale, StorageQuota},
         prelude::{ObjectType, Property},
         structs::{
-            Account, DkimSignature, Domain, EncryptionAtRest, MailingList, PublicKey, Role,
-            SubAddressing,
+            Account, DkimSignature, Domain, EncryptionAtRest, EncryptionSettings, MailingList,
+            PublicKey, Role, SubAddressing,
         },
     },
     types::id::ObjectId,
@@ -55,7 +51,7 @@ use std::{
 use store::{
     U32_LEN,
     registry::{RegistryQuery, bootstrap::Bootstrap},
-    write::key::KeySerializer,
+    write::{key::KeySerializer, now},
 };
 use trc::{AddContext, CacheEvent};
 use types::id::Id;
@@ -66,8 +62,6 @@ use utils::DomainPart;
 // SPDX-License-Identifier: LicenseRef-SEL
 #[cfg(feature = "enterprise")]
 use registry::schema::structs::MaskedEmail;
-#[cfg(feature = "enterprise")]
-use store::write::now;
 // SPDX-SnippetEnd
 
 impl Server {
@@ -513,72 +507,13 @@ impl Server {
                         if is_key_account {
                             flags |= ACCOUNT_IS_KEY_ACCOUNT;
                         }
-                        let encryption_settings = match account.encryption_at_rest {
+                        let encryption = match account.encryption_at_rest {
                             EncryptionAtRest::Disabled => None,
-                            EncryptionAtRest::Aes256(settings) => {
-                                flags |= ACCOUNT_FLAG_ENCRYPT_ALGO_AES256;
-                                settings.into()
-                            }
-                            EncryptionAtRest::Aes128(settings) => {
-                                flags |= ACCOUNT_FLAG_ENCRYPT_ALGO_AES128;
-                                settings.into()
-                            }
-                            EncryptionAtRest::Aes256Gcm(settings) => {
-                                flags |= ACCOUNT_FLAG_ENCRYPT_ALGO_AES256_GCM;
-                                settings.into()
-                            }
-                            EncryptionAtRest::ChaCha20Poly1305(settings) => {
-                                flags |= ACCOUNT_FLAG_ENCRYPT_ALGO_CHACHA20_POLY1305;
-                                settings.into()
-                            }
-                        };
-                        let encryption_key = if let Some(settings) = encryption_settings {
-                            if settings.allow_spam_training {
-                                flags |= ACCOUNT_FLAG_ENCRYPT_TRAIN_SPAM_FILTER;
-                            }
-                            if settings.encrypt_on_append {
-                                flags |= ACCOUNT_FLAG_ENCRYPT_APPEND;
-                            }
-                            if let Some(public_key) = self
-                                .registry()
-                                .object::<PublicKey>(settings.public_key)
-                                .await
-                                .caused_by(trc::location!())?
-                            {
-                                match parse_public_key(&public_key).and_then(|params| {
-                                    params.ok_or(Cow::Borrowed("No public key found"))
-                                }) {
-                                    Ok(params) => {
-                                        match params.method {
-                                            EncryptionMethod::PGP => {
-                                                flags |= ACCOUNT_FLAG_ENCRYPT_METHOD_PGP
-                                            }
-                                            EncryptionMethod::SMIME => {
-                                                flags |= ACCOUNT_FLAG_ENCRYPT_METHOD_SMIME
-                                            }
-                                        }
-                                        Some(params.certs)
-                                    }
-                                    Err(err) => {
-                                        trc::error!(
-                                            trc::EventType::Registry(
-                                                trc::RegistryEvent::ValidationError
-                                            )
-                                            .into_err()
-                                            .details("Invalid public key, encryption disabled")
-                                            .reason(err)
-                                            .account_id(account_id)
-                                            .ctx(trc::Key::Id, settings.public_key.id())
-                                            .caused_by(trc::location!())
-                                        );
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
+                            EncryptionAtRest::Enabled(settings) => Some(Arc::new(
+                                self.build_account_encryption(account_id, settings)
+                                    .await
+                                    .caused_by(trc::location!())?,
+                            )),
                         };
 
                         AccountCache {
@@ -615,7 +550,7 @@ impl Server {
                             description: account.description.map(Into::into),
                             storage: AccountStorage::za_boxed(
                                 quota_objects,
-                                encryption_key,
+                                encryption,
                                 za_generation,
                                 za_public_key,
                             ),
@@ -1253,10 +1188,10 @@ impl AccountCache {
     }
 
     #[inline(always)]
-    pub fn encryption_key(&self) -> Option<&EncryptionKeys> {
+    pub fn encryption(&self) -> Option<&AccountEncryption> {
         self.storage
             .as_ref()
-            .and_then(|storage| storage.encryption_key.as_ref())
+            .and_then(|storage| storage.encryption.as_deref())
     }
 
     #[inline(always)]
@@ -1270,5 +1205,29 @@ impl AccountCache {
             tenant_id: self.id_tenant,
             // SPDX-SnippetEnd
         }
+    }
+}
+
+impl Server {
+    async fn build_account_encryption(
+        &self,
+        account_id: u32,
+        settings: EncryptionSettings,
+    ) -> trc::Result<AccountEncryption> {
+        let public_key = self
+            .registry()
+            .object::<PublicKey>(settings.public_key)
+            .await
+            .caused_by(trc::location!())?;
+        let encryption = AccountEncryption::build(&settings, public_key.as_ref(), now());
+        if let EncryptionKeys::Unusable(reason) = &encryption.keys {
+            trc::event!(
+                Encryption(trc::EncryptionEvent::KeyUnusable),
+                AccountId = account_id,
+                Id = settings.public_key.id(),
+                Reason = reason.as_str(),
+            );
+        }
+        Ok(encryption)
     }
 }

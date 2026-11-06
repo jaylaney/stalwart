@@ -715,12 +715,12 @@
    ],
    "from_configuration": "test.yml__unit-tests__workspace-unit-tests",
    "to_configuration": "test.yml__unit-tests__http-unit-tests",
-   "to_command": "cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise -- --list",
+   "to_command": "cargo test -p http@1.0.3 --lib --bins --features test_mode,enterprise -- --list",
    "absent_from": [
     "exists__WORKSPACE__all-members"
    ],
    "unconfirmed": false,
-   "evidence": "Task 2, '`UNIT_TEST_FEATURES` for 1.0': `http/test_mode` cannot be listed in the workspace step (1.0's `telemetry` crate depends on the crates.io `http` crate), and `http`'s unit tests need `test_mode` for the fork's `za_test` module, so Task 8 runs them in a step of their own with this command. The other four `http` tests need no `test_mode` and stay required in the workspace step. Confirmed at Task 8 (part 8c, ruling 124): test.yml's unit-tests job has the step \"HTTP Unit Tests\", which runs `cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise`; part 7d1 captured `to_command`, which lists every moved test."
+   "evidence": "Task 2, '`UNIT_TEST_FEATURES` for 1.0': `http/test_mode` cannot be listed in the workspace step (1.0's `telemetry` crate depends on the crates.io `http` crate), and `http`'s unit tests need `test_mode` for the fork's `za_test` module, so Task 8 runs them in a step of their own with this command. The other four `http` tests need no `test_mode` and stay required in the workspace step. Confirmed at Task 8 (part 8c, ruling 124): test.yml's unit-tests job has the step \"HTTP Unit Tests\", which runs the fork's HTTP package (then at 1.0.1) with the `test_mode` and `enterprise` features; part 7d1 captured the listing command and verified it lists every moved test."
   },
   {
    "tests": [
@@ -764,6 +764,11 @@
     "evidence": "Part 4b (commit 4beb2ae0f): the sealed calendar PROPFIND paths; 0.16's `dav/src/common/propfind.rs` became upstream's `propfind/` directory (Task 1, 'Deleted paths and their disposition'). A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
    },
    {
+    "file": "crates/email/src/message/za/harvest.rs",
+    "runtime_excluded": false,
+    "evidence": "Upstream v1.0.3 merge plan, Task 5: upstream's key harvest takes only a delivery that committed a message as an ordinary account. A fork runtime file added by the merge (git log --diff-filter=A -- crates/email/src/message/za/harvest.rs)."
+   },
+   {
     "file": "crates/groupware/src/calendar/seal/container.rs",
     "runtime_excluded": false,
     "evidence": "Rulings 16, 23 and 29 (part 4a, commit a92064a43): the sealed dead-property container. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
@@ -789,6 +794,11 @@
     "evidence": "Part 6a (commit c8e4d78de): the index queue's key-account gates (rulings 18, 19 and 22; R58). Its test_mode hooks count as runtime, as in-file hooks did at 0.16.27. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
    },
    {
+    "file": "crates/services/src/state_manager/za.rs",
+    "runtime_excluded": false,
+    "evidence": "Upstream v1.0.3 merge plan, Task 6: state-only replacement for a key account's EmailPush with an emailPush subscription. A fork runtime file added by the merge (git log --diff-filter=A -- crates/services/src/state_manager/za.rs)."
+   },
+   {
     "file": "crates/services/src/task_manager/tasks/grantee_cleanup/za.rs",
     "runtime_excluded": false,
     "evidence": "Part 6a (commit 6766311ec): the share-revocation cleanup skips key-account owners. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
@@ -810,6 +820,10 @@
    }
   ],
   "excluded_additions": [
+   {
+    "file": "crates/store/src/write/blob_codec_za_tests.rs",
+    "reason": "fork unit tests of upstream's blob codec (upstream v1.0.3 merge plan, Task 8), a test module in its own file: not runtime code"
+   },
    {
     "file": "crates/email/src/message/ingest/group/za_tests.rs",
     "reason": "fork unit tests (ruling 59; Task 5 fix round, commit 3c88a4ffb), a test module in its own file: not runtime code"

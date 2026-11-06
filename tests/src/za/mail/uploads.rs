@@ -29,9 +29,10 @@ use crate::{
     },
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use common::za::ZA_MAIL_KEYLESS;
+use common::za::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_KEYLESS};
 use email::mailbox::INBOX_ID;
 use groupware::calendar::seal::{WRAP_MK, WRAP_PK};
+use mail_parser::MessageParser;
 use registry::schema::{enums::Permission, prelude::ObjectType};
 use serde_json::{Value, json};
 use std::{str::FromStr, time::Duration};
@@ -51,11 +52,15 @@ const ATTACHMENT: &[u8] = b"upload canary attachment \x00\x01\x02\xfe\xff bytes"
 /// The attachment of the key account's delivered message.
 const DELIVERED_ATTACHMENT: &[u8] = b"upload canary delivered \x00\xff attachment";
 const RAW_REFUSED: &str = "zero-access: raw read of a sealed source";
-const KEYLESS_REFUSED: &str = "zero-access: mail access without session keys";
 /// The key account's sealed upload in `raw_consumers_are_refused`: a valid
 /// Sieve script, which `SieveScript/set` opens and stores (ruling R32 as
 /// amended).
 const SCRIPT_UPLOAD: &[u8] = b"# upload canary script\r\nkeep;\r\n";
+// A 1x1 PNG, reused for the foreign section and own upload.
+const INLINE_IMAGE: &str = concat!(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADU",
+    "lEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg=="
+);
 const COPY_REFUSED: &str = "zero-access: mail copy across accounts";
 
 pub async fn test(test: &mut TestServer) {
@@ -98,6 +103,7 @@ pub async fn test(test: &mut TestServer) {
     raw_consumers_are_refused(
         test,
         &key,
+        &other_key,
         &plain,
         &other_plain,
         &message_blob,
@@ -379,9 +385,9 @@ async fn upload_with_the_credential_is_sealed(test: &TestServer, key: &Account) 
     blob_id
 }
 
-/// Mail spec 4, 9, ruling R30: without the target account's keys an upload
-/// answers 403 (`/jmap/upload`) or `forbidden` (`Blob/upload`) and reserves
-/// nothing; a download of the account's message or upload answers 403.
+/// An upload to an account outside the session's membership answers 400.
+/// An owner's keyless upload or download answers 403 (or `forbidden`
+/// for `Blob/upload`). None reserves a temporary link.
 async fn upload_without_keys_is_refused(
     test: &TestServer,
     key: &Account,
@@ -393,8 +399,18 @@ async fn upload_without_keys_is_refused(
     println!("upload_without_keys_is_refused");
     let id = key.id().document_id();
     let other_id = other_key.id().document_id();
-    let links = temporary_links(test, id).await;
-    let other_links = temporary_links(test, other_id).await;
+    let nonexistent_id = u32::MAX - 100;
+    assert!(
+        test.server
+            .try_account(nonexistent_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut links = Vec::new();
+    for target in [id, other_id, nonexistent_id] {
+        links.push((target, temporary_links(test, target).await));
+    }
 
     let token = za_bearer_token(&test.server, KEY).await;
     let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
@@ -451,43 +467,66 @@ async fn upload_without_keys_is_refused(
         "Blob/upload over the WebSocket: {reply}"
     );
 
-    // Another account's session holds no keys of the target.
     for (session, target, what) in [
-        (plain, key, "a plain session into a key account"),
-        (key, other_key, "a key session into another key account"),
+        (plain, key.id(), "a plain session into a key account"),
+        (
+            key,
+            other_key.id(),
+            "a key session into another key account",
+        ),
+        (
+            plain,
+            Id::from(nonexistent_id),
+            "a plain session into a nonexistent account",
+        ),
     ] {
         let response = session
             .http_post_raw(
-                &upload_url(session, target),
+                &format!("{}/jmap/upload/{target}/", session.base_url()),
                 "application/octet-stream",
                 CANARY,
             )
             .await;
-        assert_forbidden_http(response.status, &response.text(), what);
+        let body = response.text();
+        assert_eq!(response.status, 400, "{what}: {body}");
+        assert!(
+            body.as_bytes() == response.body,
+            "{what}: invalid UTF-8: {body}"
+        );
+        assert_eq!(
+            response.json(),
+            Some(json!({
+                "type": "about:blank",
+                "status": 400,
+                "title": "Invalid Parameters",
+                "detail": "One or multiple parameters could not be parsed."
+            })),
+            "{what}: {body}"
+        );
     }
 
-    // One `Security(Unauthorized)` refusal per request, naming the target
-    // account: the three uploads' (`/jmap/upload`'s gate), the two
-    // downloads' and the WebSocket call's (`za_mail_keys`).
-    let mut refused = traced
+    // Only the owner's Bearer upload, two downloads and WebSocket call
+    // reach the keyless gate.
+    let refused = traced
         .finish()
         .await
         .into_iter()
-        .filter(|event| event.details == KEYLESS_REFUSED)
+        .filter(|event| event.details == ZA_TRACE_MAIL_KEYLESS)
         .map(|event| event.account_id)
         .collect::<Vec<_>>();
-    refused.sort_unstable();
-    let mut expected = vec![Some(u64::from(id)); 5];
-    expected.push(Some(u64::from(other_id)));
-    expected.sort_unstable();
-    assert_eq!(refused, expected, "the keyless refusals' traces");
-
-    assert_eq!(temporary_links(test, id).await, links, "a reservation");
     assert_eq!(
-        temporary_links(test, other_id).await,
-        other_links,
-        "a reservation in the other key account"
+        refused,
+        vec![Some(u64::from(id)); 4],
+        "the keyless refusals' traces"
     );
+
+    for (target, before) in links {
+        assert_eq!(
+            temporary_links(test, target).await,
+            before,
+            "a reservation for {target}"
+        );
+    }
 }
 
 /// Mail spec 5.7, 6.2: an imported upload is resealed into a fresh blob
@@ -582,6 +621,52 @@ async fn sealed_upload_imported_and_attached(test: &TestServer, key: &Account, s
         assert_eq!(status, 200, "{what}");
         assert_eq!(bytes, expected, "{what}: the attachment's bytes");
     }
+
+    let image = STANDARD.decode(INLINE_IMAGE).unwrap();
+    let blob = upload(key, &image).await;
+    let reply = create_with_inline_image(key, &blob).await;
+    let email_id = accepted(&reply, "/created/e/id", "the inline image upload")
+        .as_str()
+        .unwrap()
+        .parse::<Id>()
+        .unwrap();
+    assert_sealed(test, id, email_id.document_id(), WRAP_MK).await;
+    let (_, raw) = open_message(test, id, STRONG, email_id.document_id()).await;
+    let message = MessageParser::new()
+        .parse(&raw)
+        .expect("the opened message");
+    assert!(
+        message.root_part().is_content_type("multipart", "related"),
+        "the inline image was not attached as multipart/related"
+    );
+    assert!(
+        message.parts().any(|part| {
+            part.content_id() == Some("za-inline") && part.decoded().as_ref() == image.as_slice()
+        }),
+        "the related part lost its content id or bytes"
+    );
+}
+
+/// A media attachment with a content id and no disposition uses the HTML
+/// body's related-parts path.
+async fn create_with_inline_image(account: &Account, blob_id: &str) -> JmapResponse {
+    account
+        .jmap_method_call(
+            "Email/set",
+            json!({
+                "accountId": account.id_string(),
+                "create": { "e": {
+                    "mailboxIds": { (Id::from(INBOX_ID).to_string()): true },
+                    "from": [{ "email": account.name() }],
+                    "to": [{ "email": "recipient@example.com" }],
+                    "subject": format!("{CANARY} inline image"),
+                    "htmlBody": [{ "partId": "h", "type": "text/html" }],
+                    "bodyValues": { "h": { "value": "<img src=\"cid:za-inline\">" } },
+                    "attachments": [{ "blobId": blob_id, "type": "image/png", "cid": "za-inline" }]
+                } }
+            }),
+        )
+        .await
 }
 
 /// The raw consumers of mail spec 5.7 and ruling R32, as `session` with
@@ -739,6 +824,7 @@ async fn file_node(session: &Account, account: &Account, mut node: Value) -> Str
 async fn raw_consumers_are_refused(
     test: &TestServer,
     key: &Account,
+    other_key: &Account,
     plain: &Account,
     other_plain: &Account,
     message_blob: &str,
@@ -829,6 +915,26 @@ async fn raw_consumers_are_refused(
     )
     .await;
     let shared = (other_plain.id_string(), shared_folder.as_str());
+
+    deliver(
+        test,
+        SENDER,
+        other_key.name(),
+        &message_with_attachment(&STANDARD.decode(INLINE_IMAGE).unwrap()),
+    )
+    .await;
+    let (_, foreign_section) = message_blobs(other_key).await;
+    let before = message_ids(test, key_id).await;
+    let reply = create_with_inline_image(key, &foreign_section).await;
+    assert_eq!(
+        accepted(&reply, "/notCreated/e", "the foreign inline image"),
+        &json!({ "type": "forbidden", "description": ZA_MAIL_KEYLESS }),
+    );
+    assert_eq!(
+        message_ids(test, key_id).await,
+        before,
+        "a foreign inline image was stored"
+    );
 
     let traced = Traced::start(&[
         EventType::Security(SecurityEvent::Unauthorized),

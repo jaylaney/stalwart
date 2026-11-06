@@ -5,21 +5,20 @@
  */
 
 use crate::utils::{jmap::JmapUtils, server::TestServer, smtp::SmtpConnection};
-use common::{
-    auth::{
-        ACCOUNT_FLAG_ENCRYPT_ALGO_AES128, ACCOUNT_FLAG_ENCRYPT_ALGO_AES256,
-        ACCOUNT_FLAG_ENCRYPT_METHOD_PGP, ACCOUNT_FLAG_ENCRYPT_METHOD_SMIME,
-    },
-    storage::encryption::{EncryptionMethod, parse_public_key},
+use base64::{Engine, engine::general_purpose::STANDARD};
+use crypto::{
+    EncryptOptions, KeyError, KeyKind, Profile, Protection, RecipientIds, RecipientSet,
+    is_ciphertext, parse_public_keys, protection,
 };
-use email::message::crypto::EncryptMessage;
 use mail_parser::MessageParser;
 use registry::schema::{
+    enums::HeaderProtection,
     prelude::{ObjectType, Property},
-    structs::{EncryptionAtRest, EncryptionSettings, PublicKey},
+    structs::{AccountSettings, EncryptionAtRest, EncryptionSettings},
 };
 use serde_json::json;
 use std::path::PathBuf;
+use store::write::now;
 use types::id::Id;
 
 pub async fn test(test: &mut TestServer) {
@@ -27,7 +26,7 @@ pub async fn test(test: &mut TestServer) {
 
     // Check encryption
     check_is_encrypted();
-    import_certs_and_encrypt().await;
+    import_certs_and_encrypt();
 
     // Create test account
     let account = test
@@ -53,14 +52,7 @@ pub async fn test(test: &mut TestServer) {
         )
         .unwrap();
 
-        let params = parse_public_key(&PublicKey {
-            description: cert_file.to_string(),
-            key: certs.clone(),
-            ..Default::default()
-        })
-        .unwrap()
-        .unwrap();
-        certs_parsed.push(params.certs);
+        certs_parsed.push(parse_public_keys(certs.as_bytes(), now()).unwrap());
 
         let cert_id = account
             .registry_create_many(
@@ -77,28 +69,44 @@ pub async fn test(test: &mut TestServer) {
         cert_ids.push(cert_id);
     }
 
-    // Update encryption at rest settings
+    // Keep subjects visible for the delivery checks below.
+    let setting = EncryptionAtRest::Enabled(EncryptionSettings {
+        allow_spam_training: true,
+        encrypt_on_append: true,
+        public_key: cert_ids[1],
+        header_protection: HeaderProtection::None,
+    });
     account
         .registry_update_object(
             ObjectType::AccountSettings,
             Id::singleton(),
-            json!({
-                Property::EncryptionAtRest: EncryptionAtRest::Aes256(EncryptionSettings {
-                    allow_spam_training: true,
-                    encrypt_on_append: true,
-                    public_key: cert_ids[1],
-                })
-            }),
+            json!({ Property::EncryptionAtRest: setting }),
         )
         .await;
     assert_eq!(
-        test.server
-            .account(account.id().document_id())
+        account
+            .registry_get::<AccountSettings>(Id::singleton())
             .await
-            .unwrap()
-            .encryption_key()
-            .unwrap(),
-        &certs_parsed[1]
+            .encryption_at_rest,
+        setting
+    );
+    let cached_account = test
+        .server
+        .account(account.id().document_id())
+        .await
+        .unwrap();
+    let recipients = cached_account
+        .encryption()
+        .unwrap()
+        .recipients(now())
+        .unwrap();
+    assert_eq!(recipients.kind(), KeyKind::OpenPgp);
+    let expected_recipients = &certs_parsed[1].set;
+    assert_eq!(recipients.key_type(), expected_recipients.key_type());
+    assert_eq!(
+        openpgp_recipient_ids(recipients),
+        openpgp_recipient_ids(expected_recipients),
+        "cached recipients must match the registered OpenPGP fixture"
     );
 
     // Send a new message, which should be encrypted
@@ -203,64 +211,108 @@ pub async fn test(test: &mut TestServer) {
     test.cleanup().await;
 }
 
-pub async fn import_certs_and_encrypt() {
-    for (name, method) in [
-        ("cert_pgp.pem", EncryptionMethod::PGP),
-        //("cert_pgp.der", EncryptionMethod::PGP),
-        ("cert_smime.pem", EncryptionMethod::SMIME),
-        //("cert_smime.der", EncryptionMethod::SMIME),
-    ] {
-        let pk = PublicKey {
-            description: name.to_string(),
-            key: String::from_utf8(
-                std::fs::read(
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("resources")
-                        .join("crypto")
-                        .join(name),
-                )
-                .unwrap(),
-            )
-            .unwrap(),
-            ..Default::default()
+// The fixture check observes the actual keys used to wrap a session key. PKESK
+// recipient IDs are visible even though the message and session key are encrypted.
+fn openpgp_recipient_ids(recipients: &RecipientSet) -> Vec<Vec<u8>> {
+    let message = MessageParser::new()
+        .parse(b"Subject: recipient check\r\n\r\nfixture")
+        .unwrap();
+    let encrypted = recipients
+        .encrypt(
+            &message,
+            &EncryptOptions {
+                // Modern includes all usable keys, including post-quantum keys
+                // that Compatible can omit when a certificate also has a classical key.
+                profile: Profile::Modern,
+                recipient_ids: RecipientIds::Real,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let encrypted = MessageParser::new().parse(&encrypted.message).unwrap();
+    let armor = encrypted.part(2).unwrap().decoded();
+    let armor = std::str::from_utf8(&armor).unwrap().trim_ascii();
+    let encoded: String = armor
+        .strip_prefix("-----BEGIN PGP MESSAGE-----\r\n\r\n")
+        .unwrap()
+        .strip_suffix("-----END PGP MESSAGE-----")
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with('='))
+        .collect();
+    let bytes = STANDARD.decode(encoded).unwrap();
+
+    // Read only the leading Public-Key Encrypted Session Key (PKESK)
+    // packets. Stalwart writes them with new-format packet headers.
+    const PKESK: u8 = 0xc1;
+    const SEIPD: u8 = 0xd2;
+    let mut packets = bytes.as_slice();
+    let mut ids = Vec::new();
+    while let [PKESK, length @ ..] = packets {
+        let (len, rest) = match length {
+            [a, rest @ ..] if *a < 192 => (usize::from(*a), rest),
+            [a, b, rest @ ..] if *a < 224 => {
+                (((usize::from(*a) - 192) << 8) + usize::from(*b) + 192, rest)
+            }
+            [255, a, b, c, d, rest @ ..] => (u32::from_be_bytes([*a, *b, *c, *d]) as usize, rest),
+            _ => panic!("unexpected PKESK packet length"),
         };
-
-        let params = parse_public_key(&pk).unwrap().unwrap();
-        assert_eq!(params.method, method);
-
-        for mut flags in [
-            ACCOUNT_FLAG_ENCRYPT_ALGO_AES128,
-            ACCOUNT_FLAG_ENCRYPT_ALGO_AES256,
-        ] {
-            let message = MessageParser::new()
-                .parse(b"Subject: test\r\ntest\r\n")
-                .unwrap();
-            assert!(!message.is_encrypted());
-            flags |= match method {
-                EncryptionMethod::PGP => ACCOUNT_FLAG_ENCRYPT_METHOD_PGP,
-                EncryptionMethod::SMIME => ACCOUNT_FLAG_ENCRYPT_METHOD_SMIME,
-            };
-            message.encrypt(&params.certs, flags).await.unwrap();
+        let (body, rest) = rest.split_at_checked(len).unwrap();
+        let id = match body {
+            [3, recipient @ ..] => recipient.get(..8),
+            [6, len @ (21 | 33), recipient @ ..] => recipient.get(..usize::from(*len)),
+            _ => None,
         }
+        .expect("PKESK must carry a real key ID or fingerprint");
+        assert!(id.iter().any(|byte| *byte != 0));
+        ids.push(id.to_vec());
+        packets = rest;
+    }
+    assert!(!ids.is_empty(), "OpenPGP message has no recipient packets");
+    assert_eq!(packets.first(), Some(&SEIPD));
+    ids.sort_unstable();
+    ids
+}
+
+pub fn import_certs_and_encrypt() {
+    let now = now();
+    for (cert, kind) in [
+        (
+            include_bytes!("../../resources/crypto/cert_pgp.pem").as_slice(),
+            KeyKind::OpenPgp,
+        ),
+        (
+            include_bytes!("../../resources/crypto/cert_smime.pem").as_slice(),
+            KeyKind::Smime,
+        ),
+    ] {
+        let params = parse_public_keys(cert, now).unwrap();
+        assert_eq!(params.kind, kind);
+
+        let message = MessageParser::new()
+            .parse(b"Subject: test\r\ntest\r\n")
+            .unwrap();
+        assert_eq!(protection(&message), Protection::None);
+        let encrypted = params
+            .set
+            .encrypt(
+                &message,
+                &EncryptOptions {
+                    profile: params.set.inferred_profile(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let encrypted = MessageParser::new().parse(&encrypted.message).unwrap();
+        assert_eq!(protection(&encrypted), Protection::Encrypted);
+        assert!(is_ciphertext(&encrypted));
     }
 
-    // S/MIME and PGP should not be allowed mixed
-    assert!(
-        parse_public_key(&PublicKey {
-            description: "err".into(),
-            key: String::from_utf8(
-                std::fs::read(
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("resources")
-                        .join("crypto")
-                        .join("cert_mixed.pem"),
-                )
-                .unwrap()
-            )
-            .unwrap(),
-            ..Default::default()
-        })
-        .is_err()
+    // S/MIME and PGP should not be allowed mixed.
+    assert_eq!(
+        parse_public_keys(include_bytes!("../../resources/crypto/cert_mixed.pem"), now)
+            .unwrap_err(),
+        KeyError::MixedKeyKinds
     );
 }
 
@@ -274,15 +326,16 @@ pub fn check_is_encrypted() {
     .unwrap();
 
     for raw_message in messages.split("!!!") {
-        let is_encrypted = raw_message.contains("TRUE");
         let message = MessageParser::new()
             .parse(raw_message.trim().as_bytes())
             .unwrap();
         assert!(message.content_type().is_some());
-        assert_eq!(
-            message.is_encrypted(),
-            is_encrypted,
-            "failed for {raw_message}"
-        );
+        let expected = match message.subject() {
+            Some("Encrypted") => Protection::Encrypted,
+            Some("Signed") => Protection::Signed,
+            Some("None") => Protection::None,
+            subject => panic!("unknown protection fixture label: {subject:?}"),
+        };
+        assert_eq!(protection(&message), expected, "failed for {raw_message}");
     }
 }

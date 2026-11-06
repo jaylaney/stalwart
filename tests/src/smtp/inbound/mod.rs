@@ -411,7 +411,6 @@ impl TestMessage for MessageWrapper {
     async fn read_message(&self, core: &TestServer) -> String {
         String::from_utf8(
             core.server
-                .blob_store()
                 .get_blob(self.message.blob_hash.as_slice(), 0..usize::MAX)
                 .await
                 .unwrap()

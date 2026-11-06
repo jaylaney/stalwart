@@ -23,6 +23,7 @@ store = { path = "../crates/store", features = ["test_mode", "enterprise"] }
 nlp = { path = "../crates/nlp" }
 directory = { path = "../crates/directory", features = ["enterprise"] }
 coordinator = { path = "../crates/coordinator", features = ["enterprise"] }
+crypto = { path = "../crates/crypto" }
 jmap = { path = "../crates/jmap", features = ["test_mode", "enterprise"] }
 jmap_proto = { path = "../crates/jmap-proto" }
 imap = { path = "../crates/imap" }
@@ -47,7 +48,7 @@ trc = { path = "../crates/trc", features = ["enterprise"] }
 managesieve = { path = "../crates/managesieve", features = ["enterprise"] }
 smtp-proto = { path = "../crates/smtp-proto" }
 smtp-report = { path = "../crates/smtp-report" }
-mail-auth = { version = "0.14", features = ["test"] }
+mail-auth = { version = "0.15.1", features = ["test"] }
 mail-parser = { version = "1.0", features = ["full_encoding"] }
 mail-builder = "2.0"
 sieve-rs = { path = "../crates/sieve" }

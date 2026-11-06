@@ -85,6 +85,8 @@ its upstream updates during merges; do not insert fork release entries there.
 
 ## Release implementation
 
+### Published releases through `0.3.0-beta.1`
+
 The first preview is `0.1.0-beta.1`, tagged `fork-v0.1.0-beta.1` and titled
 `release-0.1.0-beta-1`; `0.1.1-beta.1` (tag `fork-v0.1.1-beta.1`) followed on upstream
 `v0.16.27`, and `0.2.0-beta.1` (tag `fork-v0.2.0-beta.1`) moved the fork to upstream
@@ -105,9 +107,8 @@ rollback restores the old store as it was, without the writes made after the cut
 prerelease used public upstream and fork tests for qualification, and results from the
 `0.1.x` base were not evidence for it. Its exact-source Linux product build
 ran from the tag through `product-build.yml`, and the published release notes record its
-verification. The native Calendar and Mail client checklist passed on the deployed build on
-2026-11-02, per Jay; its remaining gate, a clean-context whole-branch review, carries over
-to `0.3.0-beta.1`.
+verification. Its native client checklist has no recorded results and stays pending. Its
+other remaining gate, a clean-context whole-branch review, carries over to `0.3.0-beta.1`.
 
 `0.3.0-beta.1` is a limited prerelease. It supports an in-place upgrade from `0.2.0-beta.1`:
 the store schema version is unchanged and release 5 changes no stored layout, so the
@@ -127,6 +128,28 @@ real-provider round (the Gmail, Outlook.com and iCloud section of the
 SQL backends, clusters, other platforms and the external
 protocol suites are not qualified. It stays a prerelease until its applicable
 gates pass; the [fork changelog](../CHANGELOG-fork.md) records its automated results.
+
+### Candidate `0.4.0-beta.1`
+
+This limited prerelease candidate integrates upstream Stalwart `v1.0.3`
+(`8b32686532d34623e9ce8e1237cf2bed9554af38`). Internal upstream crates and numeric
+compatibility checks follow `1.0.3`. Qualification covers fresh stores only.
+
+If an operator carries over an existing store, previously enabled per-account encryption at
+rest resets to `Disabled`. Reselect the public key in each affected account's encryption
+settings to resume encrypting new mail. Start once with
+`STALWART_UPDATE_ROLE_PERMISSIONS=true` to add missing default-role permissions, then remove the
+variable. Third-party clients that manage app passwords, API keys or account settings need the
+applicable new OAuth scopes. See the [upstream changelog](../CHANGELOG.md).
+
+Each recipient contributes to key harvesting only after its ordinary delivery commits. Key
+accounts never contribute. Failed deliveries and outcomes that write nothing do not authorize
+harvest. Key accounts retain sealed ingest and state-only push. See the [fork changelog](../CHANGELOG-fork.md)
+and [merge outcome](superpowers/plans/2026-11-05-upstream-1.0.3-merge-outcome.md) for behavior,
+qualification and residuals. Candidate `55bb9ca67` passed local product, identity, CalDAV and
+fresh-store checks on macOS. Final-head CI and Linux ELF inspection await separate authorization.
+
+### Product verification and artifacts
 
 `scripts/release/verify_product.py` checks the upstream pin as well as the binary: the pinned
 tag must name `upstream_commit` (from a local tag, or from `PINNED_UPSTREAM_TAGS` when the

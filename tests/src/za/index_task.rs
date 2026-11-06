@@ -27,11 +27,15 @@
 use super::{
     STRONG,
     dav_seal::raw_event_records,
-    mail::{message_ids, message_with, metadata_rows, stored_metadata, threading_keys},
+    leak::{create_blob_codec_key, recode_blobs, retire_blob_codec_key},
+    mail::{
+        message_ids, message_with, metadata_rows, stored_hash, stored_metadata, threading_keys,
+    },
     user_permissions,
 };
 use crate::utils::{
     account::Account,
+    imap::{ImapConnection, Type},
     server::TestServer,
     smtp::SmtpConnection,
     webdav::DummyWebDavClient,
@@ -43,13 +47,16 @@ use crate::utils::{
     },
 };
 use common::za::test_hooks::{self, ForceCommitSplit};
-use email::message::{sortkeys::MessageSortKeys, thread::ThreadSubject};
+use email::message::{sortkeys::MessageSortKeys, thread::ThreadSubject, za::MAIL_FORMAT_V1};
 use groupware::calendar::{CalendarEventContent, seal::archived_event_is_sealed};
 use hyper::StatusCode;
+use imap_proto::ResponseType;
 use registry::schema::{
-    enums::TaskAccountMaintenanceType,
+    enums::{CompressionAlgo, TaskAccountMaintenanceType, TaskBlobRecodeCompression},
     prelude::ObjectType,
-    structs::{Task, TaskAccountMaintenance, TaskStatus},
+    structs::{
+        Task, TaskAccountMaintenance, TaskBlobRecodeEncryption, TaskBlobRecodeKey, TaskStatus,
+    },
 };
 use serde_json::json;
 use std::time::Duration;
@@ -57,7 +64,7 @@ use store::{
     Serialize as _, ValueKey,
     write::{
         Archiver, BatchBuilder, IndexPropertyClass, SearchIndex, SearchIndexClass, ValueClass,
-        serialize::RawValue,
+        blob_codec::BlobFormat, serialize::RawValue,
     },
 };
 use types::{
@@ -110,7 +117,7 @@ const ATTACH_TOKEN: &str = "zzattachcanary";
 /// each carry a token, with an RTF attachment too, so the plaintext row has
 /// an extractable attachment (`has_extractable_attachments`) and the builder
 /// takes its blocking extraction path.
-fn attachment_message(n: u32) -> String {
+pub(super) fn attachment_message(n: u32) -> String {
     padded_attachment_message(n, 0)
 }
 
@@ -541,13 +548,10 @@ pub async fn test_reindex(test: &mut TestServer) {
 /// `attachment_indexer_never_reads_sealed_blob` (the plan's Task 6): a key
 /// account's message with an extractable attachment is indexed from its
 /// stub without its blob being read. Its sealed blob is deleted from the
-/// blob store and its index entry queued again: the pass completes at once
-/// with an ids-only document (a blob read would fail, "Blob not found", and
-/// put the partition in retry). The negative control proves the deletion
-/// is detected: the same for an ordinary account's message fails its pass,
-/// which is then cleared by the message's unindex (the remedy for a
-/// permanent failure); the positive control, before the deletion, holds the
-/// attachment's token from the attachment indexer.
+/// blob store and its index entry queued again: the pass recreates an
+/// ids-only document. The ordinary control indexes attachment text before
+/// deletion. Once its blob is gone, its pass skips the message and drains
+/// without rebuilding a search document (upstream v1.0.2).
 pub async fn test_attachment_indexer(test: &mut TestServer) {
     println!("Running zero-access attachment indexer test...");
     let admin = test.account("admin@example.com").clone();
@@ -562,14 +566,24 @@ pub async fn test_attachment_indexer(test: &mut TestServer) {
     assert_indexes_tokens(test, plain_id, "the control").await;
     assert_visible_fields_only(test, key_id, "delivered").await;
 
+    // Clear search keys only. The requeued passes must still find their
+    // message metadata, or both would skip before reaching the blob path.
+    for account_id in [key_id, plain_id] {
+        unindex_search_account(test, SearchIndex::Email, account_id).await;
+        assert!(
+            search_keys(test, account_id, SearchIndex::Email)
+                .await
+                .document_ids()
+                .is_empty()
+        );
+    }
+
     let delete_blobs_and_requeue = async |account_id: u32| {
         let mut batch = BatchBuilder::new();
-        for document_id in message_ids(test, account_id).await {
-            let hash = stored_metadata(test, account_id, document_id)
-                .await
-                .unarchive()
-                .unwrap()
-                .blob_hash();
+        let documents = message_ids(test, account_id).await;
+        assert_eq!(documents.len(), 1);
+        for &document_id in &documents {
+            let hash = stored_hash(test, account_id, document_id).await;
             test.server
                 .blob_store()
                 .delete_blob(hash.as_slice())
@@ -579,35 +593,195 @@ pub async fn test_attachment_indexer(test: &mut TestServer) {
         }
         test.server.commit_batch(batch).await.unwrap();
         test.server.notify_index_queue();
+        documents[0]
     };
 
-    // The key account: the pass completes well inside the 30 s retry delay.
     delete_blobs_and_requeue(key_id).await;
     wait_for_index_queue(test, key_id, Duration::from_secs(10)).await;
     assert_visible_fields_only(test, key_id, "re-indexed without its blob").await;
 
-    // The ordinary control: its pass reads the blob and fails.
-    delete_blobs_and_requeue(plain_id).await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while partition_status(test, SearchIndex::Email, plain_id)
-        .await
-        .is_none()
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the control's pass did not fail without its blob: the deletion is not detected"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    // The remedy for a permanent failure: the message's unindex, then a
-    // reset; the pass collapses the index and unindex entries into a
-    // deletion and completes.
-    admin.destroy_all_mailboxes_for_account(plain_id).await;
-    release_index_partition(&test.server, SearchIndex::Email, plain_id).await;
+    let plain_document = delete_blobs_and_requeue(plain_id).await;
     wait_for_index_queue(test, plain_id, Duration::from_secs(10)).await;
+    // The skip leaves the ordinary message and its metadata in place.
+    assert_eq!(message_ids(test, plain_id).await, [plain_document]);
+    assert!(
+        stored_metadata(test, plain_id, plain_document)
+            .await
+            .unarchive()
+            .is_ok()
+    );
+    assert!(
+        partition_status(test, SearchIndex::Email, plain_id)
+            .await
+            .is_none()
+    );
+    assert!(
+        search_keys(test, plain_id, SearchIndex::Email)
+            .await
+            .document_ids()
+            .is_empty(),
+        "the ordinary pass indexed a message whose blob was missing"
+    );
 
     test.destroy_all_mailboxes(&key).await;
+    test.destroy_all_mailboxes(&plain).await;
     test.wait_for_tasks().await;
+    admin.destroy_account(key).await;
+    admin.destroy_account(plain).await;
+    test.wait_for_tasks().await;
+}
+
+/// The storage codec wraps a linked message without changing its sealed
+/// envelope or the bytes served to authenticated clients.
+pub async fn test_blob_recode_keeps_sealed(test: &mut TestServer) {
+    println!("Running zero-access blob recode test...");
+    const KEY: &str = "keymail45@example.com";
+    const PLAIN: &str = "plainmail49@example.com";
+    let admin = test.account("admin@example.com").clone();
+    let key = admin
+        .create_key_user_account(KEY, STRONG, "Recode", &[], user_permissions())
+        .await;
+    let plain = admin
+        .create_user_account(PLAIN, STRONG, "Recode", &[], user_permissions())
+        .await;
+    let body = "original blob recode body. ".repeat(25);
+    let body = body.trim_end();
+    let message = message_with("Blob recode", body);
+    SmtpConnection::connect()
+        .await
+        .ingest("sender@example.org", &[KEY, PLAIN], &message)
+        .await;
+    wait_for_delivery(test).await;
+    let (key_id, plain_id) = (key.id().document_id(), plain.id().document_id());
+    let mut hashes = Vec::new();
+    for id in [key_id, plain_id] {
+        wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+        let documents = message_ids(test, id).await;
+        assert_eq!(documents.len(), 1);
+        let hash = stored_hash(test, id, documents[0]).await;
+        let decoded = test
+            .server
+            .get_blob(hash.as_slice(), 0..usize::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        hashes.push((hash, decoded));
+    }
+
+    let codec_key = create_blob_codec_key(&admin).await;
+    admin.reload_settings().await;
+    test.reload_core();
+    recode_blobs(
+        test,
+        &admin,
+        TaskBlobRecodeCompression::Zstd,
+        TaskBlobRecodeEncryption::Encrypt(TaskBlobRecodeKey { key_id: codec_key }),
+    )
+    .await;
+    for (index, (hash, expected)) in hashes.iter().enumerate() {
+        let encoded = test
+            .server
+            .blob_store()
+            .get_raw_blob(hash.as_slice())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            encoded.last().unwrap() & 0x10,
+            0,
+            "the blob was not encrypted"
+        );
+        if index == 1 {
+            assert_eq!(
+                BlobFormat::of(&encoded).unwrap().compression,
+                CompressionAlgo::Zstd
+            );
+        }
+        let decoded = test
+            .server
+            .get_blob(hash.as_slice(), 0..usize::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&decoded, expected, "recode changed the stored message");
+        if index == 0 {
+            assert_eq!(decoded.first(), Some(&MAIL_FORMAT_V1));
+        }
+    }
+
+    let mut imap = ImapConnection::connect(b"_recode ").await;
+    imap.authenticate(KEY, STRONG).await;
+    imap.send_ok("SELECT INBOX").await;
+    imap.send("FETCH 1 (BODY.PEEK[TEXT])").await;
+    let fetched = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert!(fetched.iter().any(|line| line == body), "{fetched:?}");
+    imap.send_ok("LOGOUT").await;
+
+    let reply = key
+        .jmap_method_call(
+            "Email/get",
+            json!({ "accountId": key.id_string(), "properties": ["blobId"] }),
+        )
+        .await;
+    assert_eq!(reply.list().len(), 1, "{reply:?}");
+    let blob_id = reply.list()[0]["blobId"].as_str().unwrap();
+    let response = key
+        .http_get_raw(
+            &format!(
+                "{}/jmap/download/{}/{blob_id}/blob",
+                key.base_url(),
+                key.id_string()
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(response.status, 200);
+    let raw = std::str::from_utf8(&response.body).unwrap();
+    let (_, downloaded_body) = raw.split_once("\r\n\r\n").unwrap();
+    assert_eq!(downloaded_body.trim_end_matches("\r\n"), body);
+
+    for id in [key_id, plain_id] {
+        wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+    }
+    recode_blobs(
+        test,
+        &admin,
+        TaskBlobRecodeCompression::Lz4,
+        TaskBlobRecodeEncryption::Disable,
+    )
+    .await;
+    for (hash, expected) in &hashes {
+        let encoded = test
+            .server
+            .blob_store()
+            .get_raw_blob(hash.as_slice())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            encoded.last().unwrap() & 0x10,
+            0,
+            "the linked blob kept its encryption"
+        );
+        let decoded = test
+            .server
+            .get_blob(hash.as_slice(), 0..usize::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&decoded, expected, "recode back changed the stored message");
+    }
+    for account in [&key, &plain] {
+        test.destroy_all_mailboxes(account).await;
+        wait_for_index_queue(test, account.id().document_id(), Duration::from_secs(10)).await;
+        assert!(
+            message_ids(test, account.id().document_id())
+                .await
+                .is_empty()
+        );
+    }
+    test.wait_for_tasks().await;
+    retire_blob_codec_key(test, &admin, codec_key, None).await;
     admin.destroy_account(key).await;
     admin.destroy_account(plain).await;
     test.wait_for_tasks().await;

@@ -16,7 +16,7 @@ use store::{
     rand,
     write::{
         AnyClass, AnyKey, BatchBuilder, BlobLink, BlobOp, Operation, QueueClass, QueueEvent,
-        RegistryClass, ValueClass, key::KeySerializer,
+        RegistryClass, ValueClass, blob_codec::BlobOpts, key::KeySerializer,
     },
     *,
 };
@@ -50,7 +50,11 @@ pub async fn test(test: &TestServer) {
         blob_hashes.push(hash.clone());
         test.server
             .blob_store()
-            .put_blob(hash.as_ref(), &data, CompressionAlgo::Lz4)
+            .put_blob(
+                hash.as_ref(),
+                &data,
+                &BlobOpts::compressed(CompressionAlgo::Lz4),
+            )
             .await
             .unwrap();
         batch.set(ValueClass::Blob(BlobOp::Commit { hash }), vec![]);

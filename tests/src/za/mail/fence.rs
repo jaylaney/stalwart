@@ -34,7 +34,10 @@ use crate::{
         },
     },
     za::{
-        STRONG, index_task::emulate_superseding_node, raw_input::SUBMISSION_PORT, user_permissions,
+        STRONG,
+        index_task::{attachment_message, emulate_superseding_node},
+        raw_input::SUBMISSION_PORT,
+        user_permissions,
     },
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -42,7 +45,10 @@ use calcard::common::timezone::Tz;
 use common::{
     Server,
     auth::AccessToken,
-    za::{ZA_MAIL_KEYLESS, test_hooks},
+    za::{
+        ZA_MAIL_KEYLESS,
+        test_hooks::{self, ForceCommitSplit},
+    },
 };
 use email::{
     cache::MessageCacheFetch,
@@ -66,10 +72,11 @@ use mail_parser::MessageParser;
 use nlp::language::Language;
 use registry::{
     schema::{
+        enums::TaskBlobRecodeCompression,
         prelude::{Object, ObjectInner, ObjectType},
         structs::{
-            self, Credential, PasswordCredential, SpamTrainingSample, Task, TaskMergeThreads,
-            TaskStatus, TaskStatusFailed,
+            self, Credential, PasswordCredential, SpamTrainingSample, Task, TaskBlobRecode,
+            TaskExternalPublicKeyMaintenance, TaskMergeThreads, TaskStatus, TaskStatusFailed,
         },
     },
     types::{datetime::UTCDateTime, id::ObjectId, map::Map},
@@ -146,6 +153,9 @@ const FAILED_MERGE: &str = "keymail18@example.com";
 const SUPERSEDED: &str = "keymail20@example.com";
 /// Its ordinary control, whose index write passes the fence.
 const SUPERSEDED_CONTROL: &str = "plainmail17@example.com";
+/// The same race through the blocking attachment extractor.
+const SUPERSEDED_ATTACHMENT: &str = "keymail40@example.com";
+const SUPERSEDED_ATTACHMENT_CONTROL: &str = "plainmail45@example.com";
 /// `setup_refuses_orphaned_search_terms`'s account (ruling R62).
 const ORPHANED_TERMS: &str = "keymail22@example.com";
 /// `unindex_between_index_chunks_leaves_no_terms`'s account (ruling R62).
@@ -254,8 +264,24 @@ pub async fn test(test: &mut TestServer) {
     let in_flight = setup_refuses_an_in_flight_index_write(test, &admin).await;
     let in_flight_event = setup_refuses_an_in_flight_calendar_index_write(test, &admin).await;
     let failed_merge = setup_refuses_a_failed_merge_task(test, &admin).await;
-    let (superseded, superseded_control) =
-        superseded_index_write_loses_to_provisioning(test, &admin).await;
+    let server_wide_tasks = server_wide_tasks_do_not_block_setup(&admin).await;
+    let (superseded, superseded_control) = superseded_index_write_loses_to_provisioning(
+        test,
+        &admin,
+        SUPERSEDED,
+        SUPERSEDED_CONTROL,
+        false,
+    )
+    .await;
+    let (superseded_attachment, superseded_attachment_control) =
+        superseded_index_write_loses_to_provisioning(
+            test,
+            &admin,
+            SUPERSEDED_ATTACHMENT,
+            SUPERSEDED_ATTACHMENT_CONTROL,
+            true,
+        )
+        .await;
     let orphaned_terms = setup_refuses_orphaned_search_terms(test, &admin).await;
     let chunked = unindex_between_index_chunks_leaves_no_terms(test, &admin).await;
     let chunked_event = unindex_between_calendar_index_chunks_leaves_no_terms(test, &admin).await;
@@ -320,8 +346,11 @@ pub async fn test(test: &mut TestServer) {
         in_flight,
         in_flight_event,
         failed_merge,
+        server_wide_tasks,
         superseded,
         superseded_control,
+        superseded_attachment,
+        superseded_attachment_control,
         orphaned_terms,
         chunked,
         chunked_event,
@@ -354,9 +383,42 @@ async fn passwordless(admin: &Account, name: &'static str) -> Account {
         .await
 }
 
+async fn server_wide_tasks_do_not_block_setup(admin: &Account) -> Account {
+    println!("server_wide_tasks_do_not_block_setup");
+    const NAME: &str = "keymail44@example.com";
+    let account = passwordless(admin, NAME).await;
+    // Both tasks must still exist at issuance. In particular, an external
+    // key maintenance task due now finishes immediately with the gateway off.
+    let due = now() + 3600;
+    let recode = admin
+        .registry_create_object(Task::BlobRecode(TaskBlobRecode {
+            compression: TaskBlobRecodeCompression::Zstd,
+            shard_index: Some(0),
+            status: TaskStatus::at(due as i64),
+            ..Default::default()
+        }))
+        .await;
+    let external = admin
+        .registry_create_object(Task::ExternalPublicKeyMaintenance(
+            TaskExternalPublicKeyMaintenance {
+                status: TaskStatus::at(due as i64),
+            },
+        ))
+        .await;
+    for id in [recode, external] {
+        assert_eq!(admin.registry_get::<Task>(id).await.due_timestamp(), due);
+    }
+    za_setup_token(admin, NAME).await;
+    admin
+        .registry_destroy(ObjectType::Task, [recode, external])
+        .await
+        .assert_destroyed(&[recode, external]);
+    account
+}
+
 /// Waits until the queue holds a message for `address` whose last attempt
 /// failed temporarily.
-async fn wait_for_temporary_failure(test: &TestServer, address: &str) {
+pub(super) async fn wait_for_temporary_failure(test: &TestServer, address: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !temporarily_failed(test, address).await {
         assert!(
@@ -825,6 +887,8 @@ async fn forward_race_imip_merge(test: &TestServer, admin: &Account) -> Account 
     let mails = message_ids(test, id).await;
 
     let update = invitation(FENCE12, "za-fence-merge", 1, "fence merge v2");
+    // The small merge otherwise keeps all four fences in one transaction.
+    let split = ForceCommitSplit::new(id);
     let parked = HookParked::start(id, test_hooks::set_ingest_pause, async move {
         submit(ORGANIZER, FENCE12, &update).await;
     })
@@ -863,6 +927,7 @@ async fn forward_race_imip_merge(test: &TestServer, admin: &Account) -> Account 
         merged[0].1, events[0].1,
         "control: the retry merged the update"
     );
+    drop(split);
     account
 }
 
@@ -1560,11 +1625,12 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
         let ingest = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(ingest_delay)).await;
             let message = message_with("stress", "stress-body");
+            let parsed_message = MessageParser::new().parse(message.as_bytes());
             let access_token = AccessToken::from_id_maybe_invalid(account_id);
             let result = server
                 .email_ingest(IngestEmail {
                     raw_message: message.as_bytes(),
-                    message: MessageParser::new().parse(message.as_bytes()),
+                    message: parsed_message.as_ref(),
                     blob_hash: None,
                     access_token: &access_token,
                     mailbox_ids: vec![INBOX_ID],
@@ -1667,7 +1733,6 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
 
     let readable = async |hash: &BlobHash| {
         test.server
-            .blob_store()
             .get_blob(hash.as_slice(), 0..usize::MAX)
             .await
             .unwrap()
@@ -2219,25 +2284,44 @@ async fn wait_for_retry_state(test: &TestServer, index: SearchIndex, account_id:
 async fn superseded_index_write_loses_to_provisioning(
     test: &TestServer,
     admin: &Account,
+    name: &'static str,
+    control_name: &'static str,
+    extractable: bool,
 ) -> (Account, Account) {
-    println!("superseded_index_write_loses_to_provisioning");
+    println!("superseded_index_write_loses_to_provisioning (extractable: {extractable})");
     test.wait_for_tasks().await;
-    let account = passwordless(admin, SUPERSEDED).await;
+    let account = passwordless(admin, name).await;
     let id = account.id().document_id();
-    let control = passwordless(admin, SUPERSEDED_CONTROL).await;
+    let control = passwordless(admin, control_name).await;
     let control_id = control.id().document_id();
-    let message = message_with("superseded", "superseded-body");
+    let (message, control_message) = if extractable {
+        (attachment_message(1), attachment_message(2))
+    } else {
+        (
+            message_with("superseded", "superseded-body"),
+            message_with("superseded control", "superseded-control-body"),
+        )
+    };
     // A: the delivery commits; its index pass classifies the account as
     // ordinary, builds the full document and parks before the write.
     let parked = HookParked::start(id, test_hooks::set_index_write_pause, async move {
         SmtpConnection::connect()
             .await
-            .ingest(SENDER, &[SUPERSEDED], &message)
+            .ingest(SENDER, &[name], &message)
             .await;
     })
     .await;
     let ids = message_ids(test, id).await;
     assert_eq!(ids.len(), 1, "{ids:?}");
+    assert_eq!(
+        stored_metadata(test, id, ids[0])
+            .await
+            .unarchive()
+            .unwrap()
+            .has_extractable_attachments(),
+        extractable,
+        "the parked write selected the wrong index builder branch"
+    );
 
     admin.destroy_all_mailboxes_for_account(id).await;
     // B, after A's lease expired.
@@ -2250,8 +2334,8 @@ async fn superseded_index_write_loses_to_provisioning(
 
     // Every term passes: no message, no metadata row, no entry, no sample,
     // no search key.
-    let token = za_setup_token(admin, SUPERSEDED).await;
-    za_setup(SUPERSEDED, &token, STRONG).await;
+    let token = za_setup_token(admin, name).await;
+    za_setup(name, &token, STRONG).await;
     assert_eq!(
         test.server
             .za_vault_record(id)
@@ -2279,13 +2363,18 @@ async fn superseded_index_write_loses_to_provisioning(
     );
 
     // The control's document passes the fence.
-    deliver(
-        test,
-        SENDER,
-        SUPERSEDED_CONTROL,
-        &message_with("superseded control", "superseded-control-body"),
-    )
-    .await;
+    deliver(test, SENDER, control_name, &control_message).await;
+    let control_ids = message_ids(test, control_id).await;
+    assert_eq!(control_ids.len(), 1, "{control_ids:?}");
+    assert_eq!(
+        stored_metadata(test, control_id, control_ids[0])
+            .await
+            .unarchive()
+            .unwrap()
+            .has_extractable_attachments(),
+        extractable,
+        "the control selected the wrong index builder branch"
+    );
     assert!(
         test.server
             .za_has_email_search_documents(control_id)

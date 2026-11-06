@@ -63,61 +63,72 @@
             ]
           },
           {
-            "partId": "3",
-            "blobId": "blob_1",
-            "size": 175,
-            "headers": [
+            "subParts": [
               {
-                "name": "Content-Language",
-                "value": " en_US"
+                "partId": "4",
+                "blobId": "blob_1",
+                "size": 175,
+                "headers": [
+                  {
+                    "name": "Content-Language",
+                    "value": " en_US"
+                  },
+                  {
+                    "name": "Content-Type",
+                    "value": " text/html"
+                  },
+                  {
+                    "name": "Content-Transfer-Encoding",
+                    "value": " quoted-printable"
+                  }
+                ],
+                "type": "text/html",
+                "charset": "us-ascii",
+                "language": [
+                  "en_US"
+                ]
               },
               {
-                "name": "Content-Type",
-                "value": " text/html"
-              },
-              {
-                "name": "Content-Transfer-Encoding",
-                "value": " quoted-printable"
+                "partId": "5",
+                "blobId": "blob_2",
+                "size": 37,
+                "headers": [
+                  {
+                    "name": "Content-ID",
+                    "value": " <cid:1234-5678-9012-3456>"
+                  },
+                  {
+                    "name": "Content-Type",
+                    "value": " image/png"
+                  },
+                  {
+                    "name": "Content-Transfer-Encoding",
+                    "value": " base64"
+                  }
+                ],
+                "type": "image/png",
+                "cid": "cid:1234-5678-9012-3456"
               }
             ],
-            "type": "text/html",
-            "charset": "us-ascii",
-            "language": [
-              "en_US"
-            ]
+            "headers": [
+              {
+                "name": "Content-Type",
+                "value": " multipart/related; type=\"text/html\";\r\n boundary=\"boundary_0\""
+              }
+            ],
+            "type": "multipart/related"
           }
         ],
         "headers": [
           {
             "name": "Content-Type",
-            "value": " multipart/alternative;\r\n boundary=\"boundary_0\""
+            "value": " multipart/alternative;\r\n boundary=\"boundary_1\""
           }
         ],
         "type": "multipart/alternative"
       },
       {
-        "partId": "4",
-        "blobId": "blob_2",
-        "size": 37,
-        "headers": [
-          {
-            "name": "Content-ID",
-            "value": " <cid:1234-5678-9012-3456>"
-          },
-          {
-            "name": "Content-Type",
-            "value": " image/png"
-          },
-          {
-            "name": "Content-Transfer-Encoding",
-            "value": " base64"
-          }
-        ],
-        "type": "image/png",
-        "cid": "cid:1234-5678-9012-3456"
-      },
-      {
-        "partId": "5",
+        "partId": "6",
         "blobId": "blob_3",
         "size": 127,
         "headers": [
@@ -166,7 +177,7 @@
       },
       {
         "name": "Content-Type",
-        "value": " multipart/mixed;\r\n boundary=\"boundary_1\""
+        "value": " multipart/mixed;\r\n boundary=\"boundary_2\""
       }
     ],
     "type": "multipart/mixed"
@@ -177,7 +188,7 @@
       "isEncodingProblem": false,
       "isTruncated": true
     },
-    "3": {
+    "4": {
       "value": "<html><p>I was thinking about quitting the &ldquo;exporting&rdquo; to focus just on the &ldquo;im...",
       "isEncodingProblem": false,
       "isTruncated": true
@@ -207,32 +218,11 @@
       "language": [
         "en"
       ]
-    },
-    {
-      "partId": "4",
-      "blobId": "blob_2",
-      "size": 37,
-      "headers": [
-        {
-          "name": "Content-ID",
-          "value": " <cid:1234-5678-9012-3456>"
-        },
-        {
-          "name": "Content-Type",
-          "value": " image/png"
-        },
-        {
-          "name": "Content-Transfer-Encoding",
-          "value": " base64"
-        }
-      ],
-      "type": "image/png",
-      "cid": "cid:1234-5678-9012-3456"
     }
   ],
   "htmlBody": [
     {
-      "partId": "3",
+      "partId": "4",
       "blobId": "blob_1",
       "size": 175,
       "headers": [
@@ -254,9 +244,11 @@
       "language": [
         "en_US"
       ]
-    },
+    }
+  ],
+  "attachments": [
     {
-      "partId": "4",
+      "partId": "5",
       "blobId": "blob_2",
       "size": 37,
       "headers": [
@@ -275,11 +267,9 @@
       ],
       "type": "image/png",
       "cid": "cid:1234-5678-9012-3456"
-    }
-  ],
-  "attachments": [
+    },
     {
-      "partId": "5",
+      "partId": "6",
       "blobId": "blob_3",
       "size": 127,
       "headers": [

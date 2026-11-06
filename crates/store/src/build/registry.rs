@@ -114,6 +114,11 @@ impl RegistryStore {
     }
 
     #[inline(always)]
+    pub fn update_role_permissions(&self) -> bool {
+        self.0.env_update_role_permissions
+    }
+
+    #[inline(always)]
     pub fn is_bootstrap_mode(&self) -> bool {
         self.0.store.is_ephemeral()
     }
@@ -157,6 +162,7 @@ impl RegistryStore {
                 store,
                 node_id: 0,
                 env_recovery_mode: false,
+                env_update_role_permissions: false,
                 env_recovery_admin: Some(("admin".to_string(), "popolna_zapora".to_string())),
                 env_cluster_role: cluster_role,
                 env_push_shard_id: push_shard_id,

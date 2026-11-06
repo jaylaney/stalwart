@@ -857,7 +857,7 @@ impl Account {
                 DkimSignature::Dkim1Ed25519Sha256(sig) => v1_ed25519.push(sig),
                 DkimSignature::Dkim2Ed25519Sha256(_)
                 | DkimSignature::Dkim2RsaSha256(_)
-                | DkimSignature::Dkim2MlDsa44Ed25519Sha512(_) => todo!(),
+                | DkimSignature::Dkim2MlDsa44(_) => todo!(),
             }
         }
 

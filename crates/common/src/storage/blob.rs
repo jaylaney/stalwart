@@ -10,12 +10,11 @@ use crate::{
 };
 use bytes::Bytes;
 use mail_parser::Encoding;
-use registry::schema::enums::CompressionAlgo;
 use std::{borrow::Cow, ops::Deref, ops::Range};
 use store::{
     U32_LEN, U64_LEN,
     dispatch::lookup::KeyValue,
-    write::{BatchBuilder, BlobLink, BlobOp, blob::BlobLinkValue, now},
+    write::{BatchBuilder, BlobLink, BlobOp, blob::BlobLinkValue, blob_codec::BlobOpts, now},
 };
 use trc::AddContext;
 use types::{
@@ -209,8 +208,18 @@ impl Server {
         }
     }
 
-    #[allow(clippy::blocks_in_conditions)]
     pub async fn put_jmap_blob(&self, account_id: u32, data: &[u8]) -> trc::Result<BlobId> {
+        self.put_jmap_blob_with_opts(account_id, data, &self.core.blob.email)
+            .await
+    }
+
+    #[allow(clippy::blocks_in_conditions)]
+    pub async fn put_jmap_blob_with_opts(
+        &self,
+        account_id: u32,
+        data: &[u8],
+        opts: &BlobOpts,
+    ) -> trc::Result<BlobId> {
         // First reserve the hash
         let hash = BlobHash::generate(data);
         let mut batch = BatchBuilder::new();
@@ -243,7 +252,7 @@ impl Server {
             self.core
                 .storage
                 .blob
-                .put_blob(hash.as_ref(), data, self.core.email.compression)
+                .put_blob(hash.as_ref(), data, opts)
                 .await
                 .caused_by(trc::location!())?;
 
@@ -273,9 +282,10 @@ impl Server {
         account_id: u32,
         data: &[u8],
         hold_for: u64,
+        opts: &BlobOpts,
     ) -> trc::Result<(BlobHash, BlobOp)> {
         let (hash, hold) = self
-            .hold_blob(account_id, BlobHash::generate(data), data, hold_for)
+            .hold_blob(account_id, BlobHash::generate(data), data, hold_for, opts)
             .await?;
         let link = BlobOp::Link {
             hash: hash.clone(),
@@ -301,6 +311,7 @@ impl Server {
         hash: BlobHash,
         data: &[u8],
         hold_for: u64,
+        opts: &BlobOpts,
     ) -> trc::Result<(BlobHash, BlobHold)> {
         // First reserve the hash
         let mut batch = BatchBuilder::new();
@@ -332,7 +343,7 @@ impl Server {
             self.core
                 .storage
                 .blob
-                .put_blob(hash.as_ref(), data, self.core.email.compression)
+                .put_blob(hash.as_ref(), data, opts)
                 .await
                 .caused_by(trc::location!())?;
         }
@@ -368,14 +379,13 @@ impl Server {
         range: Range<usize>,
         size_hint: Option<u64>,
     ) -> trc::Result<Option<FetchedBlob>> {
-        let factor = if range.start == 0 && self.core.email.compression == CompressionAlgo::None {
+        let factor = if range.start == 0 && self.core.blob.is_uncompressed() {
             1
         } else {
             READ_COPY_FACTOR
         };
         let reservation = self.read_reservation(size_hint, factor)?;
         match self
-            .blob_store()
             .get_blob(hash.as_slice(), range)
             .await
             .caused_by(trc::location!())?
@@ -393,7 +403,6 @@ impl Server {
     ) -> trc::Result<Option<FetchedBlob>> {
         let reservation = self.read_reservation(size_hint, READ_COPY_FACTOR)?;
         match self
-            .blob_store()
             .get_blob(hash.as_slice(), section.fetch_range())
             .await
             .caused_by(trc::location!())?
@@ -402,6 +411,14 @@ impl Server {
             Some(bytes) => FetchedBlob::fit(bytes, reservation).map(Some),
             None => Ok(None),
         }
+    }
+
+    pub fn get_blob(
+        &self,
+        key: &[u8],
+        range: Range<usize>,
+    ) -> impl Future<Output = trc::Result<Option<Vec<u8>>>> {
+        self.blob_store().get_blob(key, range, &self.core.blob.keys)
     }
 
     pub fn account_blob(&self, bytes: Vec<u8>) -> trc::Result<FetchedBlob> {

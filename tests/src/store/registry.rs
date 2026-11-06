@@ -85,10 +85,11 @@ pub async fn test(test: &TestServer) {
         ]),
         description: "This is a test Account".to_string().into(),
         domain_id: 1004u64.into(),
-        encryption_at_rest: EncryptionAtRest::Aes128(EncryptionSettings {
+        encryption_at_rest: EncryptionAtRest::Enabled(EncryptionSettings {
             allow_spam_training: true,
             encrypt_on_append: false,
             public_key: 0u64.into(),
+            ..Default::default()
         }),
         external_id: "8f7c1e2a-4b3d-4f1a-9c2e-7d5b6a8f0e11".to_string().into(),
         locale: Locale::EnUS,
@@ -355,10 +356,11 @@ pub async fn test(test: &TestServer) {
     assert_obj_patch(
         &mut account,
         "encryptionAtRest",
-        EncryptionAtRest::Aes128(EncryptionSettings {
+        EncryptionAtRest::Enabled(EncryptionSettings {
             allow_spam_training: true,
             encrypt_on_append: false,
             public_key: pk_id,
+            ..Default::default()
         })
         .into_value(),
         trc::location!(),

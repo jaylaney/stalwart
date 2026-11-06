@@ -22,7 +22,11 @@ use std::{
     path::PathBuf,
     time::SystemTime,
 };
-use store::{BlobStore, backend::fs::FsStore, write::now};
+use store::{
+    BlobStore,
+    backend::fs::FsStore,
+    write::{blob_codec::BlobOpts, now},
+};
 use types::blob_hash::BlobHash;
 
 #[tokio::test]
@@ -134,7 +138,7 @@ async fn generate_dsn() {
         .put_blob(
             message.message.blob_hash.as_slice(),
             dsn_original.as_bytes(),
-            CompressionAlgo::Lz4,
+            &BlobOpts::compressed(CompressionAlgo::Lz4),
         )
         .await
         .unwrap();
@@ -282,7 +286,6 @@ impl TestServer {
 
         let bytes = self
             .server
-            .blob_store()
             .get_blob(message.blob_hash.as_slice(), 0..usize::MAX)
             .await
             .unwrap()

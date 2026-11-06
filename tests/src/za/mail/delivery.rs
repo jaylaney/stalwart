@@ -235,7 +235,7 @@ const PREPENDED: &[&str] = &[
 
 /// `raw` is the delivered bytes behind a prefix made only of `PREPENDED`
 /// header fields (folded lines included).
-fn assert_received_as(raw: &[u8], message: &str) {
+pub(super) fn assert_received_as(raw: &[u8], message: &str) {
     let prefix = raw
         .strip_suffix(received(message).as_bytes())
         .unwrap_or_else(|| {
@@ -618,7 +618,7 @@ async fn restore_is_refused(test: &TestServer, key_id: u32) {
     let raw = message_with("restored", "restore-canary");
     let (hash, _) = test
         .server
-        .put_temporary_blob(key_id, raw.as_bytes(), 3600)
+        .put_temporary_blob(key_id, raw.as_bytes(), 3600, &test.server.core.blob.email)
         .await
         .unwrap();
     let mut batch = BatchBuilder::new();
