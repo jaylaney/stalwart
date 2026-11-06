@@ -1,7 +1,9 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 9 (2026-11-06), for re-approval.
-Revision 9 answers the Codex re-review of revision 8 (R16 and R17 new,
+Date: 2026-11-04. Status: revision 10 (2026-11-06), for re-approval.
+Revision 10 records Jay's decision 2: thread blobs are padded to coarse
+size classes (section 13).
+Revision 9 answered the Codex re-review of revision 8 (R16 and R17 new,
 R15 remaining) and the reviewer's advice to consolidate: section 5.1 is
 rewritten as one model, with the inputs that bound a pass, strict
 processing order, the discard rules and what each checkpoint
@@ -1988,12 +1990,13 @@ answers were tenable:
   left open, for a convenience the web client does not need. "For now":
   a later release may revisit it with socket invalidation plumbing.
 
-**Decision 2 (for Jay, revision 7): the thread-blob size channel.** A
-thread blob holds one record per message a pass indexed or reassigned,
-and its sealed size is visible (section 2). The Codex re-review of
-revision 6 (R15) asks for this to be decided explicitly. Two answers:
+**Decision 2 (Jay, 2026-11-06): the thread-blob size channel, padded.**
+A thread blob holds one record per message a pass indexed or
+reassigned, and its sealed size is visible (section 2). The Codex
+re-review of revision 6 (R15) asked for this to be decided explicitly.
+Two answers were tenable:
 
-- (a) **Recommended, and what the design is written for.** Pad every
+- (a) **Taken.** Pad every
   thread blob's compressed payload to a power of two of at least 16 KiB
   before sealing (4.2's formula). The protection is in bytes: a merge
   is hidden when the records it adds keep the payload inside the class
@@ -2008,10 +2011,11 @@ revision 6 (R15) asks for this to be decided explicitly. Two answers:
   it, per pass, until the next thread compaction folds it away, which
   pays the same proportion once on the compacted blob. The guarantee of
   section 2 is stated with that residual.
-- (b) Accept the unpadded size: the operator learns, per pass, roughly
-  how many thread records changed, and so whether a merge happened and
-  how large, for every merge. No padding cost; the guarantee is narrowed
-  to the notification entries alone.
+- (b) Not taken, kept for the record: accept the unpadded size, where
+  the operator learns, per pass, roughly how many thread records
+  changed, and so whether a merge happened and how large, for every
+  merge. No padding cost; the guarantee would have been narrowed to the
+  notification entries alone.
 
 Hiding every merge would need a full rewrite of the thread records on
 every pass, which section 12 rejects on cost.
@@ -2063,8 +2067,7 @@ every pass, which section 12 rejects on cost.
     keeps, so a message created and deleted within a range yields
     nothing, as upstream's folded log (R14).
 15. Thread blobs are padded to coarse size classes by 4.2's byte
-    formula, decision 2's recommended answer, pending Jay's choice
-    (R15).
+    formula: decision 2, taken by Jay on 2026-11-06 (R15).
 16. The pass is one model (5.1): records consumed strictly in order and
     whole, a logged deletion applied unconditionally, no cache consulted
     for existence, threading fields dropped only at tombstoning, and a
