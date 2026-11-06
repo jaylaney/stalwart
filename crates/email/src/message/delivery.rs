@@ -252,8 +252,9 @@ impl MailDelivery for Server {
                 Err(err) => Err(err),
             };
 
-            harvest_message |=
-                harvest && !rcpt.is_spam() && za_harvest_allowed(self, account_id, &status).await;
+            if !harvest_message && harvest && !rcpt.is_spam() {
+                harvest_message = za_harvest_allowed(self, account_id, &status).await;
+            }
 
             let status = match status {
                 Ok(ingested_message) => {

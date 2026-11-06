@@ -208,8 +208,18 @@ impl Server {
         }
     }
 
-    #[allow(clippy::blocks_in_conditions)]
     pub async fn put_jmap_blob(&self, account_id: u32, data: &[u8]) -> trc::Result<BlobId> {
+        self.put_jmap_blob_with_opts(account_id, data, &self.core.blob.email)
+            .await
+    }
+
+    #[allow(clippy::blocks_in_conditions)]
+    pub async fn put_jmap_blob_with_opts(
+        &self,
+        account_id: u32,
+        data: &[u8],
+        opts: &BlobOpts,
+    ) -> trc::Result<BlobId> {
         // First reserve the hash
         let hash = BlobHash::generate(data);
         let mut batch = BatchBuilder::new();
@@ -242,7 +252,7 @@ impl Server {
             self.core
                 .storage
                 .blob
-                .put_blob(hash.as_ref(), data, &self.core.blob.email)
+                .put_blob(hash.as_ref(), data, opts)
                 .await
                 .caused_by(trc::location!())?;
 
