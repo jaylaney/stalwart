@@ -1,8 +1,9 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 11 (2026-11-06), for re-approval,
-with decision 2 returned to Jay for re-confirmation (section 13).
-Revision 11 answers the fresh Fable review of revision 10 (F1 to F24)
+Date: 2026-11-04. Status: revision 12 (2026-11-06), for re-approval.
+Revision 12 records Jay's re-confirmation of decision 2 on its
+corrected premise: padding over bounded records (section 13).
+Revision 11 answered the fresh Fable review of revision 10 (F1 to F24)
 and the Codex re-review of revisions 9 and 10 (R16 for the rebuild
 cursor, R18, R19). The one P1, F1: the thread-blob size class was an
 operator-driven oracle, since a sender chooses a record's size; records
@@ -2309,20 +2310,21 @@ answers were tenable:
   left open, for a convenience the web client does not need. "For now":
   a later release may revisit it with socket invalidation plumbing.
 
-**Decision 2 (Jay, 2026-11-06, returned for re-confirmation in revision
-11): the thread-blob size channel, padded over bounded records.** A
-thread blob holds one record per message a pass indexed or reassigned,
-and its sealed size is visible (section 2). Jay took the padded answer
-on 2026-11-06 on the residual as revision 10 stated it: "a pass whose
-payload sits just under a boundary can cross it with one more record".
-The Fable review of revision 10 (F1) showed that residual to be
-operator-controllable, since a sender chooses a record's size through
-References and the operator delivers the mail: a filler could place a
-pass's payload at a boundary and a probe's merge could be read off the
-class, one bit per pass. Revision 11 therefore adds a bound, and the
-decision is returned with the changed premise:
+**Decision 2 (Jay, 2026-11-06, re-confirmed the same day on the
+corrected premise): the thread-blob size channel, padded over bounded
+records.** A thread blob holds one record per message a pass indexed or
+reassigned, and its sealed size is visible (section 2). Jay first took
+the padded answer on the residual as revision 10 stated it: "a pass
+whose payload sits just under a boundary can cross it with one more
+record". The Fable review of revision 10 (F1) showed that residual to
+be operator-controllable, since a sender chooses a record's size
+through References and the operator delivers the mail: a filler could
+place a pass's payload at a boundary and a probe's merge could be read
+off the class, one bit per pass. Revision 11 added the bound below and
+returned the decision with the changed premise; Jay re-confirmed it in
+revision 12:
 
-- (a) **Written for, re-confirmation asked.** Records keep at most `K`
+- (a) **Taken.** Records keep at most `K`
   reference hashes (16), the minimum class `M` (32 KiB) is chosen so that
   a full pass of maximal records stays under it by at least a third, and
   the padding is 4.2's byte formula. The operator can then never place a
@@ -2396,8 +2398,9 @@ the thread records on every pass, which section 12 rejects on cost.
     deleted within a range yields nothing, as upstream's folded log
     (R14).
 15. Thread blobs are padded to coarse size classes by 4.2's byte
-    formula over bounded records: decision 2, returned for
-    re-confirmation (R15, F1).
+    formula over bounded records: decision 2, taken by Jay on
+    2026-11-06 and re-confirmed the same day on the corrected premise
+    (R15, F1).
 16. The pass is one model (5.1): records consumed strictly in order and
     whole, a logged deletion applied unconditionally, no cache consulted
     for existence, threading fields dropped at tombstoning except while a
