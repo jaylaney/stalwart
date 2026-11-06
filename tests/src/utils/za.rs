@@ -61,11 +61,7 @@ use registry::schema::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{
-    future::Future,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{future::Future, sync::Arc, time::Duration};
 use store::{
     Deserialize, IterateParams, Subspace, U32_LEN, U64_LEN, ValueKey,
     write::{
@@ -993,31 +989,6 @@ pub async fn queued_recipients(test: &TestServer) -> Vec<String> {
         .iter()
         .flat_map(|m| m.message.recipients.iter().map(|r| r.address.to_string()))
         .collect()
-}
-
-/// Whether the queue holds a message for `address` whose last attempt
-/// failed temporarily.
-pub async fn temporarily_failed(test: &TestServer, address: &str) -> bool {
-    test.read_queued_messages()
-        .await
-        .into_iter()
-        .flat_map(|m| m.message.recipients)
-        .any(|r| {
-            &*r.address == address && matches!(r.status, smtp::queue::Status::TemporaryFailure(_))
-        })
-}
-
-/// Waits until the queue holds a message for `address` whose last attempt
-/// failed temporarily.
-pub async fn wait_for_temporary_failure(test: &TestServer, address: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !temporarily_failed(test, address).await {
-        assert!(
-            Instant::now() < deadline,
-            "no temporary failure queued for {address}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 /// Waits until everything the server has queued is delivered. A task that

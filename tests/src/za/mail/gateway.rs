@@ -9,8 +9,9 @@
 //! encryption events preserve the protected content boundary.
 
 use super::{
-    Traced, TracedEvent, assert_sealed, deliver, delivery::assert_received_as, key_mail_account,
-    message_ids, message_with, new_message, open_message, stored_blob, stored_hash,
+    Traced, TracedEvent, assert_sealed, deliver, delivery::assert_received_as,
+    fence::wait_for_temporary_failure, key_mail_account, message_ids, message_with, new_message,
+    open_message, stored_blob, stored_hash,
 };
 use crate::{
     utils::{
@@ -21,7 +22,7 @@ use crate::{
         smtp::SmtpConnection,
         smtp_sink::sink,
         webdav::DummyWebDavClient,
-        za::{Conn, HookParked, wait_for_delivery, wait_for_temporary_failure, za_setup_token},
+        za::{Conn, HookParked, wait_for_delivery, za_setup_token},
     },
     za::{
         STRONG, imip,

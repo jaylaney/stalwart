@@ -23,7 +23,7 @@ use crate::{
         imap::{ImapConnection, Type},
         server::TestServer,
         smtp::SmtpConnection,
-        za::{queued_recipients, temporarily_failed, wait_for_delivery, za_setup, za_setup_token},
+        za::{queued_recipients, wait_for_delivery, za_setup, za_setup_token},
     },
     za::{STRONG, user_permissions},
 };
@@ -48,6 +48,7 @@ use registry::{
     types::{datetime::UTCDateTime, list::List},
 };
 use serde_json::json;
+use smtp::queue::Status;
 use std::time::{Duration, Instant};
 use store::write::{BatchBuilder, now};
 use types::{
@@ -196,6 +197,16 @@ fn addressed(subject: &str, body: &str) -> String {
         "To: Recipient <recipient@example.com>",
         &format!("To: <{KEY}>"),
     )
+}
+
+/// Whether the queue holds a message for `address` whose last attempt
+/// failed temporarily.
+pub(super) async fn temporarily_failed(test: &TestServer, address: &str) -> bool {
+    test.read_queued_messages()
+        .await
+        .into_iter()
+        .flat_map(|m| m.message.recipients)
+        .any(|r| &*r.address == address && matches!(r.status, Status::TemporaryFailure(_)))
 }
 
 /// The DATA content `SmtpConnection` sends for `message`: it puts a CRLF of

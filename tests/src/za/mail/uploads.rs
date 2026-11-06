@@ -487,7 +487,12 @@ async fn upload_without_keys_is_refused(
                 CANARY,
             )
             .await;
-        assert_eq!(response.status, 400, "{what}: {}", response.text());
+        let body = response.text();
+        assert_eq!(response.status, 400, "{what}: {body}");
+        assert!(
+            body.as_bytes() == response.body,
+            "{what}: invalid UTF-8: {body}"
+        );
         assert_eq!(
             response.json(),
             Some(json!({
@@ -496,8 +501,7 @@ async fn upload_without_keys_is_refused(
                 "title": "Invalid Parameters",
                 "detail": "One or multiple parameters could not be parsed."
             })),
-            "{what}: {}",
-            response.text()
+            "{what}: {body}"
         );
     }
 
