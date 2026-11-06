@@ -25,20 +25,20 @@ GitHub issue #23 ("Search for key accounts"). Release 6 (JMAP calendars
 and the web client) and this release do not depend on each other; the
 number is the one the mail spec reserved.
 
-**Precondition.** The design is written against upstream v1.0.3's
-behaviour and its plan runs after the 1.0.3 merge, which is its own
-branch and pull request under README-dev's "Merging upstream" (the raw
-merge commit, the conflict ledger, the hook-inventory re-check,
-`PINNED_UPSTREAM_TAGS`, `fork-release.toml`). Two behaviours the design
-relies on arrived in 1.0.2 and were verified in v1.0.3's source, not
-only its changelog: `Email/get` looks a supplied id up with
-`cache.email_by_jmap_id(id)`, so a prefix that is not the message's
-thread id is `notFound` (v1.0.3 `crates/jmap/src/email/get.rs:245-253`),
-and `Email/queryChanges` with `collapseThreads` re-emits every message
-of a thread that a created or destroyed id touched (v1.0.3
-`crates/jmap/src/changes/query.rs:95-123`). Line numbers below are
-v1.0.1's, the checkout the design was read against; the plan re-reads
-each site after the merge.
+**Precondition, met.** The design is written against upstream v1.0.3's
+behaviour. The 1.0.3 merge landed on `main` on 2026-11-06 (PR #82,
+`f148b2973`, fork `0.4.0-beta.1` on upstream `v1.0.3`), and the design
+branch carries it. Two behaviours the design relies on arrived in 1.0.2
+and were verified in v1.0.3's source, not only its changelog: `Email/get`
+looks a supplied id up with `cache.email_by_jmap_id(id)`, so a prefix
+that is not the message's thread id is `notFound` (now
+`crates/jmap/src/email/get.rs:233-276`), and `Email/queryChanges` with
+`collapseThreads` re-emits every message of a thread that a created or
+destroyed id touched (now `crates/jmap/src/changes/query.rs:106-112`).
+The other line numbers below are v1.0.1's, the checkout the design was
+read against; the plan re-reads each site on the merged tree, and
+re-checks the za suite's next free account names, since the merge added
+`mail::gateway` (`tests/src/za/mail/gateway.rs`).
 
 The terms key account, master key (MK), session keys, key cache,
 generation and visible by structure are those of the release 1 spec,
