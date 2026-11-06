@@ -1,7 +1,14 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 7 (2026-11-06), for re-approval.
-Revision 7 answers the Codex re-review of revision 6 (R2 remaining, R14
+Date: 2026-11-04. Status: revision 8 (2026-11-06), for re-approval.
+Revision 8 answers the Codex re-review of revision 7 (R14 and R15
+remaining): a document's physical existence at the ends of a changes
+range comes from the raw log of the range, overlaid on its sealed
+record, and every pass applies deletions through the log's end,
+uncapped (5.1, 6.2, 6.3, R14); the thread-blob padding is stated as a
+byte formula with its overhead, and the message counts of decision 2
+are estimates, not guarantees (2, 4.2, 13, R15).
+Revision 7 answered the Codex re-review of revision 6 (R2 remaining, R14
 and R15 new): a map's version is the pair of its identity epoch and its
 revision, compared for equality at every validation, and the revision
 counter continues across a rebuild (4.2, 5.1, 6.2, R2); the changes
@@ -180,14 +187,21 @@ of the thread blob a pass writes (4.2; decision 2 in section 13).
   already knows each message's exact size.
 - The size class of each thread blob (4.2): a thread blob holds one
   record per message the pass indexed plus one per message it
-  reassigned, and is padded to a power of two of at least 16 KiB before
-  sealing, so a pass that indexed a few messages and reassigned up to
-  about a hundred more writes the smallest class, like a pass that
-  reassigned none. A merge that reassigned more than that in one pass
-  shows as a larger class: the operator learns that an unusually large
-  re-threading happened, coarsely how large, and nothing about which
-  messages. This is the one way a pass's writes depend on what it found
-  (decision 2).
+  reassigned, records of variable length (a reference hash per
+  Message-ID-family header, the history), and its compressed payload is
+  padded to a power of two of at least 16 KiB before sealing. The
+  operator sees the class, not the payload. What that hides is stated in
+  bytes, not messages: a merge is hidden exactly when the records it adds
+  keep the payload inside the class the pass would have written anyway,
+  so a pass whose payload sits just under a boundary can cross it with
+  one more record, and a large merge crosses several. At the design
+  corpus a compressed record is on the order of a hundred bytes, so the
+  smallest class holds on the order of a hundred records (an estimate
+  the benchmark measures, 9.6, not a guarantee). The operator thus
+  learns, per pass, the class of the pass's record count, and from a
+  class above the smallest that a large re-threading happened and
+  coarsely how large; never which messages. This is the one way a pass's
+  writes depend on what it found (decision 2).
 - Per publishing pass, which is every pass that indexed at least one
   message (6.3): one Email item update of a witness, the lowest document
   id among the messages the pass indexed, a choice the operator can make
@@ -348,12 +362,18 @@ authenticated on its own, so a loader reads one without the other):
   the pass inserted, when it inserted any.
 
 Each is zstd-compressed, then sealed under the search key with the AAD
-of 3.1. A thread blob is padded before sealing to the next power of two
-of at least 16 KiB, in the stub's form (`seal_padded`: a length prefix,
-zero padding, then the seal; `crates/groupware/src/calendar/seal/tree.rs`),
-so its sealed size says only which class it fell in (section 2, decision
-2); a content blob is not padded, since its size follows the messages'
-sizes, which are visible already. The serialization format is the fork's own, versioned by
+of 3.1. A thread blob is padded before sealing, in the stub's framing
+(`seal_padded`'s form: a u32 length prefix, zero padding, then the seal;
+`crates/groupware/src/calendar/seal/tree.rs:272-282`, whose own
+256-byte rounding is not this policy): with `p` the compressed payload
+length, the padded length is `max(16384, 2^ceil(log2(p + 4)))`. The
+overhead above the payload is therefore `16384 - (p + 4)` while the
+payload is under 16 KiB, and otherwise less than `p + 4` itself (a
+payload of 32 KiB plus one byte pads to 64 KiB); a compacted thread blob
+pays the same proportion once. The sealed size then says only which
+class the payload fell in (section 2, decision 2). A content blob is not
+padded, since its size follows the messages' sizes, which are visible
+already. The serialization format is the fork's own, versioned by
 `SEARCH_FORMAT_V1`; it is not an upstream rkyv archive read with
 `access_unchecked`, so the "stored structs never change layout" rule of
 release 1 does not bind it: a format bump is a version bump in the
@@ -563,17 +583,26 @@ request waits for the running pass, as the drain's lock does,
    (the thread prefix in the high bits is ignored: it is the singleton);
    item deletes give tombstones, each recording the record's change id
    as its deletion change id, except for a document the message cache
-   still holds; item updates are flag and mailbox changes, or the pass's
+   still holds, and ignored for a document the index does not hold (its
+   insert, if still ahead, is skipped when reached, since the cache no
+   longer holds it). Deletions are read and applied from **every**
+   record through the log's end in every pass, ahead of the cap of step
+   2 (R14): tombstoning costs no key and no blob, is idempotent, and
+   keeps the thread table and the records' deletion change ids no
+   further behind the log than one request, so that thread-valued reads
+   and the changes rendering of 6.3 see every deletion the state they
+   return reflects. Item updates are flag and mailbox changes, or the pass's
    own entries of 6.3, and need nothing (a key account's message content
    never changes in place; an IMAP COPY within the account rewrites the
    same document with the same content,
    `crates/imap/src/op/copy_move.rs:407-419`). An insert of a document
    the index already holds is skipped. These rules make a repeated delta
    (5.6, a failed write) harmless.
-2. **Cap, at record boundaries** (R1). The pass processes records whole
-   and stops before the first record that would begin after
-   `ZA_SEARCH_PASS_CAP` inserts or `ZA_SEARCH_PASS_MB` of opened message
-   bytes, cursor items counted with them; it always processes at least
+2. **Cap, at record boundaries** (R1). The cap bounds inserts only;
+   deletions were applied through the end in step 1. The pass processes
+   records whole and stops before the first record that would begin
+   after `ZA_SEARCH_PASS_CAP` inserts or `ZA_SEARCH_PASS_MB` of opened
+   message bytes, cursor items counted with them; it always processes at least
    one record or cursor item, however large (a grouped ingest's record
    holds the messages of one batch,
    `crates/email/src/message/ingest/group.rs:130-152`, bounded by
@@ -915,7 +944,10 @@ thread map as loaded (5.2) and validated (below):
   `inThread`, the `*InThreadHaveKeyword` filters, the thread-keyword
   sorts and IMAP `THREAD` group by the map's thread id instead of the
   cache's (the cache's `thread_ids` column holds singletons and is left
-  as it is).
+  as it is). Which messages exist is always the message cache's answer,
+  never the map's: a thread-valued read intersects the map with the
+  cache's present set, so a message the cache no longer holds is never
+  emitted whatever its record says (R14).
 - **No map, no ids** (R3). A keyed request whose thread part is not
   loaded and cannot be loaded or validated (a manifest read fails, the
   budget cannot make room for the thread part, the validation above does
@@ -1023,14 +1055,21 @@ in the keyless log in `(S, E]` **and** those with a history entry whose
 revision's change id is in `(S, E]`, or a deletion change id in
 `(S, E]`; the union is taken on document ids. What each candidate
 yields is decided by its **existence** at the two ends, not by which
-entry made it a candidate: for a document the index holds (present or
-as a retained tombstone), it exists at `X` when its creation change id
-is at or below `X` and its deletion change id, if any, is above `X`; for
-a document the index does not hold (never indexed, or not yet reached in
-a backlog), existence follows the folded raw log as upstream folds it
-(`Changes::push_change`, an insert cancelled by a later delete,
-`crates/store/src/query/log.rs:347-395`), and its thread is the
-singleton at both ends. Then, with `T0` the thread as of `S` and `T1`
+entry made it a candidate, and existence is a physical fact taken from
+the keyless log first and from the sealed record only for what the
+range cannot show (R14): a raw insert of `D` in `(S, E]` makes `D` absent
+at `S`; a raw delete of `D` in `(S, E]` makes `D` absent at `E`,
+whatever `D`'s record says, since the record can lag the log by the
+unconsumed part of a backlog; where the range shows neither, a document
+the index holds (present or as a retained tombstone) exists at `X` when
+its creation change id is at or below `X` and its deletion change id, if
+any, is above `X`, and a document the index does not hold (never
+indexed, or not yet reached in a backlog) exists at `X` as the folded
+raw log says (`Changes::push_change`, an insert cancelled by a later
+delete, `crates/store/src/query/log.rs:347-395`), with the singleton as
+its thread at both ends. The thread lookup stays the history's, separate
+from existence, so a lagging record still gives the old mapped id to
+destroy. Then, with `T0` the thread as of `S` and `T1`
 the thread as of `E` (the rule above): absent at `S` and at `E`: nothing,
 however many entries it had in between (a message created and deleted
 within the range, R14); absent at `S`, present at `E`: created `T1|D`;
@@ -1292,10 +1331,13 @@ two successive publications, for a first assignment from the singleton,
 for a deleted message, for a message created and deleted within the
 range, singleton and threaded, which yields nothing (R14), and for a
 pinned range whose end is older than the current revision (R2, R3, R5,
-R12); the version comparison rejects a map of another epoch with an
-equal or lower revision (R2); a thread blob of one record and one of a
-hundred records seal to the same size class, and the class steps at the
-documented count (R15); paging the stream with a small
+R12); a deletion the record lacks but the range shows renders as
+destroyed, exactly once (R14); the version comparison rejects a map of
+another epoch with an equal or lower revision (R2); the padding formula
+is checked at payloads just below, at and above each class boundary,
+32 KiB included, and the class is a function of the payload's bytes
+alone, varied by reference and history lengths at a fixed record count
+(R15); paging the stream with a small
 `maxChanges` reproduces every item exactly once, with a publication and
 a deletion landing between pages (R12); the record reader yields records
 whole with their change ids and reports truncation; the witness is a
@@ -1345,7 +1387,11 @@ and `fence.rs` and `index_task.rs` reach `keymail45` and `plainmail49`):
   pages, reconstruct the query's id set (R12); a message created, indexed
   and deleted within one range, singleton and threaded, renders as the
   plain control's folded log does, with pages and a publication between
-  them (R14); `Mailbox/changes` reports
+  them (R14); the backlog deletion (R14): an indexed message `D` whose
+  mapped id a client holds, more inserts than the pass cap, then `D`'s
+  deletion, changes requested and paged before the catch-up finishes,
+  then the catch-up finished, and the client's accumulated set equal to
+  a full query with `T|D` destroyed exactly once; `Mailbox/changes` reports
   every mailbox after a publishing pass, and IMAP `CHANGEDSINCE` does
   not report the reassigned message (R6, both pinned); a
   client-supplied id with the old prefix is `notFound` on `Email/get`
@@ -1485,8 +1531,12 @@ the manifest's batch (a link before the batch must survive an
 interrupted pass in R7's case), the scan on an incomplete traversal
 (R7's middle-node case), the epoch in the version comparison (a
 revision-only comparison must fail R2's epoch case), the existence rule
-(a created-and-deleted document must not appear, R14's case), the thread
-blob's padding (an unpadded blob must fail R15's size-class check), the
+(a created-and-deleted document must not appear, R14's case), the raw
+overlay (existence from the record alone must fail the backlog deletion
+case) and the uncapped deletions (a pass that caps deletes must leave a
+thread-valued read stale in that case), the thread blob's padding (an
+unpadded blob, or one rounded to a 256-byte multiple, must fail R15's
+byte-class checks), the
 skip of an already-held insert, and the destroy step's chain walk and
 scan.
 
@@ -1533,10 +1583,11 @@ Added:
     pass whose batch fails or loses its assertion leaves the store, the
     links and the loaded index as the committed manifest describes, and
     the next pass repeats the work, which a repeated delta does not
-    disturb. A pending cursor is worked before any shortcut. No permanent
-    link exists that the committed manifest, or a chain it names, does
-    not reach, except after a chain break, which the next rebuild or
-    destroy finds by scan.
+    disturb. A pending cursor is worked before any shortcut, and every
+    pass applies the log's deletions through its end, whatever the cap
+    leaves of its inserts. No permanent link exists that the committed
+    manifest, or a chain it names, does not reach, except after a chain
+    break, which the next rebuild or destroy finds by scan.
 51. Every content leaf and content sort of a key account's query is
     resolved from a current content part or the query is refused; no
     content leaf, sort or snippet of a key account is ever answered by
@@ -1551,7 +1602,10 @@ Added:
     emits carries it, every id supplied to a keyed method is checked
     against it, and a thread change is rendered as upstream renders a
     merge, from the history and the revision table, over a pinned range,
-    for every state at or after the epoch that the log retains. A request
+    for every state at or after the epoch that the log retains, with a
+    document's existence at the range's ends taken from the raw log
+    before the sealed record and the set of existing messages always
+    the message cache's. A request
     with no loadable or validated map fails; nothing ever substitutes a
     singleton id, or an older map's id, under a state that has seen
     mapped ones.
@@ -1718,6 +1772,16 @@ point read of the manifest on every backend.
   (revision 6). Rejected by R14: a message created and deleted within
   the range, which upstream's folded log cancels, would be resurrected
   from its sealed record. Existence at both ends decides.
+- **Existence from the sealed record alone** (revision 7). Rejected by
+  the re-review of revision 7, R14: the record lags the log by the
+  unconsumed part of a backlog, so a deletion behind the insert cap was
+  rendered as "present at both ends" and then fell out of every later
+  range. The raw log of the range decides existence; the record fills in
+  what the range cannot show.
+- **A message-count privacy threshold for the padding** (revision 7).
+  Rejected by R15: records vary in length and the rounding is on bytes,
+  so no count is a guarantee; the formula is stated in bytes and the
+  counts are the benchmark's estimates.
 - **Unpadded thread blobs** (revisions 4 to 6). Rejected by R15: a
   bridge that reassigns a hundred messages writes a hundred records more
   than a message that threads with nothing, and the sealed size shows
@@ -1799,12 +1863,19 @@ and its sealed size is visible (section 2). The Codex re-review of
 revision 6 (R15) asks for this to be decided explicitly. Two answers:
 
 - (a) **Recommended, and what the design is written for.** Pad every
-  thread blob to a power of two of at least 16 KiB before sealing (4.2).
-  A pass that reassigned up to about a hundred messages then writes the
-  same class as one that reassigned none; a larger merge shows as a
-  larger class, coarsely. The cost is at most 16 KiB of padding per pass
-  until the next thread compaction, which folds it away. The guarantee
-  of section 2 is stated with that residual.
+  thread blob's compressed payload to a power of two of at least 16 KiB
+  before sealing (4.2's formula). The protection is in bytes: a merge
+  is hidden when the records it adds keep the payload inside the class
+  the pass would have written anyway, and a pass whose payload sits near
+  a boundary can cross it with one more record. At the design corpus a
+  record is on the order of a hundred compressed bytes, so the smallest
+  class holds on the order of a hundred records, an estimate the
+  benchmark measures (9.6), not a guarantee; most passes index a few
+  messages and reassign none or a few, so they write the smallest class.
+  The cost is `16 KiB - payload` for a payload under 16 KiB and less
+  than the payload above it, per pass, until the next thread compaction
+  folds it away, which pays the same proportion once on the compacted
+  blob. The guarantee of section 2 is stated with that residual.
 - (b) Accept the unpadded size: the operator learns, per pass, roughly
   how many thread records changed, and so whether a merge happened and
   how large, for every merge. No padding cost; the guarantee is narrowed
@@ -1859,8 +1930,12 @@ every pass, which section 12 rejects on cost.
     the range, from the creation and deletion change ids its record
     keeps, so a message created and deleted within a range yields
     nothing, as upstream's folded log (R14).
-15. Thread blobs are padded to coarse size classes, decision 2's
-    recommended answer, pending Jay's choice (R15).
+15. Thread blobs are padded to coarse size classes by 4.2's byte
+    formula, decision 2's recommended answer, pending Jay's choice
+    (R15).
+16. A changes range takes a document's existence from the raw log before
+    the sealed record, and every pass applies deletions through the
+    log's end, uncapped (R14).
 
 ## 14. Release pointers
 
