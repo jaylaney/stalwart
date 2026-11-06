@@ -232,3 +232,87 @@ the error-class rule (F3) was missing. The remaining P2s each have a
 short, local resolution. After that revision the plan can be written
 without guessing, provided it also carries the keyless method table
 (F8) and the reconciliation change ids (F9).
+
+# Second round: Fable review of revision 12
+
+Reviewed on 2026-11-06 by a fresh Fable 5.1 reviewer, read-only,
+against revision 12 at `fc509f9ed`. Prior findings (R1-R19, F1-F24) were
+not re-reported except where the revision-11 answer was incomplete.
+Every cited file:line was re-verified. Revision 13 answers every item
+below; its header says where.
+
+## P1
+
+- **G1. Tombstones ride in the padded thread blob, so the F1 oracle is
+  reopened through a lever the operator controls.** Tombstones per pass
+  are unbounded (a delete record is consumed whole and the insert cap
+  does not count deletions), and an operator can schedule a mass
+  deletion through the Junk auto-expunge (`purge_account`,
+  `crates/email/src/message/delete.rs:155-159`; `expungeSchedule`,
+  `crates/common/src/config/mailstore/email.rs:337, 362`), deliver a
+  probe just before it, and choose the tombstone count so the framed
+  payload sits ε bytes under a class boundary. Resolution: pad only the
+  hidden part; tombstones and the revision row in an unpadded section.
+
+## P2
+
+- **G2. A reconciliation stamps every tombstone with "oldest retained
+  − 1", including deletions whose raw record is still in the retained
+  log**, so a client at a servable state never learns of the deletion
+  (R14's class). Resolution: attribute by the retained range before
+  stamping.
+- **G3. The validated snapshot compares the method's item state against
+  an epoch nothing moves it to**: an empty account provisioned after a
+  container-only record can be refused every `Email/*` method for ever
+  (`crates/jmap/src/changes/state.rs:133-139`; `crates/email/src/cache/mod.rs:449-483`);
+  and the no-message rebuild allocated no fresh change id (R3's defect
+  reintroduced) while a client could hold the mapped id of a since
+  deleted message. Resolution: compare `last_change_id`, write epoch 0
+  at setup, and let the no-message boundary write its mailbox entries.
+- **G4. The retention bound is per log**: `delete_changes` truncates
+  Email and Thread independently (`crates/common/src/storage/transaction.rs:116-139`),
+  the Thread log keeps older change ids, and `Thread/changes` served
+  states whose transitions were pruned. Resolution: the shorter log's
+  bound for pruning, stamps and refusals.
+- **G5. The content blob is a chosen-plaintext compression oracle**: one
+  zstd frame over up to 64 messages lets a probe delivered beside a
+  target shrink the blob by what they share, and a rebuild's clear
+  cursor bound lets the operator place the probe (CRIME class).
+  Resolution: one frame per record, or an accepted residual.
+- **G6. The memory budget has no separate bound for thread parts, and
+  the defaults cannot load an account near the cap**: thread parts share
+  the budget with content and transients, so a busy node fails every
+  mail method; `ZA_SEARCH_ACCOUNT_MAX_MB = 256` with a 2-3x transient
+  exceeds a 512 MB budget; loads are not single-flight. Resolution: a
+  thread budget, single-flight loads, the cap at a third of the budget.
+
+## P3
+
+G7 mailbox entries as `log_container_property_change`
+(`crates/common/src/storage/index/build.rs:434-443`; `changes/page.rs:116-125`);
+G8 the margin arithmetic at the defaults did not meet its own rule; G9
+`ZA_SEARCH_UNRESOLVED` must not carry a header leaf's field name; G10
+"nearest references in header order" undefined, since `ThreadFields::scan`
+sorts and dedups (`thread.rs:33, 61-62`); G11 the reconciliation cursor
+is a difference set, not a bound, and is the one place the pass
+consults the cache; G12 the destroy inventory lived only in memory
+between the marker and the unlink batch, and the scan walks every
+link of every account; G13 `State::Initial` was not rendered
+(`changes/get.rs:314-335`); G14 "current" for a content request was
+undefined against the returned state; G15 the hold duration was the
+wait budget, too short for a compacted blob; G16 a rebuild changes
+IMAP `EMAILID`/`THREADID` silently; G17 content compaction during a
+rebuild is near-quadratic; G18 attachment extraction runs inline with
+no time bound (`index/search.rs:91-99`); G19 update-only traffic never
+advanced `indexed_to`; G20 a keyless `Email/set` destroy passes with a
+stale prefix, 7.5 named update only; G21 a request's reload can run
+under a pass on the same node; G22 `EmailSubmission/get` maps at read
+where upstream returns the stored prefix.
+
+## Judgement
+
+Not ready to plan from at revision 12: G1 defeated the padded-class
+guarantee decision 2 rested on, G2 lost a deletion, G3 could refuse an
+empty account, G4 broke `Thread/changes` retention; G5 was a decision
+for Jay; the rest were plan-level clarifications, of which G7, G10,
+G11, G13 and G14 a plan could not be written from without guessing.
