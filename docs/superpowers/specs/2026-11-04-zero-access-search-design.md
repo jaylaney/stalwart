@@ -1,6 +1,12 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 4 (2026-11-05), for re-approval.
+Date: 2026-11-04. Status: revision 5 (2026-11-06), for re-approval.
+Revision 5 re-verifies every citation on the merged v1.0.3 tree and
+records what 1.0.2 and 1.0.3 changed under the design: `Email/set` and
+`SearchSnippet/get` now prefix-check supplied ids (6.2), the
+`collapseThreads` re-emission covers updated ids (6.3), `hold_blob`
+takes a `BlobOpts` and `BlobRecode` skips principal-linked blobs (4.2),
+and the za suite's next free names moved (9.2).
 Revision 4 answers the nine findings of the Codex review of revision 3
 (`2026-11-04-zero-access-search-design-codex-review.md`, R1 to R9):
 passes checkpoint at change-log record boundaries (5.1, R1); thread
@@ -35,10 +41,8 @@ that is not the message's thread id is `notFound` (now
 `crates/jmap/src/email/get.rs:233-276`), and `Email/queryChanges` with
 `collapseThreads` re-emits every message of a thread that a created or
 destroyed id touched (now `crates/jmap/src/changes/query.rs:106-112`).
-The other line numbers below are v1.0.1's, the checkout the design was
-read against; the plan re-reads each site on the merged tree, and
-re-checks the za suite's next free account names, since the merge added
-`mail::gateway` (`tests/src/za/mail/gateway.rs`).
+Every citation below was re-verified on the merged tree on 2026-11-06,
+and the line numbers are the merged tree's.
 
 The terms key account, master key (MK), session keys, key cache,
 generation and visible by structure are those of the release 1 spec,
@@ -225,7 +229,7 @@ third sub-key beside the event key and the mail wrapping key:
   they never yield it.
 
 The index's blobs and nothing else are sealed under it: `seal(swk, aad,
-bytes)` (the helpers of `keys.rs:181-219`, one nonce and tag per blob)
+bytes)` (the helpers of `keys.rs:181-235`, one nonce and tag per blob)
 with `aad("search", account_id) || segment_id || kind || prev`, where
 `kind` is the blob's kind byte (thread or content) and `prev` the
 predecessor content blob's hash, or zeros (4.2). So a blob opens only for
@@ -283,7 +287,7 @@ log still retains (R3):
   40 bytes, upper-cased) and the message's `sent_at` offset, which the
   stub drops (mail spec 5.4; `ingest.rs:379-380`).
 - **The attachment bit** (`za_has_attachment` on the opened row,
-  `crates/email/src/message/za/view.rs:402`), from which the
+  `crates/email/src/message/za/view.rs:411`), from which the
   `$hasattachment` and `$hasnoattachment` keywords are answered.
 
 And, per index: the **revision table** (revision → the change id of the
@@ -338,7 +342,7 @@ of how many passes have run: it lists the thread blobs, whose count any
 node bounds by thread compaction, and one content head.
 
 **Staging and linking** (R7): a pass stages each blob with `hold_blob`
-(`crates/common/src/storage/blob.rs:298-349`), a temporary link that
+(`crates/common/src/storage/blob.rs:308-360`), a temporary link that
 outlives the pass's remaining wait budget, and makes the links permanent
 in the manifest's batch (5.1 step 4): `BlobOp::Link{hash, to:
 BlobLink::Document}` with `hash | account_id | Collection::Principal | 0`
@@ -346,12 +350,32 @@ BlobLink::Document}` with `hash | account_id | Collection::Principal | 0`
 already carries the vault and pin records, for each new blob, and the
 clear of that link for each blob the batch retires. A batch that fails or
 loses its assertion leaves only holds, which expire, and the purge then
-deletes the blobs (`crates/store/src/write/blob.rs:152-280`): no
+deletes the blobs (`crates/store/src/write/blob.rs:159-287`): no
 permanent link ever exists that the committed manifest does not name, or
 that a chain reachable from it does not name. An owner can download a
 blob raw as upstream lets an owner download any linked blob of their own
 account; it is ciphertext under their own key, so this is harmless and
 nothing is added to refuse it. No consumer but the loader parses one.
+
+**The blob codec** (1.0.3). Every blob now passes through
+`crates/store/src/write/blob_codec/`: `hold_blob` and `put_blob` take a
+`BlobOpts` (compression, and encryption under the server's registry
+`SymmetricKey` when one is configured), and `get_blob` returns the
+decoded bytes. The index's blobs are written with the options sealed
+mail uses (`BlobOpts::new(CompressionAlgo::None, core.blob.email.encryption)`,
+as `za_stage_sealed` does, `crates/email/src/message/za/ingest.rs:171-181`):
+no codec compression, since sealed bytes do not compress and the pass
+compresses before sealing, and the operator's at-rest encryption on top
+of the seal, as for mail, so an operator who audits "every blob under my
+key" finds it so. The `BlobRecode` task, which rewrites blobs when the
+operator changes compression or rotates the codec key, walks
+`user_blob_hashes` (`crates/store/src/write/blob.rs:291-355`), which
+lists the `Document` links of Email, SieveScript and FileNode only
+(`:333-338`); the fork extends that walk to the `Document` links of
+`Collection::Principal` document 0, so a codec key rotation recodes the
+index's blobs instead of stranding them under a retired key, and so the
+destroy path's fallback scan (5.7) has one enumeration to reuse.
+`BlobRecode` never opens the seal (upgrade: `index_task::test_blob_recode_keeps_sealed`).
 
 **The manifest** is a new principal field, `PrincipalField::ZeroAccessSearch
 = 152` (`crates/types/src/field.rs`, beside 150 and 151), on principal
@@ -361,7 +385,8 @@ document 0, in the clear, holding:
 - `revision`: a counter incremented by every publishing write, and the
   newest row of the revision table, `(revision, change_id)`, whose change
   id the batch patches in at commit (`SetValue::Patched` with
-  `PatchSource::ChangeIdBe`, `crates/store/src/write/mod.rs:1177-1203`),
+  `PatchSource::ChangeIdBe`, `crates/store/src/write/mod.rs:1178-1205`,
+  applied at `:1685-1688`),
   so the revision and the change id clients see for it are bound in one
   commit (R2);
 - `indexed_to`: the change id of the last change-log record the index
@@ -421,9 +446,12 @@ structure with its own rules:
   recently used first, content parts before thread parts), and on every
   invalidation that drops the account's keys
   (`CacheInvalidation::Account` and `AccessToken`,
-  `crates/common/src/cache/invalidate.rs:581, 608`, where
-  `za_keys.remove_account` runs). There is no maximum age: a reload is
-  only a cost, and the search key does not change.
+  `crates/common/src/cache/invalidate.rs:642, 615`, where
+  `za_keys.remove_account` runs; 1.0.2's registry `PublicKey` change
+  emits the `Account` one, `:236-241`, and its `default_role_changed`
+  branch, `:719-723`, touches neither `za_keys` nor the index). There is
+  no maximum age: a reload is only a cost, and the search key does not
+  change.
 - **Account cap.** An account whose content part would exceed
   `ZA_SEARCH_ACCOUNT_MAX_MB` (default 256) loads its thread part only;
   its content requests get the unavailable refusal (7.4), with a trace,
@@ -468,7 +496,7 @@ request waits for the running pass, as the drain's lock does,
 `crates/vault/src/session.rs:161-164`).
 
 0. **Catch up with other nodes.** If the message cache's
-   `last_change_id` (`crates/common/src/lib.rs:281-289`) is ahead of the
+   `last_change_id` (`crates/common/src/lib.rs:288-296`) is ahead of the
    loaded `indexed_to`, read the manifest (one key); if its revision is
    newer than the loaded one, reload the thread part (and the content
    part if it was loaded) before anything else (5.6). If the cache is
@@ -489,7 +517,7 @@ request waits for the running pass, as the drain's lock does,
    own entry of 6.3, and need nothing (a key account's message content
    never changes in place; an IMAP COPY within the account rewrites the
    same document with the same content,
-   `crates/imap/src/op/copy_move.rs:406-418`). An insert of a document
+   `crates/imap/src/op/copy_move.rs:407-419`). An insert of a document
    the index already holds is skipped. These rules make a repeated delta
    (5.6, a failed write) harmless.
 2. **Cap, at record boundaries** (R1). The pass processes records whole
@@ -543,7 +571,7 @@ a key account that holds its keys is served, run one pass. Concretely:
   token (`access_token.za_keys_for(account_id)`); one pass per request,
   not per method call.
 - IMAP: before each command of a session that `za_key_session()`
-  answers true for (`crates/imap/src/core/mod.rs:303-306`), after the
+  answers true for (`crates/imap/src/core/mod.rs:304-307`), after the
   command is parsed, except IDLE, NOOP and LOGOUT. A client in IDLE
   learns of new mail from EXISTS and fetches it; that FETCH runs the
   pass, so the message's THREADID and EMAILID are final by the time the
@@ -696,16 +724,17 @@ does not already prevent, and a lease would add a sweep.
 - **Destroy.** Account destruction clears the Property subspace by range
   (`danger_destroy_account`, `crates/store/src/dispatch/store.rs:428`),
   which removes the manifest, but blob links are hash-prefixed and
-  `destroy_account_blobs` (`crates/services/src/task_manager/tasks/destroy_account.rs:291-366`)
-  walks only Email, FileNode and SieveScript archives. The fork adds one
-  step before the range delete: read the manifest, unlink every thread
-  blob it names and every content blob the chain from its head reaches.
-  If the manifest is missing or does not parse (R7), the step instead
-  scans the blob-link subspace, as the purge's shard iteration does
-  (`crates/store/src/write/blob.rs:152-280`), for every `Document` link
-  whose suffix is this account, `Collection::Principal`, document 0, and
-  clears each: a full scan, on a path that is rare twice over. Blobs a
-  failed pass staged hold only expiring links (4.2) and need no step.
+  `destroy_account_blobs` (`crates/services/src/task_manager/tasks/destroy_account.rs:317-392`,
+  called at `:214` before the range delete at `:246`) walks only Email,
+  FileNode and SieveScript archives. The fork adds one step before the
+  range delete: read the manifest, unlink every thread blob it names and
+  every content blob the chain from its head reaches. If the manifest is
+  missing or does not parse (R7), the step instead enumerates the
+  account's principal-linked blobs through `user_blob_hashes`
+  (`crates/store/src/write/blob.rs:291-355`, extended as 4.2 says) and
+  clears each link: a full scan of the blob-link subspace, on a path that
+  is rare twice over. Blobs a failed pass staged hold only expiring links
+  (4.2) and need no step.
   The za suite's `assert_is_empty` exempts field 152 and the index's
   blobs while their account exists, as it exempts fields 150 and 151,
   and the suite's destroy-then-purge-then-assert order verifies that
@@ -719,8 +748,8 @@ does not already prevent, and a lease would add a sweep.
 ### 6.1 Assignment
 
 The pass threads a message as upstream's ingest does for an ordinary
-account (`find_thread_id`, `crates/email/src/message/ingest.rs:1043-1142`,
-and `ThreadMerge::merge`, `:1430-1455`), against the index instead of the
+account (`find_thread_id`, `crates/email/src/message/ingest.rs:1098-1197`,
+and `ThreadMerge::merge`, `:1487-1512`), against the index instead of the
 `Threading` key class:
 
 - Candidates are the indexed, present messages with the same subject
@@ -735,7 +764,7 @@ and `ThreadMerge::merge`, `:1430-1455`), against the index instead of the
   the pass's revision.
 
 Upstream reads at most the 256 most recent rows of a subject bucket
-(`THREAD_SCAN_WINDOW`) and merges across the whole bucket in
+(`THREAD_SCAN_WINDOW`, `ingest.rs:1430`) and merges across the whole bucket in
 `MergeThreads`; the index has every member in memory and looks them all
 up, a superset that yields the same grouping on upstream's own test
 corpora (section 9's `thread_merge` variant pins it).
@@ -752,7 +781,7 @@ Upstream's JMAP Email id is `(thread_id << 32) | document_id`
 (`Id::from_parts`, `crates/types/src/id.rs:67-69`), so the thread id is
 inside every Email id a session emits, and the singleton is inside every
 Email entry of the keyless change log (`build_id`,
-`crates/store/src/write/log.rs:316-322`). For a key account, a keyed
+`crates/store/src/write/log.rs:299-314`). For a key account, a keyed
 session **maps** on the way out and **checks** on the way in, from the
 thread map as loaded (5.2):
 
@@ -774,15 +803,20 @@ thread map as loaded (5.2):
   holds under a state are never newer than that state, and every
   transition published after it appears in `/changes` since it.
 - Every Email id a client supplies to a keyed method is translated
-  before upstream's lookup: 1.0.3's `Email/get` resolves an id with
-  `cache.email_by_jmap_id(id)`, whose prefix comparison would reject
-  every mapped id against the cache's singleton. The fork checks the
-  supplied prefix against the map and hands the lookup the singleton
-  form; a prefix that is not the message's current thread id answers
-  `notFound`, as 1.0.2 answers for an id a thread merge destroyed.
-  `SEARCH EMAILID` requires the prefix to match
-  (`crates/imap/src/op/search.rs:565-574`) through the map, and `SEARCH
-  THREADID` resolves the thread through the thread table.
+  before upstream's lookup: 1.0.3 resolves a supplied id with
+  `cache.email_by_jmap_id(id)` (`crates/email/src/cache/email.rs:620-624`,
+  a lookup by document id filtered on the prefix) in `Email/get`
+  (`get.rs:233, 261, 276`), `SearchSnippet/get` (`snippet.rs:183, 213`),
+  `Email/copy` (`copy.rs:134, 242`, refused for key accounts anyway) and
+  `Email/set` destroy (`set.rs:1620-1621`), and `Email/set` update
+  filters `message_data(document_id)` on the prefix the same way
+  (`set.rs:1173-1174`); each would reject every mapped id against the
+  cache's singleton. The fork checks the supplied prefix against the map
+  and hands the lookup the singleton form; a prefix that is not the
+  message's current thread id answers `notFound`, as 1.0.2 answers for
+  an id a thread merge destroyed. `SEARCH EMAILID` requires the prefix
+  to match (`crates/imap/src/op/search.rs:565-574`) through the map, and
+  `SEARCH THREADID` resolves the thread through the thread table.
 - Thread ids a client supplies (`Thread/get`, `inThread`,
   `EmailSubmission` `threadIds`) resolve through the thread table; an
   unknown one is `notFound`, as upstream.
@@ -802,7 +836,7 @@ thread map as loaded (5.2):
 
 **Keyless sessions.** Mail spec 3.3 lets a key account's keyless tokens
 (a Bearer or OAuth token, and the WebSocket and EventSource sessions,
-which the HTTP layer strips of keys, `crates/http/src/request.rs:342, 359`)
+which the HTTP layer strips of keys, `crates/http/src/request.rs:383, 366`)
 run the methods that need no content: `Email/query`, `Thread/get`,
 `Thread/changes`, `Email/changes`, `Email/queryChanges`, `Mailbox/get`,
 `Blob/lookup`, `EmailSubmission/*` and `Email/set` flag and mailbox
@@ -818,8 +852,10 @@ account's ids for one client. Jay decided this on 2026-11-05 (section
   gated on keys for a key account, like `Email/get` (`za_assert_mail_keys`,
   `request.rs:865-874`), and a keyless session gets the keyless refusal
   there, as it does on every content read;
-- `Email/set` flag and mailbox updates stay keyless: the lookup is by
-  document id with the prefix unchecked, as 1.0.1 looked ids up, and the
+- `Email/set` flag and mailbox updates stay keyless: for a key account's
+  keyless session the fork looks the id up by document id alone, through
+  a filter beside 1.0.3's prefix checks (`set.rs:1173-1174`, `:1620-1621`),
+  since without the map there is no prefix to check against, and the
   response echoes the supplied id; a stale prefix is not detected there,
   a difference from 1.0.2's `notFound` recorded in 7.5;
 - EventSource stays keyless and unaffected: `StateChange` carries change
@@ -898,11 +934,12 @@ created, one that has none now is destroyed, else updated.
 pass's property change advances.
 
 **`Email/queryChanges`** is `email_query` plus the diff of ids
-(`crates/jmap/src/changes/query.rs:305-330`), both mapped, so
-`collapseThreads` renders the representative change as 1.0.2 does (its
-`touched_threads` are collected from the mapped created and destroyed
-ids of the rendering above and matched against the map's thread id,
-v1.0.3 `changes/query.rs:95-123`).
+(`crates/jmap/src/changes/query.rs:348-378`), both mapped, so
+`collapseThreads` renders the representative change as 1.0.2 does: its
+`touched_threads` (`changes/query.rs:105-137`) are the prefixes of the
+created, updated and destroyed ids of the rendering above, mapped, and
+the messages it re-emits as updated are selected by the map's thread id
+instead of the cache's (`:129, :133`).
 
 **Pruning.** A history entry, a deleted message's record and a
 revision-table row are kept until their change id is older than the
@@ -911,8 +948,12 @@ compaction (5.5): a client asking since an older state gets
 `cannotCalculateChanges` from the log itself.
 
 Push: a key account's content push is already none
-(`build_email_push_object`, `crates/services/src/state_manager/email_push.rs:62-70`),
-and `StateChange` carries change ids, not thread ids; nothing is added.
+(`build_email_push_object`, `crates/services/src/state_manager/email_push.rs:64-70`),
+`StateChange` carries change ids, not thread ids, and 1.0.2's
+`EmailPush` on delivery, APPEND and `Email/import` reaches a key
+account's subscribers, WebSocket and EventSource only as a `StateChange`
+(`crates/services/src/state_manager/za.rs:11-17`, `push.rs:366-391`;
+`crates/common/src/ipc.rs:439-450`); nothing is added.
 
 ### 6.4 What stays off
 
@@ -945,7 +986,8 @@ and current, the fork replaces the one call into the search store
   the result (`crates/store/src/search/local.rs:109-113`). No leaf of a
   key account's query reaches `SearchStore::filter_account`, and the
   PostgreSQL-only windowed walk (`walk_windowed`,
-  `crates/jmap/src/email/query/window.rs:31-92`, `supports_windowed_walk`,
+  `crates/jmap/src/email/query/window.rs:242-354`, over the `TextSource`
+  hooks at `:31-90`; `supports_windowed_walk`,
   `crates/store/src/dispatch/search.rs:148-162`) is not taken for a key
   account.
 - The resolved tree is merged with upstream's own
@@ -969,7 +1011,7 @@ The refusal classifiers of `crates/jmap/src/email/za.rs`
 part is needed*; what follows a "needs content" verdict is now "ensure
 the content part is loaded and current, then resolve" and only on
 failure the refusal of 7.4. `Email/queryChanges` keeps its early check
-(`changes/query.rs:69-77`, plan 13 R38) for the same reason.
+(`changes/query.rs:74-82`, plan 13 R38) for the same reason.
 
 ### 7.2 IMAP SEARCH, SORT, THREAD
 
@@ -992,7 +1034,8 @@ case.
 generator works on the opened text without the index
 (`crates/nlp/src/language/search_snippet.rs:57-122`); the refusal
 (`za_refuse_snippet_terms`, `za.rs:176-189`) is lifted and nothing else
-changes but the id translation of 6.2 on the supplied `emailIds`.
+changes but the id translation of 6.2 on the supplied `emailIds`, which
+1.0.3 prefix-checks with `email_by_jmap_id` (`snippet.rs:183, 213`).
 Snippets of an ordinary account are produced the same way, so parity
 holds including upstream's quirks (one language for all conditions,
 substring matching).
@@ -1110,10 +1153,13 @@ length; the environment variables parse and fall back. In
 ### 9.2 The za suite
 
 `tests/src/za/mail/search.rs` turns around: its refused tables become
-served tables with expected results, keeping the keyless cases refused.
+served tables with expected results, keeping the keyless cases refused
+(its `nested_search_refused`, which pins 1.0.3's nesting limit, stays).
 New modules, in the mail block after `search` and before `traces`
-(`tests/src/za/mod.rs:214-222`), with the next free names `keymail36`
-and `plainmail41` onwards:
+(`tests/src/za/mod.rs:216-225`; `mail::gateway` closes the block at
+`:225`), with the next free names `keymail46` and `plainmail50` onwards
+(the merge's `gateway.rs` took `keymail36`-`39` and `plainmail41`-`44`,
+and `fence.rs` and `index_task.rs` reach `keymail45` and `plainmail49`):
 
 - `mail::threads`: the same conversation delivered to a key account and
   a plain control gives the same `Thread/get` groupings, `Email/query`
@@ -1197,9 +1243,14 @@ store, as today; the change log of a publishing pass holds one item
 update, one Thread property change and mailbox container updates, and no
 entry for any other reassigned message (R4); after the suite destroys its
 key accounts and purges, no blob and no permanent link remains. The mail
-canaries (`VISIBLE_CANARIES`, `tests/src/za/leak.rs:235`) are searched
+canaries (`VISIBLE_CANARIES`, `tests/src/za/leak.rs:241`) are searched
 for in every blob and in the manifest, a negative control being a plain
-account's blob-less state plus a planted plaintext blob. The membership
+account's blob-less state plus a planted plaintext blob. The scan reads
+blobs through `get_blob`, which undoes the codec (1.0.3's `leak::test_codec`
+covers the codec itself, and a codec key rotation must recode the index's
+blobs as 4.2 says, pinned beside `index_task::test_blob_recode_keeps_sealed`);
+`scripts/local-server/leakcheck.sh` still does not decrypt the codec and
+counts encrypted values as failures, as before. The membership
 rule is a review case, not a canary scan (R4): two multi-message threads
 and one bridge, every keyless write enumerated, and the membership an
 observer can infer compared with section 2.
@@ -1320,11 +1371,14 @@ Added:
 
 New hotspots, fork insertions in upstream files: `crates/jmap/src/email/query.rs`
 (the resolution before `query_emails`, the mapped ids, `windowed = None`),
-`crates/jmap/src/email/get.rs` and the cache's `email_by_jmap_id` (ids,
-`threadId`, the prefix translation, state before map), `crates/jmap/src/email/{set,import}.rs`
-(the pass after commit, the mapped response, the unchecked keyless
-update), `crates/jmap/src/changes/{get,query}.rs` (the rendering of 6.3,
-the epoch check), `crates/jmap/src/thread/get.rs`, `crates/jmap/src/mailbox/get.rs`
+`crates/jmap/src/email/get.rs` and the cache's `email_by_jmap_id`
+(`crates/email/src/cache/email.rs:620-624`; ids, `threadId`, the prefix
+translation, state before map), `crates/jmap/src/email/{set,import}.rs`
+(the pass after commit, the mapped response, the prefix translation at
+`set.rs:1173-1174` and `:1620-1621` with the keyless filter beside it),
+`crates/jmap/src/email/snippet.rs:183, 213` (the same translation),
+`crates/jmap/src/changes/{get,query}.rs` (the rendering of 6.3, the epoch
+check, the mapped `touched_threads`), `crates/jmap/src/thread/get.rs`, `crates/jmap/src/mailbox/get.rs`
 (thread counts), `crates/jmap/src/blob/get.rs` (`Blob/lookup`),
 `crates/jmap/src/submission/{set,get,query}.rs` (the singleton stored,
 the mapped read), `crates/jmap/src/api/request.rs` (the pass trigger and
@@ -1332,7 +1386,10 @@ the new key gates), `crates/imap/src/op/{search,thread}.rs`,
 `crates/imap/src/op/fetch/mod.rs` (object ids), `crates/imap/src/core/session.rs`
 or wherever commands dispatch (the pass trigger), `crates/store/src/query/log.rs`
 (`za_changes_records` beside `changes`), `crates/services/src/task_manager/tasks/destroy_account.rs`
-(the unlink step and the scan), `crates/types/src/field.rs` (field 152),
+(the unlink step and the scan), `crates/store/src/write/blob.rs`
+(`user_blob_hashes` extended to principal links, 4.2),
+`crates/common/src/storage/blob.rs` (`hold_blob` with the sealed mail
+`BlobOpts`), `crates/types/src/field.rs` (field 152),
 `crates/vault/src/{keys,session}.rs` (the search key), `crates/common/src/cache/`
 (`za_search` and its invalidation arms), `crates/http/src/api/vault.rs`
 (the empty manifest at setup), and `crates/store/src/search/` where the
@@ -1345,14 +1402,14 @@ and the leaf semantics from `Leaf::plan` (`leaf.rs`) and
 `SearchFilter::has_text` (`document.rs:256-281`); a change there changes
 what the index must answer, and the differential test (9.5) is the
 detector. The thread rules mirror `find_thread_id` and
-`ThreadMerge::merge` by hand (`ingest.rs:1043-1142, 1430-1455`), as the
+`ThreadMerge::merge` by hand (`ingest.rs:1098-1197, 1487-1512`), as the
 drain mirrors `itip_ingest`. The change rendering of 6.3 mirrors
 `merge_index` (`build.rs:414-443`) and 1.0.2's `Email/queryChanges`, and
 rests on the change log's record layout and decoder (`query/log.rs`),
 on `log_item_update`'s entry, on `push_change`'s folding rules
 (`query/log.rs:347-395`), on the Mailbox state advancing on container
 changes (`cache/mod.rs:470-479`), and on `PatchSource::ChangeIdBe`
-patching a set value at commit (`write/mod.rs:1177-1203, 1684-1687`).
+patching a set value at commit (`write/mod.rs:1178-1205, 1685-1688`).
 The Email id layout (`Id::from_parts`), the log's prefixing (`build_id`,
 `SyncCollection::is_prefixed`) and 1.0.3's `email_by_jmap_id` lookup are
 assumed; a change to any changes 6.2. The sort ranks mirror
@@ -1363,9 +1420,12 @@ assumed; a change to any changes 6.2. The sort ranks mirror
 manifest's size bound rests on thread compaction and the content chain,
 not on `may_be_chunked` (`key.rs:877-897`), which only says why it must
 stay small. The purge's rules (a `Document` link keeps a blob, an expired
-`Temporary` link does not, `blob.rs:328-372`), `hold_blob`'s staging
-(`storage/blob.rs:298-349`) and `destroy_account_blobs`'s walk are what
-4.2 and 5.7 rely on. The in-memory compare of 5.1 step 0 rests on the
+`Temporary` link does not, `blob.rs:422-466`), `hold_blob`'s staging
+(`storage/blob.rs:308-360`), `user_blob_hashes`'s walk (`blob.rs:291-355`,
+which `BlobRecode` follows and the fork extends) and
+`destroy_account_blobs`'s walk are what 4.2 and 5.7 rely on; a change to
+the blob codec's options or to what `BlobRecode` selects needs a re-read
+of 4.2. The in-memory compare of 5.1 step 0 rests on the
 message cache's `last_change_id` being the account's current Email
 change id on this node, and on `CacheInvalidation` moving it across
 nodes.
@@ -1504,6 +1564,11 @@ answers were tenable:
    modseq does not move, a recorded IMAP difference (R6).
 10. A rebuild moves the identity epoch and older sync states get
     `cannotCalculateChanges` (R3).
+11. The index's blobs take the sealed mail `BlobOpts` (the operator's
+    codec encryption on top of the seal, no codec compression), and
+    `BlobRecode`'s walk gains principal-linked blobs so a codec key
+    rotation recodes them (4.2); the alternative, `BlobOpts::PLAIN`, would
+    have left them outside the operator's at-rest key.
 
 ## 14. Release pointers
 
