@@ -7,6 +7,7 @@
 use super::{
     Event,
     http::{build_push_client, http_request},
+    za::za_email_push_fallback,
 };
 use crate::state_manager::{PushBatch, PushRegistration};
 use common::{
@@ -361,6 +362,9 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
                     }
                     Event::Push { notification } => {
                         let account_id = notification.recipient();
+                        // Mail spec 7: a key account's push carries state changes only.
+                        let za_key = matches!(notification, PushNotification::EmailPush(_))
+                            && server.za_is_key_account(account_id).await.unwrap_or(true);
                         if let Some(ids) = account_push_ids.get_mut(&account_id) {
                             let current_time = now();
                             let mut remove_ids = Vec::new();
@@ -368,28 +372,32 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
                             for id in ids.iter() {
                                 if let Some(subscription) = push_servers.get_mut(id) {
                                     if subscription.server.expires > current_time {
-                                        if let Some(mut notification) =
-                                            notification.filter_types(&subscription.server.types)
-                                        {
-                                            if let PushNotification::EmailPush(email_push) =
-                                                &notification
-                                                && (!subscription
-                                                    .server
-                                                    .email_push
-                                                    .iter()
-                                                    .any(|ep| ep.account_id == account_id)
-                                                    // Mail spec 7: a key account's push
-                                                    // carries state changes only.
-                                                    || server
-                                                        .za_is_key_account(account_id)
-                                                        .await
-                                                        .unwrap_or(true))
+                                        let configured = subscription
+                                            .server
+                                            .email_push
+                                            .iter()
+                                            .any(|ep| ep.account_id == account_id);
+                                        let as_state_change;
+                                        let candidate = match &notification {
+                                            PushNotification::EmailPush(email_push)
+                                                if za_key || !configured =>
                                             {
-                                                notification = PushNotification::StateChange(
+                                                as_state_change = PushNotification::StateChange(
                                                     email_push.to_state_change(),
                                                 );
+                                                &as_state_change
                                             }
+                                            _ => &notification,
+                                        };
 
+                                        if let Some(notification) = candidate
+                                            .filter_types(&subscription.server.types)
+                                            .or_else(|| {
+                                                za_email_push_fallback(
+                                                    za_key, configured, candidate,
+                                                )
+                                            })
+                                        {
                                             subscription.pending.push(notification);
                                             let last_request = subscription.last_request.elapsed();
 

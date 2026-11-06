@@ -346,6 +346,7 @@ pub enum CompressionAlgo {
     #[default]
     Lz4 = 0,
     None = 1,
+    Zstd = 2,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -413,6 +414,7 @@ pub enum DeliveryErrorType {
     RateLimited = 6,
     ConcurrencyLimited = 7,
     Io = 8,
+    EncryptionError = 9,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -506,7 +508,7 @@ pub enum DkimSignatureType {
     Dkim1RsaSha256 = 1,
     Dkim2Ed25519Sha256 = 2,
     Dkim2RsaSha256 = 3,
-    Dkim2MlDsa44Ed25519Sha512 = 4,
+    Dkim2MlDsa44 = 4,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -797,10 +799,7 @@ pub enum DnsServerType {
 pub enum EncryptionAtRestType {
     #[default]
     Disabled = 0,
-    Aes128 = 1,
-    Aes256 = 2,
-    Aes256Gcm = 3,
-    ChaCha20Poly1305 = 4,
+    Enabled = 5,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -828,6 +827,13 @@ pub enum ExpressionConstant {
     Mixer = 10,
     Stanag4406 = 11,
     Nsep = 12,
+    Opportunistic = 13,
+    Required = 14,
+    Manual = 15,
+    Verified = 16,
+    Discovered = 17,
+    Harvested = 18,
+    Unverified = 19,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -928,6 +934,17 @@ pub enum ExpressionVariable {
     SpamScore = 91,
     SpamProbability = 92,
     SpamThreshold = 93,
+    IsSigned = 94,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum ExternalPublicKeyStatus {
+    #[default]
+    Active = 0,
+    Disabled = 1,
+    PendingApproval = 2,
+    Rejected = 3,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -938,6 +955,15 @@ pub enum FailureReportingOption {
     Any = 1,
     DkimFailure = 2,
     SpfFailure = 3,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum HeaderProtection {
+    #[default]
+    None = 0,
+    NoConfidentiality = 1,
+    Baseline = 2,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -1043,6 +1069,38 @@ pub enum JwtSignatureAlgorithm {
     Hs256 = 8,
     Hs384 = 9,
     Hs512 = 10,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum KeyDiscoverySource {
+    #[default]
+    Dnssec = 0,
+    Wkd = 1,
+    Vks = 2,
+    Hkp = 3,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum KeySourceType {
+    #[default]
+    Manual = 0,
+    Automatic = 1,
+    HarvestedSmime = 2,
+    HarvestedPgp = 3,
+    Autocrypt = 4,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum KeyTrust {
+    #[default]
+    Manual = 0,
+    Verified = 1,
+    Discovered = 2,
+    Harvested = 3,
+    Unverified = 4,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -1650,6 +1708,9 @@ pub enum OAuthScope {
     Contacts = 1,
     Calendars = 2,
     Files = 3,
+    Full = 4,
+    Security = 5,
+    Settings = 6,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -2117,6 +2178,8 @@ pub enum Permission {
     SysDsnReportSettingsUpdate = 360,
     SysEmailGet = 361,
     SysEmailUpdate = 362,
+    SysEncryptionGet = 643,
+    SysEncryptionUpdate = 644,
     // SPDX-SnippetBegin
     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
     // SPDX-License-Identifier: LicenseRef-SEL
@@ -2130,6 +2193,11 @@ pub enum Permission {
     SysEventTracingLevelUpdate = 367,
     SysEventTracingLevelDestroy = 368,
     SysEventTracingLevelQuery = 369,
+    SysExternalPublicKeyGet = 645,
+    SysExternalPublicKeyCreate = 646,
+    SysExternalPublicKeyUpdate = 647,
+    SysExternalPublicKeyDestroy = 648,
+    SysExternalPublicKeyQuery = 649,
     SysFileStorageGet = 370,
     SysFileStorageUpdate = 371,
     SysHttpGet = 372,
@@ -2326,6 +2394,11 @@ pub enum Permission {
     SysSieveUserScriptUpdate = 542,
     SysSieveUserScriptDestroy = 543,
     SysSieveUserScriptQuery = 544,
+    SysSmimeTrustAnchorGet = 650,
+    SysSmimeTrustAnchorCreate = 651,
+    SysSmimeTrustAnchorUpdate = 652,
+    SysSmimeTrustAnchorDestroy = 653,
+    SysSmimeTrustAnchorQuery = 654,
     // SPDX-SnippetBegin
     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
     // SPDX-License-Identifier: LicenseRef-SEL
@@ -2373,6 +2446,11 @@ pub enum Permission {
     SysStoreLookupUpdate = 583,
     SysStoreLookupDestroy = 584,
     SysStoreLookupQuery = 585,
+    SysSymmetricKeyGet = 656,
+    SysSymmetricKeyCreate = 657,
+    SysSymmetricKeyUpdate = 658,
+    SysSymmetricKeyDestroy = 659,
+    SysSymmetricKeyQuery = 660,
     SysSystemSettingsGet = 586,
     SysSystemSettingsUpdate = 587,
     TaskCalendarAlarmEmail = 588,
@@ -2403,6 +2481,8 @@ pub enum Permission {
     TaskShareRevokeCleanup = 603,
     TaskDmarcReportWindow = 604,
     TaskTlsReportWindow = 605,
+    TaskExternalPublicKeyMaintenance = 655,
+    TaskBlobRecode = 661,
     SysTaskGet = 606,
     SysTaskCreate = 607,
     SysTaskUpdate = 608,
@@ -2502,6 +2582,34 @@ pub enum ProviderInfo {
     LogoUrl = 5,
     LogoWidth = 6,
     LogoHeight = 7,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum PublicKeyCapability {
+    #[default]
+    Aead = 0,
+    PostQuantum = 1,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum PublicKeyKind {
+    #[default]
+    OpenPgp = 0,
+    Smime = 1,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum PublicKeyWarning {
+    #[default]
+    WeakRsa = 0,
+    NoKnownDecryptor = 1,
+    PostQuantumOnly = 2,
+    ExpiresSoon = 3,
+    AddressMismatch = 4,
+    Unusable = 5,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -2811,6 +2919,19 @@ pub enum Sig0Algorithm {
     Ed25519 = 2,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum SmimeCipher {
+    #[default]
+    Aes128Cbc = 0,
+    Aes192Cbc = 1,
+    Aes256Cbc = 2,
+    Aes128Gcm = 3,
+    Aes192Gcm = 4,
+    Aes256Gcm = 5,
+    ChaCha20Poly1305 = 6,
+}
+
 // SPDX-SnippetBegin
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 // SPDX-License-Identifier: LicenseRef-SEL
@@ -3013,6 +3134,14 @@ pub enum SubAddressingType {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[repr(u16)]
+pub enum SymmetricCipher {
+    #[default]
+    Aes256Gcm = 0,
+    Chacha20Poly1305 = 1,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
 pub enum TaskAccountMaintenanceType {
     #[default]
     Purge = 0,
@@ -3020,6 +3149,25 @@ pub enum TaskAccountMaintenanceType {
     RecalculateImapUid = 2,
     RecalculateQuota = 3,
     RebuildShares = 4,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum TaskBlobRecodeCompression {
+    #[default]
+    Keep = 0,
+    Disable = 1,
+    Lz4 = 2,
+    Zstd = 3,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum TaskBlobRecodeEncryptionType {
+    #[default]
+    Keep = 0,
+    Disable = 1,
+    Encrypt = 2,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -3125,6 +3273,8 @@ pub enum TaskType {
     ShareRevokeCleanup = 15,
     DmarcReportWindow = 16,
     TlsReportWindow = 17,
+    ExternalPublicKeyMaintenance = 18,
+    BlobRecode = 19,
 }
 
 // SPDX-SnippetBegin
@@ -3909,6 +4059,9 @@ pub enum VCardVersion {
     V3 = 1,
 }
 
+pub static ENCRYPTION_HARVEST_VARIABLE: &[ExpressionVariable] =
+    &[ExpressionVariable::Sender, ExpressionVariable::SenderDomain];
+
 pub static HTTP_VARIABLE: &[ExpressionVariable] = &[
     ExpressionVariable::Listener,
     ExpressionVariable::RemoteIp,
@@ -4376,6 +4529,20 @@ pub static SPAM_URL_VARIABLE: &[ExpressionVariable] = &[
     ExpressionVariable::SubjectWords,
     ExpressionVariable::Location,
     ExpressionVariable::SpamProbability,
+];
+
+pub static ENCRYPTION_MODE_CONSTANT: &[ExpressionConstant] = &[
+    ExpressionConstant::Disable,
+    ExpressionConstant::Opportunistic,
+    ExpressionConstant::Required,
+];
+
+pub static KEY_TRUST_CONSTANT: &[ExpressionConstant] = &[
+    ExpressionConstant::Manual,
+    ExpressionConstant::Verified,
+    ExpressionConstant::Discovered,
+    ExpressionConstant::Harvested,
+    ExpressionConstant::Unverified,
 ];
 
 pub static MTA_AGGREGATE_CONSTANT: &[ExpressionConstant] = &[

@@ -510,9 +510,24 @@ pub async fn test(test: &TestServer) {
         .with_status(StatusCode::OK)
         .body
         .unwrap();
+    let script_path = concat!(
+        "/ui-",
+        include_str!("../../../resources/html-templates/ui.hash"),
+        ".js"
+    );
     assert!(
-        page.contains("/api/calendar/rsvp"),
-        "failed for page: {page}"
+        page.contains(&format!("<script src=\"..{script_path}\">")),
+        "RSVP page is missing its UI script: {script_path}"
+    );
+    let script = john_client
+        .request("GET", script_path, "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(
+        script.contains("/api/calendar/rsvp"),
+        "RSVP API URL is missing from {script_path}"
     );
 
     // Fetching the invitation details must not change the participation status

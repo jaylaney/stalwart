@@ -61,9 +61,9 @@ for sealed fields, visible metadata and security boundaries.
 
 ## Development
 
-The fork is based on upstream Stalwart `v1.0.1` and has an independent release version,
-recorded in [fork-release.toml](fork-release.toml). `stalwart --version` prints both
-versions and the source commit. See the [fork changelog](CHANGELOG-fork.md) for releases.
+The fork is based on upstream Stalwart `v1.0.3` (`8b32686532d34623e9ce8e1237cf2bed9554af38`)
+and has an independent release version recorded in [fork-release.toml](fork-release.toml).
+`stalwart --version` prints both versions and the source commit. See the [fork changelog](CHANGELOG-fork.md) for releases.
 
 Fresh stores only: a build on the 1.0 base cannot open a store written by upstream 0.16 or
 by the fork's earlier 0.16-based releases (`0.1.x`), and there is no conversion. Those stores

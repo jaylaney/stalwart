@@ -34,6 +34,7 @@ use base64::{
 };
 use common::{
     auth::AccessToken,
+    ipc::PushNotification,
     za::{ZA_MAIL_KEYLESS, ZA_MAIL_SEARCH_REFUSED, ZA_MAIL_UNREADABLE, test_hooks},
 };
 use email::{
@@ -57,7 +58,7 @@ use trc::{
     Collector, EventType, Key, StoreEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
-use types::{blob::BlobClass, collection::Collection, id::Id};
+use types::{blob::BlobClass, collection::Collection, id::Id, type_state::StateChange};
 
 const KEY: &str = "keymail5@example.com";
 const PLAIN: &str = "plainmail3@example.com";
@@ -107,6 +108,7 @@ pub async fn test(test: &mut TestServer) {
     let corpus_doc = *message_ids(test, key_id).await.first().unwrap();
     assert_sealed(test, key_id, corpus_doc, WRAP_PK).await;
 
+    stale_prefix_not_found(&key, corpus_doc).await;
     offsets_round_trip(&key, &plain).await;
     pop3_retr_and_top(&key, &plain).await;
     keyless_reads_are_refused(test, &key, corpus_doc).await;
@@ -327,6 +329,15 @@ async fn email_get(
 /// The JMAP id of a key account's message: its thread is itself (spec 5.4).
 fn key_email_id(document_id: u32) -> String {
     Id::from_parts(document_id, document_id).to_string()
+}
+
+/// Email ids name both the thread and the message, including for singletons.
+async fn stale_prefix_not_found(key: &Account, document_id: u32) {
+    let stale = Id::from_parts(document_id ^ 1, document_id).to_string();
+    let valid = key_email_id(document_id);
+    let (list, not_found) = email_get(key, Some(vec![stale.clone(), valid.clone()]), &["id"]).await;
+    assert_eq!(not_found, [stale]);
+    assert_eq!(list, [json!({ "id": valid })]);
 }
 
 /// Destroys every message of the account.
@@ -1304,44 +1315,85 @@ async fn pushes_within(rx: &mut mpsc::Receiver<Value>, wait: Duration) -> Vec<Va
 async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
     println!("push_is_state_only");
     let (mut rx, push) = spawn_mock_push_server(test).await;
-    for account in [key, plain] {
-        let is_key = account.name() == KEY;
+    let admin = test.account("admin@example.com");
+    // The push manager removes the last subscription from its delivery table,
+    // but the router can keep the account's registration flag. Give each
+    // filter case its own account so readiness measures its own activation.
+    let no_email_push = admin
+        .create_key_user_account(
+            "keymail-push-none@example.com",
+            STRONG,
+            "Push filter test",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let mailbox_only = admin
+        .create_key_user_account(
+            "keymail-push-mailbox@example.com",
+            STRONG,
+            "Push filter test",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    // Initialize the inboxes before subscribing so the Mailbox case
+    // observes delivery to an existing inbox.
+    for account in [&no_email_push, &mailbox_only] {
+        let mailboxes = account.jmap_get("Mailbox", ["role"], [] as [&str; 0]).await;
+        assert!(
+            mailboxes
+                .list()
+                .iter()
+                .any(|mailbox| mailbox["role"] == "inbox")
+        );
+    }
+    for (account, email_push, types) in [
+        (key, true, json!([])),
+        (&no_email_push, false, json!([])),
+        (&mailbox_only, true, json!(["Mailbox"])),
+        (plain, true, json!([])),
+    ] {
+        let subscribers = &test.server.inner.ipc.push_subscribers;
+        // An empty change matches no local subscription types and dispatch
+        // alone does not queue a web push.
+        let probe = PushNotification::StateChange(StateChange::new(account.id().document_id()));
+        assert!(
+            !subscribers.dispatch(&probe),
+            "{}: already registered",
+            account.name()
+        );
+        let mut create = json!({
+            "deviceClientId": "za-mail-reads",
+            "url": format!("{PUSH_ORIGIN}/push?skip_checks=true"),
+            "keys": {
+                "p256dh": URL_SAFE_NO_PAD.encode(&push.public_key),
+                "auth": URL_SAFE_NO_PAD.encode(&push.auth_secret),
+            },
+            "types": types,
+        });
+        if email_push {
+            create["emailPush"] = json!({
+                (account.id_string()): { "properties": ["id", "subject", "from"] }
+            });
+        }
         let created = account
             .jmap_request(
                 &[
                     "urn:ietf:params:jmap:core",
                     "urn:ietf:params:jmap:emailpush",
                 ],
-                json!([[
-                    "PushSubscription/set",
-                    {
-                        "create": {
-                            "i0": {
-                                "deviceClientId": "za-mail-reads",
-                                "url": format!("{PUSH_ORIGIN}/push?skip_checks=true"),
-                                "keys": {
-                                    "p256dh": URL_SAFE_NO_PAD.encode(&push.public_key),
-                                    "auth": URL_SAFE_NO_PAD.encode(&push.auth_secret),
-                                },
-                                "types": [],
-                                "emailPush": {
-                                    (account.id_string()): { "properties": ["subject", "from"] }
-                                }
-                            }
-                        }
-                    },
-                    "0"
-                ]]),
+                json!([["PushSubscription/set", { "create": { "i0": create } }, "0"]]),
             )
             .await;
         let subscription_id = created.created_id(0).to_string();
-        let verification = pushes_within(&mut rx, Duration::from_secs(10))
+        let verification = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
-            .into_iter()
-            .find(|push| push["@type"] == "PushVerification")
-            .expect("a push verification");
+            .expect("a push verification")
+            .unwrap();
+        assert_eq!(verification["@type"], "PushVerification");
         assert_eq!(verification["pushSubscriptionId"], subscription_id);
-        account
+        let verified = account
             .jmap_request(
                 &["urn:ietf:params:jmap:core"],
                 json!([[
@@ -1354,6 +1406,15 @@ async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
             )
             .await;
 
+        verified.updated(&subscription_id);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !subscribers.dispatch(&probe) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{}: push registration did not activate", account.name()));
+
         deliver(
             test,
             SENDER,
@@ -1362,41 +1423,99 @@ async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
         )
         .await;
         let pushes = pushes_within(&mut rx, Duration::from_secs(5)).await;
-        if is_key {
+        if !email_push {
+            assert!(pushes.is_empty(), "unsubscribed types: {pushes:?}");
+        } else if types == json!(["Mailbox"]) {
+            assert_state_only(&pushes, account, &["Mailbox"]);
             assert!(
-                pushes.iter().all(|push| push["@type"] == "StateChange"),
-                "a key account's push carried more than state: {pushes:?}"
-            );
-            assert!(
-                !pushes
+                pushes
                     .iter()
-                    .any(|push| push.to_string().contains("canary")),
-                "{pushes:?}"
-            );
-            assert!(
-                pushes.iter().any(|push| {
-                    let changed = &push["changed"][account.id_string()];
-                    changed.get("Email").is_some() && changed.get("Mailbox").is_some()
-                }),
-                "no Email and Mailbox state change: {pushes:?}"
+                    .all(|push| { push["changed"][account.id_string()].get("Email").is_none() }),
+                "the Mailbox filter was bypassed: {pushes:?}"
             );
         } else {
-            assert!(
-                pushes.iter().any(|push| push["@type"] == "EmailPush"
-                    && push.to_string().contains("push subject canary")),
-                "the control received no EmailPush object: {pushes:?}"
-            );
+            let is_key = account.name() == KEY;
+            if is_key {
+                assert_state_only(&pushes, account, &["Email", "Mailbox"]);
+            } else {
+                assert!(
+                    pushes.iter().any(|push| push["@type"] == "EmailPush"
+                        && push.to_string().contains("push subject canary")),
+                    "the control received no EmailPush object: {pushes:?}"
+                );
+            }
+
+            let mut imap = imap_session(account, b"_push ").await;
+            let before_append = account.jmap_get("Email", ["id"], [] as [&str; 0]).await;
+            let subject = "append push canary";
+            imap.append("INBOX", &message_with(subject, "append push body canary"))
+                .await;
+            imap.send_ok("LOGOUT").await;
+            let after_append = account
+                .jmap_get("Email", ["id", "subject"], [] as [&str; 0])
+                .await;
+            assert_ne!(after_append.state(), before_append.state(), "APPEND state");
+            let appended = after_append
+                .list()
+                .iter()
+                .find(|email| email["subject"] == subject)
+                .expect("the appended message");
+            assert_message_push(
+                &mut rx,
+                account,
+                is_key,
+                &appended["id"],
+                subject,
+                after_append.state(),
+            )
+            .await;
+
+            let subject = "import push canary";
+            let blob_id = account
+                .jmap_client()
+                .await
+                .upload(
+                    None,
+                    message_with(subject, "import push body canary").into_bytes(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .take_blob_id();
+            let imported = account
+                .jmap_method_call(
+                    "Email/import",
+                    json!({
+                        "accountId": account.id_string(),
+                        "emails": { "i": {
+                            "blobId": blob_id,
+                            "mailboxIds": { (Id::from(email::mailbox::INBOX_ID).to_string()): true },
+                        } },
+                    }),
+                )
+                .await;
+            let imported_id = imported
+                .pointer("/methodResponses/0/1/created/i/id")
+                .expect("the imported message");
+            let import_state = imported.new_state();
+            assert_ne!(import_state, after_append.state(), "import state");
+            assert_message_push(&mut rx, account, is_key, imported_id, subject, import_state).await;
         }
-        account
+
+        let destroyed = account
             .jmap_request(
                 &["urn:ietf:params:jmap:core"],
                 json!([[
                     "PushSubscription/set",
-                    { "destroy": [subscription_id] },
+                    { "destroy": [&subscription_id] },
                     "0"
                 ]]),
             )
             .await;
+        assert_eq!(
+            destroyed.destroyed().collect::<Vec<_>>(),
+            [subscription_id.as_str()]
+        );
     }
 
     let key_id = key.id().document_id();
@@ -1417,6 +1536,66 @@ async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
     drop(push);
     clear_messages(key).await;
     clear_messages(plain).await;
+    // The ordinary fixture's verification is processed after both filter
+    // subscriptions' removal updates, so the filter accounts can be deleted.
+    for account in [no_email_push, mailbox_only] {
+        test.destroy_all_mailboxes(&account).await;
+        admin.destroy_account(account).await;
+    }
+}
+
+fn assert_state_only(pushes: &[Value], account: &Account, types: &[&str]) {
+    assert!(
+        pushes.iter().all(|push| push["@type"] == "StateChange"),
+        "a key account's push carried more than state: {pushes:?}"
+    );
+    assert!(
+        !pushes
+            .iter()
+            .any(|push| push.to_string().contains("canary")),
+        "{pushes:?}"
+    );
+    assert!(
+        pushes.iter().any(|push| {
+            let changed = &push["changed"][account.id_string()];
+            types.iter().all(|typ| changed.get(*typ).is_some())
+        }),
+        "no {types:?} state change: {pushes:?}"
+    );
+}
+
+async fn assert_message_push(
+    rx: &mut mpsc::Receiver<Value>,
+    account: &Account,
+    is_key: bool,
+    email_id: &Value,
+    subject: &str,
+    expected_state: &str,
+) {
+    let pushes = pushes_within(rx, Duration::from_secs(5)).await;
+    if is_key {
+        assert_state_only(&pushes, account, &["Email", "Mailbox"]);
+        assert!(
+            pushes.iter().any(|push| {
+                let changed = &push["changed"][account.id_string()];
+                changed["Email"] == expected_state && changed.get("Mailbox").is_some()
+            }),
+            "no Email state {expected_state} for {email_id}: {pushes:?}"
+        );
+    } else {
+        assert!(
+            pushes.iter().any(|push| {
+                push["@type"] == "EmailPush"
+                    && push["accountId"] == account.id_string()
+                    && push["emails"].as_array().is_some_and(|emails| {
+                        emails
+                            .iter()
+                            .any(|email| email["id"] == *email_id && email["subject"] == subject)
+                    })
+            }),
+            "the control received no EmailPush for {email_id}: {pushes:?}"
+        );
+    }
 }
 
 /// Review focus 1: a message delivered while a session idles is announced

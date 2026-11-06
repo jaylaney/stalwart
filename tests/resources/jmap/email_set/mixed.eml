@@ -8,11 +8,9 @@ MIME-Version: 1.0
 Content-Type: multipart/mixed;
  boundary="boundary_0"
 
-
 --boundary_0
 Content-Type: multipart/alternative;
  boundary="boundary_1"
-
 
 --boundary_1
 Content-Language: en
@@ -24,6 +22,10 @@ I was thinking about quitting the =E2=80=9Cexporting=E2=80=9D to focus just=
 but then I thought, why not do both? =E2=98=BA
 
 --boundary_1
+Content-Type: multipart/related; type="text/html";
+ boundary="boundary_2"
+
+--boundary_2
 Content-Language: en_US
 Content-Type: text/html
 Content-Transfer-Encoding: quoted-printable
@@ -31,14 +33,16 @@ Content-Transfer-Encoding: quoted-printable
 <html><p>I was thinking about quitting the &ldquo;exporting&rdquo; to focus=
  just on the &ldquo;importing&rdquo;,</p><p>but then I thought, why not do =
 both? &#x263A;</p></html>
---boundary_1--
-
---boundary_0
+--boundary_2
 Content-ID: <cid:1234-5678-9012-3456>
 Content-Type: image/png
 Content-Transfer-Encoding: base64
 
 aGVyZSBhcmUgdGhlIGVtYmVkZGVkIGltYWdlIGNvbnRlbnRzIQ==
+
+--boundary_2--
+
+--boundary_1--
 
 --boundary_0
 Content-Disposition: attachment;

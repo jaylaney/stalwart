@@ -11,7 +11,7 @@
 //! captured event may carry either secret or a base64 form of it, while raw
 //! input outside the exchange is still traced.
 
-use super::user_permissions;
+use super::{mail::Traced, user_permissions};
 use crate::utils::{
     account::Account,
     server::TestServer,
@@ -49,6 +49,8 @@ const MFA_CONTROL: &str = "rawmfactl";
 /// implicit-TLS port): it quotes no input and stays readable.
 const STATIC_DIAGNOSTIC: &str = "Already in TLS mode.";
 const MARKER: &str = "[redacted]";
+const ID_BEFORE_LOGIN: &str = "id-before-login ID (\"name\" \"Microsoft Office 365\")\r\n";
+const ID_IN_KEY_SESSION: &str = "id-in-key-session ID (\"name\" \"Microsoft Office 365\")\r\n";
 
 /// The SASL PLAIN message of `NAME` and `secret`, base64-encoded.
 fn plain(secret: &str) -> String {
@@ -124,6 +126,55 @@ async fn imap(secret: &str) {
                 .await;
         }
         conn.exchange("a2 LOGOUT\r\n", "a2 OK").await;
+    }
+}
+
+/// Client identification is private before LOGIN and throughout a key session.
+async fn imap_id_is_redacted() {
+    let traced = Traced::start(EventType::variants());
+    let mut conn = Conn::open(IMAP_PORT).await;
+    conn.until(&["* OK"]).await;
+    conn.exchange(ID_BEFORE_LOGIN, "id-before-login OK").await;
+    conn.exchange(&format!("a1 LOGIN \"{NAME}\" \"{PASSWORD}\"\r\n"), "a1 OK")
+        .await;
+    conn.exchange(ID_IN_KEY_SESSION, "id-in-key-session OK")
+        .await;
+    conn.exchange("a2 LOGOUT\r\n", "a2 OK").await;
+
+    let events = traced.finish().await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.typ == EventType::Imap(ImapEvent::Id))
+            .count(),
+        2,
+        "the ID commands did not both execute"
+    );
+    for event in &events {
+        let mut values = Vec::new();
+        for (_, value) in &event.keys {
+            strings(value, &mut values);
+        }
+        assert!(
+            values.iter().all(|value| !value.contains("Microsoft")),
+            "{:?} traced the ID client: {values:?}",
+            event.typ
+        );
+    }
+    for command in [ID_BEFORE_LOGIN, ID_IN_KEY_SESSION] {
+        assert!(
+            events.iter().any(|event| {
+                event.typ == EventType::Imap(ImapEvent::RawInput)
+                    && event.keys.iter().any(|(key, value)| {
+                        *key == Key::Size && value.to_uint() == Some(command.len() as u64)
+                    })
+                    && event
+                        .keys
+                        .iter()
+                        .any(|(key, value)| *key == Key::Contents && value.as_str() == Some(MARKER))
+            }),
+            "the ID command was not masked: {command:?}"
+        );
     }
 }
 
@@ -369,6 +420,7 @@ pub async fn test(test: &mut TestServer) {
         .await;
     test.insert_account(account);
     let app_password = za_app_password(NAME, PASSWORD, "raw-input traces").await;
+    imap_id_is_redacted().await;
 
     // The test server configures no tracer: the raw-input events are not
     // emitted until something declares interest in them.

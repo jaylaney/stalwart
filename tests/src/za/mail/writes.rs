@@ -251,11 +251,12 @@ async fn keyless_session_writes_are_refused(test: &TestServer, id: u32) {
             train_classifier: true,
         },
     ] {
+        let parsed_message = MessageParser::new().parse(message.as_bytes());
         let err = test
             .server
             .email_ingest(IngestEmail {
                 raw_message: message.as_bytes(),
-                message: MessageParser::new().parse(message.as_bytes()),
+                message: parsed_message.as_ref(),
                 blob_hash: None,
                 access_token: &AccessToken::from_id_maybe_invalid(id),
                 mailbox_ids: vec![INBOX_ID],

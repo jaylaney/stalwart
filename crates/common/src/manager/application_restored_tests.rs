@@ -14,8 +14,8 @@ const INDEX: &str = concat!(
 
 #[test]
 fn index_is_rewritten_with_the_prefix_and_client_id() {
-    let meta = oauth_client_id_meta("stalwart-webui");
-    let html = String::from_utf8(rewrite_index(INDEX, "admin", Some(&meta))).unwrap();
+    let meta = IndexMeta::new(Some("stalwart-webui"), None);
+    let html = String::from_utf8(rewrite_index(INDEX, "admin", &meta)).unwrap();
 
     assert!(html.contains("<base href=\"/admin/\" />"), "{html}");
     assert!(
@@ -29,7 +29,7 @@ fn index_is_rewritten_with_the_prefix_and_client_id() {
 
 #[test]
 fn index_keeps_the_empty_placeholder_when_no_client_id_is_configured() {
-    let html = String::from_utf8(rewrite_index(INDEX, "account", None)).unwrap();
+    let html = String::from_utf8(rewrite_index(INDEX, "account", &IndexMeta::default())).unwrap();
 
     assert!(html.contains("<base href=\"/account/\" />"), "{html}");
     assert!(
@@ -41,8 +41,8 @@ fn index_keeps_the_empty_placeholder_when_no_client_id_is_configured() {
 #[test]
 fn index_without_a_placeholder_is_left_alone() {
     let bundle = "<head>\n  <base href=\"/\" />\n</head>";
-    let meta = oauth_client_id_meta("stalwart-webui");
-    let html = String::from_utf8(rewrite_index(bundle, "admin", Some(&meta))).unwrap();
+    let meta = IndexMeta::new(Some("stalwart-webui"), None);
+    let html = String::from_utf8(rewrite_index(bundle, "admin", &meta)).unwrap();
 
     assert_eq!(html, "<head>\n  <base href=\"/admin/\" />\n</head>");
 }
@@ -53,8 +53,8 @@ fn edits_are_applied_in_document_order() {
         "<head><meta name=\"oauth-client-id\" content=\"\" />",
         "<base href=\"/\" /></head>"
     );
-    let meta = oauth_client_id_meta("app");
-    let html = String::from_utf8(rewrite_index(bundle, "admin", Some(&meta))).unwrap();
+    let meta = IndexMeta::new(Some("app"), None);
+    let html = String::from_utf8(rewrite_index(bundle, "admin", &meta)).unwrap();
 
     assert_eq!(
         html,
@@ -67,12 +67,31 @@ fn edits_are_applied_in_document_order() {
 
 #[test]
 fn client_ids_are_escaped_for_the_attribute() {
-    let meta = oauth_client_id_meta("a\"b&c<d>");
+    let meta = meta_tag(OAUTH_CLIENT_ID, "a\"b&c<d>");
 
     assert_eq!(
         meta,
         "<meta name=\"oauth-client-id\" content=\"a&quot;b&amp;c&lt;d&gt;\""
     );
+}
+
+#[test]
+fn oauth_scopes_meta_is_injected() {
+    let bundle = "<head><meta name=\"oauth-scopes\" content=\"\" /></head>";
+    let full = "urn:stalwart:oauth:scope:full";
+    let meta = IndexMeta::new(None, Some(full));
+
+    assert_eq!(
+        rewrite_index(bundle, "admin", &meta),
+        b"<head><meta name=\"oauth-scopes\" content=\"urn:stalwart:oauth:scope:full\" /></head>"
+    );
+
+    let scopes = [
+        full.to_owned(),
+        "bad\"scope".to_owned(),
+        "bad\x1fscope".to_owned(),
+    ];
+    assert_eq!(scope_list(scopes.iter()).as_deref(), Some(full));
 }
 
 async fn fixture(name: &str, client_id: Option<&str>) -> WebApplications {
@@ -101,7 +120,7 @@ async fn fixture(name: &str, client_id: Option<&str>) -> WebApplications {
         index_pages: index_pages(
             INDEX.as_bytes(),
             &["admin".to_string(), "account".to_string()],
-            client_id,
+            &IndexMeta::new(client_id, None),
         ),
         oauth_client: None,
         _bundle_dir: dir,
@@ -183,7 +202,10 @@ async fn serving_index_without_a_client_id_keeps_the_placeholder() {
 fn an_unmodified_document_is_returned_verbatim() {
     let bundle = "<head><title>x</title></head>";
 
-    assert_eq!(rewrite_index(bundle, "admin", None), bundle.as_bytes());
+    assert_eq!(
+        rewrite_index(bundle, "admin", &IndexMeta::default()),
+        bundle.as_bytes()
+    );
 }
 #[tokio::test]
 async fn missing_parent_directories_are_created() {

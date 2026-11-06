@@ -464,6 +464,8 @@ fn remove_server_set_props(typ: ObjectType, value: &mut serde_json::Value) {
                 || (is_app_pass && k == "secret")
                 // 1.0's `Action::ReloadSettings` carries its server-set result.
                 || (typ == ObjectType::Action && k == "warnings")
+                // The registry computes the symmetric key's fingerprint on create.
+                || (typ == ObjectType::SymmetricKey && k == "fingerprint")
                 // 1.0's ACME provider has three more server-set properties;
                 // a create that names them is refused with `invalidPatch`
                 // before its other properties are validated.

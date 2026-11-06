@@ -2252,11 +2252,12 @@ async fn ingest_junk(
     message: &str,
 ) {
     let access_token = test.server.access_token(account_id).await.unwrap().build();
+    let parsed_message = MessageParser::new().parse(message.as_bytes());
     test.server
         .email_ingest(IngestEmail {
             raw_message: message.as_bytes(),
             blob_hash: None,
-            message: MessageParser::new().parse(message.as_bytes()),
+            message: parsed_message.as_ref(),
             access_token: &access_token,
             mailbox_ids: vec![INBOX_ID],
             keywords: vec![],

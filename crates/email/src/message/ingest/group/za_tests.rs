@@ -26,6 +26,7 @@ fn queued(thread_id: PendingId, za_key: bool) -> PendingIngest {
         thread_recheck: None,
         private_commit: PrivateMetadataCommit::default(),
         event: MessageIngestEvent::ImapAppend,
+        encrypted: false,
         mailbox_ids: Vec::new(),
         message_id: None,
         session_id: 0,

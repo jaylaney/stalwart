@@ -16,7 +16,7 @@ on:
     - cron: "0 7 * * 1"
 
 # What this workflow can claim. It runs the tests this public repository holds,
-# against the fork on upstream 1.0.1. Upstream's private test suites are not
+# against the fork on upstream 1.0.3. Upstream's private test suites are not
 # public, so no job here runs them and no result here says they passed. The
 # external protocol suites (Dovecot imaptest, Fastmail's JMAP test suite,
 # Apple's CalDAVTester) are deferred to a follow-up plan by the 1.0 upgrade
@@ -127,9 +127,8 @@ jobs:
         # upstream's developer machine (file:///Users/me/code/spam-filter/...),
         # the UpdateRules task fails three times and stays in the queue as
         # Failed, and the test waits for it forever. The URL pins a rules
-        # release (v3.0.3, the latest when this was written); raise it
-        # deliberately. Six SMTP tests are timing-flaky when the whole filter
-        # runs in parallel (dkim2_dsn_is_signed, lmtp_delivery, queue_retry,
+        # release (v3.0.4); raise it deliberately. Six SMTP tests are timing-flaky
+        # when the whole filter runs in parallel (dkim2_dsn_is_signed, lmtp_delivery, queue_retry,
         # manage_reports, and at 1.0 antispam and dkim2_all_disclosed) and
         # pass when rerun by name. The step reruns the
         # failed ones once, taking their names from libtest's final failures
@@ -158,7 +157,7 @@ jobs:
           # shellcheck disable=SC2086
           cargo test -p tests -- --exact --nocapture $failed
         env:
-          SPAM_RULES_URL: https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.3/spam-filter-rules.json.gz
+          SPAM_RULES_URL: https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.4/spam-filter-rules.json.gz
 
       - name: IMAP Tests
         if: ${{ !cancelled() }}
@@ -229,7 +228,7 @@ jobs:
         # UNIT_TEST_FEATURES). `-p http` is ambiguous in this workspace. The
         # gates' configuration test.yml__unit-tests__http-unit-tests is this
         # step; its name and command are the selection move's.
-        run: cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise
+        run: cargo test -p http@1.0.3 --lib --bins --features test_mode,enterprise
 
   upstream-suites:
     name: Upstream Suites

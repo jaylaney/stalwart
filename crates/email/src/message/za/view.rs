@@ -26,7 +26,9 @@ use common::{
     za::{ZA_TRACE_MAIL_COPY, ZA_TRACE_MAIL_KEYLESS, mail::za_keyless_refusal},
 };
 use groupware::calendar::seal::{SealError, seal_error};
+use registry::schema::enums::CompressionAlgo;
 use std::{future::Future, sync::Arc};
+use store::write::blob_codec::BlobOpts;
 use trc::AddContext;
 use types::{
     blob::{BlobClass, BlobId},
@@ -285,9 +287,16 @@ impl ZaMailView for Server {
         let envelope = seal_mail_envelope(&dek, MailWrap::Session(keys), account_id)
             .map_err(|err| za_sealing_error(err, account_id))?;
         let sealed = seal_mail_blob(&dek, &envelope, account_id, data);
-        self.put_jmap_blob(account_id, &sealed)
-            .await
-            .caused_by(trc::location!())
+        self.put_jmap_blob_with_opts(
+            account_id,
+            &sealed,
+            &BlobOpts::new(
+                CompressionAlgo::None,
+                self.core.blob.email.encryption.clone(),
+            ),
+        )
+        .await
+        .caused_by(trc::location!())
     }
 
     async fn za_open_upload_blob(

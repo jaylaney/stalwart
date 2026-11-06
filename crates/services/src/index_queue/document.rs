@@ -32,30 +32,36 @@ pub(crate) async fn build_email_document(
     account_id: u32,
     document_id: u32,
     row: MetadataRow,
-) -> trc::Result<IndexDocument> {
+) -> trc::Result<Option<IndexDocument>> {
     #[cfg(feature = "test_mode")]
     za::test_hooks::index_build_fault(account_id)?;
     // Mail spec 5.5: a key account's message is indexed from its stub, with
     // no blob read.
     if let Some(document) = za::za_email_document(server, account_id, document_id, &row).await? {
-        return Ok(document);
+        return Ok(Some(document));
     }
     let metadata = row.unarchive().caused_by(trc::location!())?;
-    let raw_message = server
-        .blob_store()
+    let Some(raw_message) = server
         .get_blob(metadata.blob_hash().as_slice(), 0..usize::MAX)
         .await
         .caused_by(trc::location!())?
-        .ok_or_else(|| {
+    else {
+        trc::error!(
             trc::StoreEvent::NotFound
                 .into_err()
-                .details("Blob not found")
-        })?;
+                .account_id(account_id)
+                .document_id(document_id)
+                .ctx(trc::Key::Index, SearchIndex::Email.name())
+                .details("E-mail blob not found, message skipped by the indexer")
+                .caused_by(trc::location!())
+        );
+        return Ok(None);
+    };
 
     // Mail ruling R58: the plain returns carry the vault-absence assertion.
     if !metadata.has_extractable_attachments() {
         return email_document(&server.core, &row, account_id, document_id, &raw_message)
-            .map(|document| server.za_index_fence(document, account_id));
+            .map(|document| Some(server.za_index_fence(document, account_id)));
     }
 
     let core = server.core.clone();
@@ -69,7 +75,7 @@ pub(crate) async fn build_email_document(
             .details("Email indexing task failed")
             .caused_by(trc::location!())
     })?
-    .map(|document| server.za_index_fence(document, account_id))
+    .map(|document| Some(server.za_index_fence(document, account_id)))
 }
 
 fn email_document(
@@ -191,8 +197,12 @@ pub(crate) async fn build_tracing_span_document(
     use registry::schema::structs::Trace;
     use store::write::{TelemetryClass, ValueClass};
 
-    server
-        .tracing_store()
+    let store = server.tracing_store();
+    if store.is_none() {
+        return Ok(None);
+    }
+
+    store
         .get_value::<Trace>(ValueKey::from(ValueClass::Telemetry(TelemetryClass::Span(
             span_id,
         ))))

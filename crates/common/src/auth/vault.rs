@@ -944,6 +944,9 @@ impl Server {
                         | Task::AcmeRenewal(_)
                         | Task::DkimManagement(_)
                         | Task::DnsManagement(_) => None,
+                        // Server-wide: re-encodes existing blobs (no new content, no account
+                        // state), and maintains remote recipients' public keys.
+                        Task::BlobRecode(_) | Task::ExternalPublicKeyMaintenance(_) => None,
                         // The enterprise-only task types (no account's
                         // provisioning state, and absent from the OSS
                         // product, whose build stays exhaustive here).

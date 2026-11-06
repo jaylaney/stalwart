@@ -6,7 +6,6 @@ MIME-Version: 1.0
 Content-Type: multipart/mixed;
  boundary="boundary_0"
 
-
 --boundary_0
 Content-Disposition: inline
 Content-Type: text/plain
@@ -17,16 +16,13 @@ Part A
 Content-Type: multipart/mixed;
  boundary="boundary_1"
 
-
 --boundary_1
 Content-Type: multipart/alternative;
  boundary="boundary_2"
 
-
 --boundary_2
 Content-Type: multipart/mixed;
  boundary="boundary_3"
-
 
 --boundary_3
 Content-Disposition: inline
@@ -52,7 +48,6 @@ Part D
 --boundary_2
 Content-Type: multipart/related;
  boundary="boundary_4"
-
 
 --boundary_4
 Content-Type: text/html

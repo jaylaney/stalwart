@@ -202,6 +202,7 @@ pub async fn za_tests() {
     leak::test_pins(&mut test).await;
     leak::test_mail(&mut test).await;
     leak::test_imip(&mut test).await;
+    leak::test_codec(&mut test).await;
     leak::test(&mut test).await;
     leak::test_index_control(&mut test).await;
     index_task::test(&mut test).await;
@@ -209,6 +210,7 @@ pub async fn za_tests() {
     index_task::test_destroyed_stub(&mut test).await;
     index_task::test_reindex(&mut test).await;
     index_task::test_attachment_indexer(&mut test).await;
+    index_task::test_blob_recode_keeps_sealed(&mut test).await;
     index_task::test_index_retry(&mut test).await;
     index_task::test_mid_pass_provisioning(&mut test).await;
     mail::login::test(&mut test).await;
@@ -220,6 +222,7 @@ pub async fn za_tests() {
     mail::gates::test(&mut test).await;
     mail::search::test(&mut test).await;
     mail::traces::test(&mut test).await;
+    mail::gateway::test(&mut test).await;
     // Last: part 6a expects this case to reproduce a recorded residual (the
     // destroy window), and a failure here loses no other module.
     index_task::test_mid_pass_deletion(&mut test).await;

@@ -473,7 +473,6 @@ END:VCARD
             let blob_hash = metadata.blob_hash();
             let partial_message = test
                 .server
-                .blob_store()
                 .get_blob(blob_hash.as_slice(), 0..usize::MAX)
                 .await
                 .unwrap()

@@ -180,7 +180,7 @@ impl EmailSearchSnippet for Server {
                 for email_id in chunk {
                     if let MaybeInvalid::Value(email_id) = email_id
                         && cached_messages
-                            .email_by_id(&email_id.document_id())
+                            .email_by_jmap_id(*email_id)
                             .is_some_and(|message| access.allows(message))
                     {
                         batch.request(email_id.document_id());
@@ -210,7 +210,7 @@ impl EmailSearchSnippet for Server {
                         preview: None,
                     };
                     if !cached_messages
-                        .email_by_id(&document_id)
+                        .email_by_jmap_id(email_id)
                         .is_some_and(|message| access.allows(message))
                     {
                         if batch.is_first_round() {

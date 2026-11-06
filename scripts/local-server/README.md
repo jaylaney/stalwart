@@ -132,12 +132,13 @@ All scripts load `env.sh` first.
   - Reads: the `env.sh` variables.
 - `gatecheck3.sh`: the release 1 (plan 3) gating checks over `curl`. Its expectations are historical until the script is updated: plan 10 reopened the scheduling gates, so key accounts now get the auto-schedule `OPTIONS` header and the scheduling URLs on their principal, and checks 1 and 6 differ from the script's expectations by design; the invitation checks 8 and 9 predate release 2's invitations. Check 6's propstat parsing is a text heuristic.
   - Reads: the `env.sh` variables, `ALICE_PASS` and `PLAIN_PASS` (both required).
-- `leakcheck.sh <word>...`: searches `$ZA_RUN_DIR/rocks.db` for words that must not be at rest and reports how many data files contain each. Sealed content: 0. The `X-ZA-KEY` marker must appear once a key account has written, and a non-key account's event title (the positive control) must show up. At 1.0 the server compresses its archives with zstd (against the dictionaries in `resources/zstd/`) and RocksDB compresses most blocks with LZ4, so a plain `grep` sees almost no stored content. The script therefore searches each file's raw bytes, every LZ4 block it finds in the `.sst` and `.blob` files, and every zstd frame in either, and prints how many blocks and frames it decoded and how many frames it could not (expect 0). Needs Python 3.14 or later (`compression.zstd`).
+- `leakcheck.sh <word>...`: runs two checks over `$ZA_RUN_DIR/rocks.db`: the historical physical scan counts matching files in raw bytes and decoded RocksDB blocks/frames, while the logical scan counts current matching blob values after decoding. Sealed content must be absent; the `X-ZA-KEY` marker and an ordinary account's event title are positive controls. Stop the local server before scanning. The logical pass exits nonzero if a blob is encrypted or undecodable. It needs a compatible `ldb` executable and Python 3.14 or later (`compression.zstd`).
+  - If no blob values are decoded, the script warns that column family `t` may be empty or the server may use external blob storage. The physical scan still reports its results.
   - Reads: the `env.sh` variables.
 
 ## Notes
 
 - Registry objects are edited with JMAP `x:<Type>/set` calls as the admin; the settings singletons are addressed by the id string `singleton`.
 - 1.0 renamed some registry fields that hand-written provisioning may use: `NetworkListener.tlsImplicit` is now `implicitTls`, and `Domain.isEnabled` is now `enable`. The old names are refused ("Invalid key for object").
-- RocksDB scans (`leakcheck.sh`) see the files on disk: the write-ahead log (`*.log`) holds recent writes until they are flushed into `.sst` files. Wait a couple of seconds after a write before scanning.
+- Stop the local server before running `leakcheck.sh`. Its physical scan includes recent writes in the RocksDB write-ahead log (`*.log`); the logical pass counts current decoded blob values.
 - Rebuild the release binary after pulling code changes; the running server does not pick them up.

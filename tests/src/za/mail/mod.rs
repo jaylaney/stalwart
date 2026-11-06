@@ -50,6 +50,7 @@ use utils::hash128::Hash128;
 pub mod delivery;
 pub mod fence;
 pub mod gates;
+pub mod gateway;
 pub mod login;
 pub mod reads;
 pub mod search;
@@ -184,7 +185,6 @@ pub fn row_is_stub(row: &MetadataRow) -> bool {
 /// The blob `hash`, decoded as readers decode it.
 pub async fn stored_blob(test: &TestServer, hash: &BlobHash) -> Vec<u8> {
     test.server
-        .blob_store()
         .get_blob(hash.as_slice(), 0..usize::MAX)
         .await
         .unwrap()
@@ -372,7 +372,7 @@ pub async fn corrupt_blob(test: &TestServer, hash: &BlobHash) {
         .unwrap();
     test.server
         .blob_store()
-        .put_blob(hash.as_slice(), &blob, test.server.core.email.compression)
+        .put_blob(hash.as_slice(), &blob, &test.server.core.blob.email)
         .await
         .unwrap();
 }
@@ -383,7 +383,7 @@ pub async fn corrupt_blob(test: &TestServer, hash: &BlobHash) {
 /// batch after).
 pub fn append_params<'x>(
     raw: &'x str,
-    message: Option<Message<'x>>,
+    message: Option<&'x Message<'x>>,
     access_token: &'x AccessToken,
 ) -> IngestEmail<'x> {
     IngestEmail {
@@ -415,7 +415,11 @@ pub async fn group_ingest(
     let message = MessageParser::new().parse(raw.as_bytes());
     let key = message.as_ref().map(ThreadKey::new).unwrap_or_default();
     group
-        .ingest(server, append_params(raw, message, access_token), key)
+        .ingest(
+            server,
+            append_params(raw, message.as_ref(), access_token),
+            key,
+        )
         .await
 }
 
