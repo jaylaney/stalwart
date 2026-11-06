@@ -4,9 +4,9 @@ See the [release policy](releases.md) for independent versioning, tags, upstream
 provenance, and the release checklist. Record fork release changes in the
 [fork changelog](../CHANGELOG-fork.md); the root `CHANGELOG.md` remains upstream history.
 
-- Base: upstream Stalwart `v1.0.1` (commit `23b69755cb3cd8ecd952fe0443c5ac067a506184`). The fork's own version is independent of it: `fork-release.toml` records both, the shipping `stalwart` package carries the fork version, and the internal crates keep upstream's `1.0.1` (the fork-owned `vault` crate keeps `0.16.25`). `stalwart --version` prints the fork version, the upstream tag and commit, and the source commit.
+- Base: upstream Stalwart `v1.0.3` (commit `8b32686532d34623e9ce8e1237cf2bed9554af38`). The fork's own version is independent of it: `fork-release.toml` records both, the shipping `stalwart` package carries the fork version, and the internal crates keep upstream's `1.0.3` (the fork-owned `vault` crate keeps `0.16.25`). `stalwart --version` prints the fork version, the upstream tag and commit, and the source commit.
 - Fresh stores only. A 1.0-based build cannot open a store written by upstream 0.16 or by the fork's 0.16-based releases (`0.1.x`), and there is no conversion: the server stamps a new store with its schema version and edition and refuses any other. Old stores are unsupported; move an installation by provisioning a fresh store (new setup tokens, new enrolment), keeping the old store and binary for rollback. The local-server scripts default to `.run-1.0/` for this reason.
-- Package names: `-p http` is ambiguous (the dependency graph also holds the crates.io `http` crate, through hyper, reqwest, axum and others); select the fork's with `-p http@1.0.1`. `cargo fmt` rejects that form, so format it with `cargo fmt --manifest-path crates/http/Cargo.toml`.
+- Package names: `-p http` is ambiguous (the dependency graph also holds the crates.io `http` crate, through hyper, reqwest, axum and others); select the fork's with `-p http@1.0.3`. `cargo fmt` rejects that form, so format it with `cargo fmt --manifest-path crates/http/Cargo.toml`.
 - Toolchain: stable Rust via rustup. Xcode command line tools for RocksDB.
 - On this machine rustup is installed via Homebrew (keg-only): `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"` before using cargo. The curl installer in the plan is not needed.
 - Build (tests): `STORE=RocksDb RUST_MIN_STACK=16777216 cargo build -p tests`
@@ -20,7 +20,7 @@ provenance, and the release checklist. Record fork release changes in the
 - Full verification: `cargo test -p vault -p groupware -p common`, then `za::za_tests`, then `webdav::webdav_tests` in both modes.
 - Manual client checklist: `docs/zero-access/manual-checklist.md`.
 - Known limits (spec 2): the running server holds plaintext while serving a request and receives the password on every CalDAV request; the authentication cache and the key cache are process-local and bounded (15 minutes idle, 60 minutes hard cap).
-- rustfmt: `cargo fmt -p <crate> -- --check` works for most crates; for http use `cargo fmt --manifest-path crates/http/Cargo.toml -- --check` (cargo rejects `-p http@1.0.1` for fmt).
+- rustfmt: `cargo fmt -p <crate> -- --check` works for most crates; for http use `cargo fmt --manifest-path crates/http/Cargo.toml -- --check` (cargo rejects `-p http@1.0.3` for fmt).
 - Never open upstream issues or PRs from this fork (see AGENTS.md).
 - Zero-access account API tests: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests`
 - CalDAV suite against key accounts: `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav_tests`. In that mode the `acl`, `cal_alarm`, `cal_scheduling` and `copy_move` modules run the four key-mode variants in `tests/src/webdav/za_variants.rs` (`acl`, `alarm`, `scheduling`, `copy_move`) instead of skipping.
@@ -38,8 +38,8 @@ provenance, and the release checklist. Record fork release changes in the
 
 ## Merging upstream
 
-The current integrated upstream base is Stalwart `v1.0.1`, commit
-`23b69755cb3cd8ecd952fe0443c5ac067a506184`, on fresh stores only; the fork version is recorded in `fork-release.toml`. The fork moved from `v0.16.27` by the plan
+The current integrated upstream base is Stalwart `v1.0.3`, commit
+`8b32686532d34623e9ce8e1237cf2bed9554af38`, on fresh stores only; the fork version is recorded in `fork-release.toml`. The fork moved from `v0.16.27` through v1.0.1 by the plan
 [`2026-10-27-stalwart-1-upgrade.md`](superpowers/plans/2026-10-27-stalwart-1-upgrade.md); its
 [outcome note](superpowers/plans/2026-10-27-stalwart-1-upgrade-outcome.md) records the merge, the hook
 inventory, the conflict ledger and the qualification. The 0.16-based line (`0.1.x`) is not
@@ -47,24 +47,23 @@ maintained, and its stores do not open on 1.0.
 
 Plan each future upstream integration separately. Merge a verified release tag, never the
 tip of `main`, in an isolated branch/worktree; never rebase the published branch or add an
-`upstream` remote. For example, for a later 1.0 release:
+`upstream` remote. For example, when integrating the next 1.0 release:
 
 ```sh
-git fetch https://github.com/stalwartlabs/stalwart.git tag v1.0.2 --no-tags
-git rev-parse 'v1.0.2^{commit}'
+git fetch https://github.com/stalwartlabs/stalwart.git tag v1.0.4 --no-tags
+git rev-parse 'v1.0.4^{commit}'
 # Verify the commit against upstream's published release before merging.
-git merge --no-ff v1.0.2
+git merge --no-ff v1.0.4
 ```
 
 Then, in the same branch:
 
-- Add the tag and its full commit to `PINNED_UPSTREAM_TAGS` in
-  `scripts/release/verify_product.py`. The verifier refuses a `fork-release.toml` whose
-  upstream pin names another commit than its tag, is not an ancestor of the source, is
-  older than a known release in the source's history, or names another version than the
-  internal crates' (`crates/common/Cargo.toml`); a release checkout fetches no upstream
-  tags, so it reads the table. Update `fork-release.toml`'s `upstream_tag` and
-  `upstream_commit` when the fork release that ships the merge is prepared, and run
+- Update `upstream_tag` and `upstream_commit` in `fork-release.toml` and add the same tag
+  and full commit to `PINNED_UPSTREAM_TAGS` in `scripts/release/verify_product.py` on the
+  merge branch. The verifier checks that the tag names the pinned commit, the commit is
+  an ancestor of the source, no newer known release is in the source's history, and the
+  version matches `crates/common/Cargo.toml`. Release checkouts use the table when they
+  have no upstream tags. Run
   `python3 -B scripts/tests/test_release_metadata.py` and
   `python3 -B -m unittest discover -s scripts/release -p 'test_*.py' -v`.
 - Re-read the merge hotspots and silent dependencies that `CLAUDE.md` lists, with the
@@ -116,7 +115,7 @@ migration effects explicitly; ciphertext rides in existing fields and moves with
   enums.rs`) carry no fork edits; take upstream's version outright.
 
 Regression net after a merge, in this order: `cargo test -p vault`, `-p groupware`,
-`-p common`, `-p http@1.0.1 --lib --bins --features test_mode,enterprise`; `za_tests` and
+`-p common`, `-p http@1.0.3 --lib --bins --features test_mode,enterprise`; `za_tests` and
 `za::cache_swap::cache_swap_tests`; `webdav_tests`, `imap_tests` and `jmap_tests` in
 baseline and `ZA_KEY_ACCOUNTS=1` mode; the product build warning-free; then the CI dispatch
 above. The key-account mode of the upstream suites is the real guard: it runs upstream's
@@ -147,7 +146,7 @@ retaining the exact Cargo arguments below.
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 cargo fmt --all --check
 cargo test -p vault -p groupware -p common
-cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise
+cargo test -p http@1.0.3 --lib --bins --features test_mode,enterprise
 STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture
 STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests webdav::webdav_tests
 STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav::webdav_tests
