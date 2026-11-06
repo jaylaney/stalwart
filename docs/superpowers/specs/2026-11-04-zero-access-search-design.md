@@ -1,8 +1,17 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 6 (2026-11-06), for re-approval.
-Revision 6 answers the Codex re-review of revision 5 (the "Current
-review" of `2026-11-04-zero-access-search-design-codex-review.md`; R2,
+Date: 2026-11-04. Status: revision 7 (2026-11-06), for re-approval.
+Revision 7 answers the Codex re-review of revision 6 (R2 remaining, R14
+and R15 new): a map's version is the pair of its identity epoch and its
+revision, compared for equality at every validation, and the revision
+counter continues across a rebuild (4.2, 5.1, 6.2, R2); the changes
+stream decides by a document's existence at both ends of the range,
+from creation and deletion change ids the records keep, so a message
+created and deleted within a range yields nothing (4.1, 6.3, R14);
+thread blobs are padded to coarse size classes and the write-pattern
+guarantee is narrowed to what the size class leaves, a privacy decision
+for Jay (2, 4.2, 13, R15).
+Revision 6 answered the Codex re-review of revision 5 (R2,
 R3, R4, R7 remaining, R10 to R13 new): an id-emitting response
 validates that its loaded map covers the state it returns, by a manifest
 read after the state read (6.2, R2); a rebuild allocates a fresh change
@@ -154,7 +163,8 @@ no background task, delivery, or keyless path reads or writes it
 (release 1 invariant 6 is unchanged). Thread membership, which messages
 belong together, never leaves process memory unsealed: not in a stored
 field, not in the change log, not in the pattern of the pass's writes,
-which is a function of the keyless log alone (6.3).
+which is a function of the keyless log alone (6.3) up to the size class
+of the thread blob a pass writes (4.2; decision 2 in section 13).
 
 **What the operator learns, beyond mail spec 2's visible list:**
 
@@ -168,6 +178,16 @@ which is a function of the keyless log alone (6.3).
 - The sealed size of each content blob, which is roughly proportional to
   the text size of the messages it indexes, compressed; the operator
   already knows each message's exact size.
+- The size class of each thread blob (4.2): a thread blob holds one
+  record per message the pass indexed plus one per message it
+  reassigned, and is padded to a power of two of at least 16 KiB before
+  sealing, so a pass that indexed a few messages and reassigned up to
+  about a hundred more writes the smallest class, like a pass that
+  reassigned none. A merge that reassigned more than that in one pass
+  shows as a larger class: the operator learns that an unusually large
+  re-threading happened, coarsely how large, and nothing about which
+  messages. This is the one way a pass's writes depend on what it found
+  (decision 2).
 - Per publishing pass, which is every pass that indexed at least one
   message (6.3): one Email item update of a witness, the lowest document
   id among the messages the pass indexed, a choice the operator can make
@@ -266,6 +286,10 @@ log still retains (R3):
   own document id), which is what every client saw before the index
   assigned it, if any did. Two changes within one revision coalesce into
   one entry (the before of the earlier).
+- Its **creation change id**: the change id of the log record that
+  inserted it, or the epoch for a message the rebuild's cursor indexed
+  (it existed at the epoch, and no state before the epoch is served);
+  6.3 decides existence at a state from it (R14).
 - For a deleted message: its **deletion change id**, the change id of
   the log record that deleted it, which the pass reads when it tombstones
   (5.1).
@@ -324,7 +348,12 @@ authenticated on its own, so a loader reads one without the other):
   the pass inserted, when it inserted any.
 
 Each is zstd-compressed, then sealed under the search key with the AAD
-of 3.1. The serialization format is the fork's own, versioned by
+of 3.1. A thread blob is padded before sealing to the next power of two
+of at least 16 KiB, in the stub's form (`seal_padded`: a length prefix,
+zero padding, then the seal; `crates/groupware/src/calendar/seal/tree.rs`),
+so its sealed size says only which class it fell in (section 2, decision
+2); a content blob is not padded, since its size follows the messages'
+sizes, which are visible already. The serialization format is the fork's own, versioned by
 `SEARCH_FORMAT_V1`; it is not an upstream rkyv archive read with
 `access_unchecked`, so the "stored structs never change layout" rule of
 release 1 does not bind it: a format bump is a version bump in the
@@ -392,17 +421,21 @@ opens the seal (upgrade: `index_task::test_blob_recode_keeps_sealed`).
 document 0, in the clear, holding:
 
 - the format version;
-- `revision`: a counter incremented by every publishing write, and the
-  newest row of the revision table, `(revision, change_id)`, whose change
-  id the batch patches in at commit (`SetValue::Patched` with
-  `PatchSource::ChangeIdBe`, `crates/store/src/write/mod.rs:1178-1205`,
-  applied at `:1685-1688`), so the revision and the change id clients
-  see for it are bound in one commit (R2);
+- `revision`: a counter incremented by every publishing write and never
+  reset (a rebuild continues it), and the newest row of the revision
+  table, `(revision, change_id)`, whose change id the batch patches in at
+  commit (`SetValue::Patched` with `PatchSource::ChangeIdBe`,
+  `crates/store/src/write/mod.rs:1178-1205`, applied at `:1685-1688`),
+  so the revision and the change id clients see for it are bound in one
+  commit (R2);
 - `indexed_to`: the change id of the last change-log record the index
   has consumed whole (5.1);
 - `epoch`: the identity epoch, the change id at which the current
   identity history began (5.4, 6.3), patched the same way when a rebuild
-  sets it;
+  sets it. The pair `(epoch, revision)` is the manifest's **version**:
+  two maps agree only when both parts are equal, and 5.1 step 0 and 6.2
+  compare the pair, never the revision alone, since maps of different
+  epochs are of different histories whatever their counters say (R2);
 - the thread blobs: for each its segment id, blob hash and sealed size;
 - the content head: the hash and segment id of the newest content blob,
   or none;
@@ -439,8 +472,8 @@ structure with its own rules:
   manifest, open each blob (verify the format byte and the AEAD under
   `swk` with the header in the AAD), decompress and deserialize in
   `Zeroizing` buffers, merge, derive the thread table, apply the
-  tombstones. The index records the manifest's revision and
-  `indexed_to`. A **thread-only load** reads the thread blobs only and is
+  tombstones. The index records the manifest's version, the pair
+  `(epoch, revision)`, and `indexed_to`. A **thread-only load** reads the thread blobs only and is
   what every keyed mail request needs (6.2); the content chain is loaded
   on the first content request (7.1), or for a content compaction (5.5).
   Both are loads of the same entry.
@@ -512,7 +545,9 @@ request waits for the running pass, as the drain's lock does,
    loaded holds no cursor **and** the message cache's `last_change_id`
    (`crates/common/src/lib.rs:288-296`) is not ahead of the loaded
    `indexed_to`. Otherwise it reads the manifest (one key); if its
-   revision is newer than the loaded one, it reloads the thread part (and
+   version, the pair `(epoch, revision)`, differs from the loaded one in
+   either part (R2: a rebuild opens a new epoch, and counters of
+   different epochs are not comparable), it reloads the thread part (and
    the content part if it was loaded) before anything else (5.6), and
    then works the cursor, if any, before the log.
 1. **Delta, by record.** Read the change log keylessly in record order
@@ -649,9 +684,9 @@ account that holds mail, a manifest of another format version, a blob
 that is missing or does not open, or a manifest that does not parse.
 
 Its first batch (R3) is a publishing write by construction, whether or
-not it indexes anything: it writes a fresh manifest (no blobs, revision
-reset, `indexed_to` set to the account's current Email change id, and a
-rebuild cursor), the unlinks of every previous blob the old inventory
+not it indexes anything: it writes a fresh manifest (no blobs, the
+revision counter continued, `indexed_to` set to the account's current
+Email change id, and a rebuild cursor), the unlinks of every previous blob the old inventory
 reaches, and, when the account holds any message, the boundary entries:
 one Email item update of the lowest document id present, one Thread
 property change of that singleton, and a container update of every
@@ -742,8 +777,8 @@ one of two concurrent manifest writes lands, the other node discards its
 staging, reloads and continues. A node learns that another advanced the
 manifest at step 0 of its next pass, which every keyed request runs: the
 shared cache's `last_change_id` moves with the other node's publication
-or with any delivery, the manifest read shows the newer revision, and the
-node reloads before it serves; and every id-emitting response validates
+or with any delivery, the manifest read shows a different version, and
+the node reloads before it serves; and every id-emitting response validates
 its map against the manifest again after reading its state (6.2), which
 closes the window between the pass and the response that the cache's
 own refresh can open. Between a publication on one node and the next
@@ -841,13 +876,17 @@ thread map as loaded (5.2) and validated (below):
   and mapped ids, or that depends on which revision the map is at,
   takes its state and its map together: it reads the state from the
   message cache, then reads the manifest (one key, the same read as 5.1
-  step 0) and compares its revision with the loaded map's; if the
-  manifest is newer, it reloads the map and reads the state again; after
-  three rounds without agreement, or on a failed read, it fails as "no
-  map, no ids" below. Only then does it map. Since a publication's log
-  entry and its revision row commit in one batch, a state that reflects
-  a publication is only ever returned with a map that holds it, and the
-  map's revision never lags the state it accompanies. A state that lags
+  step 0) and compares its version, the pair `(epoch, revision)`, with
+  the loaded map's; if they differ in either part, it reloads the map and
+  reads the state again; after three rounds without agreement, or on a
+  failed read, it fails as "no map, no ids" below. Only then does it map,
+  and the epoch checks of 6.3 use this loaded, validated epoch. Since a
+  publication's log entry and its revision row commit in one batch, and a
+  rebuild's boundary entry and its epoch do too, a state that reflects a
+  publication or a rebuild is only ever returned with a map of that
+  history that holds it, and the map's version never lags the state it
+  accompanies. Equality of the pair, not ordering of the counter, is
+  what makes this hold across a rebuild (R2). A state that lags
   the map (a cache not yet refreshed) is harmless: the next `/changes`
   renders the publication the client already holds as a creation of an
   id it has, which clients treat as an update. The pass's own reload at
@@ -979,19 +1018,31 @@ which is what any client that fetched it then received. For a deleted
 thread it held when tombstoned.
 
 **The stream of a range** `(S, E]`, for a since-state `S` and an upper
-bound `E` (R12): the documents to render are those with a raw entry in
-the keyless log in `(S, E]` (mapped) **and** those with a history entry
-whose revision's change id is in `(S, E]`, or a deletion change id in
-`(S, E]`; the union is taken on document ids. For each, `T0` is `D`'s
-thread as of `S` and `T1` its thread as of `E`. `D` created in `(S, E]`
-(a raw insert): created `T1|D`. `D` deleted in `(S, E]` (a raw delete,
-or a retained deletion change id): destroyed `T0|D`. `T0 ≠ T1`:
-destroyed `T0|D`, created `T1|D`. Else, for a raw update: updated
-`T1|D`. The stream is ordered by the change id that put each document
-in it (its raw entry's, its revision's, or its deletion's), then by
-document id, and so is deterministic for a fixed `(S, E]` as long as the
-history is retained, which 5.5 guarantees for every state the log
-retains. This is what an ordinary account's log would show.
+bound `E` (R12, R14): the candidates are the documents with a raw entry
+in the keyless log in `(S, E]` **and** those with a history entry whose
+revision's change id is in `(S, E]`, or a deletion change id in
+`(S, E]`; the union is taken on document ids. What each candidate
+yields is decided by its **existence** at the two ends, not by which
+entry made it a candidate: for a document the index holds (present or
+as a retained tombstone), it exists at `X` when its creation change id
+is at or below `X` and its deletion change id, if any, is above `X`; for
+a document the index does not hold (never indexed, or not yet reached in
+a backlog), existence follows the folded raw log as upstream folds it
+(`Changes::push_change`, an insert cancelled by a later delete,
+`crates/store/src/query/log.rs:347-395`), and its thread is the
+singleton at both ends. Then, with `T0` the thread as of `S` and `T1`
+the thread as of `E` (the rule above): absent at `S` and at `E`: nothing,
+however many entries it had in between (a message created and deleted
+within the range, R14); absent at `S`, present at `E`: created `T1|D`;
+present at `S`, absent at `E`: destroyed `T0|D`; present at both and
+`T0 ≠ T1`: destroyed `T0|D`, created `T1|D`; present at both, `T0 = T1`,
+and a raw update in the range: updated `T1|D`; otherwise nothing. The
+stream is ordered by the change id that put each document in it (its
+raw entry's, its revision's, or its deletion's; the earliest when there
+are several), then by document id, and so is deterministic for a fixed
+`(S, E]` as long as the history is retained, which 5.5 guarantees for
+every state the log retains. This is what an ordinary account's folded
+log would show.
 
 **Pages** (R12). Upstream paginates `/changes` with
 `State::Intermediate{from_id, to_id, items_sent}`
@@ -1016,8 +1067,9 @@ entries, so the fork renders a key account's `Email/changes` and
   call continues with `Exact(to)` as upstream continues with
   `Since(to)`;
 - `cannotCalculateChanges` when `S`, or an intermediate `from`, is below
-  the epoch (5.4) or below what the log retains, as upstream answers for
-  a truncated log (`changes/get.rs:424-433`);
+  the epoch of the loaded, validated map (5.4, 6.2) or below what the
+  log retains, as upstream answers for a truncated log
+  (`changes/get.rs:424-433`);
 - `Thread/changes` renders the threads touched, from the same union: a
   thread that had no member as of `S` is created, one that has none as
   of `E` is destroyed, else updated, ordered and paged the same way;
@@ -1237,8 +1289,13 @@ subjects, merges included; the "thread of `D` as of `X`" rule and the
 stream of 6.3 over a history and a revision table give upstream's
 destroyed and created pairs, for states before, at, between and after
 two successive publications, for a first assignment from the singleton,
-for a deleted message, and for a pinned range whose end is older than
-the current revision (R2, R3, R5, R12); paging the stream with a small
+for a deleted message, for a message created and deleted within the
+range, singleton and threaded, which yields nothing (R14), and for a
+pinned range whose end is older than the current revision (R2, R3, R5,
+R12); the version comparison rejects a map of another epoch with an
+equal or lower revision (R2); a thread blob of one record and one of a
+hundred records seal to the same size class, and the class steps at the
+documented count (R15); paging the stream with a small
 `maxChanges` reproduces every item exactly once, with a publication and
 a deletion landing between pages (R12); the record reader yields records
 whole with their change ids and reports truncation; the witness is a
@@ -1285,7 +1342,10 @@ and `fence.rs` and `index_task.rs` reach `keymail45` and `plainmail49`):
   writes no entry and renders the deletion from the retained record,
   including the account's last message (R13); pages of a large merge
   with a tiny `maxChanges`, with another merge and a deletion between
-  pages, reconstruct the query's id set (R12); `Mailbox/changes` reports
+  pages, reconstruct the query's id set (R12); a message created, indexed
+  and deleted within one range, singleton and threaded, renders as the
+  plain control's folded log does, with pages and a publication between
+  them (R14); `Mailbox/changes` reports
   every mailbox after a publishing pass, and IMAP `CHANGEDSINCE` does
   not report the reassigned message (R6, both pinned); a
   client-supplied id with the old prefix is `notFound` on `Email/get`
@@ -1315,8 +1375,12 @@ and `fence.rs` and `index_task.rs` reach `keymail45` and `plainmail49`):
   past the latest issued state, which `Email/changes` then refuses with
   `cannotCalculateChanges`, a resynced client's new state works, and a
   second loss with no mail activity in between gives a second, distinct
-  boundary (R3); a rebuild of several passes over an otherwise idle
-  mailbox, with a restart between passes, finishes its cursor (R10); a
+  boundary (R3); a node whose loaded map is of the previous epoch with
+  an equal or higher revision than the rebuilt manifest's (hook
+  `SEARCH_SNAPSHOT_PAUSE` held across a rebuild) reloads or fails and
+  never serves the old map (R2); a rebuild of several passes over an
+  otherwise idle mailbox, with a restart between passes, finishes its
+  cursor (R10); a
   failed manifest read at validation fails the thread-valued methods and
   never emits a singleton or an older map's id (R2, R3); a
   reconciliation after a truncated log (a lowered `maxChangesHistory`
@@ -1369,8 +1433,10 @@ says, pinned beside `index_task::test_blob_recode_keeps_sealed`);
 counts encrypted values as failures, as before. The membership rule is a
 review case, not a canary scan (R4): two multi-message threads and one
 bridge whose losing-thread members have lower ids, every keyless write
-enumerated, and the writes shown to be the same as for a bridge that
-merged nothing.
+enumerated, and the writes, the manifest and the thread blob's size
+class shown to be the same as for a bridge that merged nothing; and a
+bridge that reassigns enough members to cross a size class, which is
+the residual section 2 records (R15).
 
 ### 9.5 Differential test
 
@@ -1417,8 +1483,12 @@ swap after commit (a swap before commit must let a failed batch leave a
 mapped id in memory, caught by the lost-assertion case), the links in
 the manifest's batch (a link before the batch must survive an
 interrupted pass in R7's case), the scan on an incomplete traversal
-(R7's middle-node case), the skip of an already-held insert, and the
-destroy step's chain walk and scan.
+(R7's middle-node case), the epoch in the version comparison (a
+revision-only comparison must fail R2's epoch case), the existence rule
+(a created-and-deleted document must not appear, R14's case), the thread
+blob's padding (an unpadded blob must fail R15's size-class check), the
+skip of an already-held insert, and the destroy step's chain walk and
+scan.
 
 ## 10. Invariants for implementers
 
@@ -1449,7 +1519,8 @@ Added:
     every key account's message, its `Thread` container and every entry
     of the change log stay the message's own document id, and the pass's
     writes are a function of the keyless log and the message cache
-    alone: the same whatever the mail said.
+    alone, up to the size class of its padded thread blob (4.2): the
+    same whatever the mail said, within that class.
 49. The index is loaded, built and written only inside a request that
     holds the account's own session keys, on that request's task; no
     background task, delivery, or keyless path reads or writes it, and a
@@ -1474,8 +1545,9 @@ Added:
     and paged by upstream's own code.
 52. A thread id of a key account leaves the server only inside a keyed
     session's response, mapped from a thread map validated against the
-    manifest after the response's state was read, so that the map holds
-    every publication the state reflects; every Email id such a session
+    manifest's version, epoch and revision alike, after the response's
+    state was read, so that the map is of the history the state belongs
+    to and holds every publication it reflects; every Email id such a session
     emits carries it, every id supplied to a keyed method is checked
     against it, and a thread change is rendered as upstream renders a
     merge, from the history and the revision table, over a pinned range,
@@ -1637,6 +1709,23 @@ point read of the manifest on every backend.
   Rejected by the re-review's R3: the latest issued state equals it and
   passes the check while holding lost identities, and repeated losses
   reuse it. The rebuild's batch allocates a fresh change id.
+- **Validating the map by its revision counter alone** (revision 6).
+  Rejected by the re-review of revision 6, R2: a rebuild that reset the
+  counter could present a different epoch under an equal or lower
+  number, and a node would keep the old history's map. The version is
+  the pair, compared for equality, and the counter continues.
+- **Classifying a changes candidate by the entry that made it one**
+  (revision 6). Rejected by R14: a message created and deleted within
+  the range, which upstream's folded log cancels, would be resurrected
+  from its sealed record. Existence at both ends decides.
+- **Unpadded thread blobs** (revisions 4 to 6). Rejected by R15: a
+  bridge that reassigns a hundred messages writes a hundred records more
+  than a message that threads with nothing, and the sealed size shows
+  it. Padding to coarse classes hides every ordinary merge; writing the
+  whole thread set on every pass would hide every merge but costs a
+  rewrite of hundreds of kilobytes per pass at the design size, and was
+  not taken. Accepting the unpadded size channel is decision 2's other
+  answer.
 - **A session-scoped background task holding keys** to index after
   login, so the first search never waits. Rejected: it is background code
   holding a key (release 1 invariant 6), and the request-time pass with a
@@ -1704,6 +1793,26 @@ answers were tenable:
   left open, for a convenience the web client does not need. "For now":
   a later release may revisit it with socket invalidation plumbing.
 
+**Decision 2 (for Jay, revision 7): the thread-blob size channel.** A
+thread blob holds one record per message a pass indexed or reassigned,
+and its sealed size is visible (section 2). The Codex re-review of
+revision 6 (R15) asks for this to be decided explicitly. Two answers:
+
+- (a) **Recommended, and what the design is written for.** Pad every
+  thread blob to a power of two of at least 16 KiB before sealing (4.2).
+  A pass that reassigned up to about a hundred messages then writes the
+  same class as one that reassigned none; a larger merge shows as a
+  larger class, coarsely. The cost is at most 16 KiB of padding per pass
+  until the next thread compaction, which folds it away. The guarantee
+  of section 2 is stated with that residual.
+- (b) Accept the unpadded size: the operator learns, per pass, roughly
+  how many thread records changed, and so whether a merge happened and
+  how large, for every merge. No padding cost; the guarantee is narrowed
+  to the notification entries alone.
+
+Hiding every merge would need a full rewrite of the thread records on
+every pass, which section 12 rejects on cost.
+
 **Calls made in this document**, each reversible at plan time:
 
 1. Mapped Email ids (6.2) rather than singleton ids with a mutable
@@ -1739,12 +1848,19 @@ answers were tenable:
     `BlobRecode`'s walk gains principal-linked blobs so a codec key
     rotation recodes them (4.2); the alternative, `BlobOpts::PLAIN`, would
     have left them outside the operator's at-rest key.
-12. An id-emitting response validates its map against the manifest with
-    one point read after reading its state, and fails rather than serve
-    an older map (R2); the benchmark measures the read's cost.
+12. An id-emitting response validates its map's version, epoch and
+    revision alike, against the manifest with one point read after
+    reading its state, and fails rather than serve an older map or one
+    of another epoch (R2); the benchmark measures the read's cost.
 13. The fork renders a key account's `Email/changes` and `Thread/changes`
     pages over a pinned range with upstream's intermediate states, and
     `Email/queryChanges` consumes the same page (R12).
+14. The changes stream decides by a document's existence at both ends of
+    the range, from the creation and deletion change ids its record
+    keeps, so a message created and deleted within a range yields
+    nothing, as upstream's folded log (R14).
+15. Thread blobs are padded to coarse size classes, decision 2's
+    recommended answer, pending Jay's choice (R15).
 
 ## 14. Release pointers
 
