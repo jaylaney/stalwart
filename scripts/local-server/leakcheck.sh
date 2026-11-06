@@ -192,7 +192,7 @@ def scan_blobs(needles):
             if match := re.fullmatch(rb"Keys in range: ([0-9]+)\n", line):
                 footer = int(match[1])
                 continue
-            match = re.fullmatch(rb"0x[0-9A-Fa-f]{64} ==> 0x([0-9A-Fa-f]*)\n", line)
+            match = re.fullmatch(rb"0x(?:[0-9A-Fa-f]{2})* ==> 0x([0-9A-Fa-f]*)\n", line)
             if not match:
                 sys.exit("leakcheck.sh: malformed ldb blob record.")
             try:
@@ -236,6 +236,9 @@ for word, count in counts.items():
 print(f"decoded: {stats['blocks']} LZ4 block(s), {stats['frames'] - stats['undecodable']} zstd "
       f"frame(s); undecodable zstd frames: {stats['undecodable']} (expect 0)")
 print(f"blob content scanned: {scanned} decoded values")
+if scanned == 0:
+    print("leakcheck.sh: warning: no blob values were decoded. Column family t may be empty "
+          "or the server may use external blob storage.", file=sys.stderr)
 if encrypted:
     print(f"blob content not scanned: {encrypted} encrypted values")
 if invalid:

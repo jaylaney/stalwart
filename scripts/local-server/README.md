@@ -133,6 +133,7 @@ All scripts load `env.sh` first.
 - `gatecheck3.sh`: the release 1 (plan 3) gating checks over `curl`. Its expectations are historical until the script is updated: plan 10 reopened the scheduling gates, so key accounts now get the auto-schedule `OPTIONS` header and the scheduling URLs on their principal, and checks 1 and 6 differ from the script's expectations by design; the invitation checks 8 and 9 predate release 2's invitations. Check 6's propstat parsing is a text heuristic.
   - Reads: the `env.sh` variables, `ALICE_PASS` and `PLAIN_PASS` (both required).
 - `leakcheck.sh <word>...`: runs two checks over `$ZA_RUN_DIR/rocks.db`: the historical physical scan counts matching files in raw bytes and decoded RocksDB blocks/frames, while the logical scan counts current matching blob values after decoding. Sealed content must be absent; the `X-ZA-KEY` marker and an ordinary account's event title are positive controls. Stop the local server before scanning. The logical pass exits nonzero if a blob is encrypted or undecodable. It needs a compatible `ldb` executable and Python 3.14 or later (`compression.zstd`).
+  - If no blob values are decoded, the script warns that column family `t` may be empty or the server may use external blob storage. The physical scan still reports its results.
   - Reads: the `env.sh` variables.
 
 ## Notes
