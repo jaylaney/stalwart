@@ -1,7 +1,17 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 16 (2026-11-07), for re-approval.
-Revision 16 answers the tenth Codex round (R31 to R34 new; R27 and R30
+Date: 2026-11-04. Status: revision 17 (2026-11-07), for re-approval.
+Revision 17 records decision 2's option (c) as taken by Jay on
+2026-11-07, after a walk-through of the decision: a compacted thread
+blob's hidden section pads to `N_records · (R + a)` rounded to a class,
+a function of public counts, so no write's size depends on what the
+index found and the time cap is decision 2's only residual (2, 4.2,
+5.5, 13, invariant 48). The bound's proof needed one pruning rule, that
+a deleted message's record stays while the publication that assigned
+it is retained, which closes the one case (H2's race) where an alias
+could outlive the record that bridged it (5.5). This change, and that
+rule, are the scope of the Codex pass requested on this revision.
+Revision 16 answered the tenth Codex round (R31 to R34 new; R27 and R30
 as wording) and the fourth Fable review (I1 to I7, saved in the Fable
 review file). Both approved revision 15 under the stopping rule agreed
 for this round, no P1 in the construction, and every finding is folded
@@ -285,7 +295,9 @@ below (4.2; decision 2 in section 13).
 - The size of each thread blob (4.2): its public section, which is a
   known multiple of the pass's tombstone count, a count the delete
   records already show; and the class of its hidden section, which for
-  a publishing pass is always the smallest class `M`. The hidden part
+  a publishing pass is always the smallest class `M`, and for a
+  compacted blob the class of `N_records · (R + a)`, a function of the
+  retained record count (5.5, decision 2 (c)). The hidden part
   holds one record per message the pass indexed and one alias per
   thread a merge retired, nothing per member of a merged thread (R21);
   the pass stops staging at a byte budget `H` with an overshoot of at
@@ -306,26 +318,30 @@ below (4.2; decision 2 in section 13).
   thread), and on the time cap, which is the processing-cost channel
   the limits below record (R30, H4). The per-pass size channel
   therefore carries nothing, and the checkpoint carries only processing
-  cost. What remains is
-  the class of a **compacted** thread blob (5.5): the cumulative size of
-  every retained record, alias and revision row. Of these only the
-  alias count is hidden (I2): the tombstone and row counts are public,
-  publications are public (the clear revision counter, the log
-  entries), and a record's size is a function of its ids, its subject
-  hash and `min(K, distinct reference hashes) · 16` bytes, which the
-  operator who delivered the message read in the clear at SMTP time
-  (mail spec 12: plaintext in the SMTP queue); only a message the owner
-  appended or imported under keys has a size the operator does not
-  know. An operator who pads the retained total to one alias below a
-  class boundary with filler messages of chosen sizes therefore learns,
-  at the next compaction, whether a chosen bridge merged two threads:
-  one bit per compaction about a chosen message, at the cost of
-  megabytes of filler mail at megabyte classes, and noisy wherever the
-  owner's own appended mail adds sizes the operator cannot see. That is
-  the one way the index's write *sizes* depend on what it found
-  (decision 2, whose option (c) would close it by padding the compacted
-  section to a function of the public counts); the time cap's channel
-  is the duration residual below.
+  cost. The class of a **compacted** thread blob (5.5) carried one more
+  channel until revision 16, and it was sharper than the "coarse count"
+  earlier revisions called it (I2): the compacted hidden section is
+  every retained record and alias, and of these only the alias count is
+  hidden, since the tombstone and row counts are public, publications
+  are public (the clear revision counter, the log entries), and a
+  record's size is a function of its ids, its subject hash and
+  `min(K, distinct reference hashes) · 16` bytes, which the operator
+  who delivered the message read in the clear at SMTP time (mail spec
+  12: plaintext in the SMTP queue); only a message the owner appended
+  or imported under keys has a size the operator does not know. An
+  operator who padded the retained total to one alias below a class
+  boundary with filler messages of chosen sizes would have learned, at
+  the next compaction, whether a chosen bridge merged two threads: one
+  bit per compaction about a chosen message, for megabytes of filler
+  mail at megabyte classes, and only where the owner's own appended
+  mail added no sizes the operator could not see. Revision 17 closes it
+  (decision 2 (c)): a compacted hidden section pads to
+  `N_records · (R + a)`, where `N_records` counts the retained records,
+  present and tombstoned, both public, and the retained aliases never
+  exceed the retained records (5.5), so the class is a function of
+  counts the operator already has. No write's size therefore depends on
+  what the index found; the time cap's channel below is decision 2's
+  one residual.
 - Per publishing pass, which is every pass that indexed at least one
   message (6.3): one Email item update of a witness, the lowest document
   id among the messages the pass indexed, a choice the operator can make
@@ -593,10 +609,14 @@ inequality the configuration refuses to violate (9.1). A publishing
 pass's hidden section therefore always pads to `M`: its sealed size is
 the same whatever the pass found, and the per-pass size channel carries
 nothing. The public section is unpadded, `t` bytes per tombstone plus
-the revision row. A compacted thread blob (5.5) pads by the same formula
-over everything retained, and its class is section 2's residual, which
-decision 2's option (c) would close by padding it to a function of the
-public counts instead (section 13, I2). A
+the revision row. A compacted thread blob (5.5) pads its hidden section
+not by its length but to `N_records · (R + a)` framed, then rounded by
+the same class formula, where `N_records` is the count of retained
+records, present and tombstoned, a public count (decision 2 (c), I2):
+the content always fits, since every record is at most `R` and the
+retained aliases never exceed the retained records (5.5), so the class
+is a function of public counts and says nothing of how many merges the
+window held. A
 content blob is not padded, since its size is the sum of per-message
 sizes, which follow the messages' sizes, visible already.
 
@@ -804,7 +824,10 @@ structure with its own rules:
   compaction's staging likewise; a load that would exceed the budget
   with its transient evicts first or fails as "no map". **Thread parts
   have a budget of their own** (G6), `ZA_SEARCH_THREAD_MEM_MB`, apart
-  from the content budget: every keyed mail request of an account needs
+  from the content budget (a compacted thread blob's sealed bytes are
+  about twice its records', decision 2 (c), so the transient of a
+  design-size thread load is a 16 MiB read beside the unsealed part,
+  well inside the default): every keyed mail request of an account needs
   its thread part, so content parts can never crowd thread parts out,
   and a node that serves many accounts at once degrades search before it
   degrades mail. A thread-part load is **never refused for budget
@@ -1399,7 +1422,25 @@ own batch (new links, old unlinks, the manifest, atomically):
   every record is rewritten and the class is cumulative), then dropped
   (`Email/changes` with an older state gets `cannotCalculateChanges`
   from the log itself, and states before the epoch are refused by 5.4).
-  A few megabytes at the design size (1.3), and what keeps the manifest
+  One exception to the record pruning (decision 2 (c)): a deleted
+  message's record and its tombstone entry stay while the publication
+  that assigned it is retained, that is until both its deletion change
+  id and its assignment's change id are below the bound. A message
+  deleted between a pass's open and its commit (H2's race) is assigned
+  by a publication after its deletion, and without the rule its record
+  would go at a bound its aliases survive. With it, every retained
+  alias's bridging record is retained, and the retained aliases never
+  exceed the retained records: the index's threads at the bound are at
+  most the records assigned before it that are retained, the threads
+  created since are at most the records assigned since, every alias
+  retires one thread, and a tombstone is never a candidate outside a
+  cursor, during which no deletion is applied (5.1), so no alias
+  retires a thread without a retained member. The compacted hidden
+  section is therefore padded to `N_records · (R + a)` (4.2), a
+  function of the public counts, and its class is the same whatever the
+  window merged. About twice the records' bytes at the design size
+  (1.3), a 16 MiB class at 30,000 messages, read once per load (4.3),
+  and what keeps the manifest
   bounded (R8).
 - **Content compaction**, when the content chain reaches
   `ZA_SEARCH_SEGMENTS` and no cursor is pending; while a cursor is
@@ -2270,7 +2311,13 @@ bytes and `2M` included, the hidden section of a maximal pass (`H`
 plus one grouped record of `G` messages each with `K − 1` aliases)
 stays under `M`, and a pass with any number of tombstones, aliases or
 merges of any size pads its hidden section to `M` exactly (F1, R15,
-R20, R21, G1); the configuration refuses `M` below the inequality
+R20, R21, G1); a compaction over fixtures of equal record and tombstone
+counts with no merge, with every message in one thread, with a chain of
+merges through one surviving message, and with bridging messages
+deleted between a pass's open and its commit (hook
+`SEARCH_COMMIT_PAUSE`) pads to the same class, and the race-deleted
+records stay until their publication's row is pruned (decision 2 (c),
+I2); the configuration refuses `M` below the inequality
 (R20); the `K` capture keeps In-Reply-To, then the last References
 first, before the sort (G10); the alias chain resolves "the thread of
 `D` as of `X`" and "the members of `T` as of `X`" across two merges and
@@ -2574,7 +2621,10 @@ operator's schedule beside a probe (G1), and two helper cohorts around
 two known Message-IDs with a bridge (R21), with the hidden section's
 class `M` in every case and the public section's length exactly the
 tombstone count's multiple; and a compaction after the mailbox is
-padded to a class boundary, which is the residual section 2 records.
+padded to a class boundary, whose class must equal the public-count
+formula's with and without the probe's merge (decision 2 (c); a pad by
+content length, or the record pruning without its exception, must fail
+the equal-counts fixtures).
 
 ### 9.5 Differential test
 
@@ -2718,10 +2768,9 @@ Added:
     the mail said, in bytes and in counts. What the byte and count
     charges do not fix is time: a pass's duration, and where its time
     cap stops it, follow the processing cost of the admitted messages
-    (section 2, R30, H4). Only that, and a compacted thread blob's
-    class, depend on what the index found (section 2, I2: the class to
-    one bit per compaction about a chosen message, for an operator who
-    delivered every message and fills the mailbox to a boundary). The
+    (section 2, R30, H4). Only that depends on what the index found: a
+    compacted thread blob pads to a function of the public counts (4.2,
+    5.5, decision 2 (c)), so no write's size does. The
     search key leaves `SessionKeys` for one place, the batch object of a
     manifest write, which holds a zeroized copy for the tag computed at
     commit (3.1, R33).
@@ -3236,12 +3285,12 @@ Jay confirmed, not weaker:
   duration and the time cap's stopping point (section 2, R30, H4), a
   coarse property of their content that the byte and count charges
   cannot close and that revision 15 states rather than claims away.
-  What remains beyond that is the class of a
+  What remained beyond that was the class of a
   compacted blob, cumulative over the mailbox, once per compaction,
   which the fourth Fable review sharpened (I2) to one bit per
   compaction about a chosen message for an operator who delivered
-  every message and fills the mailbox to a boundary (section 2; option
-  (c) below would close it). The costs: `M − (p + 4)` of padding per publishing pass,
+  every message and fills the mailbox to a boundary (section 2), and
+  which (c) below closes. The costs: `M − (p + 4)` of padding per publishing pass,
   about 64 KiB, until the next thread compaction folds it away; and the
   `K` deviation from upstream's threading (7.5), a message whose sixteen
   nearest referenced ancestors are all absent while an older one is
@@ -3252,22 +3301,28 @@ Jay confirmed, not weaker:
   merge, and where the oracle of F1 is fully available. No padding cost;
   the guarantee would have been narrowed to the notification entries
   alone.
-- (c) **Offered by the fourth Fable review (I2), awaiting Jay.** Pad a
-  compacted thread blob's hidden section not by what it holds but to a
-  function of public counts, `N_records · (R + a) + N_rows · row`
-  rounded up to a class, where `N_records` is the retained records,
-  present and tombstoned (public: the message count and the public
-  section), and `N_rows` the revision rows. The bound always holds:
-  threads are created only by records and every retained alias is
-  survived by a retained record of a thread it retired (an alias's
-  change id is below every later deletion of a former member, and the
-  retention bound drops the two together), so the aliases never exceed
-  the records. It would remove the compaction-class channel entirely
-  and leave the time cap as decision 2's only residual, at about twice
-  the thread part's sealed size on disk and in a load's transfer (a
-  16 MiB class against 8 MiB at 30,000 messages), with memory unchanged,
-  since the padding is dropped at unsealing. Section 2 states the
-  residual it would close as sharply as I2 did.
+- (c) **Taken by Jay on 2026-11-07**, offered by the fourth Fable review
+  (I2) and walked through at his request. A compacted thread blob's
+  hidden section pads not by what it holds but to a function of public
+  counts, `N_records · (R + a)` rounded up to a class (4.2), where
+  `N_records` is the retained records, present and tombstoned (public:
+  the message count and the public section's tombstone entries); the
+  revision rows sit in the unpadded public section and need no term.
+  The bound holds because the retained aliases never exceed the
+  retained records (5.5), which took one pruning rule beyond the
+  review's argument: the review's "every retained alias is survived by
+  a record of a thread it retired" is true, but one record can survive
+  a chain of aliases, and in H2's race a bridging message's record
+  could be pruned at a bound its aliases survive; keeping a deleted
+  record while the publication that assigned it is retained makes the
+  counting argument sound, since threads are created only by records
+  and every alias retires one. It removes the compaction-class channel
+  entirely and leaves the time cap as decision 2's only residual, at
+  about twice the thread part's sealed size on disk and in a load's
+  transfer (a 16 MiB class against 8 MiB at 30,000 messages), with
+  memory unchanged, since the padding is dropped at unsealing, and the
+  load's transient within the thread budget (4.4). Section 2 states the
+  channel it closes as sharply as I2 did.
 
 Hiding every merge, including the largest, would need a full rewrite of
 the thread records on every pass, which section 12 rejects on cost.
@@ -3328,7 +3383,10 @@ the thread records on every pass, which section 12 rejects on cost.
     the smallest class, by 4.2's byte formula over bounded records, a
     budgeted pass and alias merges: decision 2, taken by Jay on
     2026-11-06, re-confirmed the same day, and restated in revision 13
-    on a stronger premise (R15, F1, R20, R21, G1).
+    on a stronger premise (R15, F1, R20, R21, G1); a compacted thread
+    blob pads to `N_records · (R + a)`, a function of public counts, and
+    a deleted record stays while the publication that assigned it is
+    retained: decision 2 (c), taken by Jay on 2026-11-07 (I2).
 21. A merge is recorded as one alias entry, never as a rewrite of the
     losing thread's members except at compaction (R21); a document's
     thread and a thread's members as of any retained state are defined
