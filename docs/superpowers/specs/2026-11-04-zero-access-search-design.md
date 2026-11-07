@@ -1,7 +1,23 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 17 (2026-11-07), for re-approval.
-Revision 17 records decision 2's option (c) as taken by Jay on
+Date: 2026-11-04. Status: revision 18 (2026-11-07), for re-approval.
+Revision 18 answers Codex R35, the one P1 construction finding of the
+pass scoped to revision 17's compaction change: the alias bound's proof
+was wrong. A catch-up pass that merges threads whose roots were deleted
+before it ran publishes the aliases at a change id after the deletions,
+so at the retention bound the roots are pruned while the aliases
+survive, and 128 such bridges put 80,896 bytes in a 64 KiB class.
+Revision 18 adds the second pruning rule Codex's correction asked for:
+at thread compaction an alias is dropped when no retained record is
+assigned to its source thread, which gives the bound by an injection
+(alias sources are unique, so each kept alias names a distinct retained
+record) and keeps every retained record's resolution (the bridge rule
+of revision 17 retains, assigned to the target, the bridge of every
+kept alias a chain uses), and it states that folding a sub-bound alias
+moves an assignment one hop, not to the end of the chain (5.5, 13,
+R35). The allowance and the cost of (c) are unchanged. A second scoped
+Codex pass is requested on 5.5.
+Revision 17 recorded decision 2's option (c) as taken by Jay on
 2026-11-07, after a walk-through of the decision: a compacted thread
 blob's hidden section pads to `N_records · (R + a)` rounded to a class,
 a function of public counts, so no write's size depends on what the
@@ -616,7 +632,9 @@ records, present and tombstoned, a public count (decision 2 (c), I2):
 the content always fits, since every record is at most `R` and the
 retained aliases never exceed the retained records (5.5), so the class
 is a function of public counts and says nothing of how many merges the
-window held. A
+window held; `R` and `a` are the encoded maxima, per-entry framing
+included, and the allowance carries the section's framing before the
+rounding (R35). A
 content blob is not padded, since its size is the sum of per-message
 sizes, which follow the messages' sizes, visible already.
 
@@ -1417,30 +1435,50 @@ own batch (new links, old unlinks, the manifest, atomically):
   older than that bound; a revision-table row older than it; and an
   alias older than it, which
   is first **folded** into the records it governs (every record whose
-  assignment resolves through it takes the resolved thread as its
-  assignment, which is a rewrite of members, but at compaction, where
-  every record is rewritten and the class is cumulative), then dropped
+  assignment is the alias's source takes the alias's target as its
+  assignment, one hop, so the retained aliases above it still apply to
+  that record at the states they were published for (R35); a rewrite of
+  members, but at compaction, where every record is rewritten and the
+  class is a function of counts), then dropped
   (`Email/changes` with an older state gets `cannotCalculateChanges`
   from the log itself, and states before the epoch are refused by 5.4).
-  One exception to the record pruning (decision 2 (c)): a deleted
+  Two more pruning rules make the compacted blob's size a function of
+  public counts (decision 2 (c), R35). **The bridge rule**: a deleted
   message's record and its tombstone entry stay while the publication
   that assigned it is retained, that is until both its deletion change
-  id and its assignment's change id are below the bound. A message
-  deleted between a pass's open and its commit (H2's race) is assigned
-  by a publication after its deletion, and without the rule its record
-  would go at a bound its aliases survive. With it, every retained
-  alias's bridging record is retained, and the retained aliases never
-  exceed the retained records: the index's threads at the bound are at
-  most the records assigned before it that are retained, the threads
-  created since are at most the records assigned since, every alias
-  retires one thread, and a tombstone is never a candidate outside a
-  cursor, during which no deletion is applied (5.1), so no alias
-  retires a thread without a retained member. The compacted hidden
-  section is therefore padded to `N_records · (R + a)` (4.2), a
-  function of the public counts, and its class is the same whatever the
-  window merged. About twice the records' bytes at the design size
-  (1.3), a 16 MiB class at 30,000 messages, read once per load (4.3),
-  and what keeps the manifest
+  id and its assignment's change id are below the bound; so the bridge
+  of every retained alias is a retained record, assigned to the alias's
+  target. **The dead-alias rule**: an alias is dropped when, after the
+  record pruning and the folding above, no retained record is assigned
+  to its source thread. The rules answer the timeline Codex R35 gave: a
+  pass catching up on a backlog applies records in order, so a bridge
+  inserted before its roots were deleted merges them, and its aliases
+  publish at a change id after the deletions; at a bound between the
+  two, the roots are pruned and the aliases would survive with no
+  record behind them (three roots and one bridge leave one record and
+  two aliases; 128 bridges of fifteen roots each leave 128 records and
+  1,792 aliases, 80,896 bytes in a 64 KiB class). The index's view of
+  which threads existed at a change id and the log's view differ inside
+  a backlog, so no argument from "members present at the merge" bounds
+  the aliases; the dead-alias rule does, by an injection. **Bound**: a
+  thread is retired once, so alias sources are distinct; each kept alias
+  has a retained record assigned to its source; a record has one
+  assignment; so the kept aliases never exceed the retained records.
+  **Resolution**: for a retained record `D` and a servable state `X`,
+  the chain from `D`'s assignment uses aliases at or above the bound
+  (those below were folded into `D`, one hop each); if the chain uses
+  `L1 → L2`, that alias's bridge is retained by the bridge rule and is
+  assigned to `L2`, so `L2`'s own alias, if any, has a record assigned
+  to its source and is kept; by induction every alias on every retained
+  record's chain is kept, and "the thread of `D` as of `X`" and "the
+  members of `T` as of `X`" (6.1) are unchanged by the rule. An alias
+  the rule drops governed only pruned records, whose deletions sit
+  below every servable state. The compacted hidden section is therefore
+  padded to `N_records · (R + a)` (4.2), a function of the public
+  counts, and its class is the same whatever the window merged (in
+  R35's timelines every dead alias drops and the records fit). About
+  twice the records' bytes at the design size (1.3), a 16 MiB class at
+  30,000 messages, read once per load (4.3), and what keeps the manifest
   bounded (R8).
 - **Content compaction**, when the content chain reaches
   `ZA_SEARCH_SEGMENTS` and no cursor is pending; while a cursor is
@@ -2317,7 +2355,16 @@ merges through one surviving message, and with bridging messages
 deleted between a pass's open and its commit (hook
 `SEARCH_COMMIT_PAUSE`) pads to the same class, and the race-deleted
 records stay until their publication's row is pruned (decision 2 (c),
-I2); the configuration refuses `M` below the inequality
+I2); R35's timelines, three roots deleted before the catch-up pass that
+merges them and 128 families of fifteen roots with live bridges,
+compacted at a bound of the bridges' publication: the dead aliases
+drop, the records fit the public-count class, and every retained
+record resolves as before the compaction at every servable state; a
+chain of three merges with the middle roots pruned keeps the aliases
+the surviving records' chains use, and a folded sub-bound alias moves
+an assignment one hop so the record still renders its pre-merge thread
+at a state before the next alias (R35); the configuration refuses `M`
+below the inequality
 (R20); the `K` capture keeps In-Reply-To, then the last References
 first, before the sort (G10); the alias chain resolves "the thread of
 `D` as of `X`" and "the members of `T` as of `X`" across two merges and
@@ -2623,8 +2670,10 @@ class `M` in every case and the public section's length exactly the
 tombstone count's multiple; and a compaction after the mailbox is
 padded to a class boundary, whose class must equal the public-count
 formula's with and without the probe's merge (decision 2 (c); a pad by
-content length, or the record pruning without its exception, must fail
-the equal-counts fixtures).
+content length must fail the equal-counts fixtures, the bridge rule
+without the dead-alias rule must fail R35's fit, the dead-alias rule
+without the bridge rule must fail the chain fixture's resolution, and a
+fold to the end of the chain must fail the pre-merge rendering, R35).
 
 ### 9.5 Differential test
 
@@ -3309,14 +3358,18 @@ Jay confirmed, not weaker:
   the message count and the public section's tombstone entries); the
   revision rows sit in the unpadded public section and need no term.
   The bound holds because the retained aliases never exceed the
-  retained records (5.5), which took one pruning rule beyond the
-  review's argument: the review's "every retained alias is survived by
-  a record of a thread it retired" is true, but one record can survive
-  a chain of aliases, and in H2's race a bridging message's record
-  could be pruned at a bound its aliases survive; keeping a deleted
-  record while the publication that assigned it is retained makes the
-  counting argument sound, since threads are created only by records
-  and every alias retires one. It removes the compaction-class channel
+  retained records (5.5), which took two pruning rules beyond the
+  review's argument. The review's "every retained alias is survived by
+  a record of a thread it retired" is true at the merge but not at the
+  bound: revision 17 kept a deleted bridge while its publication is
+  retained, and Codex R35 then showed that the roots a bridge retires
+  can all be pruned while its aliases survive, since a catch-up pass
+  publishes a merge after the deletions it precedes in the log, to the
+  point of 80,896 bytes in a 64 KiB class. Revision 18 drops an alias
+  whose source thread has no retained record assigned to it, which
+  bounds the aliases by the records through an injection and keeps
+  every retained record's resolution through the bridge rule (5.5). It
+  removes the compaction-class channel
   entirely and leaves the time cap as decision 2's only residual, at
   about twice the thread part's sealed size on disk and in a load's
   transfer (a 16 MiB class against 8 MiB at 30,000 messages), with
@@ -3384,9 +3437,11 @@ the thread records on every pass, which section 12 rejects on cost.
     budgeted pass and alias merges: decision 2, taken by Jay on
     2026-11-06, re-confirmed the same day, and restated in revision 13
     on a stronger premise (R15, F1, R20, R21, G1); a compacted thread
-    blob pads to `N_records · (R + a)`, a function of public counts, and
-    a deleted record stays while the publication that assigned it is
-    retained: decision 2 (c), taken by Jay on 2026-11-07 (I2).
+    blob pads to `N_records · (R + a)`, a function of public counts, a
+    deleted record stays while the publication that assigned it is
+    retained, an alias whose source thread has no retained record is
+    dropped, and a folded alias moves an assignment one hop: decision 2
+    (c), taken by Jay on 2026-11-07 (I2, R35).
 21. A merge is recorded as one alias entry, never as a rewrite of the
     losing thread's members except at compaction (R21); a document's
     thread and a thread's members as of any retained state are defined
