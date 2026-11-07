@@ -316,3 +316,91 @@ guarantee decision 2 rested on, G2 lost a deletion, G3 could refuse an
 empty account, G4 broke `Thread/changes` retention; G5 was a decision
 for Jay; the rest were plan-level clarifications, of which G7, G10,
 G11, G13 and G14 a plan could not be written from without guessing.
+
+# Third round: Fable review of revision 14
+
+Reviewed on 2026-11-07 by a fresh Fable 5.1 reviewer, read-only,
+against revision 14 at `ea39108fe`, with both prior review files as the
+list of what not to re-report. About forty-five citations re-verified;
+two semantically loose (H10, H16). The reviewer tried to break the
+`K − 1` proof and could not: the invariant that carries it is that,
+within a subject bucket, every present message whose kept hashes
+contain a given hash is in one thread; merges re-establish it for every
+hash they carry, deletions only remove members, aliases never split,
+folding at compaction preserves every resolution; so it holds for log
+inserts, cursor items, the concurrent-commit inversion, content-only
+rebuilds and either reconciliation order. Revision 15 answers every
+item below; its header says where.
+
+## P1
+
+- **H1. The R27 epoch rule's open interval lets the latest pre-loss
+  state pass.** The boundary batch's change id *is* the epoch, so its
+  Email witness update and Thread property change sit at the epoch, not
+  inside `(S, epoch)`; a client at the latest pre-loss state is served,
+  the pre-loss revision table is gone, and the stream renders destroyed
+  `D|D`, created `T'|D` for every message while the client keeps `T|D`.
+  Resolution: close the interval, `(S, epoch]`; drop Mailbox from the
+  rule.
+
+## P2
+
+- **H2.** A deletion committed between a pass's log read and its commit
+  leaves a present record for a message a client already saw deleted;
+  at that client's next `/changes` the record says "present at both
+  ends" and the stream emits a phantom `created`. Resolution: existence
+  at `E` from the message cache's present set for the current state, or
+  from the log outside the range for a pinned one, before the record.
+- **H3.** The reconciliation's processing order was unspecified; one
+  reading tombstones first and reintroduces R16's evidence loss, and the
+  difference cursor subsuming a rebuild cursor contradicts "no tombstone
+  exists while a cursor is pending". Resolution: inserts oldest first,
+  gap deletions last; record the gap-order residual.
+- **H4.** The time cap and the pass's duration make the checkpoint and
+  the write pattern a function of content (processing cost), which
+  sections 2, 48 and 50 denied. Resolution: record the channel; narrow
+  the invariants to the byte and count charges.
+- **H5.** A persistent non-absent error on one object (an S3 403, a
+  backend fault, the codec's missing key,
+  `crates/store/src/write/blob_codec/mod.rs:206-222`) wedges the
+  account's index and every later message's threading for ever.
+  Resolution: classify codec errors; a bounded per-document attempt
+  count, then skip as loss.
+- **H6.** Absence of a blob is loss at once, so a blob store without
+  cross-node read-after-write consistency turns replication lag into a
+  full rebuild. Resolution: a retry window before loss.
+- **H7.** Rebuild throughput at the defaults is unstated and low: about
+  38 items per pass (`H / (R + (K−1)·a)`), ~790 passes for the design
+  size, `ZA_SEARCH_PASS_CAP = 64` never binding, ~50 thread compactions
+  and a content chain of hundreds of nodes. Resolution: state the cost
+  model, make the caps consistent, measure a design-size rebuild.
+- **H8.** The thread-part budget is a hard ceiling on concurrently
+  active accounts; crossing it fails every id-emitting mail method.
+  Resolution: never refuse a thread-part load for budget alone.
+
+## P3
+
+H9 the manifest is unauthenticated (a keyed tag under `swk` is free);
+H10 the merge survivor rule is upstream's "most matching candidates,
+ties lowest" (`ingest.rs:1449-1451, 1487-1512`), not "most members";
+H11 a missing manifest on an empty account was not loss, so it stayed
+"no map" for ever; H12 `Mailbox/changes` cannot apply the epoch rule;
+H13 the non-publishing thread blob's shape; H14 whether the boundary
+batch opens a revision; H15 the cursor's end bound and a single
+snapshot; H16 `commit_batch` broadcasts only when the batch logged a
+change (`transaction.rs:37-48`); H17 `Email/query`'s `anchor` and
+`queryChanges`'s `upToId` are matched as whole ids; H18 the Thread log
+is read for its state and bound only; H19 `Initial` renders
+cursor-indexed messages as created; H20 two passes per keyed write
+request; H21 APPEND answers `APPENDUID`, not `EMAILID`; H22 `K` is a
+property of the format; H23 loss of a content node need not reset
+identities.
+
+## Judgement
+
+The construction of revisions 13 and 14 holds where it was attacked
+before. Not ready to plan from at revision 14 for one defect and two
+gaps, H1 (a one-token fix), H2 and H3; H4 a wording correction Jay
+should see; H5-H8 resource and failure items a plan can carry once
+stated; of the P3s, H11, H13, H14, H15, H17 and H18 the ones a plan
+could not be written from without guessing.

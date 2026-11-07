@@ -1,7 +1,27 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 14 (2026-11-07), for re-approval.
-Revision 14 answers the eighth Codex round (R20 and R21 remaining, R26
+Date: 2026-11-04. Status: revision 15 (2026-11-07), for re-approval.
+Revision 15 answers the ninth Codex round (R27 and R28 remaining, R29
+and R30 new) and the third Fable review (H1 to H23, saved in the Fable
+review file), and adds no mechanism: the epoch interval is closed,
+`(S, epoch]`, so the boundary's own entries fence the latest pre-loss
+state (5.4, 6.3, R27, H1); a partial record is resumed inclusively and
+the checkpoint says whether it is complete (5.1, R29); `Initial` is
+`Exact(0)` with an always-admissible continuation (6.3, R28); the time
+cap's processing-cost channel is recorded as a residual and invariants
+48 and 50 narrowed to the byte and count charges (2, 10, R30, H4);
+existence at a range's end comes from the message cache or the log
+outside the range before the record (6.3, H2); a reconciliation inserts
+first and tombstones last (5.4, H3); error classes gain the codec's
+missing key, a retry window for an absent blob and a bounded attempt
+count per document (5.1, H5, H6); the rebuild cost model is stated and
+the caps made consistent (4.4, 5.5, 9.6, H7); a thread-part load is
+never refused for budget (4.3, H8); the manifest carries a keyed tag
+(4.2, H9); the merge survivor rule is upstream's (6.1, H10); a missing
+manifest is loss on any key account and a lost content blob a
+content-only rebuild (5.4, H11, H23); and the clarity items (H12 to
+H22) where they fall.
+Revision 14 answered the eighth Codex round (R20 and R21 remaining, R26
 to R28 new) by making the pass chronological, upstream's own order: a
 rebuild cursor runs oldest first and no post-epoch record is applied
 until it is exhausted, so each of an item's hashes names one present
@@ -14,8 +34,8 @@ so where a pass stops is a function of public counts (2, 4.2, 5.1,
 R21); a consumed insert or deletion that staged nothing checkpoints
 (5.1, R26); the epoch refuses a state only when the method's log holds
 a record between the state and the epoch, never `Initial` (5.4, 6.3,
-R27); and `Initial` renders as `Exact(m − 1)` with kinds preserved
-(6.3, R28). Revision 13 answered the second Fable review, of revision 12 (G1 to
+R27); and `Initial` rendered as `Exact(m − 1)` with kinds preserved
+(6.3, R28; revision 15 makes it `Exact(0)`). Revision 13 answered the second Fable review, of revision 12 (G1 to
 G22, saved in `2026-11-04-zero-access-search-design-fable-review.md`),
 and the seventh Codex round (R20 to R25, with R16 and R19 remaining).
 Their P1s met at one point: a merge rewrote every member of the losing
@@ -255,12 +275,14 @@ below (4.2; decision 2 in section 13).
   sender-chosen record size, an unbounded tombstone count or a merge
   that rewrote every member made the class an oracle on exactly these).
   Where a pass stops, which `indexed_to` and the cursor bound publish,
-  depends only on how many items it admitted, since every item is
-  charged the same reservation whatever its aliases came to (R21: a
-  charge of actual alias bytes would have moved the stopping point by
-  one record according to whether a probe's two references already
-  shared a thread). The per-pass size channel therefore carries nothing,
-  and neither does the checkpoint. What remains is
+  depends on how many items it admitted, since every item is charged
+  the same reservation whatever its aliases came to (R21: a charge of
+  actual alias bytes would have moved the stopping point by one record
+  according to whether a probe's two references already shared a
+  thread), and on the time cap, which is the processing-cost channel
+  the limits below record (R30, H4). The per-pass size channel
+  therefore carries nothing, and the checkpoint carries only processing
+  cost. What remains is
   the class of a **compacted** thread blob (5.5): the cumulative size of
   every retained record and alias, a function of the mailbox's size,
   which is known, and of the number of merges and publications the
@@ -307,7 +329,18 @@ never traced (mail spec invariant 30).
 - Timing: a pass runs inside the first keyed requests after mail arrives,
   so the moment of indexing is visible in the blob store and the
   manifest. It says the account was in use, which the operator's
-  connection logs already say.
+  connection logs already say. A pass's **duration** is visible too,
+  from the hold and commit timestamps and the request's response time,
+  and where the time cap `ZA_SEARCH_PASS_MS` stops a pass is published
+  by the checkpoint (R30, H4): both are the processing cost of the
+  messages the pass admitted, tokenization and attachment-text
+  extraction, which equal sealed sizes do not fix (a text-heavy PDF and
+  an encrypted archive of one size cost differently). An operator who
+  delivers the mail can calibrate with their own messages and read a
+  target's processing cost off a pass's duration or its stopping point,
+  a coarse property of the message's content. This is the one channel
+  of a pass's writes that the byte and count charges do not close, and
+  decision 2 is stated with it.
 - Freshness is tied to presence. Mail that arrives while nobody holds the
   account's keys is indexed by the first keyed requests afterwards, so
   for that interval it is not searchable from any client and threads as
@@ -478,8 +511,12 @@ forward-index codec (`Document::encode`, `term.rs:629-647`) may be
 reused for positions if the builder re-exposes it; the builder chooses.
 
 **Bounded records and the padding** (F1, R15, R20, R21, G1). A thread
-record keeps at most `K` reference hashes (`K = 16` at 4.4's defaults;
-upstream keeps every one, so 7.5 records the deviation): the message's
+record keeps at most `K` reference hashes (`K = 16`, a constant of
+format version 1, not a knob, H22: two nodes with different `K` would
+write records of different maxima into one index and check the
+inequality against different `R`, so a change of `K` is a format bump
+and a rebuild; upstream keeps every one, so 7.5 records the
+deviation): the message's
 own Message-ID hash, then its In-Reply-To hash (the parent), then its
 References hashes from the last (the nearest ancestor) backwards, then
 Resent-Message-ID, taken in that order before `ThreadFields::scan`'s
@@ -496,7 +533,7 @@ admitted item exactly that reservation, whatever it comes to, and stops
 at the next insert boundary once the reservations reach
 `H = ZA_SEARCH_PASS_HIDDEN_KB` (5.1), so the overshoot is one
 reservation and the hidden section is never more than
-`H + R + (K − 1) · a` bytes, 24 KiB + 296 + 360 at the defaults. The
+`H + R + (K − 1) · a` bytes, 32 KiB + 296 + 360 at the defaults. The
 stopping point therefore depends only on how many items the pass
 admitted, a public count, never on what their records or aliases
 actually came to (R21), and no record of any writer, a MULTIAPPEND
@@ -591,8 +628,15 @@ document 0, in the clear, holding:
   `crates/store/src/write/mod.rs:1178-1205`, applied at `:1685-1688`),
   so the revision and the change id clients see for it are bound in one
   commit (R2);
-- `indexed_to`: the change id of the last change-log record the index
-  has consumed whole (5.1);
+- `indexed_to`: the checkpoint `(c, p, complete)` of 5.1: the record the
+  index has reached, the last insert done in it, and whether the record
+  is complete (R29);
+- a **tag**: a keyed BLAKE3 tag under the search key over every other
+  field (H9), which a loader verifies and treats as loss when it fails,
+  and which destroy ignores, so a store writer who rewrites the manifest
+  from authentic blobs (dropping the cursor, advancing the checkpoint,
+  zeroing the epoch) forces a rebuild rather than a silently incomplete
+  index; every manifest writer holds keys, so the tag is free;
 - `epoch`: the identity epoch, the change id at which the current
   identity history began (5.4, 6.3), `0` at setup (nothing has been
   issued, G3) and patched in at commit when a rebuild's boundary batch
@@ -607,9 +651,11 @@ document 0, in the clear, holding:
   message also has its content record, with a **suspended** flag while
   the account is over the cap (R23); a content-only rebuild (5.4) is
   what moves `content_to` forward again;
-- the rebuild cursor, when a rebuild is in progress (5.4), and the
-  **reconciliation marker** with its bound when one is pending (G11):
-  the difference set itself is not stored but recomputed per pass;
+- the rebuild cursor, when a rebuild is in progress (5.4): the last
+  document id done and the highest document id present at the epoch,
+  its end (H15); and the **reconciliation marker** with its bound when
+  one is pending (G11): the difference set itself is not stored but
+  recomputed per pass;
 - or, in place of all of the above, the **destroying marker** (5.7,
   R19), which carries the inventory of the manifest it replaced, so a
   destroy that dies after writing it retries from the marker (G12).
@@ -702,7 +748,13 @@ structure with its own rules:
   from the content budget: every keyed mail request of an account needs
   its thread part, so content parts can never crowd thread parts out,
   and a node that serves many accounts at once degrades search before it
-  degrades mail.
+  degrades mail. A thread-part load is **never refused for budget
+  alone** (H8): it evicts idle thread parts first and, when every
+  resident one is in use, exceeds the soft budget with a trace
+  (`ZA_SEARCH_OVER_BUDGET`), since refusing would fail every mail method
+  of the account; at the defaults a node holds the thread parts of some
+  tens of design-size accounts at once before it overruns, and the
+  deployment sizes the budget from its account count.
 - **Never swapped** (F16). 1.0's cache swap tier persists snapshots of
   the caches that implement `SwapCached`
   (`crates/common/src/cache/swap/evict.rs:20-26`); `Caches::za_search`
@@ -738,21 +790,26 @@ after eviction is the load cost of 4.3. The knobs:
 | `ZA_SEARCH_THREAD_MEM_MB` | 256 | process budget for loaded thread parts, transients included (G6) |
 | `ZA_SEARCH_ACCOUNT_MAX_MB` | 128 | largest content part a node loads or extends; at most a third of `ZA_SEARCH_MEM_MB`, for the load's transient (G6) |
 | `ZA_SEARCH_IDLE_SECS` | 900 | eviction after disuse |
-| `ZA_SEARCH_PASS_CAP` | 64 | inserts after which a pass stops at the next record boundary (`C`) |
-| `ZA_SEARCH_PASS_MB` | 32 | opened message bytes after which a pass stops at the next record boundary |
-| `ZA_SEARCH_PASS_HIDDEN_KB` | 24 | staged hidden thread bytes after which a pass stops at the next record boundary (`H`, 4.2) |
-| `ZA_SEARCH_PASS_MS` | 2000 | elapsed time after which a pass stops at the next record boundary (G18) |
+| `ZA_SEARCH_PASS_CAP` | 48 | admitted items after which a pass stops at the next insert boundary (`C`); at most `H / (R + (K − 1) · a)`, so that it binds (H7) |
+| `ZA_SEARCH_PASS_MB` | 32 | opened message bytes after which a pass stops at the next insert boundary |
+| `ZA_SEARCH_PASS_HIDDEN_KB` | 32 | reserved hidden thread bytes after which a pass stops at the next insert boundary (`H`, 4.2) |
+| `ZA_SEARCH_PASS_MS` | 2000 | elapsed time after which a pass stops at the next insert boundary (G18; its leak is section 2's) |
 | `ZA_SEARCH_WAIT_SECS` | 30 | how long a content request completes passes before refusing |
 | `ZA_SEARCH_SEGMENTS` | 16 | thread-blob count, and content-chain length, that trigger compaction |
 | `ZA_SEARCH_CHECKPOINT` | 1000 | update-only records after which a pass writes a manifest-only checkpoint (G19) |
-| `ZA_SEARCH_REFS` | 16 | reference hashes kept per thread record (`K`) |
+| `ZA_SEARCH_SKIP_AFTER` | 8 | aborted passes on one document after which it is skipped as loss (H5) |
+| `ZA_SEARCH_ABSENT_RETRY_SECS` | 10 | how long a blob a committed manifest names may be reported absent before that is loss (H6) |
 | `ZA_SEARCH_PAD_MIN` | 65536 | the smallest hidden-section class in bytes (`M`) |
 
-The configuration refuses `M < H + R + (K − 1) · a + 4` and
+`K = 16` is a constant of the format, not a knob (4.2, H22). The
+configuration refuses `M < H + R + (K − 1) · a + 4`,
+`ZA_SEARCH_PASS_CAP > H / (R + (K − 1) · a)` and
 `ZA_SEARCH_ACCOUNT_MAX_MB > ZA_SEARCH_MEM_MB / 3` at boot, with `R` and
-`a` derived from `K` and the record layout, not measured (R20). The
-plan's benchmark (9.6) records the measured figures for the design size
-against these defaults and adjusts them before release.
+`a` derived from `K` and the record layout, not measured (R20). At
+these defaults a pass admits up to 48 items, so a design-size rebuild of
+30,000 messages is about 625 passes (H7, 9.6). The plan's benchmark
+(9.6) records the measured figures for the design size against these
+defaults and adjusts them before release.
 
 ## 5. Building the index
 
@@ -795,11 +852,16 @@ order is what makes an insert see exactly the messages that existed
 when it was logged: every message deleted later is still in the index,
 every message deleted earlier is a tombstone, and no message newer than
 the insert has been indexed before it. That last clause is what bounds
-a merge: at the moment an item is indexed, each of its at most `K`
-hashes names at most one present message (a Message-ID names one
-message, ids are unique), and a present message is in exactly one
-thread, so an item retires at most `K − 1` threads and writes at most
-`K − 1` aliases, with no exception for the cursor (R20: a newest-first
+a merge: within a subject bucket, every present message whose kept
+hashes contain a given hash is in one thread, an invariant each insert
+re-establishes for every hash it carries by merging every thread of
+every candidate it matches, which deletions (they only remove members),
+aliases (they never split a thread) and folding at compaction (it keeps
+every resolution) preserve; so at the moment an item is indexed, each of
+its at most `K` hashes resolves to at most one thread, duplicate
+Message-IDs included (they share the root), and an item retires at most
+`K − 1` threads and writes at most `K − 1` aliases, with no exception
+for the cursor (R20: a newest-first
 cursor let later messages be indexed before an older one they
 referenced, and one old item could then merge arbitrarily many
 threads). The one inversion the order admits is a pair of concurrent
@@ -821,16 +883,28 @@ point compaction folds the alias into the records it governs (5.5). Its
 content records go at content compaction. Nothing is discarded for any
 other reason.
 
-**Checkpoints, and what each guarantees.** `indexed_to = (c, p)` means
-every record below `c` has been consumed whole and, of record `c`, its
-inserts up to document id `p` (every insert of a whole record when `p`
-is its last): every such insert is indexed, or recorded as skipped
-because its message was gone or would not open, with its thread assigned
-as of its position; every deletion of a completed record is a tombstone;
-it says nothing about what lies beyond, which the renderer's raw overlay
-(6.3) and the cache intersection (6.2) cover for every read. The
-cursor's bound means every message present at the epoch with a lower
-document id is indexed or skipped. The identity version `(epoch, revision)` means every identity
+**Checkpoints, and what each guarantees.** `indexed_to = (c, p,
+complete)` means every record below `c` has been consumed whole and, of
+record `c`, its inserts up to document id `p`, with `complete` set when
+`c` is done (every insert processed and its deletions applied): every
+such insert is indexed, or recorded as skipped because its message was
+gone or would not open, with its thread assigned as of its position;
+every deletion of a completed record is a tombstone; it says nothing
+about what lies beyond, which the renderer's raw overlay (6.3) and the
+cache intersection (6.2) cover for every read. A pass that resumes from
+a partial `c` reads record `c` itself, **inclusively** (R29: the log
+reader skips the from-key for an exclusive query,
+`crates/store/src/query/log.rs:130-148`, so an exclusive resume would
+lose the record's suffix for good), processes the inserts after `p`,
+then applies `c`'s deletions, and only then reads on exclusively; a
+record `c` found replaced by the truncation marker (the empty value
+`truncate_change_log` writes, `crates/common/src/storage/transaction.rs:228-244`)
+is loss of the unfinished record and takes the reconciliation of 5.4.
+Where `indexed_to` is compared (the shortcut of step 0, "current" in
+7.4), a partial `c` counts as not consumed. The cursor's bound means
+every message present at the epoch with a lower document id is indexed
+or skipped, up to the highest document id present at the epoch, which
+the manifest stores as the cursor's end (H15). The identity version `(epoch, revision)` means every identity
 transition up to that revision is published with its change id (4.2).
 `content_to` means every message indexed up to it has its content
 record too (R23). The manifest hash is the version of everything above
@@ -838,19 +912,36 @@ together (R18). All of them move only in the one batch of step 3; a
 pass that has nothing to stage and no checkpoint to move writes
 nothing (step 2).
 
-**Error classes** (F3). Two kinds of failure, told apart once, for the
-pass and the loader alike: **loss**, a stub that the store reports
-absent, a blob the store reports absent, or a blob that fails its AEAD
-or does not parse; and **transient**, any other error (a store or
-blob-store timeout, a refused connection, a budget that cannot make
-room). In a pass, loss of a message's stub or blob skips that message
-(a trace, never retried, as 1.0.2's index queue skips a message whose
-blob is missing); a transient error aborts the pass with nothing
-written and `indexed_to` unchanged, and the next pass retries. In a
-load, loss of a thread blob is loss of the index (a rebuild, 5.4); a
-transient error is "no map" for this request (6.2) and nothing more.
-Nothing is ever skipped for good, or rebuilt, because the blob store was
-slow.
+**Error classes** (F3, H5, H6). Two kinds of failure, told apart once,
+for the pass and the loader alike: **loss**, a stub that the store
+reports absent, a blob the store reports absent for longer than a
+short retry window, or a blob that fails its AEAD or does not parse
+(the blob codec's truncation and decompression failures included); and
+**transient**, any other error: a store or blob-store timeout, a
+refused connection, a budget that cannot make room, a blob the store
+reports absent within the retry window (H6: a blob store without
+read-after-write consistency across nodes can answer "not found" for a
+blob another node committed moments ago, and a committed manifest
+names it, so absence is loss only when it persists past
+`ZA_SEARCH_ABSENT_RETRY_SECS`), and the codec's missing-key error
+(`BlobKeyring::unavailable_key`, a `StoreEvent::DecryptError`,
+`crates/store/src/write/blob_codec/mod.rs:206-222`: an operator who
+removed a codec key is a configuration fault to repair, not a reason to
+rebuild every key account's index). In a pass, loss of a message's stub
+or blob skips that message (a trace, never retried, as 1.0.2's index
+queue skips a message whose blob is missing); a transient error aborts
+the pass with nothing written and `indexed_to` unchanged, and the next
+pass retries, except that a document whose open has aborted
+`ZA_SEARCH_SKIP_AFTER` passes (its id and count kept in the manifest,
+public facts) is then skipped as loss with `ZA_SEARCH_SKIPPED` carrying
+the persistent class (H5: a single object answering a persistent
+non-absent error, an S3 403 on one key or a backend fault, must not
+wedge the account's index and every later message's threading for
+ever). In a load, loss of a thread blob is loss of the index (a
+rebuild, 5.4), loss of a content blob is loss of the content part only
+(a content-only rebuild, 5.4, H23); a transient error is "no map" for
+this request (6.2) and nothing more. Nothing is ever skipped for good,
+or rebuilt, because the blob store was slow.
 
 0. **Shortcut, and catching up with other nodes** (R10, R18, F19). The
    pass is done at once when the manifest as loaded holds no cursor
@@ -869,10 +960,12 @@ slow.
    records into one flat vector and keeps only range-level change ids
    (`crates/store/src/query/log.rs:118-183`), so the fork adds a reader
    beside it, `za_changes_records`, that iterates the same keys
-   (`LogKey{account_id, collection, change_id}`) from `indexed_to`
-   exclusive and yields `(change_id, Vec<Change>)` per record,
-   deserialized by upstream's record decoder, unfolded, and reports
-   truncation as `changes` does. A truncated log takes the
+   (`LogKey{account_id, collection, change_id}`) from `indexed_to`'s
+   record, inclusively when that record is partial and exclusively when
+   it is complete (R29), and yields `(change_id, Vec<Change>)` per
+   record, deserialized by upstream's record decoder, unfolded, and
+   reports truncation as `changes` does, the marker in place of a
+   partial record included. A truncated log takes the
    reconciliation of 5.4 instead. For each record, in order:
    - an **insert** (the thread prefix in the high bits is ignored: it is
      the singleton): skipped if the index already holds the document;
@@ -946,9 +1039,12 @@ slow.
    function of the log alone; so a long run of flag changes never forces
    a reconciliation, a cursor of vanished messages still finishes, and a
    skipped insert is consumed once. A pass that tombstoned but indexed
-   nothing is **non-publishing**: it writes a thread blob whose hidden
-   section is empty and whose public section holds its tombstones,
-   advances `indexed_to`, opens no revision and writes no log entry. A
+   nothing is **non-publishing**: it writes a thread blob with no
+   hidden section and no revision row, its public section the
+   tombstones alone (H13: an empty padded section would cost `M` per
+   deletion-only pass and hide nothing, since the pass's kind is public
+   already), advances `indexed_to`, opens no revision and writes no log
+   entry. A
    pass that indexed at least one message is **publishing**: it opens
    revision `revision + 1`, known before anything is written (R2),
    records under it every assignment it makes and every alias, and
@@ -997,7 +1093,9 @@ once if one is running (5.1). Concretely:
   client reads them, in normal use.
 - POP3: no pass. Nothing POP3 serves depends on the index.
 - A keyed write that adds a message (IMAP APPEND, `Email/set` create,
-  `Email/import`): one pass after its commit and before its response. In
+  `Email/import`): one pass after its commit and before its response,
+  beside the pass the dispatcher or the command loop ran before the
+  method, so such a request runs at most two, each bounded (H20). In
   normal use the delta is that message's record and the response carries
   its final id (6.2); after a backlog (a rebuild, a long absence) the
   pass may not reach it, and the response carries the id as loaded,
@@ -1046,10 +1144,17 @@ accounts: threads merge in the pass (6.1).
 ### 5.4 Rebuild and reconciliation
 
 A **rebuild** starts when a keyed request finds **loss** (5.1's error
-class): no manifest on an account that holds mail, a manifest of an
-*older* format version, a manifest that does not parse, or a thread blob
-or chain node that the store reports absent or that fails its AEAD or
-parse. A manifest of a *newer* format version is not loss (F7): during
+class): no manifest on a key account, whether or not it holds mail
+(H11: an account provisioned before this release, or one whose empty
+manifest was deleted, must get one, and the no-message boundary below
+writes it), a manifest of an *older* format version, a manifest that
+does not parse or whose tag fails (4.2), or a thread blob that the
+store reports absent past the retry window or that fails its AEAD or
+parse. Loss of a content blob alone, a chain node absent or unopenable,
+is not loss of the index (H23): the thread part and every identity are
+intact, so it takes the content-only rebuild below, dropping the chain
+and resetting `content_to`, and no client resyncs. A manifest of a
+*newer* format version is not loss (F7): during
 a rolling upgrade the older binary answers "no map" (6.2) and
 unavailable (7.4) for that account until it is upgraded, and never
 rebuilds under the older format. A transient error is never loss.
@@ -1061,8 +1166,11 @@ Email change id, and a rebuild cursor), the unlinks of every previous
 blob the old inventory reaches, and, when the account holds any message,
 the boundary entries: one Email item update of the lowest document id
 present, one Thread property change of that singleton, and a container
-property change of every mailbox (6.3). The batch's change id, patched
-in at commit as the manifest's revision row is, becomes `epoch`. It is
+property change of every mailbox (6.3). The boundary is a publishing
+write: it opens `revision + 1` and its row `(revision + 1, epoch)`, so
+`R(X)` for every `X` from the epoch on resolves to it (H14), and the
+batch's change id, patched in at commit as that row is, becomes
+`epoch`. It is
 therefore newer than every state any client was ever issued, including
 the latest one, and distinct for every loss, so no issued state
 survives the boundary and no boundary is reused. An account that holds
@@ -1083,8 +1191,12 @@ From then on each pass works the cursor first, oldest document id
 first, and reads no log record after `indexed_to` until the cursor is
 exhausted (5.1's chronological order, R20); step 0's shortcut never
 applies while the cursor is pending (R10). The cursor is the set of
-document ids present in the message cache when the rebuild started,
-walked upwards; the manifest stores the last id done. Oldest first is
+document ids present in one message-cache snapshot taken when the
+rebuild started, walked upwards; the manifest stores the last id done
+and the highest id of that snapshot as the cursor's end, and the
+rebuild's `indexed_to` is that same snapshot's `last_change_id`, so a
+message between the snapshot and the first batch is in the log after
+`indexed_to` and in neither gap (H15). Oldest first is
 upstream's own order, which is what bounds a merge (5.1); its cost is
 freshness during the rebuild: mail that arrives while the cursor runs
 is indexed only after it, so until then it is not searchable and
@@ -1102,17 +1214,21 @@ refuse until `content_to` has caught up with `indexed_to`.
 
 The identities a lost index had published cannot be reconstructed, so
 `epoch` invalidates the sync states that would need them: a `/changes`
-or `/queryChanges` call of Email, Thread or Mailbox with a since-state
-`S` below the epoch (an intermediate state's `from` included) answers
+or `/queryChanges` call of Email or Thread with a since-state `S` below
+the epoch (an intermediate state's `from` included) answers
 `cannotCalculateChanges` when that method's log holds any record with a
-change id in `(S, epoch)`, the part of the client's delta the lost
-history would have rendered; when it holds none, nothing was lost for
-that client and the call is served (R27: an account whose messages were
-all deleted before the loss returns Email and Thread states that never
-move past the boundary, since the boundary batch touches only the
-mailbox log, and those states must stay usable; `Initial` is never
-refused, since a client at `Initial` holds nothing). Clients refused
-resync as JMAP clients do on that error (a full query and get).
+change id in `(S, epoch]`, closed at the epoch (R27, H1: the boundary
+batch's own Email witness update and Thread property change sit *at*
+the epoch, and they are what a client at the latest pre-loss state must
+not pass; an open interval let it through); when it holds none, nothing
+was lost for that client and the call is served (R27: an account whose
+messages were all deleted before the loss writes no Email or Thread
+entry at its boundary, so its clients' states stay usable). `Mailbox/*`
+is outside the rule (H12): nothing of the mailbox history is lost at a
+loss, and a keyless session has no map to carry an epoch. `Initial`,
+and its continuation (6.3), are never refused, since a client at
+`Initial` holds nothing. Clients refused resync as JMAP clients do on
+that error (a full query and get).
 From the epoch on, every assignment the rebuild makes is an ordinary
 transition from the singleton with a published revision, rendered by 6.3
 for clients that synced after the epoch. IMAP keeps no object-id sync
@@ -1124,9 +1240,19 @@ records, 10,000 by default). It is the one place a pass consults the
 message cache for existence (an exception to 5.1's rule, G11): the pass
 writes a reconciliation marker with a bound into the manifest, and each
 pass recomputes the difference between the index's document set and a
-revalidated cache snapshot's, tombstoning what the cache lacks and
-indexing what the index lacks through a cursor over the difference,
-then sets `indexed_to` to the cache's change id. Before stamping
+revalidated cache snapshot's, indexing what the index lacks and
+tombstoning what the cache lacks through a cursor over the difference,
+in this order (H3): the difference's inserts first, oldest document id
+first, the gap items (those the retained log does not show) before the
+retained ones, which follow in record order, inserts before deletions
+within a record; the gap deletions last of all, after every insert,
+so that no tombstone exists while the cursor is pending and a gap
+insert still finds every message it references that the gap deleted,
+as upstream did whenever the insert came first (a gap insert and a gap
+deletion carry no order of their own, so an insert that in fact
+arrived after the deletion threads with the deleted message where
+upstream did not: 7.5); then sets `indexed_to` to the cache's change
+id. Before stamping
 anything it attributes by the retained log (R24, G2): it reads the
 retained records once, unfolded, and a message of the difference whose
 raw insert or delete lies among them takes that record's change id, in
@@ -1177,11 +1303,15 @@ own batch (new links, old unlinks, the manifest, atomically):
   A few megabytes at the design size (1.3), and what keeps the manifest
   bounded (R8).
 - **Content compaction**, when the content chain reaches
-  `ZA_SEARCH_SEGMENTS` and no cursor is pending (G17: during a rebuild
-  every sixteenth pass would otherwise rewrite everything indexed so
-  far, near-quadratic in writes; the chain bound relaxes to
-  `ZA_SEARCH_SEGMENTS` plus the rebuild's passes until the cursor is
-  exhausted): a node that has the content part loaded, or that can load
+  `ZA_SEARCH_SEGMENTS` and no cursor is pending; while a cursor is
+  pending, a **tiered** merge instead (G17, H7: a full merge every
+  sixteenth pass would rewrite everything indexed so far, near-quadratic
+  in writes, and no merge at all would leave a rebuild's chain of
+  hundreds of nodes to the first content load): when the chain reaches
+  `2 · ZA_SEARCH_SEGMENTS`, the youngest `ZA_SEARCH_SEGMENTS` blobs merge
+  into one, so the chain stays under `2 · ZA_SEARCH_SEGMENTS + 1` and
+  each byte is rewritten a logarithmic number of times; the full merge
+  follows once the cursor is exhausted: a node that has the content part loaded, or that can load
   it (under the account cap), loads it for this and merges the chain
   into one content blob with no predecessor, dropping the content of
   tombstoned messages. Above the cap the chain is not extended (4.2), so
@@ -1201,10 +1331,14 @@ assertion, not from a lock: exactly one of two concurrent manifest
 writes lands, the other node discards its staging, reloads and
 continues. A node learns that another changed the manifest at step 0 of
 its next pass, which every keyed request runs: the shared cache's
-`last_change_id` moves with the other node's commit (through
-`commit_batch`'s broadcast, within the cache's 5 s revalidation
-otherwise) or with any delivery, the manifest read shows a different
-hash, and the node reloads before it serves; and every id-emitting
+`last_change_id` moves with the other node's publishing commit
+(`commit_batch` marks caches stale and broadcasts only when the batch
+logged a change, `crates/common/src/storage/transaction.rs:37-48`, H16,
+so a non-publishing pass or a manifest-only checkpoint moves no other
+node's counter and is learnt at that node's next manifest read, which
+every id-emitting response makes) or with any delivery, the manifest
+read shows a different hash, and the node reloads before it serves; and
+every id-emitting
 response validates its map against the manifest and its state against
 the newest publication after reading its state (6.2), which closes the
 windows between the pass and the response that the cache's own refresh
@@ -1297,8 +1431,19 @@ of 4.2, as one model rather than one patch each:
 | One cursor item merging arbitrarily many threads; a record larger than any fixed overshoot (R20) | chronological order; the intra-record checkpoint; a fixed reservation per admitted item | each hash names one present message in one thread, so at most `K − 1` aliases; the overshoot is one reservation whatever the record |
 | The stopping point moving with a probe's actual aliases (R21) | every admitted item charged the same reservation | `indexed_to` is a function of the admitted count |
 | A permanently skipped insert never checkpointed, holding search back (R26) | a consumed insert or delete record checkpoints even when nothing was staged | only update-only work is a no-op |
-| An empty account's post-rebuild states refused for ever (R27) | the epoch refuses a state only when the method's log holds a record in `(S, epoch)`; `Initial` never | nothing was lost for a client whose delta has no such record |
-| An `Initial` page continued as `Exact` with another classification (R28) | `Initial` renders as `Exact(m − 1)`, kinds preserved, no mode | the two rules are the same rule |
+| An empty account's post-rebuild states refused for ever (R27) | the epoch refuses a state only when the method's log holds a record in `(S, epoch]`; `Initial` never | nothing was lost for a client whose delta has no such record |
+| An `Initial` page continued as `Exact` with another classification, or refused below the retained bound or the epoch (R28, both forms) | `Initial` is `Exact(0)`; `from = 0` is never refused | a client there holds nothing, and 0 is below every record |
+| The latest pre-loss state admitted by an open interval (R27, H1) | the interval is `(S, epoch]` | the boundary's own Email and Thread entries sit at the epoch |
+| A split record's suffix skipped by an exclusive resume (R29) | the checkpoint carries `complete`; a partial record is resumed inclusively; its marker is loss | the reader skips the from-key only for a complete record |
+| The time cap making the checkpoint a function of processing cost (R30, H4) | recorded as the one remaining channel; invariants 48 and 50 narrowed to the byte and count charges | duration is observable anyway |
+| A deletion committed between a pass's log read and its commit, a phantom `created` (H2) | existence at `E` from the cache's present set, or from the log outside the range for a pinned `E`, before the record | a lagging record never decides presence at `E` |
+| A reconciliation tombstoning before it inserts (H3) | inserts oldest first, gap deletions last | no tombstone exists while the cursor is pending |
+| One persistently failing object wedging the index (H5) | a per-document attempt count in the manifest; skipped as loss after `ZA_SEARCH_SKIP_AFTER` | a persistent fault is bounded; a transient one still retries |
+| A lagging blob store read as loss (H6) | absence is loss only past `ZA_SEARCH_ABSENT_RETRY_SECS` | a committed manifest's blob exists |
+| A thread-part load refused for budget, failing every mail method (H8) | thread loads evict idle parts and overrun the soft budget with a trace, never refuse | mail degrades after search |
+| An unauthenticated manifest rewritten from authentic blobs (H9) | the keyed tag; a bad tag is loss | every manifest writer holds keys |
+| An empty account without a manifest in "no map" for ever (H11) | a missing manifest is loss on any key account; the boundary writes it | the no-message boundary exists |
+| A content node's loss resetting every identity (H23) | loss of a content blob is a content-only rebuild | the thread part is intact |
 | A deletion skipped against a stale cache snapshot (R17) | the pass consults no cache for existence; a logged deletion is applied unconditionally; ids are never reused | there is no snapshot to be stale |
 | A fresh checkpoint adopted with stale records after a deletion-only pass (R18) | the loaded index is versioned by the manifest's hash, the value the write asserts | any committed change reloads, identity publication or not |
 | A pass publishing between destroy's inventory and its range delete (R19) | destroy writes the marker first, asserting the manifest | every in-flight pass and every rebuild loses its assertion |
@@ -1350,8 +1495,11 @@ and `ThreadMerge::merge`, `:1487-1512`), against the index instead of the
 - No candidate: the message is a new thread whose id is its own document
   id.
 - One thread among the candidates: the message joins it.
-- Several: they merge into the one with the most members (ties to the
-  lowest thread id), the new message joins it, and each losing thread
+- Several: they merge into the one with the most matching candidates
+  (upstream's `ThreadMerge` counts one entry per matched row and the
+  survivor is the thread with the most, ties to the lowest thread id,
+  `crates/email/src/message/ingest.rs:1449-1451, 1487-1512`; not the
+  most members, H10), the new message joins it, and each losing thread
   gets one alias to the survivor under the pass's revision (4.1, R21);
   no member's record is touched, so a merge costs the same few bytes
   whether the losing thread holds one message or a thousand, and an
@@ -1437,7 +1585,12 @@ thread map as loaded (5.2) and validated (below):
   message's current thread id answers `notFound`, as 1.0.2 answers for
   an id a thread merge destroyed. `SEARCH EMAILID` requires the prefix
   to match (`crates/imap/src/op/search.rs:565-574`) through the map, and
-  `SEARCH THREADID` resolves the thread through the thread table.
+  `SEARCH THREADID` resolves the thread through the thread table. Two
+  more supplied ids are compared as whole u64s against result ids and
+  so are matched after mapping (H17): `Email/query`'s `anchor`
+  (`crates/jmap/src/api/query.rs:45, 98`; a stale prefix is
+  `anchorNotFound`) and `Email/queryChanges`'s `upToId`
+  (`changes/query.rs:369`).
 - Thread ids a client supplies (`Thread/get`, `inThread`,
   `EmailSubmission` `threadIds`) resolve through the thread table; an
   unknown one is `notFound`, as upstream.
@@ -1590,9 +1743,18 @@ record only for what the range cannot show (R14): any insert record of
 `D` in `(S, E]` makes `D` absent at `S`; any delete record of `D` in
 `(S, E]` makes `D` absent at `E`, whatever `D`'s record says, since the
 record can lag the log by the unconsumed part of a backlog; where the
-range shows neither, a document the index holds (present or as a
-retained tombstone) exists at `X` when its creation change id is at or
-below `X` and its deletion change id, if any, is above `X`, and a
+range shows neither, existence at `E` is decided before the record is
+consulted (H2: a deletion committed between a pass's log read and its
+commit leaves a present record for a message a client may already have
+seen deleted): when `E` is the current state, `D` exists at `E` exactly
+when the message cache's present set holds it; when `E` is a pinned
+past state, `D` exists at `E` when the cache holds it or the unfolded
+log shows a delete of `D` after `E`, and a `D` the cache lacks with no
+delete record anywhere in `(S, now]` was deleted at or before `S`,
+absent at both ends. Only after that, and only for existence at `S`, a
+document the index holds (present or as a retained tombstone) exists at
+`X` when its creation change id is at or below `X` and its deletion
+change id, if any, is above `X`, and a
 document the index does not hold (never indexed, or not yet reached in
 a backlog) exists at `X` as its own raw records in the range say, with
 the singleton as its thread at both ends. The thread lookup stays the
@@ -1631,15 +1793,20 @@ entries, so the fork renders a key account's `Email/changes` and
 `Thread/changes` pages itself, inside `ChangesLookup::changes`
 (`changes/get.rs:148-608`), keeping upstream's state shapes:
 
-- for `Initial` (G13, R28): as upstream answers it from `Query::All`
-  over the retained log without the truncation error
-  (`changes/get.rs:314-335`) and with each record's kind preserved
-  (`changes/page.rs:383-395`), the stream of `(m − 1, E]` with `m` the
-  log's oldest retained change id, rendered by the same rule as any
-  range and nothing else: a document created before `m` and updated
-  after it renders as updated, exactly as `Exact(m − 1)` renders it, so
-  a continuation page needs no mode of its own and the two never
-  diverge; `Initial` is never refused by the epoch (5.4);
+- for `Initial` (G13, R28): the stream of `(0, E]`, `Exact(0)`, with
+  the continuation `Intermediate{from: 0, to: E, sent}`; no message
+  existed at change id 0, so a client at `Initial` or at `Exact(0)`
+  holds nothing, every candidate is absent at `S`, and every present
+  document renders as created. The lower bound 0 is never refused by the
+  truncation check (upstream reads `Query::All` from 0 without it,
+  `changes/get.rs:314-335`) or by the epoch (5.4), so a continuation is
+  always admissible and needs no mode of its own: the first page and
+  every later one render the same stream by the same rule (R28's two
+  forms: a shared `Intermediate` shape and a continuation that fell
+  below the retained bound or the epoch). Upstream's `Query::All`
+  preserves each record's kind, so a pre-existing message with a
+  retained update renders there as updated and here as created (7.5,
+  H19); to a client that holds nothing the two are the same instruction;
 - for `Exact(S)`: `E` is the validated current state (6.2); if `S == E`
   the response is empty, as upstream's equality return; otherwise the
   stream of `(S, E]` is computed, the first `maxChanges` items are
@@ -1654,15 +1821,24 @@ entries, so the fork renders a key account's `Email/changes` and
   `Since(to)`;
 - `cannotCalculateChanges` when `S`, or an intermediate `from`, is below
   the epoch of the loaded, validated map and the method's log holds a
-  record in `(S, epoch)` (5.4, R27), or when `S` is below what the log
-  retains, as upstream answers for a truncated log
-  (`changes/get.rs:424-433`); never for `Initial`;
+  record in `(S, epoch]` (5.4, R27, H1), or when `S` is below what the
+  log retains, as upstream answers for a truncated log
+  (`changes/get.rs:424-433`); never for `from = 0`, which is `Initial`
+  and its continuations (R28: a client there holds nothing, so neither
+  refusal protects anything, and a continuation that could be refused
+  would loop the client between a first page that succeeds and a second
+  that fails);
 - `Thread/changes` renders the threads touched, from the same union and
   the membership rule above: a thread that had no member as of `S` is
   created, one that has none as of `E` is destroyed, else updated,
-  ordered and paged the same way; `Thread/get`'s `state` stays the
-  change id of the Thread log, which the pass's property change
-  advances;
+  ordered and paged the same way. The Thread log itself is read only
+  for its state, its truncation bound and the epoch check (H18): its
+  records are the stub ingest's singleton container inserts,
+  `log_threads_emptied`'s deletes and the witness's property change,
+  none of which names a mapped thread. `E` for `Thread/changes`, and
+  `Thread/get`'s `state`, is the Thread log's change id, which the
+  pass's property change advances and which lags the Email state by
+  flag-only records;
 - `Email/queryChanges` consumes the same page through its `changes` call
   (`changes/query.rs:65-74`) and diffs it against the mapped query as
   upstream does (`:348-378`); its `collapseThreads` handling
@@ -1854,6 +2030,15 @@ apart from the recorded differences:
 - `EmailSubmission/get` returns a submission's `threadId` as the map has
   it now, where upstream returns the prefix stored at submission time,
   stale after a merge (G22);
+- `Initial` renders every present message as created, where upstream's
+  `Query::All` renders a pre-existing message with a retained update as
+  updated (6.3, H19); to a client that holds nothing the two are the
+  same instruction;
+- after a truncation, a reconciliation's gap insert that referenced a
+  message the gap also deleted threads with it, where upstream did so
+  only when the insert came first (5.4, H3);
+- a pass's duration, and where its time cap stops it, reveal the
+  processing cost of the messages it admitted (section 2, R30, H4);
 - what 6.4 keeps off at delivery.
 
 Parity is by construction where it matters: the same `index_document`,
@@ -1947,9 +2132,18 @@ not the other, stop at the same checkpoint (R21); a record of more
 inserts than the cap is left part-way with the checkpoint naming the
 record and the last document id (R20, R1); `Initial` paged with
 `maxChanges = 1` over pre-existing updated messages equals its unpaged
-result and `Exact(m − 1)`'s (R28); the epoch rule serves a state below
-the epoch when the method's log holds no record in `(S, epoch)` and
-refuses one when it does (R27); a logged
+result (R28); the epoch rule serves a state below the epoch when the
+method's log holds no record in `(S, epoch]` and refuses one when it
+does, the boundary's own entries included, and never refuses
+`from = 0` (R27, H1); a partial record resumed inclusively indexes its
+suffix and applies its deletions, and a marker in its place is loss
+(R29); a deletion committed between a pass's log read and its commit
+renders nothing for the deleted message at a state that already saw
+it (H2); a reconciliation fixture with a gap insert referencing a
+gap-deleted message threads them, and one whose deletion is in the
+retained log threads as the control does (H3); the survivor of a merge
+is the thread with the most matching candidates, ties lowest (H10); a
+manifest with a bad tag is loss (H9); a logged
 deletion is applied whatever a presence snapshot says (R17); the error
 classes map a store timeout to abort and an absent stub to skip (F3);
 paging the stream with a small `maxChanges` reproduces every item
@@ -2021,11 +2215,14 @@ and `fence.rs` and `index_task.rs` reach `keymail45` and `plainmail49`):
   control groups them with `D` absent, repeated with the insert cap
   falling between `N`'s insert and `D`'s deletion; the rebuild form
   (R16, R20): the chain `A`, `D`, `N` indexed, the index lost, a capped
-  rebuild under way with `A` done and `D`, `N` pending, `D` deleted
+  rebuild under way with `A` and `D` done and `N` pending, `D` deleted
   through POP3 and a new `N2` replying to `D` delivered mid-rebuild,
   the cursor finished and then the log consumed, with `A`, `N` and `N2`
   grouped as the control groups them, `D` absent from every read, and
-  no alias count above `K − 1` in any pass; the checkpoint case (R21):
+  no alias count above `K − 1` in any pass; and its residual, `D`
+  deleted while still pending in the cursor, where `N2` threads as a
+  singleton and the control does not (the accepted missing-evidence
+  case of 7.5, pinned rather than expected to match); the checkpoint case (R21):
   two accounts with identical public inputs, thirty-seven fillers and a
   probe whose two references share a thread in one account and not the
   other, with equal `indexed_to`, cursor bound, publication sequence
@@ -2035,7 +2232,7 @@ and `fence.rs` and `index_task.rs` reach `keymail45` and `plainmail49`):
   requests, an eviction and a restart; a loss after the last message
   was deleted (R27): a fresh Email and a fresh Thread resync each make
   an empty `/changes` round trip without new mail while pre-loss states
-  are refused; `Initial` and `Exact(m − 1)` paged with a tiny
+  are refused; `Initial` and `Exact(0)` paged with a tiny
   `maxChanges` over pre-existing updated messages, each equal to its own
   unpaged result, after a reload between pages too (R28); the
   residual pinned beside them: `N` and `D` both arriving and `D` deleted
@@ -2055,8 +2252,10 @@ and `fence.rs` and `index_task.rs` reach `keymail45` and `plainmail49`):
   on every gated method of 6.2's table and served on every keyless one,
   `Mailbox/get` refused among them (F8); `Mailbox/get` thread counts
   match the control, and `Mailbox/changes` after a publishing pass
-  reports `updatedProperties` of the counts only (G7); a keyed APPEND's
-  response carries the final id; the amplified-merge probe (R21): two
+  reports `updatedProperties` of the counts only (G7); a FETCH after a
+  keyed APPEND carries the final `EMAILID` (H21: APPEND itself answers
+  `APPENDUID`), as does `Email/set` create's response; the
+  amplified-merge probe (R21): two
   threads filled with helpers referencing two known Message-IDs, then a
   bridge, with the thread blob's hidden class the same whether the two
   were one thread or two, and the alias table holding one entry; a
@@ -2221,8 +2420,14 @@ size against the derived bound `R` at `K = 16`, the load time of each,
 the pass rate (messages per second with
 and without attachment text), the compaction times, the cost of the
 validation read per request on RocksDB and on a networked store, the
-cost of the mailbox container updates per publishing pass, and the
-first-search latency after an absence of one day's volume. The figures
+cost of the mailbox property changes per publishing pass, the
+first-search latency after an absence of one day's volume, and a
+design-size rebuild end to end (H7): at the defaults about 625 passes
+of 48 items, each a padded thread blob, a content blob and a
+publication, with the thread compactions and the chain's tiered
+content compactions along the way, the number of content requests that
+refuse before the first succeeds, and the wall time under a client
+that issues a keyed request every few seconds. The figures
 decide the blob format's details and confirm or adjust the defaults of
 4.4, `M` against `C · R` among them, before the rest of the plan is
 executed.
@@ -2271,9 +2476,17 @@ the cursor order (a newest-first cursor, or a log record applied before
 the cursor is exhausted, must fail R20's fan-in case), the intra-record
 checkpoint (a whole-record-only stop must fail the MULTIAPPEND case),
 the skipped checkpoint (treating a skipped-only pass as a no-op must
-fail R26's case), the epoch rule (refusing without the `(S, epoch)`
-check must fail R27's empty rebuild), the `Initial` rule (an
-all-created override must fail R28's paging), per-record
+fail R26's case), the epoch rule (refusing without the `(S, epoch]`
+check must fail R27's empty rebuild, and an open interval must admit the latest
+pre-loss state in H1's case), the `Initial` rule (a continuation that
+the retained bound or the epoch can refuse must loop R28's client), the
+inclusive resume (an exclusive resume of a partial record must lose its
+suffix in R29's case), the existence rule's cache step (a record
+consulted first must emit H2's phantom `created`), the reconciliation
+order (a tombstone applied before the gap inserts must fail H3's
+fixture), the survivor rule (a most-members rule must fail H10's
+fixture), the manifest tag (an unverified manifest must accept H9's
+rewrite), per-record
 compression (one frame over a blob must fail G5's differential), the
 thread blob's padding (an unpadded blob, or one rounded to a 256-byte
 multiple, must fail R15's byte-class checks), the alias resolution (a
@@ -2321,8 +2534,11 @@ Added:
     are bounded, merges cost one alias each and the staged bytes are
     budgeted under the class (4.2), and a public section that is a
     multiple of the tombstone count the log shows; the same whatever
-    the mail said. Only a compacted thread blob's class depends on what
-    the index found, coarsely (section 2).
+    the mail said, in bytes and in counts. What the byte and count
+    charges do not fix is time: a pass's duration, and where its time
+    cap stops it, follow the processing cost of the admitted messages
+    (section 2, R30, H4). Only that, and a compacted thread blob's
+    class, depend on what the index found, coarsely.
 49. The index is loaded, built and written only inside a request that
     holds the account's own session keys, on that request's task; no
     background task, delivery, or keyless path reads or writes it, a
@@ -2332,7 +2548,9 @@ Added:
 50. The index is a deterministic function of the account's present mail
     and the change log's records in order, and, after a loss, of the
     rebuild cursor's order, which is chronological (G16). `indexed_to`
-    names a record and the last insert done in it, and advances, with
+    names a record, the last insert done in it and whether it is
+    complete; a partial record is resumed inclusively and a marker in
+    its place is loss (R29); it advances, with
     the revision, the blob links and the unlinks, only in one batch that
     asserted the previous manifest, committed through `commit_batch`; a
     pass whose batch fails or loses its assertion leaves the store, the
@@ -2345,7 +2563,8 @@ Added:
     inserts in document-id order before deletions within a record, a
     record left part-way at an insert boundary when the cap falls inside
     it; every admitted item is charged one fixed reservation, so where a
-    pass stops is a function of how many it admitted; a logged deletion
+    pass stops is a function of how many it admitted and of the time
+    cap, the processing-cost channel section 2 records; a logged deletion
     is always applied, since a document id is never reused; a transient
     error aborts a pass and never skips a message or rebuilds. No permanent link exists that
     the committed manifest, or a chain it names, does not reach, except
@@ -2400,9 +2619,10 @@ Added:
     leaves the shorter of the Email and Thread logs; a rebuild that
     loses identities allocates a fresh change id for its epoch, with or
     without a message to witness it, and refuses every sync state below
-    it whose method's log holds a record between the state and the
-    epoch, the latest issued one included, and never `Initial`; a newer
-    manifest format is never loss.
+    it whose method's log holds a record in `(S, epoch]`, the boundary's
+    own entries and the latest issued state included, and never
+    `Initial` or its continuations; a newer manifest format is never
+    loss, and loss of a content blob alone never moves the epoch.
 
 ## 11. Merge hotspots and silent dependencies
 
@@ -2690,13 +2910,39 @@ on `sync_view` and `View::sync` (`imap/src/core/view.rs:813-838, 645-647`).
   done in it.
 - **An all-created `Initial`** (revision 13). Rejected by R28: a
   continuation page cannot tell it from `Exact(m − 1)`, which preserves
-  kinds. `Initial` is `Exact(m − 1)`, as upstream's `Query::All` is.
+  kinds. Revision 14 made `Initial` `Exact(m − 1)`; revision 15 made it
+  `Exact(0)` (the bullet below), whose continuation nothing can refuse.
 - **Refusing every state below the epoch** (revisions 6 to 13).
   Rejected by R27: an empty account's Email and Thread states never pass
   a boundary that touched only the mailbox log, so its clients were
   refused for ever. The refusal applies when the method's log holds a
   record between the state and the epoch, the part of the delta the lost
   history would have rendered.
+- **An open interval for the epoch refusal, `(S, epoch)`** (revision
+  14). Rejected by the ninth Codex round's R27 and the third Fable
+  review's H1: the boundary's own entries sit at the epoch, so the
+  latest pre-loss state passed and R3's defect was back. The interval is
+  closed at the epoch.
+- **An exclusive resume of a partial record** (revision 14, implied by
+  "from `indexed_to` exclusive"). Rejected by R29: the reader skips the
+  from-key, so a split record's suffix was lost. A partial record is
+  resumed inclusively, and the checkpoint says whether it is complete.
+- **`Initial` as `Exact(m − 1)`** (revision 14). Rejected by R28: its
+  continuation carried a `from` below the retained bound, which the
+  truncation check and the epoch refused, looping the client between a
+  first page that succeeded and a second that failed. `Initial` is
+  `Exact(0)`, and `from = 0` is never refused.
+- **No time cap, so that the checkpoint depends on counts alone.**
+  Rejected: a pass of attachment-heavy mail would stall the triggering
+  command without bound, and the duration channel exists whatever the
+  cap does; the processing-cost leak is recorded (section 2, R30, H4).
+- **An unauthenticated manifest** (revisions 4 to 14). Rejected by H9:
+  a store writer could rewrite it from authentic blobs into a silently
+  incomplete index, where a dropped message is at least noticeable. The
+  keyed tag costs nothing, since every writer holds keys.
+- **Loss of a content blob as loss of the index** (revisions 11 to 14).
+  Rejected by H23: it reset every identity and resynced every client for
+  a part that holds no identity. It is a content-only rebuild.
 - **A session-scoped background task holding keys** to index after
   login, so the first search never waits. Rejected: it is background code
   holding a key (release 1 invariant 6), and the request-time pass with a
@@ -2796,8 +3042,13 @@ Jay confirmed, not weaker:
   the minimum class `M` (64 KiB) sits above that total by an inequality
   the configuration enforces (4.2). A publishing pass's hidden section
   therefore always pads to `M`, and its checkpoint is a function of
-  public counts: the per-pass channel, size and boundary alike, carries
-  nothing, whatever merged. What remains is the class of a
+  public counts and of the time cap: the per-pass channel carries
+  nothing of what merged, in size or in boundary; what it does carry is
+  the processing cost of the admitted messages, through the pass's
+  duration and the time cap's stopping point (section 2, R30, H4), a
+  coarse property of their content that the byte and count charges
+  cannot close and that revision 15 states rather than claims away.
+  What remains beyond that is the class of a
   compacted blob, cumulative over the mailbox, once per compaction
   (section 2). The costs: `M − (p + 4)` of padding per publishing pass,
   about 64 KiB, until the next thread compaction folds it away; and the
@@ -2885,8 +3136,24 @@ the thread records on every pass, which section 12 rejects on cost.
     Thread logs (G4); a reconciliation attributes by the retained log
     before stamping (R24, G2).
 25. The epoch refuses a state only when the method's log holds a record
-    between the state and the epoch, and never `Initial` (R27);
-    `Initial` renders as `Exact(m − 1)` with kinds preserved (R28).
+    in `(S, epoch]`, closed at the epoch, and never `from = 0` (R27, H1);
+    `Initial` is `Exact(0)`, every present message created, its
+    continuation always admissible (R28, H19); `Mailbox/*` is outside the
+    rule (H12).
+27. The checkpoint carries whether its record is complete and a partial
+    record is resumed inclusively (R29); the manifest carries a keyed
+    tag (H9); the merge survivor is the thread with the most matching
+    candidates (H10); a missing manifest is loss on any key account
+    (H11), a lost content blob a content-only rebuild (H23); absence of
+    a blob is loss only past a retry window and a persistently failing
+    document is skipped after `ZA_SEARCH_SKIP_AFTER` passes (H5, H6);
+    a thread-part load is never refused for budget (H8); content
+    compaction is tiered while a cursor is pending (H7); a
+    reconciliation inserts first and tombstones last (H3); existence at
+    the range's end comes from the message cache or the log outside the
+    range before the record (H2); `K` is a constant of the format (H22);
+    the time cap's processing-cost channel is recorded, not claimed away
+    (R30, H4).
 26. Cursor movement, and a consumed insert or deletion that staged
     nothing, are durable progress through a manifest-only checkpoint,
     which update-only runs also write past `ZA_SEARCH_CHECKPOINT`
