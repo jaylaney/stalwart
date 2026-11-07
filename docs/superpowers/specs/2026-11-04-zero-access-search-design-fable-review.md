@@ -404,3 +404,95 @@ gaps, H1 (a one-token fix), H2 and H3; H4 a wording correction Jay
 should see; H5-H8 resource and failure items a plan can carry once
 stated; of the P3s, H11, H13, H14, H15, H17 and H18 the ones a plan
 could not be written from without guessing.
+
+# Fourth round: Fable review of revision 15
+
+Reviewed on 2026-11-07 by a fresh Fable 5.1 reviewer, read-only,
+against revision 15 at `005b1d990`, with both prior review files as the
+list of what not to re-report and the stopping rule in the brief:
+classify every finding as construction (the design as built cannot
+meet a stated guarantee) or wording (a slip the text can fix in place),
+and approve unless a P1 in the construction remains. About 110
+citations re-verified; every one holds. The reviewer attacked the
+`(S, epoch]` interval with the boundary's own entries at the epoch,
+`Initial` as `Exact(0)` against the record-based existence rule, the
+inclusive resume of a partial record against `Store::changes`'
+exclusive skip and the truncation marker, the validated snapshot across
+a cross-node publication in both read orders, the `K − 1` proof under
+the concurrent-commit inversion, duplicate Message-IDs and a cursor
+item referenced earlier, the rebuild cursor's single snapshot against
+an inverted commit, the empty-account boundary against `Email/get`'s
+and `Thread/get`'s states, the pruning and folding rules at the
+shorter-log bound, the hold/release/link/purge sequence, the destroy
+marker against an in-flight pass, and the public section's tombstone
+count as a function of the log, and broke none. The tenth Codex round
+landed while it read; it had reached R33 and R27-wording independently
+before seeing them, verified R31 against upstream (upstream's `Initial`
+continuation carries `from = first retained id`,
+`changes/get.rs:593-597`, and refuses after a truncation where the
+fork's `from = 0` continuation recomputed a stream that had lost
+entries), concurred with all six Codex findings without re-reporting
+them, and added to R33 that the tag key must then travel in the batch
+object (a `Secret`, zeroized, rerun on a FoundationDB retry; 3.1,
+invariant 48) and to R31 that upstream's state encoding could carry a
+fourth field (declined in revision 16, call 28: a stream that needs no
+record needs no field). Revision 16 answers every item below; its
+header says where.
+
+**Verdict under the stopping rule: no P1 in the construction; the
+design is approved for planning.** Every finding of this round is P3
+and classified wording.
+
+## P3
+
+- **I1.** Reconciliation order: with the gap's deletions applied last, a
+  retained insert referencing a message the gap had deleted threaded
+  with it, where upstream did not, since that deletion certainly
+  preceded the insert. Resolution: gap inserts, then gap deletions,
+  then the retained records (5.4, 7.5, 9); the gap-insert/gap-deletion
+  deviation, whose order is unknowable, stays recorded.
+- **I2.** The compaction-class residual is sharper than "coarsely":
+  record sizes are public for delivered mail (headers in the clear at
+  SMTP time), tombstone and row counts and publications are public, so
+  the alias count is the only hidden term, and a filler to one alias
+  below a class boundary reads one bit per compaction about a chosen
+  bridge; a pad to a function of public counts,
+  `N_records · (R + a) + N_rows · row`, would close the channel at about
+  twice the thread part's sealed size, since aliases never exceed
+  records. Resolution: section 2 and invariant 48 restate the residual
+  as I2 did; option (c) under decision 2 offers the pad, for Jay.
+- **I3.** Existence at `S` from a lagging record emitted a duplicate
+  `destroyed`, the mirror of H2, when a deletion at or before `S` had
+  not yet been consumed by a pass. Resolution: the "cache lacks `D` and
+  no delete record in `(S, now]`" clause applies for a current `E` as
+  well as a pinned one (6.3).
+- **I4.** The post-commit swap had no version precondition: a reload
+  between commit and swap could be mislabelled or lose a compaction's
+  folding until the next validated snapshot. Resolution: swap only when
+  the loaded index is still at the hash the pass read at step 0, else
+  discard the staging (5.1).
+- **I5.** `Thread/get` reads its state from the store
+  (`thread/get.rs:80-85`, the Email group's counter Thread shares), not
+  the cache, so the validated snapshot's comparison did not name the
+  state a Thread method returns. Resolution: a Thread method reads its
+  state after the manifest and holds it to the same bound (6.2).
+- **I6.** A blob store answering "not found" for every key skipped the
+  backlog as loss after the retry window with no named remedy.
+  Resolution: upstream's per-account reindex task writes the index's
+  destroying marker for a key account, so the next keyed request after
+  the repair rebuilds (5.1, call 30).
+- **I7.** Clarity: the reconciliation marker's bound defined (4.2, 5.4);
+  the content-only rebuild's own cursor bound, and `content_to` not
+  moving until that cursor is exhausted (4.2, 5.4); the revision counter
+  restarting after a lost manifest, harmless (5.4); `H` 24 KiB corrected
+  to 32 KiB in decision 2; one pass per request and keyed account
+  (5.2); "every present document renders as created" at `Initial` is
+  true under R31's rule, and 7.5 records that upstream omits what its
+  log lost.
+
+## Judgement
+
+Approved for planning under the stopping rule agreed for this round.
+The four Codex P2s of the tenth round (R31 to R34) and R27-wording are
+repaired in revision 16 within the construction; I2's sharper premise
+and the public-count pad are for Jay to see under decision 2.
