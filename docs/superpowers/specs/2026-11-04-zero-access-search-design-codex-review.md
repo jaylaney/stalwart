@@ -1,6 +1,110 @@
 # Zero-access search design: Codex review
 
-## Current review — revision 15, 2026-11-07
+## Current review — revision 17, 2026-11-07
+
+**Verdict: REQUEST CHANGES under the stopping rule: one P1 construction finding.**
+
+This final pass is limited to the requested compaction changes: section 5.5's pruning
+exception and alias-count proof, section 4.2's compacted hidden-section allowance, and
+section 2's public-count guarantee. It does not reopen the rest of revision 16 or the
+previously accepted design decisions.
+
+Reviewed the [spec](2026-11-04-zero-access-search-design.md) at this exact baseline:
+
+- Worktree: `/Users/jay/Development/stalwart/.worktrees/za-search-design`.
+- HEAD: `39453054f16e9887716d62778a75ef311936b06e`.
+- Spec SHA-256: `6dbc33c3b4180cd82b892b18c4ae08ffb49a0e4a1b28c1bbc7f72ce4c2afa33d`.
+
+The rule remains **approve unless a P1 in the construction exists**. R35 is one shared
+cause across the three requested sections, not three separate findings. There are no
+additional wording findings in this scoped pass.
+
+### R35 — P1 — Construction: Retaining bridges does not bound aliases by records
+
+**Spec:** 1425–1439 (pruning and proof), 612–618 (size), and 338–345 (guarantee).
+
+The exception retains the record of each bridge whose aliases survive, but a bridge can
+retire several old threads. Their old member records can all be pruned while those aliases
+remain. The proof's claim that no alias retires a thread without a retained member is
+therefore false after pruning. Being present when an insert is replayed does not mean a
+record survives the later retention boundary.
+
+A minimal timeline, with P the bridge's publication change ID:
+
+1. A, B and C are already indexed in separate threads with the same subject. Their
+   assignment publications precede P.
+2. N is inserted with references to all three. A, B and C are then deleted, all before
+   the next keyed pass. N remains present.
+3. Catch-up processes N before those deletion records. The old indexed records still
+   have their threading fields, so N merges the three threads. Its assignment and the
+   two aliases publish at P, after the raw deletion change IDs. The pass also applies
+   those deletions in their chronological positions.
+4. Compaction's retention bound reaches P. A, B and C have both assignment and deletion
+   IDs below P, so section 5.5 prunes them. N and the two aliases at P remain: aliases
+   are dropped only when their publication is older than the bound.
+
+That leaves **one retained record and two retained aliases**. This uses the normal
+chronological replay at 931–947 and 1069–1090; it needs neither a rebuild nor a concurrent
+delete. The new exception protects N, but it does not protect the roots that N retired.
+
+The discrepancy can exceed an actual padding class, not just invalidate the proof.
+Use 128 independent families of 15 old singleton roots. Each live bridge keeps its unique
+own Message-ID and references to its family's 15 roots, exactly K = 16 hashes, and creates
+14 aliases. Queue every bridge before the root deletions, and perform catch-up after
+those deletions. Split-record checkpoints permit multiple publishing passes; every
+bridge's assignment and aliases publish at or after P, the first such publication.
+At a later compaction with bound P, all old roots prune, leaving:
+
+| Quantity | Value at the stated R = 296 and a = 24 byte widths |
+|---|---:|
+| Retained records | 128 |
+| Retained aliases | 1,792 |
+| Hidden payload, 128R + 1,792a | 80,896 bytes |
+| Prescribed framed allowance, 128(R + a) + 4 | 40,964 bytes |
+| Prescribed class, including the 64 KiB minimum | 65,536 bytes |
+
+The required compaction cannot fit. Refusing to publish prevents that compaction from
+completing; choosing a larger class from the actual payload restores dependence on hidden
+merge history and contradicts section 2. This is P1 construction because the specified
+retention and padding rules cannot jointly meet the new guarantee. Correcting the proof's
+wording alone cannot repair them.
+
+**Correction:** change the retention/pruning rule and prove its resulting alias bound, or
+use a larger public-count allowance. The existing bridge-retention exception supports the
+straightforward bound `(K - 1) * N_records` aliases, hence an allowance of
+`N_records * (R + (K - 1) * a)`, with complete framing before class rounding. That option
+changes the stated padding cost. If pruning unreachable aliases instead, specify which
+aliases can go and prove both retained-state resolution and the tighter count bound;
+the current age-only alias pruning does not perform that operation.
+
+**Validation required when implementing:** compact the minimal and amplified timelines
+above at P. Check serialized fit and every retained-state resolution. Compare equal
+public-count fixtures whose old roots were separate versus already joined; both must
+successfully serialize into the same class chosen solely from the public inputs.
+
+### Disposition of the other scoped checks
+
+- **Hidden-section inventory:** records and aliases are the specified hidden contents.
+  Tombstones and revision rows are explicitly in the public section (542–549); the
+  four-byte framing prefix is explicit (601–607), and blob headers and sealing overhead
+  are fixed outside the class. No additional missing hidden component was identified.
+  The eventual codec must include its record framing in R/a and section framing in the
+  allowance; the approximate byte figures do not replace encoded maxima.
+- **Public-count selection:** the stated record-retention predicate uses deletion and
+  assignment-publication boundaries, not merge outcomes. No independent defect was found
+  in choosing N_records. R35 prevents that count's current allowance from being sufficient,
+  so the public-count-only guarantee is not yet established by this construction.
+
+### Review method and limits
+
+Two independent read-only review scopes covered the pruning proof and the byte/public-count
+contract. The primary checked their common counterexample against the current spec and
+adjudicated it as one finding. Existing inherited parent-model routes were reused because
+the originating model's capability ceiling was not established; no stronger-model claim
+is made. This was source and design review only: no build, test, runtime probe or network
+validation ran. Only this report was edited; all prior reviews below are preserved.
+
+## Historical review — revision 15, 2026-11-07
 
 **Verdict: APPROVE under the requested stopping rule. No P1 construction finding remains.**
 
