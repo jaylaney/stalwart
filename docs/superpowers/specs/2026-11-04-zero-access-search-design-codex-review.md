@@ -1,6 +1,77 @@
 # Zero-access search design: Codex review
 
-## Current review — revision 17, 2026-11-07
+## Current review — revision 18, 2026-11-07
+
+**Verdict: APPROVE under the stopping rule. R35 is closed; no scoped findings remain.**
+
+This pass covers section 5.5's bridge and dead-alias pruning rules, the injection proving
+the alias bound, the induction preserving resolution, and one-hop folding. The related
+assignment, state-resolution and padding clauses were checked as dependencies. The rest
+of the design was not reopened.
+
+Reviewed the [spec](2026-11-04-zero-access-search-design.md) at this exact baseline:
+
+- Worktree: `/Users/jay/Development/stalwart/.worktrees/za-search-design`.
+- HEAD: `9d3457e4d7c5f85058bf000ea293141fdee6ca17`.
+- Spec SHA-256: `74f8ef6d4670ee76ad70e624a63cef1eba8d5749c394653e992ce32ac3f4278a`.
+
+The stopping rule remains **approve unless a P1 in the construction exists**. This pass
+found no construction or wording defect within the requested scope. No additional design
+round is required for R35.
+
+### Why the revised construction holds
+
+**The bound is now a direct injection (1451–1466).** After record pruning and folding,
+each kept alias has a retained record assigned directly to its source. Alias sources are
+distinct because a thread is retired once, and a record has only one assignment. Choosing
+one such record for each kept alias therefore cannot choose the same record twice:
+`N_aliases <= N_records`. Fresh document-ID roots and non-reuse preserve source uniqueness
+across compactions (1103–1106, 1687–1696). This proof no longer depends on the log's view
+of which messages existed when a delayed publication occurred.
+
+**R35's two counterexamples are closed.** In the three-root case, the bridge is assigned
+to the survivor, and neither losing source has a retained record after the roots prune.
+Both aliases drop. In the amplified case, all 1,792 unsupported aliases drop, leaving the
+128 bridge records within the prescribed 64 KiB class. The test requirements explicitly cover
+both timelines (2358–2362).
+
+**The bridge rule makes direct-source pruning safe for chains (1446–1453, 1467–1474).**
+The first alias in a retained record's chain has that record as its witness. For an edge
+`L1 -> L2`, the bridge that created it is assigned to L2 in the same publication and is
+retained while that publication is retained, even if deletion preceded publication.
+It therefore witnesses L2's outgoing alias. Successor aliases have nondecreasing
+publication revisions, including ties within one pass: L2 must still be a live root when
+the incoming edge is created. Consequently, an expired successor cannot fold that bridge
+away from L2 while the incoming edge remains retained. The induction preserves every
+needed alias, so the state-limited traversal and membership rules remain unchanged
+(1915–1928).
+
+**One-hop folding preserves the retained suffix (1437–1442, 1468–1469).** Expired aliases
+move assignments along the expired prefix, without following a retained alias early.
+For `A -> B` below the bound and `B -> C` above it, the folded assignment is B: it still
+renders B before the second publication and C afterward. With several expired hops, the
+stated postcondition requires all of them to be folded before they are discarded; a
+reverse-order destructive sweep that strands an assignment halfway would violate that
+postcondition. Repeated compactions re-establish the same witnesses for the retained
+suffix. The chain and one-hop fixture and mutation requirements cover these obligations
+(2363–2366, 2672–2676).
+
+**The public-count allowance remains valid.** Record retention still depends on deletion
+and assignment-publication boundaries, not merge results. Dead-alias pruning removes
+aliases without adding records. Thus the injection supplies the missing inequality for
+`N_records * (R + a)`, and the encoded-maxima/framing clause accounts for serialization
+before rounding (628–637). No larger padding allowance is needed for this correction.
+
+### Review method and limits
+
+Two independent read-only scopes checked the count/public-count proof and the resolution/
+folding proof. The primary verified both against the current spec. Existing inherited
+parent-model routes were reused because the originating capability ceiling was not
+established; no stronger-model claim is made. This is design approval within the requested
+scope, not implementation validation. No builds, tests, runtime probes or network checks
+ran. Only this report was edited, and the previous review history below is preserved.
+
+## Historical review — revision 17, 2026-11-07
 
 **Verdict: REQUEST CHANGES under the stopping rule: one P1 construction finding.**
 
