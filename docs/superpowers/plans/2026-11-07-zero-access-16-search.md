@@ -1,0 +1,3052 @@
+# Zero-access plan 16: search and threads for key accounts (release 7) Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** A key account gets server-side search, sorting, snippets and real threads that behave as an ordinary account's do, from a per-account index built only inside requests that hold the account's keys, stored as sealed blobs under a key only those requests hold, with the thread id sealed in the index and substituted into every id a keyed session emits, while nothing new about the account's mail appears in the clear.
+
+**Architecture:**
+
+- **Phase A, measurement and primitives (Tasks 1–2):** the format benchmark on a 1 GB corpus (positions, per-record compression, the record bound `R`, indexing rate), whose table goes to Jay before the model is built; then the search key `swk`, principal field 152, the `ZA_SEARCH_*` configuration with its boot refusals, the format constants (`K`, `R`, `a`, the padding formula), the trace strings, the test hooks and counters, and the suite's cleanup exemptions.
+- **Phase B, the index model (Tasks 3–5, `crates/store/src/za_search/`):** the thread part (records, aliases, revision rows, tombstones; `R(X)`, "the thread of `D` as of `X`", "the members of `T` as of `X`", the assignment rule of 6.1 with the survivor rule of H10), the content part (upstream's term set, positions, sort keys, `sent_at`, the attachment bit; exhaustive leaf resolution; per-record zstd frames), and the blob format: authenticated headers, the hidden and public sections, framing and padding, the manifest with its keyed tag serialized at commit.
+- **Phase C, the loaded index (Task 6, `crates/common/src/za/search/`):** `Caches::za_search`, the loader with its loss and transient classes, incremental reload, the read lock, the pass lock, single-flight loads, two budgets, eviction, never swapped.
+- **Phase D, the pass (Tasks 7–9, `crates/store/src/query/log.rs`, `crates/email/src/message/za/search/`):** the unfolded record reader and the openers' error classes, the pass itself (chronological consumption under the cap and the fixed reservation, the four write outcomes, one asserted batch through `commit_batch`, the post-commit swap) and setup's empty manifest, then the triggers on JMAP, IMAP and the keyed writers with the content request's wait budget.
+- **Phase E, serving (Tasks 10–13, `jmap`, `imap`):** `Email/query`, IMAP SEARCH and SORT, snippets and the unavailable refusal from the loaded content part; the validated snapshot and the mapped ids at every emitting and accepting site with the method table's gates; the thread-valued reads; and the changes stream over a pinned range read unfolded, rendered as pages with upstream's state shapes, with the epoch rule.
+- **Phase F, recovery and lifecycle (Tasks 14–16):** rebuild from loss with a fresh epoch, the content-only rebuild, the reconciliation after a truncated log; thread compaction with the bridge rule, the dead-alias rule, one-hop folding and the public-count pad, and tiered content compaction; destroy's marker, unlink and scan, `BlobRecode`'s walk, the `Reindex` remedy.
+- **Phase G, coverage and closure (Tasks 17–19):** the key-mode variants, the leak rules and the differential test (the parity contract of 7.5), the system benchmark, the mutation sample, `CLAUDE.md`, the checklist and the outcome note.
+
+The fork diff stays narrow: new modules (`crates/store/src/za_search/`, `crates/common/src/za/search/`, `crates/email/src/message/za/search/`, `crates/jmap/src/email/za_search.rs`, `crates/jmap/src/changes/za.rs`, `crates/imap/src/op/za_search.rs`, `tests/src/za/mail/{threads,index,differential}.rs`, `tests/src/za/search_bench.rs`) plus one-line insertions at the upstream sites spec 11 lists, each task naming its own.
+
+**Tech Stack:** Rust 2024 on upstream Stalwart v1.0.3 (fork `0.4.0-beta.1`; internal crates `1.0.3`, `vault` `0.16.25`); upstream's `index_document`, `SearchQuery`/`Leaf` planner and forward-index codec (`crates/store/src/search/`), `MessageSortKeys`, `ThreadFields`, `commit_batch`, `hold_blob`/`BlobHold`, the blob codec; `vault::keys::{aad, seal, open}` (XChaCha20-Poly1305), HKDF sub-keys; `blake3` 1.8 (keyed tag, manifest hash; already a `store` dependency); `zstd` 0.14 through `store::write::compress::compress`; `roaring` bitmaps; tokio `RwLock`/`Mutex`; the `tests` crate harness (`TestServer`, `TestServerBuilder`, `SmtpConnection` on LMTP 11200, `za_unlock`, the JMAP and IMAP clients, `assert_is_empty`).
+
+**Spec:** `docs/superpowers/specs/2026-11-04-zero-access-search-design.md`, revision 18 (2026-11-07, `9d3457e4d`), approved by Jay on 2026-11-07 after Codex approved revision 18 under the stopping rule (`24fbd54d8`, the Codex review file beside the spec; the Fable review file `2026-11-04-zero-access-search-design-fable-review.md` holds the four Fable rounds). Cited by section number; where this plan and the spec disagree, the spec wins. The release 1, mail (release 3), invitations, key pinning, sharing and iMIP specs bind where it cites them. Project rules: `CLAUDE.md`, `docs/README-dev.md`, the plan 3 outcome note (gate inventory), the 1.0 upgrade outcome note (hook inventory, conflict ledger), the plan 13 outcome note (the mail rulings R0–R63).
+
+## Spec questions / plan calls
+
+Each is the plan's choice, pending Jay; none changes a decision of the spec, and the ones marked *spec wording* ask for a one-line correction of the spec's text. They are numbered by task group (A: Tasks 1–2, B: 3–6, C: 7–9, D: 10–13, E: 14–16, F: 17–19), and a task's text cites them by that number.
+
+**Tasks 1–2**
+
+- **A1.** **9.6's benchmark is in two halves.** 1.3 and 9.6 make the benchmark the plan's first task, but the pass rate, the compaction times, the validation read's cost, the mailbox entries' cost, the first-search latency and the design-size rebuild need the pass, the cache and compaction to exist. Task 1 measures what decides the blob format before anything is built (positions, per-record compression, the record bound, the indexing rate) and Task 19 measures the rest on the finished system; both tables go in the outcome note.
+- **A2.** **No trained dictionary.** 4.2 says "the fork's static dictionary"; the workspace's `zstd` is built with `default-features = false` (`crates/store/Cargo.toml:36`), so no dictionary trainer is available without a new feature or dependency. Task 1 measures per-record frames with no dictionary and with each of upstream's `Dictionary::Term` and `Dictionary::Email` (`resources/zstd/`, `crates/store/src/write/compress.rs:13-19`), as figures; the content record's term bytes are upstream's stored search document, one zstd frame per document under upstream's `Dictionary::Term` (plan call B2), so no dictionary is chosen here. Training a fork dictionary is a follow-up if Jay wants one.
+- **A3.** **A test-mode accessor on `IndexDocument`.** Its `fields` and upstream's `Document::encode` are `pub(crate)` (`crates/store/src/search/mod.rs:176-184`, `term.rs:629`), so the benchmark in the `tests` crate cannot measure term bytes; Task 1 adds `IndexDocument::za_bench_term_bytes(&self, positions: bool) -> Vec<u8>` under `test_mode`, sharing the tokenization `build_batch` performs (`term.rs:276`) through a private helper, no behaviour change for upstream's path.
+- **A4.** **Attachments in the corpus are text.** The benchmark attaches `text/plain` files of 40 KB to 1 MB (upstream's extractor indexes them as attachment text); it builds no PDF or Office documents, so the "with attachment text" rate is a lower bound on extraction cost and the outcome note says so.
+- **A5.** **The configuration refusal exits the process from `main`.** `Caches::parse` is infallible (`crates/common/src/config/inner.rs:122-140`), so `ZaSearchConfig::from_env()` is read there into `ZaSearchCache` with the defaults kept and the refusal's message retained, and `main` checks `za_search.refusal()` right after `verify_schema_version` (`crates/main/src/main.rs:64-72`) and exits `ExitCode::FAILURE` with `ServerEvent::StartupError`, the schema check's own pattern.
+- **A6.** **The format constants live in Task 2.** The boot refusals need `R`, `a` and `K` (4.4) before the model exists, so Task 2 creates `crates/store/src/za_search/mod.rs` with the constants, `reservation()`, `padded_len` and `compaction_allowance` and their boundary tests; Tasks 3 and 5 add the model to that module. The record layout that fixes `R = 304` and `a = 15` is given in Task 2.
+
+**Tasks 3–6**
+
+- **B1.** *Spec wording.* **`R = 304` and `a = 15` by derivation** (the layout is Task 2's comment and Task 3's constants). The spec's 296 and 24 were
+   estimates; R20 asks for derived maxima. Nothing else changes: the inequality, the
+   reservation (529 bytes, so `ZA_SEARCH_PASS_CAP = 48` is under `H / 529 = 61`, H7) and the
+   compaction class at 30,000 messages (16 MiB) all hold. If Jay prefers the spec's figures
+   as reserved room, set `ALIAS_LEN = 24` with 9 zero bytes in the alias body; the plan does
+   not.
+- **B2.** **Upstream's stored document is the content record's term part**, so the
+   G5 dictionary is upstream's `term-v1.dict` and Task 1 need not train one; Task 1 measures
+   the ratios only (A2).
+- **B3.** **A compaction whose hidden content exceeds its public-count allowance is a defect**:
+   `FormatError::AllowanceExceeded`, the pass aborts and traces `ZA_SEARCH_ABORTED` with
+   class `defect`; it never writes a blob whose size depends on content (invariant 48).
+- **B4.** **A phrase check over a corrupt record is unresolvable** (`ResolveError::Corrupt`), so
+   the query refuses (7.4's third case) rather than widening.
+- **B5.** **Idle eviction runs on access** (`sweep_idle` from `entry()`), not from a timer task:
+   nothing new runs in the background, though the index is not key material.
+- **B6.** **Memory accounting is decremented when an entry leaves the map**; a reader still holding
+   the `Arc` keeps its bytes alive for the rest of its request, a transient the budget's 3×
+   factor already covers.
+- **B7.** **`AssignedIds` test constructor**: Task 5's tag test needs a current change id in an
+   `AssignedIds`; `set_current_change_id` is `pub(crate)` and needs a reserved change id, so
+   the plan adds a one-line `#[cfg(test)] pub(crate) fn with_current_change_id(u64)` beside
+   `write/mod.rs:1648`. If Jay prefers no upstream-file edit, the test can
+   build the ids through a `BatchBuilder` with a change-id reservation and `resolve`.
+- **B8.** **`thread_of` carries a cycle guard** (`aliases.len() + 1` steps) although the
+   construction has no cycles (an alias always points at a thread that survived at its
+   revision); a cycle would be a defect, and the guard turns it into the singleton rather
+   than a hang.
+- **B9.** **Prefix matching follows `fetch`'s rule** (`query.rs:787-792`): verbatim terms of at most
+   16 bytes not ending in `*`; a longer term never matches a prefix, as upstream.
+
+**Tasks 7–9**
+
+- **C1.** **The retry window for an absent message blob is kept in memory** (Task 6's `IndexEntry::absent_since`, keyed by the message blob's hash), the attempt count in the manifest (R34). An eviction forgets the window's start, so the window can only lengthen; the durable bound stays `ZA_SEARCH_SKIP_AFTER` passes. Plan's call; spec 5.1 names only the window and the count.
+- **C2.** **A pass that works cursor items consumes no log record** (records resume on the next pass once the cursor is `None`), rather than continuing into records within the same pass when the cursor is exhausted under the cap. Simpler for the implementer; one extra pass per rebuild. Plan's call under 5.1's order.
+- **C3.** **The committed manifest's hash is recomputed** from the assigned change id (`AssignedIds::change_id(account_id, SyncCollection::Email.change_group())`) and `ManifestValue::encode`, not re-read from the store, which requires `ManifestWrite` to serialize exactly as `encode` does (Task 5 pins it). Plan's call; 5.1 says only "record the new manifest hash".
+- **C4.** **The setup manifest joins the vault batch through a trailing `extra` parameter** on `vault_batch_write`, `vault_commit_store`, `za_vault_commit` and the http `za_commit`, every other caller passing `None`, rather than a second batch (which could not be in "setup's vault batch", 4.2, F22). Plan's call.
+- **C5.** **`is_current` is evaluated from `scanned_to`** rather than re-reading the records in `(indexed_to, scanned_to]`: the pass sets `scanned_to` only to a change id it read whole, and every insert or deletion it read moved `indexed_to` (indexed, skipped or tombstoned) or aborted (nothing moved), so the two statements of 7.4 coincide. Plan's call.
+- **C6.** **The JMAP trigger runs when any method call of the request names a mail object** (`Email`, `Thread`, `Mailbox`, `SearchSnippet`, `EmailSubmission`, `Blob`), once, for the token's own account. A request of only `Core/echo` or `Identity/*` runs none. Plan's call under 5.2 and I7.
+- **C7.** **The suite's "restart"** is `simulate_restart` (the account's loaded index, resident keys and message cache dropped; Task 8's helper), since the za suite runs one server; the manifest and the blobs are then re-read from the store as after a restart. Plan's call for every case that says "restart" (R1, R10, R22, R26).
+- **C8.** **The transient skip's recorded loss class** when `ZA_SEARCH_SKIP_AFTER` is reached is `BlobAbsent` for `AbsentWithinWindow` and `Parse` otherwise (a persistent non-absent fault); `ZA_SEARCH_SKIPPED` carries it as the reason (H5 says "the persistent class"). Plan's call.
+
+**Tasks 10–13**
+
+- **D1.** **Benchmark-independent default kept (plan's call).** `za_content_current` treats `scanned_to` as proof that `(indexed_to, scanned_to]` holds only update records, which is how 5.1 step 2 defines it; the pass (Task 8) must never set `scanned_to` after consuming an insert or deletion it did not stage.
+- **D2.** **`QueryResults` accessor (plan's call).** `QueryResults::into_bitmap()` exists (`local.rs:200`); no store change is needed for the pure merge.
+- **D3.** **One test-mode configuration override (plan's call, Task 2's mechanism).** Cases that need a short wait budget, a small pass cap, few segments or a low account cap set `test_hooks::set_search_config_override(Some(ZaSearchConfig { .. }))`, which `Server::za_search_config()` reads before the boot value in test mode; Task 9's `search_config_guard` restores it on drop, and the cases write it as `search_config_guard!(field: value)`. Every per-knob setter a part named (`set_search_wait_override`, `set_search_pass_cap_override`, `set_segments_override`, `set_account_max_mb_override`) is this one override.
+- **D4.** **A test-mode `SEARCH_SWAP_SKIP` hook (plan's call, for Task 8).** Another node's publication is simulated in one process by a pass that commits and skips its swap (`SEARCH_SWAP_SKIP: Mutex<Option<u32>>`, checked at 5.1 step 3's swap); without it the cross-node and stale-state cases cannot be driven. `SEARCH_SNAPSHOT_PAUSE`'s pause point sits in `za_snapshot` between step 2 and step 3.
+- **D5.** **The "no map" error's event type (plan's call).** The generated `trc::JmapEvent` has no `serverUnavailable` variant; jmap-proto maps every non-JMAP `trc::Error` to `serverUnavailable` (`error/method.rs:190-198`), so `za_no_map_error` is a `StoreEvent::UnexpectedError` carrying `ZA_SEARCH_UNAVAILABLE` and the reason class, and IMAP adds `ResponseCode::Unavailable` at its call sites. The spec's wording is met; the event class in the logs is a store event, recorded in the outcome note.
+- **D6.** **`EmailSubmission/changes` is gated on keys as the table says** though it emits submission ids only; the plan follows decision 1's list as written and notes the looseness for Jay.
+- **D7.** **`Email/copy`'s translation sites (`copy.rs:134, 242`) are left untouched**: `za_assert_mail_copy` refuses every copy touching a key account before the lookup, so no mapped id reaches them.
+- **D8.** **Interim between Tasks 11 and 13.** With mapping on and the page not yet rendered by the fork, a key account's `Email/changes` emits raw singleton-prefixed ids; no suite case runs against that interim (the variants run in Task 17), and Task 13 closes it.
+- **D9.** **The retained-bound refusal (plan's reading of 6.3).** `S` is refused when `S < max(marker(Email), marker(Thread))`, the change id of `truncate_change_log`'s marker in each log (`transaction.rs:238-244`), for both `Email/changes` and `Thread/changes`: pruning is by the shorter log, so both methods refuse below either bound. Task 7's `first_retained` is read as that marker's change id.
+- **D10.** **Sheet additions this part relies on**: `ThreadPart::records()` (Task 3; 13.1); `ContentPart::resolve(&[SearchFilter])`, `sort_ranks(SortField, &RoaringBitmap)` with `SortField::SentAt`, `document_ids()` (Task 4, as Task 4 defines them); `SEARCH_CACHE_HOLD` and `SEARCH_MANIFEST_FAIL_ONCE` hooks (placed by Task 11 in `email`'s cache and `common`'s loader); `ZaSnapshot::thread_state(&self, server)` is async and takes the server (the store read of I5), a variation of the sheet's `thread_state(&self) -> u64`; `ingested_into_object(email, thread_id)` gains a parameter.
+- **D11.** **Candidate scan cost (plan's call).** The stream's candidate set is a linear scan of the thread records (≤ 30,000 at the design size, a few milliseconds); Task 19's benchmark measures a `/changes` call and a revision-indexed shortcut is deferred unless it shows.
+- **D12.** **`THREAD` in `mail::search` between Tasks 10 and 12** compares UID sets, not groupings; Task 12 tightens it.
+
+**Tasks 14–16**
+
+- **E1.** *Spec wording.* **The benchmark aside, the only wording the plan adds to 5.5 is the floor row.** 5.5 prunes "a revision-table row older than [the bound]"; after that, `R(X)` for a servable `X` between the bound and the next retained row has no row to resolve to, and a folded record's assignment `(target, r_folded)` would read as "not yet published" at such an `X`. The plan keeps the newest row below the bound (one row) so `R(X)` is defined at every servable state. No channel: the row count is public already (4.2). Jay may prefer the alternative, every folded record's revision set to the first retained row's revision, which keeps 5.5's wording but changes what `R(X)` means for those records; the plan takes the floor row.
+- **E2.** **The reindex reset is marker + unlink + clear, not a marker that persists.** 5.1/I6 say the reindex task "writes the index's destroying marker" so the next keyed request rebuilds, while 5.7 says a loader treats the marker as "no map" (so a rebuild cannot sneak in between destroy's marker and its range delete and leak blobs). Both hold only if the reindex path also clears field 152 after unlinking: the next keyed request then finds no manifest, which is loss (H11). The plan does that (`za_search_destroy(account_id, clear_field = true)`).
+- **E3.** **Cursor fields**: `next`/`end` for the rebuild cursor and `next_below` for the content cursor, because "last done" cannot express "nothing done" with document id 0 present.
+- **E4.** **The reconciliation's progress is the difference itself**: gap items are durable through the index (an indexed gap insert leaves the difference; a tombstoned gap delete likewise), so the marker carries only the bound and the pass recomputes the sets each time (4.2, I7); the retained records are then consumed from `first_retained` inclusively with `indexed_to` moving as usual, and the marker clears when the difference is empty and `indexed_to` has reached the cache's change id as read at that pass.
+- **E5.** **A compaction whose hidden section exceeds its allowance is refused as a defect**, traced, and the pass writes uncompacted (the next pass retries); by the injection it cannot happen, and `compact_tests` asserts the fit on R35's fixtures. The alternative, growing the pad to fit, would reopen the class channel.
+- **E6.** **Over the cap, no content merge runs on that node**: the chain is not extended (4.2), and a node that cannot load the content part under its cap does not perform the full merge; a node with a higher cap does.
+- **E7.** **The destroy step runs for every account** (one read of field 152 for an ordinary account, which has none): the marker written in the `None` case is what fences a rebuild that a concurrent provisioning could start; the range delete removes it.
+- **E8.** **The config overrides the tests need** are the one `set_search_config_override` of Task 2 (plan call D3), written in the cases as `search_config_guard!(field: value)`.
+- **E9.** **Restart is simulated**, not performed: the za suite runs one server, so `simulate_restart` evicts the account's search entry, its resident keys and its message cache, which is every in-memory state a restart would lose; `scanned_to`, the attempt count's in-memory part and the loaded index are all gone after it.
+
+**Tasks 17–19**
+
+- **F1.** **The IMAP variants `search` and `thread` are deleted, not mirrored.** A key account's IMAP session always holds keys, so no difference from upstream's body remains; the dispatch runs upstream's tests in both modes. `fetch` follows if its only difference was the refused `FROM` search (the implementer decides and reports); `store` keeps its training steps and loses its refused line.
+- **F2.** **`query_changes` in key mode makes a real merge where upstream rewrites the stored thread id.** Upstream's `Move` manipulates `MessageData.thread_id`, which a key account's renderer never reads (6.2, 6.3), so the variant imports a bridging reply instead and keeps upstream's bookkeeping; test 4's `thread_id_map` keeps the older thread's first message. The alternative, skipping the `Move` steps and leaving merge rendering to `mail::threads` (Task 13), is one line; the plan takes the real merge.
+- **F3.** **`can_stem` is `true` for key accounts** in the `query` and `search_snippet` variants: the content part is upstream's stemmed term set whatever the search store backs the ordinary accounts (7.5 parity by construction), so the stemming-dependent rows run on every backend.
+- **F4.** **Interface additions placed in the producing tasks**: `ManifestValue::decode_unverified(bytes)` (Task 5; destroy's keyless read of 5.7 needs it anyway); the test-mode configuration override of plan call D3 (`set_search_config_override` in Task 2, `search_config_guard` in Task 9), needed by Tasks 15, 18 and 19 to reach a compaction or a refusal in seconds; the helpers `za_index_current`, `imap_index_current` (Task 17, or an equivalent from Tasks 10 to 13), `za_search_thread_part`, `log_records_since`, `compaction_class` (Task 18), and `read_manifest`, `principal_blob_links` assumed from Task 8; `public_len(tombstones, rows)` (Task 5) for the G1 byte-exact assertion (or the constants `TOMBSTONE_LEN`, `REVISION_ROW_LEN` and the seal overhead exported, from which the test computes it).
+- **F5.** **The membership case and the oracle attempts live in a new `leak_search::test`** after `leak::test_mail`, not inside it: `test_mail` is already 300 lines and these cases need three accounts and a thousand-message delivery; the spec's "`leak::test_mail` gains the rules" is kept for the scan rules and the counts.
+- **F6.** **The differential corpus is `tests/resources/mailbox.gz` plus seventeen generated messages**, delivered to both accounts in one LMTP transaction so bytes and Message-IDs agree, compared by Message-ID rather than by document id. The `K` deviation is constructed exactly once (`K1`) and asserted as a difference; every other form must agree.
+- **F7.** **The system benchmark's networked-store figure** is measured only if a PostgreSQL store is available locally (Docker); otherwise it is recorded as pending for a later run, with the RocksDB figure and the raw point-read timing in its place.
+- **F8.** **A default of 4.4 changes only on Jay's decision**: Task 19 records a recommendation per knob and the controller puts it to him before the documentation steps, as spec 1.3 and 9.6 intend ("adjusts them before release").
+- **F9.** **The compaction-class case cannot observe folding or dropping directly**, so `leak_search::compaction_class` asserts the class alone; the resolution twins (bridge rule, dead-alias rule, one-hop fold) are Task 15's unit fixtures and mutations M50–M52.
+- **F10.** **No CI workflow change**: the new za modules run inside `za::za_tests`, the benchmarks are `#[ignore]`d, so `ci_steps.py`'s table is untouched; the gates scripts are run in Step 5 to confirm it.
+
+## Execution
+
+Subagent-driven development on a new branch `release7-search` cut from `za-search-design` (the spec at revision 18 and this plan committed there). Implementers: `opus` for Tasks 3, 4, 5, 6, 8, 11, 13, 14, 15 (the kernels: the model, the format, the cache, the pass, ids, changes, rebuild, compaction); `sonnet` for Tasks 1, 2, 7, 9, 10, 12, 16, 17, 18, 19. Reviewers: `opus` for every task; every finding reported with confidence and severity and filtered at adjudication (no severity filter in a reviewer brief). No Fable review during execution; Jay authorizes one at the PR stage. Briefs for Opus and Sonnet implementers carry a scope-discipline line ("deliver at the scope of the task; don't widen it") and never ask them to verify or double-check their work. Task 1's table goes to Jay before Task 3 starts (a checkpoint; Task 2 may run meanwhile). Ledger: `.superpowers/sdd/2026-11-07-zero-access-16-search/progress.md`. Commits: the plan gives each subject; the executing session adds a blank line and its trailer lines.
+
+## Global Constraints
+
+Commands:
+- Every cargo command starts with `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"`.
+- Product build: `cargo build --release -p stalwart --no-default-features --features rocks`. Never build with `enterprise`.
+- The http crate is `http@1.0.3` (`crates/http/Cargo.toml` version `1.0.3`): `cargo test -p http@1.0.3 --lib --bins --features test_mode,enterprise`; format it with `cargo fmt --manifest-path crates/http/Cargo.toml -- --check`.
+- Per-task compile check, shipping configuration; the build must succeed before the warning filter runs, so a failed build is never read as `clean`:
+  ```bash
+  log="${TMPDIR:-/tmp}/za-check.log"
+  cargo check -p stalwart --no-default-features --features rocks > "$log" 2>&1 || { tail -40 "$log"; echo BUILD FAILED; false; }
+  grep -E "^(warning|error)" -A3 "$log" | grep -E "crates/(store|common|email|jmap|imap|vault|services|types)/|crates/http/src/api/vault\.rs|crates/main/" || echo clean
+  ```
+  Upstream's known warnings elsewhere are not this plan's.
+- Test-mode compile check: `cargo check -p tests --tests`, with no warning in `tests/src/za/mail/{threads,index,differential}.rs`, `tests/src/za/search_bench.rs`, `tests/src/utils/za.rs` or a line this plan touched.
+- Unit tests, per crate (the features are those of CI's `UNIT_TEST_FEATURES`, `.github/workflows/test.yml:48-58`): `cargo test -p vault --features test_mode`; `cargo test -p store --lib --features test_mode za_search`; `cargo test -p common --lib --features test_mode za::search`; `cargo test -p email --lib --features test_mode,enterprise za::search`; `cargo test -p jmap --lib --features test_mode,enterprise za`; `cargo test -p imap --lib za`; `cargo test -p services --lib --features test_mode,enterprise za`; the http form above. If a crate's unit build needs a feature not listed here, use the one CI lists for it and say so in the task report.
+- Integration: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture`; at the end of Tasks 9, 13, 16 and 19 also with `BLOB_STORE=FileSystem`. Mail suites: the same prefix with `jmap::jmap_tests` and `imap::imap_tests`, plain and with `ZA_KEY_ACCOUNTS=1`. CalDAV (`webdav::webdav_tests`, both modes) runs in Task 19 only; this plan touches no calendar path. Upstream's `cal_itip` and `calendar::notification` sub-tests are timing-flaky: rerun once before calling a failure there a regression.
+- Benchmarks (ignored tests, run by name): `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::search_bench::format -- --exact --ignored --nocapture` (Task 1) and `za::search_bench::system` (Task 19). Each builds its own `TestServer` and deletes it.
+- One cargo command at a time; never while Jay's manual server is under test.
+- Formatting: `cargo fmt -p <crate> -- --check` for `store`, `common`, `email`, `jmap`, `imap`, `vault`, `services`, `types`, `tests`; the http form above.
+
+Spec values, verbatim (4.2, 4.4, 7.4, 8, 6.2):
+- `K = 16`, a constant of format version 1 (`SEARCH_FORMAT_V1 = 1`), not a knob; a change of `K` is a format bump and a rebuild (H22).
+- `R = RECORD_MAX = 304` bytes (the encoded maximum of a thread record at `K = 16`, framing included), `a = ALIAS_LEN = 15`, `t = TOMBSTONE_LEN = 12`, `REVISION_ROW_LEN = 12`; `reservation() = R + (K − 1) · a = 304 + 225 = 529`.
+- The hidden section of a publishing pass is never more than `H + R + (K − 1) · a` bytes and always pads to `M`; `padded_len(framed, M) = max(M, 2^ceil(log2 framed))` where `framed = p + 4`; a compacted hidden section pads to `compaction_allowance(N_records) = N_records · (R + a) + 4` framed, then the same rounding (decision 2 (c), R35).
+- The knobs (4.4), each read once at boot by the parse-and-fall-back convention (`KeyCacheConfig::from_env`, `crates/vault/src/cache.rs:41-53`) and logged beside the key cache's (`crates/common/src/manager/boot.rs:199-210`):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `ZA_SEARCH_MEM_MB` | 512 | process budget for loaded content parts, transients included |
+  | `ZA_SEARCH_THREAD_MEM_MB` | 256 | process budget for loaded thread parts, transients included (G6) |
+  | `ZA_SEARCH_ACCOUNT_MAX_MB` | 128 | largest content part a node loads or extends; at most a third of `ZA_SEARCH_MEM_MB` (G6) |
+  | `ZA_SEARCH_IDLE_SECS` | 900 | eviction after disuse |
+  | `ZA_SEARCH_PASS_CAP` | 48 | admitted items after which a pass stops at the next insert boundary (`C`); at most `H / (R + (K − 1) · a)` (H7) |
+  | `ZA_SEARCH_PASS_MB` | 32 | opened message bytes after which a pass stops at the next insert boundary |
+  | `ZA_SEARCH_PASS_HIDDEN_KB` | 32 | reserved hidden thread bytes after which a pass stops at the next insert boundary (`H`) |
+  | `ZA_SEARCH_PASS_MS` | 2000 | elapsed time after which a pass stops at the next insert boundary (G18) |
+  | `ZA_SEARCH_WAIT_SECS` | 30 | how long a content request completes passes before refusing |
+  | `ZA_SEARCH_SEGMENTS` | 16 | thread-blob count, and content-chain length, that trigger compaction |
+  | `ZA_SEARCH_CHECKPOINT` | 1000 | update-only records after which a pass writes a manifest-only checkpoint (G19) |
+  | `ZA_SEARCH_SKIP_AFTER` | 8 | aborted passes on one document after which it is skipped as loss (H5) |
+  | `ZA_SEARCH_ABSENT_RETRY_SECS` | 10 | how long a blob a committed manifest names may be reported absent before that is loss (H6) |
+  | `ZA_SEARCH_PAD_MIN` | 65536 | the smallest hidden-section class in bytes (`M`) |
+
+- The boot refusals, with `H = ZA_SEARCH_PASS_HIDDEN_KB · 1024`: `ZA_SEARCH_PAD_MIN < H + R + (K − 1) · a + 4` (at the defaults the bound is `32768 + 529 + 4 = 33301`); `ZA_SEARCH_PASS_CAP > floor(H / (R + (K − 1) · a))` (at the defaults `floor(32768 / 529) = 61`); `ZA_SEARCH_ACCOUNT_MAX_MB > floor(ZA_SEARCH_MEM_MB / 3)` (at the defaults `170`). `R` and `a` are the constants, never measured (R20).
+- Refusal texts: `ZA_MAIL_SEARCH_UNAVAILABLE = "Search for this account is not available right now; try again shortly."` (7.4, a content request only, in the three cases of 7.4), beside the unchanged keyless text `ZA_MAIL_SEARCH_REFUSED` (`crates/common/src/za/mod.rs:31`). On IMAP both are `NO [CANNOT]`; on JMAP `unsupportedFilter` / `unsupportedSort`. The no-map failure of 6.2 is `serverUnavailable` on JMAP and `NO [UNAVAILABLE]` on IMAP.
+- Trace strings (section 8 and 4.3), each a `pub const &str` in `crates/common/src/za/search/trace.rs`, carried as `Details` of an existing event in release 5's fixed-constant convention (`crates/common/src/za/imip.rs:22-38`), with ids, counts, change ids, revisions and reason classes and nothing else (invariant 54): `ZA_SEARCH_PASS = "zero-access: search pass"` (a pass committed: account id, inserts, tombstones, published, revision, `indexed_to`, content bytes written, bytes merged by a compaction); `ZA_SEARCH_SKIPPED = "zero-access: search message skipped"` (account id, document id, the loss class); `ZA_SEARCH_ABORTED = "zero-access: search pass aborted"` (account id, the transient class); `ZA_SEARCH_LOST = "zero-access: search manifest write lost"` (account id); `ZA_SEARCH_REBUILD = "zero-access: search rebuild"` (account id, which of rebuild, content-only rebuild or reconciliation, started or finished, the loss class, the cursor size, the epoch, and the unlink set's source, `inventory` or `scan`); `ZA_SEARCH_SUSPENDED = "zero-access: search content indexing suspended"` (account id, the chain's size); `ZA_SEARCH_UNAVAILABLE = "zero-access: search unavailable"` (account id, the reason class); `ZA_SEARCH_EVICTED = "zero-access: search index evicted"` (account id, idle, budget or invalidation); `ZA_SEARCH_UNRESOLVED = "zero-access: search leaf unresolved"` (account id, the leaf's kind as an enum, never its field name, G9); `ZA_SEARCH_OVER_BUDGET = "zero-access: search thread budget exceeded"` (account id, the budget and the loaded bytes).
+- Test hooks (`crates/common/src/za/test_hooks.rs`, test mode only, in the file's own style: a pause is a `Mutex<Option<Arc<Pause>>>` with `set_<name>_pause` and an awaited `<name>_pause_point(account_id)`; a one-shot is a `Mutex<Option<u32>>` with `set_<name>_once` and `take_<name>(account_id) -> bool`): `SEARCH_COMMIT_PAUSE`, `SEARCH_SWAP_PAUSE`, `SEARCH_SNAPSHOT_PAUSE`, `SEARCH_SWEEP_PAUSE`, `SEARCH_PASS_PAUSE`, `SEARCH_DESTROY_PAUSE` (pauses); `SEARCH_CACHE_HOLD`, `SEARCH_SWAP_SKIP`, `SEARCH_OPEN_FAIL_ALL` (flags: `Mutex<Option<u32>>`, `set_search_<name>(Option<u32>)`, read with `search_<name>(account_id) -> bool`, not taken), `SEARCH_HOLD_EXPIRE` (the account's holds expire at once), `SEARCH_BLOB_FAIL_ONCE`, `SEARCH_OPEN_FAIL_ONCE`, `SEARCH_MANIFEST_FAIL_ONCE`, `SEARCH_DESTROY_FAIL_ONCE` (one-shots), `SEARCH_BLOB_SLOW` (`Mutex<Option<(u32, u64)>>`: a delay in milliseconds before the account's blob put); the counters `za_search_blob_reads(account_id) -> u64`, `za_search_message_opens(account_id) -> u64`, `reset_za_search_counters(account_id)`. Each hook is cleared at the end of the step that set it. `SEARCH_CONFIG_OVERRIDE: Mutex<Option<ZaSearchConfig>>` with `set_search_config_override(Option<ZaSearchConfig>)`, read by `Server::za_search_config(&self) -> ZaSearchConfig` in test mode before the boot value (plan call D3; Task 9's `search_config_guard` wraps it). Traces are emitted through `za_search_trace!(CONSTANT, Key = value, ..)` in `trace.rs`, a macro over `trc::event!` on one fixed existing event type exported as `ZA_SEARCH_EVENT_TYPE: trc::EventType` so the suite can capture them (`Traced::start`).
+- The method table of 6.2 for a key account (decision 1): keys required for `Email/get`, `Email/query`, `Email/changes`, `Email/queryChanges`, `Email/import`, `Email/parse`, `Email/copy`, `Email/set` create, `Thread/get`, `Thread/changes`, `Mailbox/get`, `EmailSubmission/get`, `EmailSubmission/query`, `EmailSubmission/changes`, `EmailSubmission/set`, `Blob/lookup`, `Blob/get`, `Blob/upload`, `Blob/copy`, `SearchSnippet/get`; keyless for `Email/set` update and destroy (prefix unchecked, the fork looks the id up by document id), `Mailbox/query`, `Mailbox/changes`, `Mailbox/set`, `Identity/*`, `VacationResponse/*`, `PushSubscription/*`, `Core/echo`, EventSource and WebSocket push (`StateChange` carries no Email id).
+- Account names, unique across modules (the mail block's next free names are `keymail46` and `plainmail50`): Task 1 `search-bench` (its own server); Tasks 7–9 (`mail::index`, early cases) `keymail46`–`keymail49`, `plainmail50`–`plainmail51`; Tasks 10–13 (`mail::search` keeps its accounts; `mail::threads`) `keymail50`–`keymail57`, `plainmail52`–`plainmail55`; Tasks 14–16 (`mail::index`, later cases) `keymail58`–`keymail63`, `plainmail56`–`plainmail57`; Tasks 17–18 `keymail64`–`keymail68`, `plainmail58`–`plainmail59`; after this plan the next free names are `keymail69` and `plainmail60`. All at `example.com`. Task 16's destroy cases create and destroy `search-destroy-1` to `search-destroy-6` inside the task.
+
+Invariants and code rules (the mail spec's 24–32 hold with section 10's amendments; this release adds 48–56; every task restates the ones it touches):
+- 48: terms, positions, sort keys, threading fields, thread ids, thread history and revision table exist outside process memory only in blobs sealed under `swk`, bound to the account, the segment id, the kind and the predecessor; the manifest holds versions, revisions, change ids, segment ids, hashes, sizes and counts and nothing derived from content; the stored thread id, the `Thread` container and every change-log entry stay the document id; a publishing pass's hidden section always pads to `M` and its public section is a multiple of the tombstone count; a compacted hidden section pads to a function of public counts; only the time cap follows what the index found; `swk` leaves `SessionKeys` only as the zeroized copy in a manifest batch's object.
+- 49: the index is loaded, built and written only inside a request holding the account's own keys, on that request's task; no background task, delivery or keyless path reads or writes it; it is dropped on every invalidation that drops the keys and never swapped by the cache swap tier.
+- 50: the index is a deterministic function of the present mail and the log's records in order (after a loss, of the cursor's chronological order); `indexed_to` names a record, the last insert done in it and whether it is complete, resumed inclusively; everything advances in one asserted batch through `commit_batch`; a lost or failed batch leaves store, links and memory as the committed manifest describes; update-only passes write nothing; the order is chronological with a fixed reservation per admitted item; a logged deletion is always applied; a transient error never skips or rebuilds; no permanent link exists outside the committed manifest's reach except after a chain break the next rebuild or destroy finds by scan.
+- 51: every content leaf and sort of a key account's query is resolved from a current content part or the query is refused; never from the search store, never by decrypting and scanning, never from an index behind the request's view; results are merged, masked, ranked and paged by upstream's code.
+- 52: a thread id leaves the server only inside a keyed response, mapped from a map validated against the manifest's hash and identity version after the state was read, with the change counter at or past the newest publication and the epoch; every emitted Email id carries it, every supplied id is checked against it, and a thread change is rendered from the assignments, aliases and revision table over a pinned range read unfolded, existence from the raw records before the sealed record, the existing set always the message cache's; a request with no loadable or validated map fails; no thread-valued read waits for a pass's I/O.
+- 53: the pass's keyless writes are the manifest, the links and unlinks, and for every pass that indexed a message one Email item update and one Thread property change of the lowest indexed document id and a container property change of every mailbox; nothing for a pass that indexed none but a manifest-only checkpoint; the boundary batch is the same shape with the lowest message present, or the mailbox entries alone.
+- 54: traces carry account and document ids, counts, change ids, revisions and reason classes, never a term, header, Message-ID, sort key, query string or thread membership.
+- 55: destroy fences with the destroying marker carrying the replaced manifest's inventory, then unlinks what the inventory and its chain reach, or every principal-linked blob by scan when they cannot be read, before the Property range is removed; a manifest-creating batch asserts the vault record; the purge then holds nothing of the index.
+- 56: a deleted message's identity and an alias are retained, sealed, until their change id leaves the shorter of the Email and Thread logs; a rebuild allocates a fresh change id for its epoch and refuses every sync state below it whose method's log holds a record of the method's kind in `(S, epoch]`, never `Initial` or its continuations; a newer manifest format is never loss, and loss of a content blob alone never moves the epoch.
+- No stored struct changes layout: the index's blobs are the fork's own format (`SEARCH_FORMAT_V1`), exempt from the rkyv rule; the manifest is a new field, 152; `MessageData.thread_id` and the change log are untouched.
+- Non-key accounts take unchanged upstream code paths: every new branch is behind a key-account check, and the two shared helpers this plan extracts (Task 1's tokenization helper, Task 16's link walk) are called by upstream's code with upstream's arguments.
+- No settings, permissions or event variants are added (`crates/registry/src/schema/*` and `crates/trc/src/event/enums.rs` are generated); configuration is the `ZA_SEARCH_*` environment and tracing the fixed strings above.
+- Every source file starts with the SPDX header copied from a neighbour. Never open issues, pull requests or reports against upstream `stalwartlabs/stalwart`; an upstream bug found here goes in the outcome note, described without naming the private tracker.
+- Reviews: once Task 18's differential test passes, a later finding is in scope if it breaks invariants 48–56 (or an earlier one as amended) or shows the differential would pass on wrong behaviour; anything else is recorded as a residual or deferred in the outcome note.
+
+Tests:
+- New za modules `tests/src/za/mail/threads.rs`, `tests/src/za/mail/index.rs` and `tests/src/za/mail/differential.rs`, declared in `tests/src/za/mail/mod.rs` (`:50-59`) and run from `tests/src/za/mod.rs` after `mail::search::test` and before `mail::traces::test` (`:222-223`), in the order `threads`, `index`, `differential`; each `pub async fn test(test: &mut TestServer)` runs its cases as inner async fns named after the review tag they pin (`case_r21_checkpoint`), in the order its task lists. `tests/src/za/search_bench.rs` holds the two `#[ignore]`d benchmarks and is never called from `za_tests`.
+- Each module deletes what it creates except its key accounts, which the suite destroys at the end (`destroy_key_accounts`, `tests/src/za/mod.rs:229`); `assert_is_empty` then runs, with field 152 and the index's blobs exempt only while their account exists (Task 2).
+- Inbound mail goes over LMTP 11200 (`SmtpConnection::connect().await.ingest(from, &[to], message)`, `tests/src/utils/smtp.rs:37, 59`) or in process through `email_ingest` with `IngestSource::Smtp { .. }` as `mail::fence` calls it (`tests/src/za/mail/fence.rs:1631-1648`); a key account's message is sealed at delivery under its served public key, so every message in these modules is a stub plus a sealed blob (mail spec 5.1).
+- Helpers shared by several tasks live in `tests/src/utils/za.rs`, named in the task that first needs them and repeated in Interfaces where consumed; session keys for store-level reads come from `za_unlock(test, account_id, password) -> Arc<SessionKeys>` (`tests/src/utils/za.rs:408`).
+- Hooks are cleared at the end of the step that set them. An existing za assertion that fails only because a search is now served or an id is now mapped is adjusted with a comment citing the spec section and listed in the task report; any other failure is a regression.
+- `webdav_tests`, `imap_tests` and `jmap_tests` are run in both modes in Task 19; the key-mode variants change in Task 17.
+
+## Review Focus
+
+Five inputs the spec implies but its test catalogue does not name, most likely first; each has its test in the task that owns the code (the Case map's last rows).
+
+1. **A message with no `Date` header or an unparsable one.** A person sorting by date or searching `SENTSINCE` expects such a message where the ordinary account puts it, not dropped or first. Task 4 ranks `sent_at = None` as upstream's ingest stores a missing date (the implementer reads the fallback at `crates/email/src/message/ingest.rs:385-395` and mirrors it); Task 18's corpus carries two messages without a `Date` and one with `Date: yesterday`, and the differential asserts equal order and equal `SENT*` results.
+2. **A message whose term set exceeds upstream's 1 MiB document cap.** A newsletter or a log attachment must still be found by the terms upstream keeps, and the pass must not abort on it. Task 4's `s42_document_cap_is_upstreams` pins the truncation at unit level; Task 18's corpus carries a 1.2 MiB body and the differential asserts equal results for a word inside the kept prefix.
+3. **IMAP searches in a non-UTF-8 `CHARSET` and multi-key `SORT` with a reversed content key.** Desktop clients still send `CHARSET ISO-8859-1` literals and `SORT (REVERSE SUBJECT DATE)`; upstream decodes the charset before the filter tree is built, so the resolution must see the decoded term. Task 18 adds both forms to the differential.
+4. **An account invalidation between a pass's commit and its swap.** A password change on another connection drops the keys and evicts the loaded index while a pass is between step 3's commit and its swap; the swap must not put a stale or orphaned entry back, and the next request must load the committed manifest. Task 8's `case_invalidation_between_commit_and_swap` parks the pass at `SEARCH_SWAP_PAUSE`, evicts, and asserts the next load equals the store.
+5. **A message with no `Message-ID` and a whitespace-only `Subject`, and duplicate Message-IDs across imports.** Both are common in imported mail. Upstream threads a message with no references as a new thread and never uses it as a candidate; duplicates share a root. Task 3's `s61_empty_threading_fields_are_a_singleton_and_never_a_candidate` and `s41_duplicate_message_ids_share_the_root` pin the rules, and Task 18's corpus carries one such message.
+
+A sixth, folded into Task 9's `case_content_wait_budget`: a content search that times out under `ZA_SEARCH_WAIT_SECS` must leave the passes' progress in the store so that the next search needs less work, not more.
+
+## Case map
+
+Every test case the spec names (9.1 unit, 9.2 suite, 9.3 variants, 9.4 leak, 9.5 differential, 9.7 mutation) with the task that owns it and the test that pins it; the Review Focus cases are at the end.
+
+| Spec case (tag) | Task | Test |
+|---|---|---|
+| 9.6 first half: content part size with and without positions; per-record compression against one frame (G5's cost); the thread part's record size against `R` at `K = 16`; load (decompression) time; the pass's per-message rate with and without attachment text | 1 | `za::search_bench::format` (ignored; its table in the outcome note) |
+| 9.1: `swk` derivation is stable across a rewrap (3.1) | 2 | `vault::session::tests::session_keys_carry_the_search_key_and_it_survives_a_rewrap` |
+| 9.1: the configuration refuses `M` below the inequality (R20), and refuses a value `C · R` leaves no margin under | 2 | `common::za::search::config::tests::the_pad_minimum_must_cover_the_budget_the_overshoot_and_the_frame`, `the_pass_cap_must_bind_under_the_budget` |
+| 4.4: `ZA_SEARCH_ACCOUNT_MAX_MB` at most a third of `ZA_SEARCH_MEM_MB` (G6) | 2 | `the_account_cap_is_at_most_a_third_of_the_budget` |
+| 9.1: the environment variables parse and fall back | 2 | `defaults_when_unset_or_malformed`, `a_value_parses_with_surrounding_space`, `a_zero_is_malformed_where_zero_cannot_work` |
+| 9.1: the padding formula at framed lengths just below, at and above each class boundary, payloads of `M − 5`, `M − 4` and `2M` (F1, R15, R20, R21, G1), and the compaction allowance at equal counts (decision 2 (c)) | 2 | `store::za_search::tests::padding_rounds_to_a_class_above_the_minimum`, `the_compaction_allowance_is_a_function_of_the_record_count` |
+| 4.2: `R`, `a` derived from `K` and the record layout, not measured (R20) | 2 | `the_record_bound_and_the_reservation_are_the_specs`; Task 1's measured maximum ≤ 304 |
+| 8: traces carry fixed strings (invariant 54) | 2 | `common::za::search::trace::tests::every_search_trace_is_a_fixed_prefixed_string` |
+| 5.7: `assert_is_empty` exempts field 152 and the index's blobs while their account exists | 2 | the suite's end-of-run assertion from Task 8 on (`tests/src/utils/cleanup.rs`) |
+| The thread rules reproduce `find_thread_id` and `ThreadMerge::merge` on a fixture, merges included (9.1) | 3 | `s61_*`, `h10_survivor_is_the_thread_with_most_candidates_ties_lowest` |
+| The survivor is the thread with the most matching candidates, ties lowest (H10) | 3 | `h10_survivor_is_the_thread_with_most_candidates_ties_lowest` |
+| Duplicate Message-IDs share the root (5.1) | 3 | `s41_duplicate_message_ids_share_the_root` |
+| `K` references each naming a present message in a distinct thread write exactly `K − 1` aliases, and none can write more (R20) | 3 | `r20_k_references_in_k_distinct_threads_write_exactly_k_minus_one_aliases`, `r20_no_assignment_writes_more_than_k_minus_one_aliases` |
+| Insert followed by a deletion of the referenced message, in order vs deletion first (R16) | 3 | `r16_insert_then_delete_in_order_threads_as_upstream_did` |
+| Cursor fixture: chronological threads the control's way, newest-first fans in (R16, R20) | 3 | `r16_r20_cursor_chronological_order_threads_as_the_control` |
+| "The thread of `D` as of `X`" before, at, between and after two publications; first assignment from the singleton (R2, R5) | 3 | `r5_thread_of_d_as_of_x_before_at_between_and_after` |
+| The alias chain resolves thread and members across two merges and a deletion after `X` (R25) | 3 | `r25_members_of_t_as_of_x_across_two_merges_and_a_later_deletion`, `s63_exists_at_follows_creation_and_deletion_change_ids` |
+| A deleted message resolves through its retained record (R3, 6.3) | 3 | `s63_a_deleted_record_resolves_through_its_retained_record`, `r3_tombstone_keeps_identity_and_drops_fields` |
+| Folding an alias at compaction leaves every resolution unchanged; one hop (5.5, R35) | 3 (helper), 15 (the rule) | `s55_fold_alias_moves_one_hop_and_keeps_every_servable_resolution` |
+| Content record from `index_document`, parity by construction (4.1, 7.5) | 4 | `s41_term_bytes_are_upstreams_stored_document`, `s42_document_cap_is_upstreams` |
+| Per-record compression, nothing across records (G5) | 4, 5 | `g5_records_are_encoded_independently`, `g5_content_section_is_length_prefixed_records` |
+| Each `SearchFilter` leaf answered: `Text` Standard/Exact/Prefix, `KeyValue` (4.1, 7.1) | 4 | `s71_standard_text_matches_terms_and_stems`, `s71_groups_and_across_tokens`, `s71_exact_phrase_uses_positions`, `s71_prefix_matches_verbatim_short_terms_only`, `s71_key_value_equals_contains_exists` |
+| The phrase check agrees with `matches_phrase` and reduces to co-occurrence on `Language::None` fields (9.1) | 4 | `s71_exact_phrase_uses_positions`, `s71_phrase_on_a_language_none_field_is_co_occurrence` |
+| Resolution is exhaustive: an unresolvable leaf refuses, never widens (7.1, invariant 51) | 4 (the error), 10 (the refusal) | `s71_integer_leaf_is_unresolvable`, `s71_resolve_keeps_operators_and_replaces_leaves` |
+| Sort ranks as upstream's rule: pad to 40, sort, dense rank (7.1) | 4 | `s71_ranks_mirror_message_sort_ranks` |
+| The padding formula just below, at and above each class boundary, `M − 5`, `M − 4`, `2M` (F1, R15) | 5 | `r15_padded_len_at_class_boundaries` |
+| The maximal pass (`H` plus one grouped record with `K − 1` aliases each) stays under `M`; any tombstones, aliases or merges pad to `M` exactly (R20, R21, G1) | 5 | `r20_g1_maximal_pass_stays_under_m_and_every_pass_pads_to_m`, `r20_record_max_and_alias_len_are_the_encoded_maxima` |
+| A compaction over equal record and tombstone counts pads to the same class whatever merged (decision 2 (c), I2) | 5 (formula), 15 (the rule) | `i2_compaction_allowance_is_a_function_of_counts` |
+| The allowance carries the framing before rounding; a content over the allowance is a defect (R35) | 5 | `r35_allowance_exceeded_is_an_error` |
+| A blob sealed for one account, segment id, kind or predecessor does not open under another (3.1, 9.1) | 5 | `s31_a_section_opens_only_under_its_account_header_and_kind`, `s42_thread_blob_rejects_another_position` |
+| The thread blob's length is the class plus a known multiple of the tombstone count (4.2) | 5 | `r9_h13_thread_blob_parses_with_and_without_a_hidden_section`, `s42_public_section_is_fixed_width` |
+| A deletion-only pass's blob has no hidden section (H13) | 5 | `r9_h13_thread_blob_parses_with_and_without_a_hidden_section` |
+| A content chain node names its predecessor in its authenticated header (R11) | 5, 6 | `r11_content_blob_names_its_predecessor`, `r11_chain_is_walked_from_the_head_descriptor` |
+| A manifest with a bad tag is loss; a published and a rebuilt manifest reload with a verified tag computed at commit over the filled-in change id; an altered field fails it (H9, R33) | 5 | `h9_r33_tag_is_computed_at_commit_over_the_filled_change_id`, `h9_a_manifest_without_fill_keeps_its_change_ids` |
+| A newer manifest format is "no map", an older one loss (F7, 5.4) | 5, 6 | `f7_newer_format_is_no_map_older_is_loss`, `h11_f7_g12_manifest_outcomes` |
+| The manifest stays a few kilobytes at `ZA_SEARCH_SEGMENTS` thread blobs whatever the chain's length (R8) | 5 | `r8_manifest_stays_small_at_segments_entries` |
+| The destroying marker carries the inventory and is read without a key (G12, R19) | 5 | `g12_destroying_marker_and_inventory_decode_without_a_key` |
+| The codecs round-trip a populated index; the thread part loads without the content part (9.1) | 6 | `s43_round_trip_a_populated_index`, `r9_thread_load_fetches_no_content_blob` |
+| A content chain reloads from its head with nothing but the manifest's head descriptor (R11) | 6 | `r11_chain_is_walked_from_the_head_descriptor` |
+| An incremental reload of appended blobs and chain nodes, and a whole reload after a compaction, each end as a fresh load (F20) | 6 | `f20_incremental_reload_equals_a_fresh_load`, `f20_compaction_reloads_whole` |
+| The manifest-hash comparison reloads on a deletion-only change with an equal identity version (R18) | 6 | `r18_a_deletion_only_change_moves_the_hash_and_reloads` |
+| The identity version rejects a map of another epoch with an equal or lower revision (R2) | 6 (the value), 11 (the check) | `r2_identity_version_distinguishes_epochs` |
+| The error classes map a store timeout to abort and an absent stub to skip; absence is loss only past the window (F3, H5, H6) | 6 (classes), 7 (stubs) | `f3_h6_error_classes` |
+| A missing manifest is loss on any key account (H11) | 6 (class), 14 (rebuild) | `h11_f7_g12_manifest_outcomes` |
+| A load whose transient would exceed the budget evicts first; content parts before thread parts (F18, G6) | 6 | `f18_budget_counts_the_transient_and_evicts_idle_content_first` |
+| A thread-part load is never refused for budget alone (H8) | 6 | `h8_thread_parts_are_never_refused` |
+| Loads are single-flight per account (G6) | 6 | `g6_loads_are_single_flight` |
+| Eviction by idle and by invalidation (4.3) | 6 (unit), 8 (suite) | `s43_idle_sweep_and_invalidation_drop_entries` |
+| The index is never swapped (F16, invariant 49) | 6 | `f16_never_swapped_is_pinned_by_the_type` |
+| The record reader yields records whole with their change ids and reports truncation (9.1) | 7 | `records_are_whole_and_unfolded`, `the_truncation_marker_is_reported_and_the_lost_record_named` |
+| A partial record resumed inclusively; a marker in its place is loss (R29, unit) | 7 | `resume_is_inclusive_for_a_partial_record_and_exclusive_for_a_complete_one`, `the_truncation_marker_is_reported_and_the_lost_record_named` |
+| The `K` capture keeps In-Reply-To, then the last References first, before the sort (G10) | 7 | `the_capture_keeps_own_id_parent_then_nearest_references_before_any_sort`, `a_short_chain_keeps_everything_once_and_resent_last` |
+| The error classes map a store timeout to abort and an absent stub to skip (F3, unit) | 7 | `open_errors_are_classified` |
+| Two fixtures equal in public inputs stop at the same checkpoint (R21, unit) | 8 | `equal_public_inputs_stop_at_the_same_checkpoint_whatever_the_probe_merged` |
+| A record of more inserts than the cap is left part-way, the checkpoint naming the record and the last id (R20, R1, unit) | 8 | `a_record_larger_than_the_cap_is_left_part_way` |
+| A partial record resumed inclusively indexes its suffix and applies its deletions (R29) | 8 | `a_partial_record_finishes_then_applies_its_deletions` |
+| The witness is a function of the indexed set's ids alone (R4, unit) | 8 | `the_witness_is_the_lowest_indexed_id_whatever_threaded` |
+| A logged deletion is applied whatever a presence snapshot says (R17) | 8 | `a_logged_deletion_is_applied_unconditionally` |
+| A consumed insert or deletion that staged nothing checkpoints; update-only is a no-op; cursor movement is durable (R22, R26, F4, G19, unit) | 8 | `the_decision_follows_what_changed` |
+| Transient failures of one document reach `ZA_SEARCH_SKIP_AFTER` through the checkpointed count (R34, H5, unit) | 8 | `a_transient_open_aborts_with_the_attempt_count` |
+| The cursor precedes the shortcut and the log (R10, unit form) | 8 | `cursor_items_come_first_and_take_the_epoch_as_creation` |
+| The time cap stops at an insert boundary (G18, unit) | 8 | `the_time_cap_stops_at_an_insert_boundary_with_at_least_one_item` |
+| The manifest is created at setup and no account without mail ever rebuilds (9.2) | 8 | `case_setup_manifest` |
+| Persistence: a second session serves without opening a message blob; a thread-only load reads no content blob (R9) | 8 | `case_persistence_and_thread_only_load` |
+| Catch-up after offline deliveries (9.2) | 8 | `case_catch_up_after_offline_deliveries` |
+| The publishing pass's keyless writes are exactly one item update of the lowest indexed id, one Thread property change and every mailbox's container update (R4, 9.2; the bridge form is Task 18's) | 8 | `case_catch_up_after_offline_deliveries` |
+| The pass caps crossed inside a grouped ingest's record with a restart between passes, every message indexed once (R1) | 8 | `case_multiappend_split_record_with_restart` |
+| A hundred flag changes write no blob and no manifest; `scanned_to` keeps the shortcut cheap (F4) | 8 | `case_flag_changes_write_nothing` |
+| Ten thousand flag changes write manifest-only checkpoints and never force a reconciliation (G19; 25 at a lowered threshold) | 8 | `case_update_only_checkpoints` |
+| An unreadable logged insert checkpointed once, never reopened, the other mail indexed (R26) | 8 | `case_unreadable_insert_is_consumed_once` |
+| A blob store that times out once aborts the pass with no index write, its attempt count checkpointed, and the next pass indexes (F3, R34) | 8 | `case_transient_blob_error_aborts_then_indexes` |
+| A lost manifest assertion discards the loser's staging and serves the winner's (5.6) | 8 | `case_lost_assertion` |
+| A compacted content blob staged to a slow store outlives the wait budget and is never purged (G15; the pass's blob form) | 8 | `case_slow_store_hold_outlives_the_wait` |
+| A deletion-only pass writes no entry (R13; the rendering half is Task 13's) | 8 | `case_deletion_only_pass_writes_no_entry` |
+| A repeated delta changes nothing (9.2) | 8 | `case_repeated_delta_changes_nothing` |
+| A skipped message is absent from results and traced with ids only (9.2; the results half is Task 10's) | 8 | `case_unreadable_insert_is_consumed_once` |
+| The pass runs before every keyed mail request, not on IDLE, NOOP, LOGOUT, POP3 or a keyless request; a keyed write runs one after its commit (5.2, 5.3, H20) | 9 | `case_triggers` |
+| A flag update and a `Mailbox/get` answered while a pass is paused on its blob I/O; a request finding the pass running does not wait (F5) | 9 | `case_reads_do_not_wait_for_a_pass` |
+| The wait budget (hook `SEARCH_PASS_PAUSE`) (9.2) | 9 | `case_content_wait_budget` |
+| A pass that opens attachment-heavy mail stops at the time cap and the triggering command returns within it (G18) | 9 | `case_time_cap_bounds_the_command` |
+| Non-key accounts take unchanged upstream paths (CLAUDE.md invariant) | 9 | `case_plain_control_unaffected` |
+| 9.2 `search.rs` turns around: refused tables served, keyless cases kept, `nested_search_refused` stays | 10 | `mail::search::imap_served_content_keys`, `jmap_served_content_filters_and_sorts`, `keyless_search_refused`, `nested_search_refused` |
+| 7.4 the unavailable text under a paused pass past the budget; a mixed served and refused key refused whole | 10 | `mail::search::unavailable_refusal` |
+| 7.1 an unresolved leaf refuses, never widens (invariant 51; mutation: exhaustive resolution) | 10 | `an_unresolvable_leaf_refuses_instead_of_widening` |
+| 7.1, 7.2 `sentBefore`/`sentAfter`, `SENTBEFORE/ON/SINCE`, `hasAttachment`, `KEYWORD $HasAttachment` from the index | 10 | `sent_and_attachment_conditions_read_the_index_not_the_cache`, `senton_is_a_day_window_over_the_index` |
+| 7.1 `from`/`to`/`subject`/`sentAt` sorts as dense ranks | 10 | `sort_comparators_are_dense_ranks_over_the_result_set` |
+| 7.4 "current" against the response's `E` (G14) | 10 | `current_means_scanned_past_the_end_with_content_at_indexed_to` |
+| 9.2 `key.terms == 0`, `documents_are_ids_only()` (invariant 27) | 10 | `mail::search::visible_field_document` (unchanged) |
+| 9.1 the state check rejects a counter below the newest row and passes an empty account (F2, G3) | 11 | `the_counter_check_rejects_a_cache_below_the_newest_row_and_passes_an_empty_account` |
+| 9.2 the cross-node case (R2) | 11 | `mail::threads::case_r2_cross_node` |
+| 9.2 the stale-state case (F2) | 11 | `mail::threads::case_f2_stale_state` |
+| 9.2 a stale prefix `notFound` on `Email/get`, served on a keyless `Email/set` update and destroy (G20) | 11 | `mail::threads::case_g20_stale_prefix`, `check_id_accepts_the_current_prefix_only` |
+| 9.2 a keyless token refused on every gated method, served on every keyless one (F8; the Bearer form) | 11 | `mail::threads::case_f8_keyless_table` |
+| 9.2 a FETCH after a keyed APPEND carries the final `EMAILID`; `Email/set` create's response the mapped id (H21) | 11 | `mail::threads::case_h21_final_ids_after_keyed_writes` |
+| 9.2 a failed manifest read fails the thread-valued methods and never emits a singleton (R2, R3) | 11 | `mail::threads::case_failed_manifest_read` |
+| 6.2 a thread-valued read intersects the map with the cache's present set (R14) | 11 | `thread_members_intersect_the_present_set` |
+| 6.2 `EmailSubmission/get` returns the current `threadId` (G22) | 11 | `mail::threads::case_h21_final_ids_after_keyed_writes` (its submission step) |
+| 9.2 the same conversation gives the same `Thread/get` groupings, `collapseThreads` results, IMAP `THREAD` | 12 | `mail::threads::case_conversation_parity` |
+| 9.2 a reply delivered while no keyed request runs is a singleton until the next keyed request | 12 | `mail::threads::case_singleton_until_keyed_request` |
+| 9.2 `Mailbox/get` thread counts match the control (G7) | 12 | `mail::threads::case_g7_mailbox_counts`, `counts_and_keyword_threads_group_by_the_map` |
+| 9.2 more than `K` references thread through the nearest; the `K` deviation pinned (F1, 7.5) | 12 | `mail::threads::case_f1_k_bound` |
+| 9.1 the stream over a history and a revision table gives upstream's pairs for states before, at, between and after two publications (R2, R5) | 13 | `a_first_assignment_from_the_singleton_renders_destroyed_then_created`, `two_merges_render_from_each_state` |
+| 9.1 a deleted message's old mapped id (R3) | 13 | `a_deleted_members_old_mapped_id_is_destroyed` |
+| 9.1 created and deleted within the range yields nothing (R14) | 13 | `created_and_deleted_within_the_range_yields_nothing` |
+| 9.1 a deletion the record lacks but the range shows renders destroyed exactly once (R14, F10) | 13 | `a_deletion_the_record_lacks_but_the_range_shows_is_destroyed_once` |
+| 9.1 a deletion between a pass's log read and its commit renders nothing at a state that saw it (H2) | 13 | `a_lagging_record_never_decides_presence_at_a_pinned_end` |
+| 9.1 a deletion logged but not consumed, then a publication, then `/changes` from the state that saw it emits nothing (I3) | 13 | `an_unconsumed_deletion_before_s_emits_nothing` |
+| 9.1 paging reproduces every item once with a publication and a deletion between pages (R12) | 13 | `paging_with_a_small_max_changes_covers_the_stream_once`, `mail::threads::case_r12_pages` |
+| 9.1 the epoch rule serves below the epoch with no record in `(S, epoch]`, refuses with one, the boundary's entries included, never `from = 0` (R27, H1) | 13 | `the_epoch_refuses_only_when_the_methods_log_holds_a_record_in_s_epoch` |
+| 9.1 `Initial` paged with `maxChanges = 1` over pre-existing updated messages equals its unpaged result (R28) | 13 | `the_initial_stream_is_every_present_document_in_id_order`, `mail::threads::case_r28_r31_initial` |
+| 9.1 the alias chain resolves "the members of `T` as of `X`" across a deletion after `X` (R25, F14) | 13 | `thread_members_at_a_pinned_end_count_a_member_deleted_after_it` |
+| 9.2 a merge renders in `Email/changes`, `Thread/changes` and `queryChanges` with `collapseThreads` as the control's | 13 | `mail::threads::case_merge_rendering_parity` |
+| 9.2 two successive merges from states before, at, between and after (R5) | 13 | `mail::threads::case_r5_two_merges` |
+| 9.2 the backlog case (R2) | 13 | `mail::threads::case_r2_backlog` |
+| 9.2 pages of a large merge with a tiny `maxChanges`, a merge and a deletion between pages (R12) | 13 | `mail::threads::case_r12_pages` |
+| 9.2 created, indexed and deleted within one range, with pages and a publication between; the insert reached and the deletion behind the cap (R14, F10) | 13 | `mail::threads::case_r14_f10_created_and_deleted` |
+| 9.2 the backlog deletion, `T\|D` destroyed exactly once (R14) | 13 | `mail::threads::case_r14_backlog_deletion` |
+| 9.2 the ordering case and its cap variant (R16) | 13 | `mail::threads::case_r16_ordering` |
+| 9.2 a deletion-only pass writes no entry and renders the deletion, the last message included (R13) | 13 | `mail::threads::case_r13_deletion_only` |
+| 9.2 `Initial` and `Exact(0)` paged equal unpaged, after a reload and after a truncation between pages, where the control refuses (R28, R31) | 13 | `mail::threads::case_r28_r31_initial` |
+| 9.2 a pinned `Thread/changes` page across a last-member deletion and a later merge (R25) | 13 | `mail::threads::case_r25_pinned_thread_page` |
+| 9.2 `Thread/changes` from a state the Thread log retains but the Email log does not is refused (G4) | 13 | `mail::threads::case_g4_two_bounds` |
+| 9.2 an empty account on a warm cache with a trailing container-only record serves every `Email/*` method (G3) | 13 | `mail::threads::case_g3_empty_account` |
+| 9.2 `Mailbox/changes` reports every mailbox's counts as `updatedProperties` only; `CHANGEDSINCE` silent on the reassigned message; the witness `FETCH (FLAGS ...)` with an unchanged MODSEQ (G7, R6, F15, pinned) | 13 | `mail::threads::case_g7_r6_f15_pinned` |
+| A rebuild from a deleted blob, a deleted manifest and an older format moves the epoch past the latest issued state; `cannotCalculateChanges`; a resynced client works; a second loss gives a distinct boundary (R3, 9.2 index) | 14 | `mail::index::case_r3_rebuild_moves_the_epoch` |
+| A manifest of a newer format gives "no map" and the unavailable refusal, no rebuild (F7) | 14 | `mail::index::case_f7_newer_format_is_no_map` |
+| A rebuild of several passes with a restart between passes finishes its cursor (R10) | 14 | `mail::index::case_r10_cursor_finishes_across_restarts` |
+| A cursor whose every remaining item vanished finishes through a manifest-only checkpoint, after eviction and restart, no blob, no log entry (R22) | 14 | `mail::index::case_r22_vanished_cursor_checkpoints` |
+| A missing manifest on an empty account gets one and never rebuilds again (H11; 9.2 "the manifest is created at setup and no account without mail ever rebuilds") | 14 | `mail::index::case_h11_missing_manifest_on_an_empty_account` |
+| Loss of a content blob is a content-only rebuild, identities unchanged (H23) | 14 | `mail::index::case_h23_content_loss_is_content_only` |
+| Over the cap: threads served, searches refused, chain not extended; a raised cap takes a content-only rebuild that backfills, refusing until `content_to` catches up, identities unchanged (F6, R23) | 14 | `mail::index::case_f6_r23_over_the_cap_then_raised` |
+| A reconciliation after a truncated log renders nothing a client saw (F9); a truncation during a pending rebuild (F9) | 14 | `mail::index::case_f9_reconciliation_renders_nothing_seen`, `case_f9_truncation_during_a_pending_rebuild` |
+| A reconciliation whose difference includes a deletion still in the retained log renders the destroyed mapped id exactly once (R24, G2) | 14 | `mail::index::case_r24_g2_retained_deletion_rendered_once` |
+| A loss after the last message was deleted: fresh resyncs round-trip empty, pre-loss states served when nothing of the kind was lost (R27) | 14 | `mail::index::case_r27_empty_rebuild_keeps_clients` |
+| A loss on an account whose messages were all deleted while a client holds their mapped ids refuses that client's state (G3) | 14 | `mail::index::case_g3_loss_with_all_deleted_refuses_holders` |
+| A node whose loaded map is of the previous epoch reloads or fails, never serves the old map (R2) | 14 | `mail::index::case_r2_old_epoch_map_never_served` |
+| The rebuild form of the ordering case, `D` deleted through POP3 and `N2` mid-rebuild, grouped as the control, no alias count above `K − 1`; its residual pinned (R16, R20, 7.5) | 14 | `mail::threads::case_r16_r20_rebuild_form` |
+| Reconciliation order fixtures: a gap insert threads with a gap-deleted message (H3); a retained insert does not (I1) | 14 | `rebuild::tests::reconciliation_h3_gap_insert_threads_with_gap_deleted`, `reconciliation_i1_retained_insert_does_not_see_gap_deleted` |
+| Compaction over equal-count fixtures pads to the same class; race-deleted records stay until their publication's row is pruned (decision 2 (c), I2) | 15 | `thread::compact_tests::equal_counts_equal_class`, `bridge_rule_keeps_a_deleted_bridge` |
+| R35's timelines: dead aliases drop, records fit, resolution unchanged at every servable state | 15 | `compact_tests::r35_three_roots_one_bridge`, `r35_128_families_of_fifteen_roots` |
+| A chain of three merges with the middle roots pruned keeps the aliases surviving records use; a folded alias moves one hop and renders the pre-merge thread before the next alias (R35) | 15 | `compact_tests::chain_keeps_the_aliases_surviving_records_use`, `fold_is_one_hop`, `two_expired_hops_fold_in_order` |
+| Folding an alias leaves every resolution unchanged (5.5) | 15 | `compact_tests::chain_keeps_the_aliases_surviving_records_use` (the resolution loop) |
+| The bridge rule without the dead-alias rule fails R35's fit; the dead-alias rule without the bridge rule fails the chain's resolution; a fold to the chain's end fails the pre-merge rendering (9.4 mutations) | 15 | `compact_tests::dead_alias_rule_needs_the_bridge_rule`, `fold_is_one_hop` |
+| Thread compaction by a node holding no content, the manifest bounded, the chain growing (R8) | 15 | `mail::index::case_r8_thread_compaction_bounds_the_manifest` |
+| Content compaction leaves one blob, old blobs unlinked and purged | 15 | `mail::index::case_content_compaction_leaves_one_blob` |
+| Tiered merges during a rebuild: bytes rewritten against `⌈log_S n⌉`, chain length against `(S − 1)·⌈log_S n⌉ + 1`, the full merge after the cursor (G17, H7, R32) | 15 | `mail::index::case_g17_h7_r32_tiered_merges_during_a_rebuild`, `compact::tests::chain_bound_holds` |
+| A deleted merged message, a thread compaction and a reload, then changes from a retained pre-delete state rendering the destroyed mapped id (R3, 9.2 threads) | 15 | `mail::threads::case_r3_deleted_merged_message_after_compaction` |
+| The stale-snapshot deletion: tombstone persisted, after retention and compaction the record and content gone (R17) | 15 | `mail::index::case_r17_tombstone_gone_after_retention` |
+| The amplified-merge probe: hidden class the same, one alias (R21, 9.2 threads) | 15 | `mail::threads::case_r21_amplified_merge_probe_class` |
+| Every link and manifest transition interrupted, then restart, destroy, purge: no blob or link survives (R7) | 16 | `mail::index::case_r7_interrupted_transitions_leave_nothing` |
+| A middle content blob deleted, a rebuild, a destroy, a purge: no older blob or link survives (R7) | 16 | `mail::index::case_r7_middle_node_break` |
+| A destroy with an unparseable manifest, and one of a pre-release account without a manifest, take the scan and leave nothing (F23) | 16 | `mail::index::case_f23_unparseable_manifest`, `case_f23_pre_release_account_without_a_manifest` |
+| A keyed pass paused after staging while destroy writes its marker, resumed, loses its assertion; the purge leaves nothing (R19) | 16 | `mail::index::case_r19_paused_pass_loses_to_the_marker` |
+| A destroy that dies after writing the marker retries from the marker's inventory and leaves nothing (G12) | 16 | `mail::index::case_g12_destroy_dies_after_the_marker` |
+| A codec key rotation recodes the index's blobs (4.2, 9.4) | 16 | `mail::index::case_blob_recode_recodes_the_index`, `index_task::test_blob_recode_keeps_sealed` |
+| Upstream's per-account reindex task on a key account writes the marker and the next keyed request rebuilds, after a blob store that answered "not found" for every key had skipped the backlog (I6) | 16 | `mail::index::case_i6_reindex_resets_the_index` |
+| A manifest recreated after destroy by a batch asserting `None` (R19, second form): the creating batch asserts the vault record | 14 (rule), 16 (pinned) | `rebuild.rs` step 3 of the first batch; `mail::index::case_r19_paused_pass_loses_to_the_marker` (the rebuild variant: start the parked request's rebuild instead of a pass) |
+| The suite's destroy-then-purge-then-assert order verifies nothing remains (5.7) | 16 | `tests/src/za/mod.rs` end, `assert_is_empty` |
+| 9.3: `query` variant asserts upstream's outcomes with a keyed pass in place of the queue wait, plus the keyless refusal | 17 | `jmap::za_variants::query` (calls `mail::query::query` and `query_options`; `keyless_query_refused`) |
+| 9.3: `search_snippet` variant, upstream's snippets | 17 | `jmap::za_variants::search_snippet` (mirrors `search_snippet.rs:54-170`) |
+| 9.3: `query_changes` variant, upstream's five queries, `from` served, a real merge in place of the stored-id rewrite | 17 | `jmap::za_variants::query_changes` |
+| 9.3: `thread_get` variant, one thread of five | 17 | `jmap::za_variants::thread_get` |
+| 9.3: `thread_merge` variant, upstream's grouping on its corpora (6.1's superset pinned) | 17 | `jmap::za_variants::thread_merge` |
+| 9.3: IMAP `search` and `thread` assert upstream's outcomes | 17 | `imap::search::test` and `imap::thread::test` in key mode (variants deleted) |
+| 9.3: `websocket.rs` and `mail::gates` gain the keyless cases of 6.2's table: gated methods refused, keyless served, `StateChange` still arrives (F8, decision 1) | 17 | `mail::gates::keyless_tokens_hit_the_dispatcher_gate`; `websocket::keyless_socket_after_setup` |
+| 9.4: every principal-linked blob is a sealed index blob (format byte, kind, no canary) | 18 | `leak::scan` rule; `leak::test_mail` (`index_blobs >= 1`, the planted-blob control) |
+| 9.4: field 152 holds no canary and parses as a manifest | 18 | `leak::scan` rule; `leak::test_mail` (`manifests == 1`, the planted-field control) |
+| 9.4: no `Threading` key, no term, ids-only documents (invariant 27) | 18 | `leak::scan` (existing rules), `mail::search::visible_field_document` kept (Task 10) |
+| 9.4: a publishing pass's log holds one item update of the lowest indexed id, one Thread property change and every mailbox's container update, nothing for any other message (R4) | 18 | `leak::test_mail` log check; `leak_search::membership` |
+| 9.4: after destroy and purge no blob and no permanent link remains | 18 | `za_tests`' end (`destroy_key_accounts`, `leak::purge_blobs`, `assert_is_empty`) |
+| 9.4: the visible canaries searched in every blob and the manifest, with the plain account's blob-less state and a planted plaintext blob as negative control | 18 | `leak::scan`; `leak::test_mail` (`plainmail59` controls) |
+| 9.4: the membership review case: two multi-message threads, a bridge with lower-id losing members, every keyless write enumerated, the writes, manifest and class equal to a bridge that merged nothing (R4, F1) | 18 | `leak_search::membership` (`keymail65` vs `keymail66`) |
+| 9.4: the oracle attempt F1, a filler with a thousand references beside a probe, hidden class `M` | 18 | `leak_search::f1_filler_references` |
+| 9.4: the oracle attempt G1, a thousand junk messages expunged beside a probe, public length exactly the tombstone multiple | 18 | `leak_search::g1_junk_expunged` |
+| 9.4: the oracle attempt R21, two helper cohorts with a bridge, class `M` and one alias | 18 | `leak_search::r21_cohorts` |
+| 9.4: a compaction after padding to a class boundary, the class equal to the public-count formula with and without the probe's merge (decision 2 (c)) | 18 | `leak_search::compaction_class_is_public_counts` (`keymail67` vs `keymail66`) |
+| 9.4: a pad by content length must fail the equal-counts fixtures | 19 | mutation M29/M42 against `leak_search::compaction_class` and the unit class tests |
+| 9.4: the bridge rule without the dead-alias rule must fail R35's fit | 19 | mutation M51 |
+| 9.4: the dead-alias rule without the bridge rule must fail the chain fixture's resolution | 19 | mutation M50 |
+| 9.4: a fold to the end of the chain must fail the pre-merge rendering | 19 | mutation M52 |
+| G5: a chosen neighbour sharing a target's vocabulary does not shrink the content blob (9.7 M41) | 18 | `mail::differential::case_g5` |
+| 9.5: the differential test, every IMAP SEARCH and SORT form of `search.rs`'s tables, every JMAP filter, sort and `collapseThreads` combination of the `query` variant, `SearchSnippet/get` on each result, equal through the map except the pinned `K` deviation | 18 | `mail::differential::test` |
+| 9.6: the pass rate with and without attachment text | 19 | `search_bench::system`, row 1 |
+| 9.6: the compaction times | 19 | `search_bench::system`, rows 2 and 3 |
+| 9.6: the cost of the validation read per request on RocksDB and on a networked store | 19 | `search_bench::system`, row 4 (networked: measured or pending) |
+| 9.6: the cost of the mailbox property changes per publishing pass | 19 | `search_bench::system`, row 5 |
+| 9.6: the first-search latency after an absence of one day's volume | 19 | `search_bench::system`, row 6 |
+| 9.6: a design-size rebuild end to end: about 625 passes, the compactions, the rewritten bytes against `⌈log_S n⌉`, the refusals before the first success, the wall time (H7, R32) | 19 | `search_bench::system`, row 7 |
+| 9.6: the figures confirm or adjust 4.4's defaults, `M` against `C · R` among them | 1, 19 | `search_bench::format` (Task 1) and the **Defaults** section of the outcome note |
+| 9.7: every listed site | 19 | Step 2's table M1–M52, one row per site, each naming the mutant and the catcher |
+| Review Focus 1: a message with no `Date` or an unparsable one sorts and filters as the control's | 4, 18 | `SortField::SentAt`'s `None` rule; `mail::differential::test` (the no-`Date` and `Date: yesterday` messages) |
+| Review Focus 2: a term set above `MAX_DOCUMENT_SIZE` is truncated as upstream's and indexed without an abort | 4, 18 | `s42_document_cap_is_upstreams`; `mail::differential::test` (the 1.2 MiB body) |
+| Review Focus 3: `SEARCH CHARSET ISO-8859-1` and `SORT (REVERSE SUBJECT DATE)` equal the control's | 18 | `mail::differential::test` (the two IMAP forms) |
+| Review Focus 4: an account invalidation between a pass's commit and its swap leaves no stale entry | 8 | `mail::index::case_invalidation_between_commit_and_swap` |
+| Review Focus 5: no `Message-ID` and a whitespace subject is a singleton and never a candidate; duplicates share a root | 3, 18 | `s61_empty_threading_fields_are_a_singleton_and_never_a_candidate`, `s41_duplicate_message_ids_share_the_root`; `mail::differential::test` |
+| Review Focus 6: a content search that times out leaves the passes' progress in the store | 9 | `mail::index::case_content_wait_budget` (its last assertion) |
+
+---
+
+### Task 1: Format benchmark
+
+**Files:**
+- Create: `tests/src/za/search_bench.rs`
+- Modify: `tests/src/za/mod.rs:16-51` (`pub mod search_bench;` in the module list; nothing added to `za_tests`)
+- Modify: `crates/store/src/search/mod.rs:176-184` (`IndexDocument::za_bench_term_bytes`, test mode) and `crates/store/src/search/term.rs:276` (the tokenization of `build_batch` lifted into a private helper both call)
+- Create: `docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md` (the note's header and `## Format benchmark (Task 1)`)
+- Test: the `#[ignore]`d `za::search_bench::format`; `crates/store/src/search/index_za_tests.rs` (the accessor's unit test)
+
+**Interfaces:**
+- Consumes: `TestServerBuilder::new(name).await.with_default_listeners().await.build().await` (`tests/src/za/cache_swap.rs:189-196`); `create_key_user_account` (`tests/src/utils/account.rs:183`) and `za_setup_token`/`za_setup` (`tests/src/utils/za.rs:277, 284`); `Server::email_ingest(IngestEmail { raw_message, message, blob_hash: None, access_token, mailbox_ids: vec![INBOX_ID], keywords: vec![], received_at: None, source: IngestSource::Smtp { deliver_to, envelope_from, sender_authentication: SenderAuthentication::DmarcPass, is_spam: false }, metadata: None, session_id: 0 })` (`tests/src/za/mail/fence.rs:1631-1648`); `za_unlock(&test, account_id, password) -> Arc<SessionKeys>` (`tests/src/utils/za.rs:408`); `ZaMailView::za_open_metadata_row(&self, stored: &MetadataRow, keys: Option<&SessionKeys>, account_id, document_id) -> trc::Result<Option<MetadataRow>>` and `za_open_message_blob(&self, stored_is_stub: bool, keys, account_id, document_id, bytes: Vec<u8>) -> Zeroizing<Vec<u8>>` (`crates/email/src/message/za/view.rs:95-118`; the stored row and the blob read as `leak::test_mail` reads a key account's message, `tests/src/za/leak.rs`, with `za_open_stub_row` at `view.rs:364`); `MetadataRow::index_document(account_id, document_id, &headers, blob, index_fields, default_language, &extract_limits) -> IndexDocument` (`crates/email/src/message/index/search.rs:43-52`) called as `email_document` calls it (`crates/services/src/index_queue/document.rs:81-102`: `core.email.index_fields.get(&SearchIndex::Email)`, `row.raw_headers()`, `row.unarchive()`, `core.email.default_language`, `core.email.extract_limits`); `MessageSortKeys::from_envelope(EnvelopeView)` (`crates/email/src/message/sortkeys.rs:471`); `za_has_attachment(&ArchivedMessageMetadata)` (`view.rs:411`); `ThreadFields::scan(&Message)` (`crates/email/src/message/thread.rs:30-64`, `message_ids: Vec<u128>` sorted and deduped); `store::write::compress::compress(dictionary: Option<Dictionary>, input: &[u8], trailer_len: usize) -> io::Result<Vec<u8>>` and `decompress_into` (`crates/store/src/write/compress.rs:145`, `Dictionary::{Email, Term}` at `:13-19`); `mail_builder::MessageBuilder` (`tests/Cargo.toml:53`).
+- Produces: `#[cfg(feature = "test_mode")] impl IndexDocument { pub fn za_bench_term_bytes(&self, positions: bool) -> Vec<u8> }`; the outcome note's table under `## Format benchmark (Task 1)` with the three decisions Tasks 4 and 5 read: **positions** (kept or dropped), **dictionary** (upstream's `Dictionary::Term`, confirmed, with the measured ratios), **defaults** (4.4 confirmed, or the adjusted values).
+
+- [ ] **Step 1: Write the accessor's failing unit test**
+
+In `crates/store/src/search/index_za_tests.rs` (the file exists; add beside its tests):
+
+```rust
+#[test]
+fn za_bench_term_bytes_counts_positions() {
+    let mut document = IndexDocument::new(SearchIndex::Email)
+        .with_account_id(1)
+        .with_document_id(7);
+    document.index_text(EmailSearchField::Subject, "quarterly budget review", Language::English);
+    document.index_text(EmailSearchField::Body, "the budget review is on thursday the review is long", Language::English);
+    let with = document.za_bench_term_bytes(true);
+    let without = document.za_bench_term_bytes(false);
+    assert!(!without.is_empty());
+    assert!(with.len() > without.len(), "positions add bytes: {} vs {}", with.len(), without.len());
+}
+```
+
+Use the field-setting methods `IndexDocument` actually exposes (read `crates/store/src/search/document.rs` for the text and key-value setters) and adjust the two `index_text` lines to them; the assertions stay.
+
+- [ ] **Step 2: Run the test and see it fail**
+
+Run: `cargo test -p store --lib --features test_mode za_bench_term_bytes_counts_positions`
+Expected: compile error, `no method named za_bench_term_bytes`.
+
+- [ ] **Step 3: Implement the accessor**
+
+In `crates/store/src/search/term.rs`, lift the part of `IndexDocument::build_batch` (`:276`) that turns the document's fields into a `Document` (tokenization, term admission, the position lists) into `fn tokenized(&self) -> Document` (private to the module), call it from `build_batch` where that code was (no behaviour change: the batch built is byte-identical), and add in `crates/store/src/search/mod.rs`:
+
+```rust
+#[cfg(feature = "test_mode")]
+impl IndexDocument {
+    /// Plan 16 Task 1: the forward-index bytes of this document as
+    /// `Document::encode` writes them, with or without the position lists.
+    pub fn za_bench_term_bytes(&self, positions: bool) -> Vec<u8> { .. }
+}
+```
+
+`positions == false` encodes a copy of the `Document` whose `fields` map is emptied (`Document::encode`, `term.rs:629-647`, writes the term list, then the per-field position lists). Return the writer's bytes.
+
+- [ ] **Step 4: Run the unit test and the store suite**
+
+Run: `cargo test -p store --lib --features test_mode za_bench_term_bytes_counts_positions` then `cargo test -p store --lib --features test_mode search::`
+Expected: PASS; every existing search test passes (the lifted helper changed nothing).
+
+- [ ] **Step 5: Write the corpus generator**
+
+In `tests/src/za/search_bench.rs`:
+
+```rust
+pub struct Generated { pub raw: Vec<u8>, pub attachment_bytes: usize, pub references: usize }
+
+/// Deterministic (xorshift64 from `seed`), about 70 KB a message on
+/// average with the attachment shares below, so that `count` = 15,000 is about 1 GB.
+pub fn corpus(seed: u64, count: usize) -> Vec<Generated>
+```
+
+Shape, per message `i` (fix these proportions; they are the design size of 1.3): a `Message-ID` `<bench-{i}@example.com>`; 60% are replies into an existing thread (`In-Reply-To` the parent's id and `References` the parent's chain plus the parent, so chains grow to 40 and about 5% of messages carry more than `K = 16` references), 10% are forwards (`Fwd: ` subject, no `References`), 30% start threads; 10% of subjects carry non-ASCII words (`Réunion`, `会議`, `Überprüfung`); 2% repeat an earlier `Message-ID` (duplicates); bodies are 1 to 8 KB of words drawn from a 5,000-word list by a Zipf-like rule (rank `r` with weight `1/r`), with one in twenty sentences repeated across messages (phrases); 25% carry a `text/plain` attachment `notes-{i}.txt` of 40 to 200 KB and 5% one of 500 KB to 1 MB, both of the same word rule; `Date` advances one to ninety seconds per message from 2025-01-01; `From`/`To` from a pool of 200 addresses. Build with `mail_builder::MessageBuilder` (`.header("Message-ID", ..)`, `.header("In-Reply-To", ..)`, `.header("References", ..)`, `.text_body`, `.attachment("text/plain", name, bytes)`, `.write_to_vec()`).
+
+- [ ] **Step 6: Write the benchmark**
+
+In the same file:
+
+```rust
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+pub async fn format() { .. }
+```
+
+Procedure, printing each figure as it is measured and keeping it for the table: (1) build a standalone server named `search_bench` (the cache_swap shape; default listeners), create the key account `search-bench@example.com` with password `bench-secret`, provision it (setup token, setup); (2) ingest `corpus(1, env SEARCH_BENCH_MESSAGES or 15_000)` in process through `email_ingest` with `deliver_to = "search-bench@example.com"`, `envelope_from = "bench@remote.test"`, timing the whole ingest; (3) `za_unlock` the account; for every document id of the account read the stored row and blob, open both with the keys, and compute: `index_document` with the server's `index_fields`, `default_language` and `extract_limits`; the same with an `ExtractLimits` that admits no attachment text (its size limit zero; read the struct in `crates/common/src/config/` for the field); `za_bench_term_bytes(true)` and `(false)` of the first; `compress(None, ..)`, `compress(Some(Dictionary::Term), ..)` and `compress(Some(Dictionary::Email), ..)` of the with-positions bytes, trailer 0; `MessageSortKeys::from_envelope`, `za_has_attachment` and `ThreadFields::scan` (record `message_ids.len()` and `min(16, len) · 16 + 48` as the record's encoded size at Task 2's layout); (4) one frame over the concatenation of every with-positions byte string, `compress(None, all, 0)`; (5) the decompression time of every per-record frame in sequence (`decompress_into`); (6) the indexing rate: documents per second of step 3's open-and-index loop with attachment text and without. Then print the table of Step 7 and shut the server down (`test.shutdown()`, delete the temp dir as `cache_swap_tests` does).
+
+- [ ] **Step 7: Run the benchmark and record the table**
+
+Run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::search_bench::format -- --exact --ignored --nocapture` (budget an hour; set `SEARCH_BENCH_MESSAGES=2000` for a smoke run first).
+Expected: the test passes and prints the table. Create `docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md` with the header line (`# Zero-access search and threads: plan 16 outcome`, the date, the plan and spec paths, revision 18, `9d3457e4d`) and `## Format benchmark (Task 1)` holding the machine (CPU, memory, store), the corpus (count, raw bytes, ingest seconds), and this table with the measured values:
+
+| Figure | With positions | Without positions |
+|---|---|---|
+| content term bytes, total / mean / p95 per message | | |
+| per-record zstd, no dictionary, total | | |
+| per-record zstd, `Dictionary::Term`, total | | |
+| per-record zstd, `Dictionary::Email`, total | | |
+| one frame over all records, total (the G5 cost is the ratio to the row above it) | | |
+| projected content part at 30,000 messages (mean × 30,000) | | |
+| decompression of every record, seconds | | |
+
+and below it: thread record encoded size mean / max (must be ≤ `R = 304`), messages with more than `K = 16` reference hashes (count and share), indexing rate with and without attachment text (documents per second), and the three decisions by these rules (plan's call, pending Jay): positions are **kept** if the projected content part with positions at 30,000 messages is under `ZA_SEARCH_ACCOUNT_MAX_MB = 128` MiB, else dropped (and Task 4 then builds the phrase check on co-occurrence alone, a recorded parity deviation); the **dictionary** is upstream's `Dictionary::Term` by construction (Task 4 encodes upstream's stored document, plan call B2); the measured ratios are recorded, and a saving above 20% from `Dictionary::Email` is noted for Jay as a possible follow-up, not adopted; the **defaults** of 4.4 stand unless a figure contradicts them, which the note states as a question for Jay. If the maximum record size exceeds 296, stop and report: the derivation of `R` in Task 2 is wrong, and Task 3 must not start.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add tests/src/za/search_bench.rs tests/src/za/mod.rs crates/store/src/search/mod.rs crates/store/src/search/term.rs crates/store/src/search/index_za_tests.rs docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md
+git commit -m "Search plan 16 Task 1: format benchmark and its figures"
+```
+
+Report the table to Jay with the three decisions before Task 3 starts.
+
+### Task 2: Key, field, configuration, constants and hooks
+
+**Files:**
+- Modify: `crates/vault/src/keys.rs:23-29` (`LABEL_SEARCH`), `:155-157` (`derive_search_key` after `derive_mail_key`); `crates/vault/src/session.rs:33-40` (the `swk` field), `:167-182` (`new`), `:192-194` (`swk()` after `mwk()`), `:600-606` (the test beside `session_keys_carry_the_mail_key`)
+- Modify: `crates/types/src/field.rs:92-95` (`ZeroAccessSearch = 152`), `:209-210` (the mapping)
+- Create: `crates/store/src/za_search/mod.rs` (constants, `reservation`, `padded_len`, `compaction_allowance`, the record layout comment); modify `crates/store/src/lib.rs` (`pub mod za_search;`)
+- Create: `crates/common/src/za/search/mod.rs`, `config.rs`, `trace.rs`, `cache.rs` (the skeleton `ZaSearchCache { config, refusal }`; Task 6 extends it); modify `crates/common/src/za/mod.rs:14-20` (`pub mod search;`) and `:31` (`ZA_MAIL_SEARCH_UNAVAILABLE` beside `ZA_MAIL_SEARCH_REFUSED`)
+- Modify: `crates/common/src/lib.rs` (`pub za_search: ZaSearchCache` on `Caches`, beside `za_keys`); `crates/common/src/config/inner.rs:140` (`za_search: ZaSearchCache::new(ZaSearchConfig::from_env())`); `crates/common/src/manager/boot.rs:199-210` (log the effective values); `crates/main/src/main.rs:64-72` (the refusal exit)
+- Modify: `crates/common/src/za/test_hooks.rs` (the statics, setters, pause points, take functions and counters of Global Constraints, in the file's style at `:159-217`, `:241-376`, `:446-462`, `:515-566`)
+- Modify: `tests/src/utils/cleanup.rs:409-420` (field 152 in the Properties exemption) and the `BlobLink` arm (`Document` links on `Collection::Principal` document 0 exempt while the account exists)
+- Test: `crates/vault/src/session.rs` (unit), `crates/store/src/za_search/mod.rs` (unit), `crates/common/src/za/search/config.rs` (unit), `crates/common/src/za/search/trace.rs` (unit)
+
+**Interfaces:**
+- Consumes: `hkdf_expand(ikm: &[u8], label: &[u8]) -> Secret` (`keys.rs:117`), `Secret` (`keys.rs:32-34`, `Zeroizing<[u8; 32]>` with a redacting `Debug`), `SessionKeys::new(account_id: u32, generation: u64, mk: Secret) -> Self` (`session.rs:167`); `KeyCacheConfig::from_env`'s `var` helper shape (`crates/vault/src/cache.rs:41-53`) and `lease_secs_from`'s trim-and-parse (`crates/common/src/za/lease.rs:55-60`); `Pause` (`crates/store/src/za_test.rs:52-66`, re-exported by `test_hooks.rs:137`), `wait(take_for(&STATIC, account_id)).await` (`test_hooks.rs:454-456`); `verify_schema_version`'s refusal pattern (`crates/main/src/main.rs:64-72`: `eprintln!`, `ServerEvent::StartupError`, `ExitCode::FAILURE`).
+- Produces (used by every later task):
+  - `vault::keys::derive_search_key(mk: &Secret) -> Secret` (`LABEL_SEARCH = b"za/v1/search"`); `SessionKeys::swk(&self) -> &Secret`.
+  - `types::field::PrincipalField::ZeroAccessSearch` (= 152).
+  - `store::za_search::{SEARCH_FORMAT_V1: u8 = 1, K: usize = 16, RECORD_MAX: usize = 304, ALIAS_LEN: usize = 15, TOMBSTONE_LEN: usize = 12, REVISION_ROW_LEN: usize = 12}`, `pub const fn reservation() -> usize` (529), `pub fn padded_len(framed_len: usize, min_class: usize) -> usize`, `pub fn compaction_allowance(n_records: usize) -> usize`.
+  - `common::za::search::config::ZaSearchConfig { pub mem_mb: u64, pub thread_mem_mb: u64, pub account_max_mb: u64, pub idle_secs: u64, pub pass_cap: usize, pub pass_mb: u64, pub pass_hidden_kb: usize, pub pass_ms: u64, pub wait_secs: u64, pub segments: usize, pub checkpoint: usize, pub skip_after: u8, pub absent_retry_secs: u64, pub pad_min: usize }` with `ZaSearchConfig::from_env() -> Result<Self, String>`, `ZaSearchConfig::from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String>` (what `from_env` calls with `std::env::var(name).ok()`), `ZaSearchConfig::hidden_budget(&self) -> usize` (`pass_hidden_kb · 1024`) and `impl Default` (the 4.4 defaults).
+  - `common::za::search::cache::ZaSearchCache::new(config: Result<ZaSearchConfig, String>) -> Self`, `config(&self) -> &ZaSearchConfig` (the defaults when refused), `refusal(&self) -> Option<&str>`; `Caches::za_search`.
+  - `common::za::search::trace::{ZA_SEARCH_PASS, ZA_SEARCH_SKIPPED, ZA_SEARCH_ABORTED, ZA_SEARCH_LOST, ZA_SEARCH_REBUILD, ZA_SEARCH_SUSPENDED, ZA_SEARCH_UNAVAILABLE, ZA_SEARCH_EVICTED, ZA_SEARCH_UNRESOLVED, ZA_SEARCH_OVER_BUDGET}` with the strings of Global Constraints; `common::za::ZA_MAIL_SEARCH_UNAVAILABLE`.
+  - `common::za::test_hooks::{SEARCH_COMMIT_PAUSE, SEARCH_SWAP_PAUSE, SEARCH_SNAPSHOT_PAUSE, SEARCH_SWEEP_PAUSE, SEARCH_PASS_PAUSE, SEARCH_DESTROY_PAUSE}` with `set_search_<name>_pause(Option<Arc<Pause>>)` and `async fn search_<name>_pause_point(account_id: u32)`; `SEARCH_HOLD_EXPIRE`, `SEARCH_BLOB_FAIL_ONCE`, `SEARCH_OPEN_FAIL_ONCE` with `set_search_<name>_once(Option<u32>)` and `take_search_<name>(account_id: u32) -> bool` (`SEARCH_HOLD_EXPIRE` is read, not taken: `search_hold_expire(account_id) -> bool`); `SEARCH_BLOB_SLOW` with `set_search_blob_slow(Option<(u32, u64)>)` and `search_blob_slow(account_id) -> Option<Duration>`; `za_search_blob_reads(account_id) -> u64`, `za_search_message_opens(account_id) -> u64`, `count_za_search_blob_read(account_id)`, `count_za_search_message_open(account_id)`, `reset_za_search_counters(account_id)` (a `Mutex<HashMap<u32, (u64, u64)>>`). The flags `SEARCH_CACHE_HOLD`, `SEARCH_SWAP_SKIP`, `SEARCH_OPEN_FAIL_ALL` (`Mutex<Option<u32>>`, `set_search_<name>(Option<u32>)`, `search_<name>(account_id: u32) -> bool`); the one-shots `SEARCH_MANIFEST_FAIL_ONCE` and `SEARCH_DESTROY_FAIL_ONCE` (`set_search_<name>_once`, `take_search_<name>`); `SEARCH_CONFIG_OVERRIDE: Mutex<Option<ZaSearchConfig>>` with `set_search_config_override(Option<ZaSearchConfig>)` and `Server::za_search_config(&self) -> ZaSearchConfig` (`common::za::search::cache`: the override when set in test mode, else the boot value); and in `trace.rs` `macro_rules! za_search_trace` plus `pub const ZA_SEARCH_EVENT_TYPE: trc::EventType` (plan calls C6, D3, D4; the pause points, flag reads and one-shot takes are placed by the tasks that use them).
+
+- [ ] **Step 1: Write the failing vault test**
+
+In `crates/vault/src/session.rs`'s test module, after `session_keys_carry_the_mail_key` (`:600-606`):
+
+```rust
+#[test]
+fn session_keys_carry_the_search_key_and_it_survives_a_rewrap() {
+    let mk = Secret::random();
+    let keys = SessionKeys::new(7, 3, mk.clone());
+    assert_eq!(keys.swk().as_bytes(), derive_search_key(&mk).as_bytes());
+    // A password change, a recovery or an app password rewraps mk under a
+    // new generation; the derived key does not move (spec 3.1).
+    let rewrapped = SessionKeys::new(7, 4, mk.clone());
+    assert_eq!(rewrapped.swk().as_bytes(), keys.swk().as_bytes());
+    assert_ne!(keys.swk().as_bytes(), keys.mwk().as_bytes());
+    assert_ne!(keys.swk().as_bytes(), keys.ewk().as_bytes());
+    let other = SessionKeys::new(7, 3, Secret::random());
+    assert_ne!(other.swk().as_bytes(), keys.swk().as_bytes());
+    assert_eq!(format!("{keys:?}"), "SessionKeys(account 7, generation 3)");
+}
+```
+
+- [ ] **Step 2: Run it and see it fail**
+
+Run: `cargo test -p vault --features test_mode session_keys_carry_the_search_key`
+Expected: compile error, `no method named swk` / `cannot find function derive_search_key`.
+
+- [ ] **Step 3: Implement the search key**
+
+In `crates/vault/src/keys.rs`: `const LABEL_SEARCH: &[u8] = b"za/v1/search";` after `LABEL_MAIL` (`:29`), and after `derive_mail_key` (`:155-157`):
+
+```rust
+/// The search key (search spec 3.1): seals the index's blobs and keys the
+/// manifest's tag. Derived from mk, so a rewrap does not move it.
+pub fn derive_search_key(mk: &Secret) -> Secret {
+    hkdf_expand(mk.as_bytes(), LABEL_SEARCH)
+}
+```
+
+In `crates/vault/src/session.rs`: a `swk: Secret` field beside `mwk` (`:39`), derived in `new` (`:169`), and `pub fn swk(&self) -> &Secret` after `mwk()` (`:192-194`). `Debug` is unchanged (it prints the account and generation only).
+
+- [ ] **Step 4: Run the vault tests**
+
+Run: `cargo test -p vault --features test_mode`
+Expected: PASS, the new test included.
+
+- [ ] **Step 5: Add field 152**
+
+In `crates/types/src/field.rs` after `ZeroAccessPins = 151` (`:95`):
+
+```rust
+    /// Zero-access search manifest (search spec 4.2). 152 has never been
+    /// assigned to any field in upstream's history.
+    ZeroAccessSearch = 152,
+```
+
+and `PrincipalField::ZeroAccessSearch => 152,` after `:210`. Grep the crate for every match on `ZeroAccessPins` (`crates/types/src/field.rs` only; the other sites, `crates/common/src/auth/vault.rs`, `crates/vault/src/pins.rs`, `crates/groupware/src/calendar/sharing/convert.rs`, `tests/src/utils/{cleanup,za}.rs`, use the variant and need no arm) and add the new variant wherever the enum is matched exhaustively.
+
+Run: `cargo check -p types` — Expected: clean.
+
+- [ ] **Step 6: Write the failing constants tests**
+
+Create `crates/store/src/za_search/mod.rs` with `pub mod` nothing yet and a `#[cfg(test)] mod tests`:
+
+```rust
+#[test]
+fn the_record_bound_and_the_reservation_are_the_specs() {
+    assert_eq!(K, 16);
+    assert_eq!(RECORD_MAX, 304);
+    assert_eq!(ALIAS_LEN, 15);
+    assert_eq!(TOMBSTONE_LEN, 12);
+    assert_eq!(REVISION_ROW_LEN, 12);
+    assert_eq!(reservation(), 529);
+}
+
+#[test]
+fn padding_rounds_to_a_class_above_the_minimum() {
+    const M: usize = 65_536;
+    assert_eq!(padded_len(1, M), M);
+    assert_eq!(padded_len(33_301, M), M);          // H + R + (K − 1)·a + 4 at the defaults
+    assert_eq!(padded_len(M - 1, M), M);           // a payload of M − 5 bytes
+    assert_eq!(padded_len(M, M), M);               // a payload of M − 4 bytes
+    assert_eq!(padded_len(M + 1, M), 2 * M);
+    assert_eq!(padded_len(2 * M, M), 2 * M);
+    assert_eq!(padded_len(2 * M + 1, M), 4 * M);
+    assert_eq!(padded_len(100, 4096), 4096);
+}
+
+#[test]
+fn the_compaction_allowance_is_a_function_of_the_record_count() {
+    assert_eq!(compaction_allowance(0), 4);
+    assert_eq!(compaction_allowance(1), RECORD_MAX + ALIAS_LEN + 4);
+    assert_eq!(compaction_allowance(30_000), 30_000 * 319 + 4);
+    // 30,000 messages: a 16 MiB class (spec 5.5, decision 2 (c)).
+    assert_eq!(padded_len(compaction_allowance(30_000), 65_536), 16 * 1024 * 1024);
+    // Equal counts, equal classes, whatever merged.
+    assert_eq!(padded_len(compaction_allowance(12_345), 65_536), padded_len(compaction_allowance(12_345), 65_536));
+}
+```
+
+Add `pub mod za_search;` to `crates/store/src/lib.rs`.
+
+- [ ] **Step 7: Run them and see them fail**
+
+Run: `cargo test -p store --lib --features test_mode za_search`
+Expected: compile errors for the missing items.
+
+- [ ] **Step 8: Implement the constants**
+
+In `crates/store/src/za_search/mod.rs`, with the SPDX header and a module comment naming the spec (4.2), the record layout that fixes the bounds, as a comment the encoders of Tasks 3 and 5 follow:
+
+```
+thread record  = u16 len | u8 flags | u32 document_id | u32 thread_id | u32 revision
+               | u64 created | u64 deleted (0 = none) | u128 subject_hash | u8 n | n × u128 hash
+               = 48 + 16·n bytes, n ≤ K  →  RECORD_MAX = 304
+alias          = u16 len | u8 kind | u32 source | u32 target | u32 revision
+               = 15 bytes  →  ALIAS_LEN
+tombstone      = u32 document_id | u64 deleted  = 12  →  TOMBSTONE_LEN
+revision row   = u32 revision | u64 change_id   = 12  →  REVISION_ROW_LEN
+```
+
+```rust
+pub const SEARCH_FORMAT_V1: u8 = 1;
+pub const K: usize = 16;
+pub const RECORD_MAX: usize = 48 + 16 * K;
+pub const ALIAS_LEN: usize = 15;
+pub const TOMBSTONE_LEN: usize = 12;
+pub const REVISION_ROW_LEN: usize = 12;
+
+/// One admitted item's charge against the hidden budget (spec 4.2, R21).
+pub const fn reservation() -> usize { RECORD_MAX + (K - 1) * ALIAS_LEN }
+
+/// `max(min_class, 2^ceil(log2(framed_len)))` (spec 4.2).
+pub fn padded_len(framed_len: usize, min_class: usize) -> usize
+
+/// The framed length a compacted hidden section pads to:
+/// `n_records · (R + a) + 4` (spec 4.2, 5.5, decision 2 (c)).
+pub fn compaction_allowance(n_records: usize) -> usize
+```
+
+`padded_len` uses `usize::next_power_of_two` on `framed_len.max(1)`, then `max(min_class)`.
+
+- [ ] **Step 9: Run the constants tests**
+
+Run: `cargo test -p store --lib --features test_mode za_search`
+Expected: PASS (three tests).
+
+- [ ] **Step 10: Write the failing configuration tests**
+
+Create `crates/common/src/za/search/config.rs` with a `#[cfg(test)] mod tests` using `from_lookup` over a `HashMap<&str, &str>`:
+
+```rust
+fn cfg(vars: &[(&str, &str)]) -> Result<ZaSearchConfig, String> {
+    let map: HashMap<&str, &str> = vars.iter().copied().collect();
+    ZaSearchConfig::from_lookup(|name| map.get(name).map(|v| v.to_string()))
+}
+
+#[test]
+fn defaults_when_unset_or_malformed() {
+    let c = cfg(&[("ZA_SEARCH_PASS_CAP", "lots"), ("ZA_SEARCH_IDLE_SECS", "")]).unwrap();
+    assert_eq!(c, ZaSearchConfig::default());
+    assert_eq!(c.mem_mb, 512); assert_eq!(c.thread_mem_mb, 256); assert_eq!(c.account_max_mb, 128);
+    assert_eq!(c.idle_secs, 900); assert_eq!(c.pass_cap, 48); assert_eq!(c.pass_mb, 32);
+    assert_eq!(c.pass_hidden_kb, 32); assert_eq!(c.pass_ms, 2000); assert_eq!(c.wait_secs, 30);
+    assert_eq!(c.segments, 16); assert_eq!(c.checkpoint, 1000); assert_eq!(c.skip_after, 8);
+    assert_eq!(c.absent_retry_secs, 10); assert_eq!(c.pad_min, 65_536);
+    assert_eq!(c.hidden_budget(), 32_768);
+}
+
+#[test]
+fn a_value_parses_with_surrounding_space() {
+    assert_eq!(cfg(&[("ZA_SEARCH_WAIT_SECS", " 7 ")]).unwrap().wait_secs, 7);
+}
+
+#[test]
+fn the_pad_minimum_must_cover_the_budget_the_overshoot_and_the_frame() {
+    assert!(cfg(&[("ZA_SEARCH_PAD_MIN", "33300")]).unwrap_err().contains("ZA_SEARCH_PAD_MIN"));
+    assert_eq!(cfg(&[("ZA_SEARCH_PAD_MIN", "33301")]).unwrap().pad_min, 33_301);
+    // A larger budget moves the bound with it: H = 64 KiB needs M ≥ 66069.
+    assert!(cfg(&[("ZA_SEARCH_PASS_HIDDEN_KB", "64")]).unwrap_err().contains("ZA_SEARCH_PAD_MIN"));
+    assert!(cfg(&[("ZA_SEARCH_PASS_HIDDEN_KB", "64"), ("ZA_SEARCH_PAD_MIN", "131072")]).is_ok());
+}
+
+#[test]
+fn the_pass_cap_must_bind_under_the_budget() {
+    assert!(cfg(&[("ZA_SEARCH_PASS_CAP", "62")]).unwrap_err().contains("ZA_SEARCH_PASS_CAP"));
+    assert_eq!(cfg(&[("ZA_SEARCH_PASS_CAP", "61")]).unwrap().pass_cap, 61);
+}
+
+#[test]
+fn the_account_cap_is_at_most_a_third_of_the_budget() {
+    assert!(cfg(&[("ZA_SEARCH_ACCOUNT_MAX_MB", "171")]).unwrap_err().contains("ZA_SEARCH_ACCOUNT_MAX_MB"));
+    assert_eq!(cfg(&[("ZA_SEARCH_ACCOUNT_MAX_MB", "170")]).unwrap().account_max_mb, 170);
+    assert!(cfg(&[("ZA_SEARCH_MEM_MB", "300")]).unwrap_err().contains("ZA_SEARCH_ACCOUNT_MAX_MB"));
+}
+
+#[test]
+fn a_zero_is_malformed_where_zero_cannot_work() {
+    // Zero means "unset" for the counts and intervals that must be positive.
+    let c = cfg(&[("ZA_SEARCH_SEGMENTS", "0"), ("ZA_SEARCH_WAIT_SECS", "0"), ("ZA_SEARCH_SKIP_AFTER", "0")]).unwrap();
+    assert_eq!((c.segments, c.wait_secs, c.skip_after), (16, 30, 8));
+}
+```
+
+Create `crates/common/src/za/search/trace.rs` with:
+
+```rust
+#[test]
+fn every_search_trace_is_a_fixed_prefixed_string() {
+    for s in [ZA_SEARCH_PASS, ZA_SEARCH_SKIPPED, ZA_SEARCH_ABORTED, ZA_SEARCH_LOST, ZA_SEARCH_REBUILD,
+              ZA_SEARCH_SUSPENDED, ZA_SEARCH_UNAVAILABLE, ZA_SEARCH_EVICTED, ZA_SEARCH_UNRESOLVED, ZA_SEARCH_OVER_BUDGET] {
+        assert!(s.starts_with("zero-access: search "), "{s}");
+        assert!(!s.contains('{'), "{s}");
+    }
+    assert_eq!(crate::za::ZA_MAIL_SEARCH_UNAVAILABLE, "Search for this account is not available right now; try again shortly.");
+}
+```
+
+- [ ] **Step 11: Run them and see them fail**
+
+Run: `cargo test -p common --lib --features test_mode za::search`
+Expected: compile errors for the missing module and items.
+
+- [ ] **Step 12: Implement the configuration, the traces, the cache skeleton and the boot refusal**
+
+`config.rs`: `ZaSearchConfig` (derive `Debug, Clone, PartialEq, Eq`), `impl Default` with the 4.4 defaults, `from_lookup` reading each variable by trim-and-parse with a zero or malformed value falling back to the default (as `lease_secs_from` does), then the three refusals in this order, each returning `Err` with a message that names the variable, its value and the bound, for example `"ZA_SEARCH_PAD_MIN=33300 is below 33301 = ZA_SEARCH_PASS_HIDDEN_KB·1024 + R + (K − 1)·a + 4; refusing to start"` (use `store::za_search::{reservation, RECORD_MAX, ALIAS_LEN, K}`); `from_env` calls `from_lookup(|name| std::env::var(name).ok())`.
+
+`trace.rs`: the ten constants of Global Constraints.
+
+`cache.rs`: `pub struct ZaSearchCache { config: ZaSearchConfig, refusal: Option<String> }` with `new`, `config`, `refusal` (Task 6 adds the entries, budgets and locks to this struct). `mod.rs`: `pub mod cache; pub mod config; pub mod trace;` and re-exports. `crates/common/src/za/mod.rs`: `pub mod search;` and `pub const ZA_MAIL_SEARCH_UNAVAILABLE: &str = ..` beside `ZA_MAIL_SEARCH_REFUSED` (`:31`).
+
+`crates/common/src/lib.rs`: `pub za_search: za::search::cache::ZaSearchCache,` on `Caches` after `za_keys`; `crates/common/src/config/inner.rs:140`: `za_search: ZaSearchCache::new(ZaSearchConfig::from_env()),`. `crates/common/src/manager/boot.rs:199-210`: a second `Server(ServerEvent::Startup)` event, `Details = "Zero-access search"`, `Value` the effective fourteen `NAME=value` pairs joined by single spaces in one `Details` string from `cache.za_search.config()`. `crates/main/src/main.rs`, after the schema check (`:72`):
+
+```rust
+    if let Some(reason) = init.inner.cache.za_search.refusal() {
+        eprintln!("{reason}");
+        trc::event!(
+            Server(trc::ServerEvent::StartupError),
+            Details = "Zero-access search configuration refused, aborting startup.",
+            Reason = reason.to_string(),
+        );
+        return ExitCode::FAILURE;
+    }
+```
+
+- [ ] **Step 13: Run the common tests and the compile check**
+
+Run: `cargo test -p common --lib --features test_mode za::search`, then the per-task compile check of Global Constraints.
+Expected: PASS (seven tests); `clean`.
+
+- [ ] **Step 14: Add the hooks and counters**
+
+In `crates/common/src/za/test_hooks.rs`, under the existing `#[cfg(feature = "test_mode")]` gating, in the file's style: the six pause statics (`SEARCH_COMMIT_PAUSE`, `SEARCH_SWAP_PAUSE`, `SEARCH_SNAPSHOT_PAUSE`, `SEARCH_SWEEP_PAUSE`, `SEARCH_PASS_PAUSE`, `SEARCH_DESTROY_PAUSE`) with their `set_search_*_pause` and `search_*_pause_point` functions (`wait(take_for(&SEARCH_COMMIT_PAUSE, account_id)).await`, as `commit_pause_point` at `:454-456`); `SEARCH_HOLD_EXPIRE: Mutex<Option<u32>>` with `set_search_hold_expire(Option<u32>)` and `search_hold_expire(account_id) -> bool` (read, not taken); `SEARCH_BLOB_FAIL_ONCE` and `SEARCH_OPEN_FAIL_ONCE` with `set_search_blob_fail_once`, `take_search_blob_fail`, `set_search_open_fail_once`, `take_search_open_fail` (one-shot, as `take_commit_fail` at `:525-529`); `SEARCH_BLOB_SLOW: Mutex<Option<(u32, u64)>>` with `set_search_blob_slow` and `search_blob_slow(account_id) -> Option<Duration>`; the counters `static ZA_SEARCH_COUNTERS: Mutex<HashMap<u32, (u64, u64)>>` with `count_za_search_blob_read`, `count_za_search_message_open`, `za_search_blob_reads`, `za_search_message_opens`, `reset_za_search_counters`. No call site is added here; Tasks 6–16 await the pause points and take the one-shots at the sites they name. Add one unit test beside the existing hook tests: `take_search_blob_fail(5)` is true once after `set_search_blob_fail_once(Some(5))`, false after, and false for account 6. Then the flags `SEARCH_CACHE_HOLD`, `SEARCH_SWAP_SKIP` and `SEARCH_OPEN_FAIL_ALL` in the `SEARCH_HOLD_EXPIRE` shape (`set_search_<name>(Option<u32>)`, `search_<name>(account_id) -> bool`); the one-shots `SEARCH_MANIFEST_FAIL_ONCE` and `SEARCH_DESTROY_FAIL_ONCE` (`set_search_<name>_once`, `take_search_<name>`); `SEARCH_CONFIG_OVERRIDE: Mutex<Option<ZaSearchConfig>>` with `set_search_config_override(Option<ZaSearchConfig>)`, and in `cache.rs` `Server::za_search_config(&self) -> ZaSearchConfig` returning the override when set (test mode) and the boot value otherwise, with a unit test `the_override_replaces_the_boot_value_in_test_mode`; and in `trace.rs` the macro `za_search_trace!(CONSTANT, Key = value, ..)` expanding to `trc::event!` on the one fixed existing event type `ZA_SEARCH_EVENT_TYPE` (choose the event release 5 uses for its fixed strings, `crates/common/src/za/imip.rs:22-38`, and export the constant) with a unit test that the macro compiles with two keys.
+
+Run: `cargo test -p common --lib --features test_mode test_hooks && cargo test -p common --lib --features test_mode za::search`
+Expected: PASS.
+
+- [ ] **Step 15: Exempt field 152 and the index's principal links in `assert_is_empty`**
+
+In `tests/src/utils/cleanup.rs:409-420`, extend the `Rule::Properties` arm's condition with `|| key[U32_LEN + 1] == PrincipalField::ZeroAccessSearch as u8`, and update the comment ("vault, pin and search-manifest records persist for the life of the account"). In the arm that reads `Subspace::BlobLink` leftovers (`:81`, the `Rule::Leftover { with_values: true }` handling), treat a `BlobLink::Document` link whose suffix is `account_id | Collection::Principal as u8 | 0u32` as the manifest's blob: record the account id in `vault_accounts` and return `Ok(true)`, so the existence check the vault records already get covers it, and a link of a destroyed account still fails the assertion. Then `cargo check -p tests --tests` — Expected: clean. (No za case exercises the exemption until Task 8 writes a manifest; the suite's current run must still pass: run `za::za_tests` once here, since the cleanup file is shared by every module.)
+
+Run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture`
+Expected: PASS.
+
+- [ ] **Step 16: Format and commit**
+
+Run: `cargo fmt -p vault -- --check && cargo fmt -p types -- --check && cargo fmt -p store -- --check && cargo fmt -p common -- --check && cargo fmt -p tests -- --check` and `cargo fmt --manifest-path crates/main/Cargo.toml -- --check`.
+
+```bash
+git add crates/vault/src/keys.rs crates/vault/src/session.rs crates/types/src/field.rs crates/store/src/lib.rs crates/store/src/za_search/mod.rs crates/common/src/za/mod.rs crates/common/src/za/search crates/common/src/lib.rs crates/common/src/config/inner.rs crates/common/src/manager/boot.rs crates/main/src/main.rs crates/common/src/za/test_hooks.rs tests/src/utils/cleanup.rs
+git commit -m "Search plan 16 Task 2: search key, field 152, configuration, format constants and hooks"
+```
+
+### Task 3: Thread part model
+
+**Files:**
+- Create: `crates/store/src/za_search/thread.rs`, `crates/store/src/za_search/thread_tests.rs`
+- Modify: `crates/store/src/za_search/mod.rs` (Task 2's file: `pub mod thread;`, `Checkpoint`, `ThreadFieldsK`, `FormatError`)
+
+**Interfaces:**
+- Consumes: `store::ahash::AHashMap`, `xxhash_rust` (re-exported at `lib.rs:26`); nothing of
+  the search store. The rule it mirrors by hand: `find_thread_id`
+  (`crates/email/src/message/ingest.rs:1098-1197`: one `ThreadMerge::add(thread_id,
+  document_id)` per bucket row whose references intersect the new message's hashes,
+  `has_message_id`, `:1341-1349`) and `ThreadMerge::merge` (`:1487-1512`: the survivor is the
+  thread with the most rows, ties to the lowest thread id; every other matched thread is a
+  `merge_id`). Spec 4.1, 5.1 ("Order"), 6.1, 6.3 ("The revision of a state", "The thread of
+  `D` as of `X`", "The members of `T` as of `X`").
+- Consumes (Task 2, `crates/store/src/za_search/mod.rs`): `SEARCH_FORMAT_V1`, `K`, `RECORD_MAX` (304: entry
+    length `u16`, kind `u8`, document id, thread id, revision, created, deleted, subject hash `u128`, hash
+    count `u8`, `K` hashes), `ALIAS_LEN` (15), `TOMBSTONE_LEN`, `REVISION_ROW_LEN`, `reservation()` (529).
+- Produces (`crates/store/src/za_search/mod.rs`):
+  - `pub struct Checkpoint { pub change_id: u64, pub position: u32, pub complete: bool }`
+    (`Copy`, `Eq`, `Default`; `Default` is `(0, 0, true)`)
+  - `pub struct ThreadFieldsK { pub hashes: Vec<u128>, pub subject_hash: u128, pub sent_at: Option<i64> }`
+    (the caller caps `hashes` at `K`, G10; `assign` debug-asserts `hashes.len() <= K`)
+  - `pub enum FormatError { Version(u8), Kind(u8), Truncated, Count, AllowanceExceeded }`
+    (`Debug`, `Display`)
+- Produces (`crates/store/src/za_search/thread.rs`):
+  - `pub struct ThreadRecord { pub document_id: u32, pub thread_id: u32, pub revision: u32, pub created: u64, pub deleted: Option<u64>, pub subject_hash: u128, pub hashes: Vec<u128> }`
+    (`Clone`, `Eq`, `Debug`; a tombstoned record has `deleted: Some(..)`, `hashes` empty and
+    `subject_hash == 0`)
+  - `pub struct Alias { pub source: u32, pub target: u32, pub revision: u32 }` (`Copy`, `Eq`)
+  - `pub struct RevisionRow { pub revision: u32, pub change_id: u64 }` (`Copy`, `Eq`)
+  - `pub struct Tombstone { pub document_id: u32, pub deleted: u64 }` (`Copy`, `Eq`)
+  - `pub struct Assignment { pub thread_id: u32, pub aliases: Vec<Alias> }`
+  - `pub struct ThreadPart { .. }` (`Default`, `Clone`) with
+    - `pub fn from_parts(records: Vec<ThreadRecord>, aliases: Vec<Alias>, rows: Vec<RevisionRow>) -> ThreadPart`
+    - `pub fn extend(&mut self, records: impl IntoIterator<Item = ThreadRecord>, aliases: impl IntoIterator<Item = Alias>, rows: impl IntoIterator<Item = RevisionRow>, tombstones: impl IntoIterator<Item = Tombstone>)`
+      (records are inserted, aliases added by source, rows merged by revision, tombstones
+      applied as `tombstone` does; a tombstone for a document the part does not hold is
+      ignored, 5.1)
+    - `pub fn record(&self, document_id: u32) -> Option<&ThreadRecord>`
+    - `pub fn is_present(&self, document_id: u32) -> bool`
+    - `pub fn records(&self) -> impl Iterator<Item = &ThreadRecord>`,
+      `pub fn aliases(&self) -> impl Iterator<Item = &Alias>`,
+      `pub fn rows(&self) -> &[RevisionRow]` (sorted by revision),
+      `pub fn newest_revision(&self) -> u32`
+    - `pub fn revision_at(&self, change_id: u64) -> u32` (`R(X)`: the greatest `revision`
+      whose row's `change_id <= X`; `0` when none)
+    - `pub fn revision_change_id(&self, revision: u32) -> Option<u64>` (`None` when the row
+      was pruned, which only happens below every servable state, 5.5)
+    - `pub fn thread_of(&self, document_id: u32, change_id: u64) -> u32` (the singleton
+      `document_id` when there is no record or `record.revision > R(X)`; otherwise start at
+      `record.thread_id` and follow `aliases` by source while the alias's `revision <= R(X)`,
+      returning the thread where no alias applies)
+    - `pub fn current_thread(&self, document_id: u32) -> u32` (`thread_of` at `u64::MAX`)
+    - `pub fn exists_at(&self, document_id: u32, change_id: u64) -> Option<bool>` (`None`
+      without a record; else `created <= X && deleted.is_none_or(|d| d > X)`)
+    - `pub fn members_of(&self, thread_id: u32, change_id: u64) -> Vec<u32>` (every record,
+      present or tombstoned, with `exists_at == Some(true)` and `thread_of == thread_id`,
+      ascending document ids; never read from the present thread table, R25)
+    - `pub fn present_members(&self, thread_id: u32) -> &[u32]` (the derived thread table:
+      present records grouped by `current_thread`, ascending)
+    - `pub fn assign(&mut self, fields: &ThreadFieldsK, document_id: u32, revision: u32, created: u64) -> Assignment`
+      (6.1; inserts the new record; see step 4)
+    - `pub fn tombstone(&mut self, document_id: u32, deleted: u64) -> bool` (`false` when
+      the part holds no record; else sets `deleted`, clears `hashes` and `subject_hash`,
+      removes the document from the candidate index and the thread table, keeps the
+      assignment and `created`)
+    - `pub fn fold_alias(&mut self, alias: &Alias)` (every record whose `thread_id ==
+      alias.source` gets `thread_id = alias.target` and `revision = alias.revision`, one hop; the alias
+      is removed; the thread table is rebuilt for the two threads; Task 15 calls it for every
+      alias below the bound, in ascending `revision` order)
+    - `pub fn loaded_bytes(&self) -> usize` (an estimate for the thread budget: records
+      `× 72 + hashes × 16`, aliases `× 16`, rows `× 16`, thread table `× 8` per member)
+
+- [ ] **Step 1: Write the failing unit tests** in `crates/store/src/za_search/thread_tests.rs`
+  (declared from `thread.rs` as `#[cfg(test)] #[path = "thread_tests.rs"] mod tests;`, the
+  style of `crates/store/src/search/index.rs:416-417`). A fixture helper
+  `msg(document_id, subject: u128, hashes: &[u128]) -> ThreadFieldsK` and a part builder
+  `indexed(items: &[(u32, u128, &[u128])]) -> ThreadPart` that assigns each item in order
+  at revision 1, created `document_id as u64 * 10`. The tests, named after the review tag
+  they pin, with these assertions:
+  - `s61_no_candidate_is_a_new_thread_of_its_own_id`: `assign(msg(5, 1, &[0x55]), 5, 1, 50)`
+    on an empty part returns `thread_id == 5` and no alias; `present_members(5) == [5]`.
+  - `s61_one_candidate_thread_joins_it`: after `1: (1, 1, [0x11])`, `assign(msg(2, 1,
+    &[0x22, 0x11]), ..)` returns `thread_id == 1`, no alias; `present_members(1) == [1, 2]`.
+  - `s61_subject_bucket_must_match`: `1: (1, 7, [0x11])` then `msg(2, 8, &[0x22, 0x11])` is a
+    new thread `2`.
+  - `s61_a_tombstoned_record_is_not_a_candidate`: `1: (1, 1, [0x11])`, `tombstone(1, 15)`,
+    then `msg(2, 1, &[0x22, 0x11])` is a new thread `2`; `record(1)` is `Some` with
+    `deleted == Some(15)`, `hashes.is_empty()` and `thread_id == 1`.
+  - `h10_survivor_is_the_thread_with_most_candidates_ties_lowest`: present messages
+    `3: (3, 1, [0x33])`, `5: (5, 1, [0x55])`, `6: (6, 1, [0x66, 0x55])` (joins 5),
+    `9: (9, 1, [0x99])`, `4: (4, 1, [0x44, 0x33])` (joins 3); `assign(msg(10, 1, &[0xa0,
+    0x33, 0x44, 0x55, 0x66, 0x99]), 10, 2, 100)` sees two candidates in thread 3 (3, 4), two
+    in 5 (5, 6), one in 9: `thread_id == 3`; `aliases` sorted by source `== [Alias{5, 3, 2},
+    Alias{9, 3, 2}]`; `present_members(3) == [3, 4, 5, 6, 9, 10]`, `present_members(5)` and
+    `present_members(9)` are empty; `current_thread(6) == 3`.
+  - `s41_duplicate_message_ids_share_the_root`: `1: (1, 1, [0x11])`, `2: (2, 1, [0x11])`
+    joins 1 (same Message-ID hash); `msg(3, 1, &[0x33, 0x11])` sees two candidates in one
+    thread: `thread_id == 1`, no alias.
+  - `s61_empty_threading_fields_are_a_singleton_and_never_a_candidate` (Review Focus): `msg(1, h_empty, &[])` and `msg(2, h_empty, &[])` (no Message-ID, a whitespace-only subject: `hashes` empty, `subject_hash` the empty thread name's): each `assign` returns its own id with no alias, `present_members(1) == [1]` and `present_members(2) == [2]`; a later `msg(3, h_empty, &[0x33])` is a singleton too, since neither earlier message has a hash to intersect (upstream's `find_thread_id` returns the new thread when `message_ids` is empty, `crates/email/src/message/ingest.rs:1098-1110`; the implementer confirms the line and cites it in the test).
+  - `r20_k_references_in_k_distinct_threads_write_exactly_k_minus_one_aliases`: `K` present
+    singletons `i: (i, 1, [i as u128])` for `i in 1..=16`; `assign(msg(17, 1, &(1..=16)
+    .map(u128::from).collect::<Vec<_>>()), 17, 2, 170)` returns `aliases.len() == K - 1`
+    and `thread_id == 1` (all counts tie at one, lowest wins).
+  - `r20_no_assignment_writes_more_than_k_minus_one_aliases`: a loop of 200 random fixtures
+    (seeded `rand::rngs::SmallRng`): 60 messages in one bucket, each with 1 to `K` hashes
+    drawn from a pool of 40, assigned in order; after every `assign`, `aliases.len() <= K -
+    1` and the invariant "every present message holding a given hash is in one thread"
+    holds (for each hash, the set of `current_thread` over present records holding it has at
+    most one element).
+  - `r16_insert_then_delete_in_order_threads_as_upstream_did`: `A: (1, 1, [0xa])`, `D: (2, 1,
+    [0xd, 0xa])`; then, in log order, `assign(msg(3, 1, &[0xee, 0xd]), 3, 2, 30)` and
+    `tombstone(2, 31)`: `current_thread(3) == 1`. The same fixture with the deletion first
+    (`tombstone(2, 31)` then the assign): `current_thread(3) == 3` (the control's grouping
+    only under the chronological order).
+  - `r16_r20_cursor_chronological_order_threads_as_the_control`: items `A: (1, 1, [0xa])`,
+    `D: (2, 1, [0xd, 0xa])`, `N: (3, 1, [0xe, 0xd])`, `N2: (4, 1, [0xf, 0xd])` assigned oldest
+    first: one thread, `present_members(1) == [1, 2, 3, 4]`, no alias, and at each `assign`
+    every hash of the item named at most one present thread (the invariant 5.1's order
+    re-establishes; assert it through the candidate lookup). The fan-in bound itself is
+    `r20_k_references_in_k_distinct_threads_write_exactly_k_minus_one_aliases`; the suite's
+    `case_r16_r20_rebuild_form` (Task 14) pins the order end to end.
+  - `r5_thread_of_d_as_of_x_before_at_between_and_after`: `from_parts` with record
+    `{document_id: 7, thread_id: 7, revision: 1, created: 50, deleted: None, ..}`, aliases
+    `[Alias{7, 5, 2}, Alias{5, 3, 3}]`, rows `[(1, 100), (2, 200), (3, 300)]`: `thread_of(7,
+    99) == 7`, `thread_of(7, 100) == 7`, `thread_of(7, 150) == 7`, `thread_of(7, 200) == 5`,
+    `thread_of(7, 250) == 5`, `thread_of(7, 300) == 3`, `thread_of(7, u64::MAX) == 3`;
+    `revision_at(99) == 0`, `revision_at(250) == 2`; `thread_of(8, 1000) == 8` (no record).
+  - `r25_members_of_t_as_of_x_across_two_merges_and_a_later_deletion`: records `1: thread 1,
+    rev 1, created 10`; `2: thread 2, rev 1, created 20`; `3: thread 1, rev 3, created 250,
+    deleted Some(350)`; alias `[Alias{2, 1, 2}]`; rows `[(1, 100), (2, 200), (3, 300)]`:
+    `members_of(1, 150) == [1]`, `members_of(2, 150) == [2]`, `members_of(1, 250) == [1,
+    2]`, `members_of(1, 300) == [1, 2, 3]`, `members_of(1, 400) == [1, 2]`, `members_of(2,
+    400).is_empty()`, `present_members(1) == [1, 2]` (3 is deleted).
+  - `s63_exists_at_follows_creation_and_deletion_change_ids`: with the fixture above:
+    `exists_at(3, 249) == Some(false)`, `exists_at(3, 250) == Some(true)`, `exists_at(3,
+    349) == Some(true)`, `exists_at(3, 350) == Some(false)`, `exists_at(99, 1) == None`.
+  - `s63_a_deleted_record_resolves_through_its_retained_record`: `thread_of(3, 300) == 1`
+    after the deletion too (`thread_of(3, 400) == 1`).
+  - `s55_fold_alias_moves_one_hop_and_keeps_every_servable_resolution`: the R5 fixture;
+    `fold_alias(&Alias{7, 5, 2})`: `record(7).thread_id == 5`, `record(7).revision == 2` (the alias's),
+    `aliases()` holds only `Alias{5, 3, 3}`; for every `x in [200, 250, 300, 1000]`
+    `thread_of(7, x)` equals its value before the fold (`5, 5, 3, 3`).
+  - `r3_tombstone_keeps_identity_and_drops_fields`: `tombstone(d, 350)` returns `true`,
+    `record(d)` keeps `thread_id`, `revision`, `created`; `hashes.is_empty()`,
+    `subject_hash == 0`, `is_present(d) == false`; `tombstone(999, 1) == false`.
+  - `s43_extend_merges_rows_by_revision_and_ignores_unknown_tombstones`: `extend` with a row
+    already held (same revision, same change id) keeps one row; a tombstone for an unknown
+    document changes nothing.
+
+- [ ] **Step 2: Run the tests to see them fail**
+  ```bash
+  export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+  cargo test -p store --lib za_search::thread 2>&1 | tail -20
+  ```
+  Expected: compile error, `unresolved import` or `could not find za_search in store`.
+
+- [ ] **Step 3: Create `crates/store/src/za_search/mod.rs`** with the SPDX header copied from
+  `crates/store/src/search/mod.rs:1-5`, a module doc comment ("Zero-access fork, release 7:
+  the sealed per-account search index's model and formats (spec 4)"), `pub mod thread;`,
+  the constants, `Checkpoint`, `ThreadFieldsK` and `FormatError` of the Interfaces block
+  (each constant with a one-line comment giving its derivation), and add `pub mod
+  za_search;` to `crates/store/src/lib.rs` after line 14.
+
+- [ ] **Step 4: Implement `crates/store/src/za_search/thread.rs`.** Storage: `records:
+  AHashMap<u32, ThreadRecord>`, `aliases: AHashMap<u32, Alias>` keyed by source (a thread
+  is retired once, 5.5), `rows: Vec<RevisionRow>` kept sorted by revision, `threads:
+  AHashMap<u32, Vec<u32>>` (present members by `current_thread`, ascending) and
+  `buckets: AHashMap<u128, Vec<u32>>` (present document ids by `subject_hash`). `assign`:
+  `candidates` = the present records in `buckets[fields.subject_hash]` whose `hashes` share
+  at least one value with `fields.hashes`; count one entry per candidate under its
+  `current_thread` (upstream's `ThreadMerge::add` per matched row); no candidate: the new
+  thread id is `document_id`; one thread: join it; several: the survivor is the thread with
+  the highest count, ties to the lowest thread id (`ThreadMerge::merge`, `ingest.rs:1487-
+  1512`), and every other candidate thread `L` yields `Alias { source: L, target: survivor,
+  revision }`, inserted into `aliases` and applied to `threads` (move `L`'s members under
+  the survivor; the members' records are not rewritten, R21). Then insert the new record
+  `{ document_id, thread_id: survivor, revision, created, deleted: None, subject_hash,
+  hashes }` and index it. `thread_of` follows `aliases` by source with a step bound of
+  `aliases.len() + 1` (a defensive cycle stop; the construction has no cycles since an alias
+  always points at a surviving thread). `fold_alias` updates `records` and rebuilds the two
+  affected `threads` entries.
+
+- [ ] **Step 5: Run the tests to see them pass**
+  ```bash
+  cargo test -p store --lib za_search::thread 2>&1 | tail -30
+  ```
+  Expected: `test result: ok.`, every test above passing.
+
+- [ ] **Step 6: Format and check**
+  ```bash
+  cargo fmt -p store -- --check && cargo check -p store 2>&1 | grep -E "^(warning|error)" -A3 | grep za_search || echo clean
+  ```
+  Expected: `clean`.
+
+- [ ] **Step 7: Commit**
+  ```bash
+  git add crates/store/src/lib.rs crates/store/src/za_search/mod.rs crates/store/src/za_search/thread.rs crates/store/src/za_search/thread_tests.rs
+  git commit -m "Search index: thread part model with upstream's assignment and resolution rules (release 7, task 3)"
+  ```
+
+### Task 4: Content part model
+
+**Files:**
+- Create: `crates/store/src/za_search/content.rs`, `crates/store/src/za_search/content_tests.rs`
+- Modify: `crates/store/src/za_search/mod.rs` (add `pub mod content;`)
+
+**Interfaces:**
+- Consumes (all inside `store`, so `pub(crate)` items are reachable): `search::IndexDocument`
+  (`crates/store/src/search/mod.rs:176-184`, built by upstream's `index_document`,
+  `crates/email/src/message/index/search.rs:43-153`, which Task 8 calls);
+  `search::term::AccountIndexer::index_document(&mut self, IndexDocument, u32) -> Document`
+  (`term.rs:100-134`, with `insert_value`'s term admission, stems and positions,
+  `term.rs:136-200`); `Document::encode(&self) -> codec::Writer` and
+  `codec::Writer::into_document(self) -> Vec<u8>` (`term.rs:629-647`, `codec.rs:89-102`: the
+  stored form, one zstd frame under `Dictionary::Term` above `COMPRESS_WATERMARK_DICTIONARY`,
+  with a trailing `DOCUMENT_ZSTD`/`DOCUMENT_PLAIN` marker); `codec::read_document(stored,
+  scratch) -> Option<&[u8]>` (`codec.rs:119-129`); `term::deserialize_term_fields(stored,
+  scratch, cb(CheekyHash, u32 field_mask)) -> Option<()>` (`term.rs:731-748`);
+  `term::matches_phrase(document, field, words, ordinals, failure) -> Option<bool>`
+  (`term.rs:656-729`; a field without positions answers `Some(true)` once every word is
+  present, `:728`); `leaf::Leaf` and `Leaf::plan(&SearchFilter)` (`leaf.rs:20-40, 51-162`);
+  `leaf::LeafPlan::new(&[SearchFilter]) -> trc::Result<LeafPlan>` (`:232`, the query size
+  limits `MAX_QUERY_LEAVES`, `MAX_QUERY_PLANNED_TOKENS`); the evaluation rules of
+  `AccountContext::evaluate` and `intersect` (`crates/store/src/search/query.rs:574-629`) and
+  the prefix rule of `fetch` (`:787-792`: a term is a prefix candidate when its stored length
+  is at most `CheekyHash::HASH_SIZE` and its key does not end in `b'*'`); `SearchField::u8_id`;
+  `utils::cheeky_hash::CheekyHash` (`new`, `as_key`, `len`, `crates/utils/src/cheeky_hash.rs:32-76`);
+  `search::{SearchFilter, SearchComparator}`; the rank rule of `message_sort_ranks`
+  (`crates/email/src/message/sortkeys.rs:134-218`: truncate each key to `MAX_SORT_KEY_LEN =
+  40` bytes, zero-pad, sort, dense rank from 1); `roaring::RoaringBitmap`.
+- Produces (`crates/store/src/za_search/content.rs`):
+  - `pub struct SortKeys { pub from: String, pub to: String, pub subject: String }`
+    (upstream's three keys as `MessageSortKeys` holds them, each at most 40 bytes; `email`
+    implements `From<&MessageSortKeys>` in Task 8)
+  - `pub enum SortField { From, To, Subject, SentAt }` (`SentAt` ranks by `sent_at`, equal timestamps sharing a dense rank and `None` after every `Some`, which mirrors upstream's missing-date fallback at `crates/email/src/message/ingest.rs:385-395`; the implementer reads and cites it)
+  - `pub struct ContentRecord { .. }` (`Clone`, `Eq`) with
+    - `pub fn new(document: IndexDocument, document_id: u32, sort_keys: SortKeys, sent_at: Option<i64>, has_attachment: bool) -> ContentRecord`
+      (runs `AccountIndexer::default().index_document(document, document_id)` and keeps
+      `encode().into_document()` as the term bytes)
+    - `pub fn document_id(&self) -> u32`, `pub fn encoded_len(&self) -> usize`
+    - `pub fn encode(&self) -> Vec<u8>`: `u32 LE document_id | u8 flags (bit 0 has_attachment,
+      bit 1 sent_at present) | i64 LE sent_at (0 when absent) | u8 len, from | u8 len, to |
+      u8 len, subject | u32 LE len, term bytes`
+    - `pub fn decode(bytes: &[u8]) -> Result<ContentRecord, FormatError>`
+  - `pub struct ContentPart { .. }` (`Default`) with
+    - `pub fn insert(&mut self, record: ContentRecord)` (replaces an existing record of the
+      same document id), `pub fn remove(&mut self, document_id: u32) -> bool`,
+      `pub fn extend(&mut self, records: impl IntoIterator<Item = ContentRecord>)`
+    - `pub fn contains(&self, document_id: u32) -> bool`, `pub fn len(&self) -> usize`,
+      `pub fn is_empty(&self) -> bool`, `pub fn document_ids(&self) -> RoaringBitmap`
+    - `pub fn record_bytes(&self, document_id: u32) -> Option<&[u8]>` (the encoded record,
+      kept for compaction's rewrite without re-encoding, Task 15)
+    - `pub fn resolve(&self, filters: &[SearchFilter]) -> Result<Vec<SearchFilter>, ResolveError>`
+      (every `Text` and `KeyValue` filter replaced by `SearchFilter::DocumentSet`; an `Integer` filter is `Err(Unresolvable(LeafKind::Integer))`, the caller having stripped the account-id leaf, Task 10;
+      `And`, `Or`, `Not`, `End` and existing `DocumentSet`s copied; the size limits of
+      `LeafPlan::new` applied first)
+    - `pub fn sort_ranks(&self, field: SortField, documents: &RoaringBitmap) -> AHashMap<u32, u32>`
+    - `pub fn sent_at(&self, document_id: u32) -> Option<i64>`,
+      `pub fn has_attachment(&self, document_id: u32) -> bool`
+    - `pub fn loaded_bytes(&self) -> usize` (record bytes plus postings: 16 bytes per
+      posting key plus the bitmaps' `serialized_size()`)
+  - `pub enum ResolveError { Unresolvable(LeafKind), TooLarge(trc::Error), Corrupt(u32) }`,
+    `pub enum LeafKind { Text, KeyValue, Integer }` (`Copy`, `Debug`; the trace of 8 carries
+    `LeafKind`, never a field name, G9)
+
+- [ ] **Step 1: Write the failing unit tests** in `crates/store/src/za_search/content_tests.rs`
+  (declared from `content.rs` as `#[cfg(test)] #[path = "content_tests.rs"] mod tests;`).
+  Helpers: `doc(document_id) -> IndexDocument` = `IndexDocument::new(SearchIndex::Email)
+  .with_account_id(1).with_document_id(document_id)`; `record(document_id, build: impl
+  FnOnce(&mut IndexDocument)) -> ContentRecord` with `SortKeys::default()`, `sent_at
+  Some(1_700_000_000)`, `has_attachment false`; `body(text)` = `index_text(EmailSearchField::
+  Body, text, Language::English)`; `part(records) -> ContentPart`; `resolve_one(part,
+  filter) -> RoaringBitmap` = `part.resolve(&[filter])` then the single `DocumentSet`. The
+  tests:
+  - `s41_record_round_trips_through_its_encoding`: a record with body "the quick brown fox",
+    subject "Quick", `insert_key_value(EmailSearchField::Headers, "x-custom", "Hello World")`,
+    sort keys `("ALICE", "BOB", "QUICK")`, `sent_at Some(42)`, `has_attachment true`:
+    `ContentRecord::decode(&r.encode()) == Ok(r)`; `decode` of a truncated encoding is
+    `Err(FormatError::Truncated)`.
+  - `s41_term_bytes_are_upstreams_stored_document`: build the same `IndexDocument` twice; the
+    record's term bytes equal `AccountIndexer::default().index_document(doc2, 7).encode()
+    .into_document()` (parity by construction, 7.5).
+  - `g5_records_are_encoded_independently`: `encode(a)` is byte-identical whether or not `b`
+    was built in the same `AccountIndexer`; a record above the watermark decodes with
+    `read_document` into the same plaintext as its own `Document::encode()`.
+  - `s71_standard_text_matches_terms_and_stems`: body "the connections dropped"; `resolve_one
+    (SearchFilter::has_english_text(EmailSearchField::Body, "connection"))` contains the
+    document (stem `connect*`); `has_english_text(Body, "dropping")` contains it;
+    `has_english_text(Body, "elephant")` is empty.
+  - `s71_groups_and_across_tokens`: body "alpha beta gamma": `has_english_text(Body, "alpha
+    gamma")` matches, `"alpha delta"` is empty.
+  - `s71_exact_phrase_uses_positions`: body "alpha beta gamma": `has_english_text(Body,
+    "\"alpha beta\"")` matches; `"\"beta alpha\""` is empty; `"\"alpha gamma\""` is empty.
+  - `s71_phrase_on_a_language_none_field_is_co_occurrence`: `index_text(EmailSearchField::
+    From, "alice example", Language::None)`: `has_keyword(From, "\"example alice\"")`
+    matches (`term.rs:728`: no positions, every word present).
+  - `s71_prefix_matches_verbatim_short_terms_only`: doc 1 body (`Language::None`) "alphabet",
+    doc 2 body "alphabetical_sequence_of_terms" (more than 16 bytes, stored hashed): `has_
+    keyword(Body, "alpha*")` is `{1}`; `has_keyword(Body, "alphabetical*")` is empty.
+  - `s71_key_value_equals_contains_exists`: `insert_key_value(Headers, "x-custom", "Hello
+    World")`: `KeyValue { key: "X-Custom", op: Equals("hello world") }` matches, `Contains
+    ("world")` matches, `Exists` matches, `KeyValue { key: "x-other", op: Exists }` is empty.
+  - `s71_integer_leaf_is_unresolvable`: `SearchFilter::integer_eq(SearchField::Email(
+    EmailSearchField::Size), 10u64)` → `Err(ResolveError::Unresolvable(LeafKind::Integer))`
+    (use whichever `EmailSearchField` variant exists for an integer; `grep -n 'enum
+    EmailSearchField' -A 12 crates/store/src/search/mod.rs`).
+  - `s71_resolve_keeps_operators_and_replaces_leaves`: `[And, has_english_text(Body, "alpha"),
+    Not, has_keyword(From, "alice"), End, End]` resolves to `[And, DocumentSet(_), Not,
+    DocumentSet(_), End, End]`, and `SearchQuery::new(SearchIndex::Email).with_filters
+    (resolved).with_mask(all).filter().into_bitmap()` equals the hand-computed set.
+  - `s71_too_many_leaves_is_too_large`: `MAX_QUERY_LEAVES + 1` text leaves → `Err(ResolveError::
+    TooLarge(_))`.
+  - `s71_ranks_mirror_message_sort_ranks`: sort keys `from` of docs 1..=4 = `"B", "a", "B",
+    ""`: `sort_ranks(SortField::From, &all) == {4: 1, 1: 2, 3: 2, 2: 3}`; two keys that differ
+    only after byte 40 tie; a document outside `documents` is absent from the map.
+  - `s71_sent_at_and_attachment_bit_per_document`: records 1 (`sent_at Some(100)`, attachment
+    true) and 2 (`None`, false): `sent_at(1) == Some(100)`, `sent_at(2) == None`,
+    `has_attachment(1)`, `!has_attachment(2)`, `has_attachment(9) == false` (unknown document).
+  - `s71_remove_drops_postings_and_the_document`: after `remove(1)`, every earlier match of
+    doc 1 is empty, `contains(1) == false`, `record_bytes(1) == None`.
+  - `s42_document_cap_is_upstreams`: a body of 2,000,000 distinct tokens: the record's term
+    bytes equal upstream's for the same document (truncated the same way), and `encoded_len
+    () <= MAX_STORED_DOCUMENT_SIZE + 256` (`crates/store/src/search/mod.rs:40`).
+
+- [ ] **Step 2: Run the tests to see them fail**
+  ```bash
+  cargo test -p store --lib za_search::content 2>&1 | tail -20
+  ```
+  Expected: compile error, `could not find content in za_search`.
+
+- [ ] **Step 3: Implement `crates/store/src/za_search/content.rs`.** Storage: `documents:
+  AHashMap<u32, Stored>` with `Stored { encoded: Box<[u8]>, term_range: Range<usize>, sent_at:
+  Option<i64>, has_attachment: bool, sort: [Box<str>; 3] }`; `postings: AHashMap<(u8,
+  CheekyHash), RoaringBitmap>`; `verbatim: AHashMap<u8, BTreeMap<Vec<u8>, RoaringBitmap>>`
+  for the prefix rule (terms with `len() <= CheekyHash::HASH_SIZE` whose key does not end in
+  `b'*'`). `insert` runs `deserialize_term_fields` over the stored document and adds the
+  document to every `(field, term)` of its field mask (`term.rs:238-250` shows the mask walk).
+  `resolve`: `LeafPlan::new(filters)?` for the limits (`TooLarge`), then for each filter:
+  `And | Or | Not | End | DocumentSet` copied; otherwise `Leaf::plan(filter)` and
+  - `Leaf::Empty` → empty set; `Leaf::Resolved(bm)` → `bm`;
+  - `Leaf::Groups { field, groups }` → for each group the union of the postings of its
+    present hashes, intersected across groups, empty on the first empty intersection
+    (`query.rs:576-596`);
+  - `Leaf::Terms { field, terms }` → the intersection of every term's postings, empty when
+    any is missing (`:605-629`);
+  - `Leaf::Phrase { field, words }` → candidates = the intersection; for each candidate
+    `matches_phrase(read_document(term bytes, &mut scratch).ok_or(ResolveError::Corrupt(d))?, field, &words, &mut ordinals,
+    &mut failure)`; `None` → `Err(ResolveError::Corrupt(document_id))`; keep `Some(true)`;
+  - `Leaf::Prefix { field, prefix }` → the union over `verbatim[field].range(prefix..)` while
+    the key `starts_with(prefix)`;
+  - `Leaf::UnsupportedRange` → `Err(Unresolvable(LeafKind::Integer))`; an `Integer` filter
+    is `Unresolvable(Integer)` (the caller strips the account-id leaf, Task 10; an Email query
+    never carries one, 7.1).
+  `sort_ranks`: collect `(padded_key, document_id)` for every document in `documents` ∩
+  the part, pad as `message_sort_ranks` does (`sortkeys.rs:169-172`), `sort_unstable_by_key`,
+  dense rank from 1 (`:199-213`).
+
+- [ ] **Step 4: Run the tests to see them pass**
+  ```bash
+  cargo test -p store --lib za_search::content 2>&1 | tail -30
+  ```
+  Expected: `test result: ok.`, every test above passing.
+
+- [ ] **Step 5: Format, check, commit**
+  ```bash
+  cargo fmt -p store -- --check && cargo check -p store 2>&1 | grep -E "^(warning|error)" -A3 | grep za_search || echo clean
+  git add crates/store/src/za_search/mod.rs crates/store/src/za_search/content.rs crates/store/src/za_search/content_tests.rs
+  git commit -m "Search index: content part model resolving upstream's leaves from in-memory postings (release 7, task 4)"
+  ```
+
+### Task 5: Blob format, sealing and the manifest
+
+**Files:**
+- Create: `crates/store/src/za_search/blob.rs`, `crates/store/src/za_search/blob_tests.rs`,
+  `crates/store/src/za_search/manifest.rs`, `crates/store/src/za_search/manifest_tests.rs`,
+  `crates/common/src/za/search/mod.rs`, `crates/common/src/za/search/seal.rs`,
+  `crates/common/src/za/search/seal_tests.rs`
+- Modify: `crates/store/src/za_search/mod.rs` (`pub mod blob; pub mod manifest;`, the header
+  types), `crates/store/Cargo.toml` (add `zeroize = "1.9"` beside `blake3 = "1.8"`, the
+  version `crates/vault/Cargo.toml:13` uses), `crates/common/src/za/mod.rs:14-20` (add
+  `pub mod search;`)
+
+**Interfaces:**
+- Consumes: Task 3's and Task 4's types; `store::write::{SerializeWithIds, AssignedIds}`
+  (`crates/store/src/write/mod.rs:1148-1152`, `AssignedIds::current_change_id` `:1648-1651`,
+  `set_current_change_id` `:1660`, `pub(crate)`, for the test); `types::blob_hash::BlobHash`
+  (`[u8; 32]`, `crates/types/src/blob_hash.rs:9, 28`); `blake3::{hash, keyed_hash}`;
+  `zeroize::Zeroizing`; `vault::keys::{Secret, aad, seal, open, KeyError}`
+  (`crates/vault/src/keys.rs:36-48, 151-158, 181-235`: `seal` returns `nonce || ciphertext`,
+  `open` returns `Zeroizing<Vec<u8>>` or `KeyError::{Length, Aead}`); the framing convention
+  of `seal_padded` (`crates/groupware/src/calendar/seal/tree.rs:276-284`: a `u32 LE` length
+  prefix, the plaintext, zero padding, then `seal`; its 256-byte rounding is not this
+  policy); the byte-hash assertion form `AssertValue::Hash(xxh3_64(bytes))`
+  (`crates/common/src/auth/vault.rs:264-268`, `crates/store/src/write/assert.rs:57`).
+- Produces (`crates/store/src/za_search/mod.rs`):
+  - `pub struct SegmentId(pub [u8; 16]);` (`Copy`, `Eq`, `Hash`; `SegmentId::random()` via
+    `rand::random`) `pub enum BlobKind { Thread = 1, Content = 2 }`
+    `pub enum SectionKind { Hidden = 1, Public = 2, Content = 3 }` (both `Copy`, `Eq`,
+    `TryFrom<u8>`)
+  - `pub struct BlobHeader { pub kind: BlobKind, pub tier: u8, pub segment: SegmentId, pub predecessor: Option<(BlobHash, SegmentId)> }`
+    (`Clone`, `Eq`) with `pub const LEN: usize = 1 + 1 + 1 + 16 + 32 + 16;` (67),
+    `pub fn encode(&self) -> [u8; Self::LEN]` (`SEARCH_FORMAT_V1`, kind, tier, segment,
+    predecessor hash and segment or zeros) and
+    `pub fn decode(bytes: &[u8]) -> Result<(BlobHeader, &[u8]), FormatError>` (the rest of
+    the blob follows; `Version(v)` for another first byte, `Kind(k)` for an unknown kind;
+    an all-zero predecessor decodes as `None`)
+  - `pub struct ZaSearchKey(Zeroizing<[u8; 32]>)` with `pub fn new([u8; 32]) -> Self`,
+    `pub fn as_bytes(&self) -> &[u8; 32]`, `Clone`, and `Debug` printing `ZaSearchKey(..)`
+  - (Task 2's, consumed) `padded_len(framed_len: usize, min_class: usize) -> usize` =
+    `max(min_class, framed_len.next_power_of_two())`
+  - (Task 2's, consumed) `compaction_allowance(n_records: usize) -> usize` = `n_records * (RECORD_MAX +
+    ALIAS_LEN) + 4` (the framed length of a section holding `n` maximal records and `n`
+    aliases, decision 2 (c), R35)
+  - `pub enum PadTarget { Publishing, Compaction { n_records: usize } }`
+- Produces (`crates/store/src/za_search/blob.rs`, plaintext only):
+  - `pub struct HiddenSection { pub records: Vec<ThreadRecord>, pub aliases: Vec<Alias> }`,
+    `pub struct PublicSection { pub tombstones: Vec<Tombstone>, pub rows: Vec<RevisionRow> }`
+  - `pub fn encode_hidden(section: &HiddenSection) -> Vec<u8>` (entries, each self-delimiting, `len` being the entry's total length including the prefix: `u16 LE len | u8
+    kind (1 record, 2 alias) | body`; record body `u32 document_id | u32 thread_id | u32
+    revision | u64 created | u64 deleted (0 = present) | u128 subject_hash | u8 n | n × u128`;
+    alias body `u32 source | u32 target | u32 revision`; all little-endian; records first)
+  - `pub fn decode_hidden(bytes: &[u8]) -> Result<HiddenSection, FormatError>`
+  - `pub fn frame_and_pad(hidden: &[u8], target: PadTarget, min_class: usize) -> Result<Vec<u8>, FormatError>`
+    (`u32 LE hidden.len() | hidden | zeros` to `padded_len(hidden.len() + 4, min_class)` for
+    `Publishing`, to `padded_len(compaction_allowance(n_records), min_class)` for
+    `Compaction`; `Err(AllowanceExceeded)` when `hidden.len() + 4 > compaction_allowance
+    (n_records)`, a defect that aborts the pass rather than writing a content-dependent size)
+  - `pub fn unframe(padded: &[u8]) -> Result<&[u8], FormatError>` (`Truncated` when the
+    prefix exceeds what follows)
+  - `pub fn encode_public(section: &PublicSection) -> Vec<u8>` (`u32 LE n | n × (u32
+    document_id | u64 deleted) | u32 LE m | m × (u32 revision | u64 change_id)`; `u32` for the rows too, since a compaction keeps every row at or above the bound) and
+    `pub fn decode_public(bytes: &[u8]) -> Result<PublicSection, FormatError>`;
+    `pub fn public_len(tombstones: usize, rows: usize) -> usize` = `4 + 12·t + 4 + 12·m`
+  - `pub fn encode_content(records: &[&[u8]]) -> Vec<u8>` (`u32 LE n | n × (u32 LE len |
+    record)`) and `pub fn decode_content(bytes: &[u8]) -> Result<Vec<ContentRecord>, FormatError>`
+  - `pub const SEAL_OVERHEAD: usize = 24 + 16;` (nonce and tag of `vault::keys::seal`)
+- Produces (`crates/store/src/za_search/manifest.rs`):
+  - `pub struct ThreadBlobEntry { pub segment: SegmentId, pub hash: BlobHash, pub size: u32 }`,
+    `pub struct ContentHead { pub hash: BlobHash, pub segment: SegmentId, pub length: u32, pub size: u64 }`,
+    `pub struct ContentTo { pub checkpoint: Checkpoint, pub suspended: bool, pub cursor: Option<ContentCursor> }`,
+    `pub struct ContentCursor { pub next_below: u32 }` (newest first: the exclusive upper bound
+    of what is left, `u32::MAX` at the start; plan call E3),
+    `pub struct RebuildCursor { pub next: u32, pub end: u32 }` (`next` the lowest document id not yet done, 0 at the start; `end` the highest id present at the snapshot, inclusive; E3),
+    `pub struct ReconciliationMarker { pub bound: u64 }`,
+    `pub struct FailingDocument { pub document_id: u32, pub attempts: u8 }`,
+    `pub struct Manifest { pub revision: u32, pub newest_row: RevisionRow, pub indexed_to: Checkpoint, pub epoch: u64, pub thread_blobs: Vec<ThreadBlobEntry>, pub content: Option<ContentHead>, pub content_to: ContentTo, pub cursor: Option<RebuildCursor>, pub reconciliation: Option<ReconciliationMarker>, pub failing: Option<FailingDocument> }`
+    (all `Clone`, `Eq`, `Debug`, `Default`) with `pub fn identity_version(&self) -> (u64, u32)`
+    (`(epoch, revision)`) and `pub fn inventory(&self) -> Inventory`
+  - `pub struct Inventory { pub thread_blobs: Vec<ThreadBlobEntry>, pub content: Option<ContentHead> }`
+  - `pub enum ManifestValue { Index(Manifest), Destroying(Inventory) }` with
+    - `pub fn encode(&self, key: &ZaSearchKey) -> Vec<u8>`: `[SEARCH_FORMAT_V1][1][fields][tag]`
+      for `Index`, the tag `blake3::keyed_hash(key, &bytes[..len - 32])` written last;
+      `[SEARCH_FORMAT_V1][2][inventory]` for `Destroying`, no tag (destroy holds no key and
+      ignores the tag, 4.2). Field order and widths: `u32 revision | u32 row.revision | u64
+      row.change_id | u64 indexed_to.change_id | u32 indexed_to.position | u8 complete | u64
+      epoch | u8 n_thread | n × (16 segment | 32 hash | u32 size) | u8 has_content | (32 hash
+      | 16 segment | u32 length | u64 size) | content_to (13 checkpoint | u8 suspended | u8
+      has_cursor | u32 next_below) | u8 has_cursor | u32 next | u32 end | u8 has_marker |
+      u64 bound | u8 has_failing | u32 document_id | u8 attempts`, little-endian; an absent optional field writes its `has_*` byte as `0` and omits the field's bytes.
+    - `pub fn decode(bytes: &[u8], key: &ZaSearchKey) -> Result<ManifestValue, ManifestError>`
+      (`NewerFormat(v)` when the first byte is above `SEARCH_FORMAT_V1`, `OlderFormat(v)`
+      below; `Tag` when the keyed hash differs, compared as `blake3::Hash` values, which is
+      constant-time; `Parse` otherwise)
+    - `pub fn decode_unverified(bytes: &[u8]) -> Result<ManifestValue, ManifestError>` (either state parsed, the tag read but not checked: destroy, the reindex reset and the suite's `read_manifest` helper, 5.7), `pub fn decode_inventory(bytes: &[u8]) -> Result<Inventory, ManifestError>` (either
+      state's inventory, no key, no tag check: destroy's read, 5.7) and `pub fn encode_destroying(inventory: &Inventory) -> Vec<u8>` (`Destroying(inv).encode` needs no key: the same bytes without a tag)
+  - `pub enum ManifestError { Tag, Parse, NewerFormat(u8), OlderFormat(u8) }`
+  - `pub fn manifest_hash(bytes: &[u8]) -> [u8; 32]` (`blake3::hash`, the loaded index's
+    version, R18; distinct from the write assertion's `xxh3_64`)
+  - `pub fn manifest_assertion(previous: Option<&[u8]>) -> AssertValue` (`Hash(xxh3_64
+    (bytes))` or `None`, as `ZaPinRead::assertion`, `crates/common/src/auth/vault.rs`)
+  - `pub struct ManifestFill { pub newest_row: bool, pub epoch: bool }` (`Copy`, `Default`)
+  - `pub struct ManifestWrite { .. }` with `pub fn new(value: ManifestValue, key: ZaSearchKey, fill: ManifestFill) -> ManifestWrite`
+    and `impl SerializeWithIds`: `serialize_with_ids` sets `newest_row.change_id` and/or
+    `epoch` to `ids.current_change_id()` when the flag is set, then `Ok((value.encode(&key),
+    None))`, deterministic so a FoundationDB retry reruns it (R33); `size_hint` is the
+    encoded size; the key is zeroized when the write is dropped (invariant 48)
+- Produces (`crates/common/src/za/search/seal.rs`):
+  - `pub const AAD_SEARCH: &str = "search";`
+  - `pub fn section_aad(account_id: u32, header: &BlobHeader, kind: SectionKind) -> Vec<u8>` =
+    `aad(AAD_SEARCH, account_id) || b"|" || header.encode() || [kind as u8]`
+  - `pub fn seal_section(key: &Secret, account_id: u32, header: &BlobHeader, kind: SectionKind, plaintext: &[u8]) -> Vec<u8>`
+  - `pub fn open_section(key: &Secret, account_id: u32, header: &BlobHeader, kind: SectionKind, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, LossClass>`
+    (`KeyError::{Aead, Length}` → `LossClass::Aead`)
+  - `pub fn build_thread_blob(key: &Secret, account_id: u32, header: &BlobHeader, hidden: Option<(&HiddenSection, PadTarget)>, public: &PublicSection, min_class: usize) -> Result<Vec<u8>, FormatError>`
+    (`header.encode() | u32 LE hidden_sealed.len() | hidden_sealed | public_sealed`; a
+    non-publishing pass passes `hidden: None` and writes length 0, H13)
+  - `pub fn parse_thread_blob(key: &Secret, account_id: u32, expected: &BlobHeader, bytes: &[u8]) -> Result<(Option<HiddenSection>, PublicSection), LossClass>`
+    (`Parse` when the header decodes to anything but `expected`, so a blob cannot be moved
+    to another position; `Aead` from either section; `Parse` from a section decoder)
+  - `pub fn build_content_blob(key: &Secret, account_id: u32, header: &BlobHeader, records: &[&[u8]]) -> Vec<u8>`
+    (`header.encode() | content_sealed`)
+  - `pub fn parse_content_blob(key: &Secret, account_id: u32, expected_segment: Option<SegmentId>, expected_hash_of_predecessor: Option<&(BlobHash, SegmentId)>, bytes: &[u8]) -> Result<(BlobHeader, Vec<ContentRecord>), LossClass>`
+    (the head is checked against the manifest's descriptor, each later node against the
+    predecessor its successor's header named, R11)
+  - `pub fn za_search_key(secret: &Secret) -> ZaSearchKey` (`ZaSearchKey::new(*secret.as_bytes())`; a `From` impl would break the orphan rule, `ZaSearchKey` being `store`'s and `Secret` `vault`'s)
+  - `LossClass` lives in Task 6's `error.rs`; this task creates it there with the variants
+    of the Interfaces block of Task 6 and Task 6 adds the other enums.
+
+- [ ] **Step 1: Write the failing unit tests.** In `crates/store/src/za_search/blob_tests.rs`:
+  - `r20_record_max_and_alias_len_are_the_encoded_maxima`: a record with `K` hashes encodes
+    (as one entry) to exactly `RECORD_MAX`; a record with 0 hashes to `RECORD_MAX - 16 * K`;
+    an alias to `ALIAS_LEN`; `reservation() == 529`; `RECORD_MAX == 304 && ALIAS_LEN == 15`.
+  - `r15_padded_len_at_class_boundaries`: with `M = 65536`: `padded_len(100, M) == M`,
+    `padded_len(M - 1, M) == M`, `padded_len(M, M) == M`, `padded_len(M + 1, M) == 2 * M`,
+    `padded_len(2 * M, M) == 2 * M`, `padded_len(2 * M + 1, M) == 4 * M`; payloads: a hidden
+    section of `M - 5` bytes frames to `M - 1` and pads to `M`; `M - 4` to `M`; `M - 3` to
+    `2 * M`; `2 * M` to `4 * M`.
+  - `r20_g1_maximal_pass_stays_under_m_and_every_pass_pads_to_m`: with `H = 32768` and
+    `M = 65536`: `H + reservation() + 4 <= M`; fixtures (a) one record with 0 hashes, no
+    alias; (b) one record, 15 aliases; (c) 61 records with `K` hashes and `61 * 15` aliases
+    (every reservation of a full pass spent, `61 * 529 = 32269 <= H`) plus one grouped record
+    of 8 messages each with `K - 1` aliases (the overshoot of one grouped record, R20): each
+    `frame_and_pad(encode_hidden(..), PadTarget::Publishing, M)` has length exactly `M`;
+    `encode_hidden` of (c) is at most `H + reservation() * 8`, and (c)'s framed length is
+    under `M`.
+  - `i2_compaction_allowance_is_a_function_of_counts`: two `HiddenSection`s with 1,000
+    records each (500 present with `K` hashes, 500 tombstoned), one with no alias and one
+    with 999 aliases: `frame_and_pad(.., PadTarget::Compaction { n_records: 1000 }, M)`
+    lengths are equal; `compaction_allowance(30_000) == 30_000 * 319 + 4` and `padded_len
+    (compaction_allowance(30_000), M) == 16 * 1024 * 1024` (the 16 MiB class of 1.3 and
+    13); `padded_len(compaction_allowance(0), M) == M`.
+  - `r35_allowance_exceeded_is_an_error`: 10 records and 11 aliases with `n_records: 10`
+    whose encoding exceeds `compaction_allowance(10)` (add a 12th alias if needed) →
+    `Err(FormatError::AllowanceExceeded)`.
+  - `s42_hidden_section_round_trips_records_then_aliases`: `decode_hidden(encode_hidden(s))
+    == Ok(s)` for a section with tombstoned and present records and aliases; a stray kind
+    byte 9 → `Err(Kind(9))`; a cut entry → `Err(Truncated)`.
+  - `s42_public_section_is_fixed_width`: `encode_public(s).len() == public_len(t, m)` for
+    `t in [0, 1, 1000]`, `m in [0, 1]`; round trip.
+  - `g5_content_section_is_length_prefixed_records`: three encoded records round-trip; the
+    section's length is the sum of record lengths plus `4 + 4 * 3`.
+  - `s42_blob_header_round_trips_and_rejects_other_versions_and_kinds`: with and without a
+    predecessor; first byte `2` → `Err(Version(2))`; kind `3` → `Err(Kind(3))`;
+    `BlobHeader::LEN == 67`.
+  - `s42_zero_access_search_key_debug_is_silent`: `format!("{:?}", ZaSearchKey::new([7; 32]))
+    == "ZaSearchKey(..)"`.
+  In `crates/store/src/za_search/manifest_tests.rs`:
+  - `s42_manifest_round_trips_every_field`: a `Manifest` with 3 thread blobs, a content head,
+    a suspended `content_to` with a cursor, a rebuild cursor, a marker and a failing
+    document: `decode(&encode(key), key) == Ok(Index(m))`.
+  - `h9_r33_tag_is_computed_at_commit_over_the_filled_change_id`: `ManifestWrite::new(Index
+    (m), key, ManifestFill { newest_row: true, epoch: true })`; `let mut ids = AssignedIds::
+    default(); ids.set_current_change_id(..)` is `pub(crate)` and needs a change id in the
+    struct: add
+    `#[cfg(test)] pub(crate) fn with_current_change_id(change_id: u64) -> AssignedIds` (plan call B7)
+    beside `:1648` (one test-only constructor, the plan's call); `serialize_with_ids(&mut
+    write, &ids)` → `(bytes, None)`; `decode(&bytes, key)` → `Index(m2)` with
+    `m2.newest_row.change_id == 4242 && m2.epoch == 4242`; flipping byte 10 → `Err(Tag)`;
+    decoding with another key → `Err(Tag)`; serializing twice gives identical bytes
+    (deterministic, the FoundationDB retry).
+  - `h9_a_manifest_without_fill_keeps_its_change_ids`: `ManifestFill::default()` leaves
+    `newest_row.change_id` and `epoch` as given.
+  - `f7_newer_format_is_no_map_older_is_loss`: first byte `2` → `Err(NewerFormat(2))`; `0`
+    → `Err(OlderFormat(0))`.
+  - `r8_manifest_stays_small_at_segments_entries`: 16 thread blobs and a head with `length
+    == 10_000` encode to fewer than 2,048 bytes.
+  - `g12_destroying_marker_and_inventory_decode_without_a_key`: `Destroying(inv)` encodes
+    without a tag and `decode_inventory` returns `inv`; `decode_inventory` of an `Index`
+    manifest returns its inventory even when a byte of the tag was altered.
+  - `r18_manifest_hash_changes_on_any_byte`: `manifest_hash(a) != manifest_hash(a')` for a
+    one-byte difference in `indexed_to`; `manifest_assertion(Some(&a)) == AssertValue::Hash
+    (xxh3_64(&a))`, `manifest_assertion(None) == AssertValue::None`.
+  In `crates/common/src/za/search/seal_tests.rs` (declared from `seal.rs`):
+  - `s31_a_section_opens_only_under_its_account_header_and_kind`: seal under `(key, 1, h1,
+    Hidden)`; opening with account 2, with a header whose segment differs, with a header
+    whose predecessor differs, with `SectionKind::Public`, or with another key is
+    `Err(LossClass::Aead)`; the right tuple returns the plaintext.
+  - `r9_h13_thread_blob_parses_with_and_without_a_hidden_section`: `build_thread_blob` with
+    `Some((&hidden, PadTarget::Publishing))` and with `None`; `parse_thread_blob` returns
+    `(Some(hidden), public)` and `(None, public)`; the blob with a hidden section has length
+    `BlobHeader::LEN + 4 + (M + SEAL_OVERHEAD) + (public_len(t, m) + SEAL_OVERHEAD)` exactly
+    (the length formula of 4.2).
+  - `s42_thread_blob_rejects_another_position`: `parse_thread_blob` with an `expected` header
+    of another segment → `Err(LossClass::Parse)`.
+  - `r11_content_blob_names_its_predecessor`: build node 1 (no predecessor) and node 2
+    (predecessor = (hash of node 1's bytes, node 1's segment)); `parse_content_blob(key, 1,
+    Some(seg2), None, node2)` returns header with `predecessor == Some((h1, seg1))`; parsing
+    node 1 with `expected_hash_of_predecessor = Some(&(h1, seg1))` where its own hash or
+    segment differs → `Err(Parse)`.
+  - `s31_sealed_bytes_hold_no_plaintext`: a record with a 64-byte recognisable `subject_hash`
+    and hash pattern; the blob bytes do not contain the pattern.
+
+- [ ] **Step 2: Run the tests to see them fail**
+  ```bash
+  cargo test -p store --lib za_search::blob 2>&1 | tail -5; cargo test -p store --lib za_search::manifest 2>&1 | tail -5; cargo test -p common --lib za::search::seal 2>&1 | tail -5
+  ```
+  Expected: compile errors (`could not find blob`, `manifest`, `search`).
+
+- [ ] **Step 3: Implement the store side**: the header types, `ZaSearchKey`, `padded_len`,
+  `compaction_allowance` and `PadTarget` in `mod.rs`; `blob.rs` and `manifest.rs` as the
+  Interfaces block specifies. `frame_and_pad` builds the framed buffer in a `Zeroizing<Vec<u8>>`
+  before copying out, as `seal_padded` does (`tree.rs:278`). `ManifestWrite` holds its
+  `ManifestValue` and `ZaSearchKey` by value. Add `zeroize = "1.9"` to `crates/store/Cargo.toml`.
+
+- [ ] **Step 4: Implement the common side**: `crates/common/src/za/search/mod.rs` with
+  `pub mod error; pub mod seal;` (`error.rs` created here with `LossClass`; Task 6 extends
+  it), `pub mod search;` in `crates/common/src/za/mod.rs` after line 17; `seal.rs` as
+  specified, opening each section into a `Zeroizing<Vec<u8>>` and decoding from it.
+
+- [ ] **Step 5: Run the tests to see them pass**
+  ```bash
+  cargo test -p store --lib za_search 2>&1 | tail -5; cargo test -p common --lib za::search 2>&1 | tail -5
+  ```
+  Expected: `test result: ok.` in both.
+
+- [ ] **Step 6: Format, check, commit**
+  ```bash
+  cargo fmt -p store -- --check && cargo fmt -p common -- --check && cargo check -p common 2>&1 | grep -E "^(warning|error)" -A3 | grep -E "za_search|za/search" || echo clean
+  git add crates/store/Cargo.toml Cargo.lock crates/store/src/za_search/ crates/common/src/za/mod.rs crates/common/src/za/search/
+  git commit -m "Search index: blob format with padded hidden sections, sealed sections and the tagged manifest serialized at commit (release 7, task 5)"
+  ```
+
+### Task 6: The loaded index: cache, loader and error classes
+
+**Files:**
+- Create: `crates/common/src/za/search/load.rs`, `crates/common/src/za/search/load_tests.rs`
+- Modify: `crates/common/src/za/search/cache.rs` (Task 2's skeleton gains the fields and methods below), `crates/common/src/za/search/error.rs` (the other enums), `crates/common/src/za/search/mod.rs`,
+  `crates/common/src/cache/invalidate.rs:615, 642` (`cache.za_search.remove_account(*id,
+  EvictReason::Invalidation)` beside each `za_keys.remove_account(*id)`)
+
+**Interfaces:**
+- Consumes: Tasks 3 to 5; Task 2's `ZaSearchConfig::from_env() -> Result<ZaSearchConfig,
+  String>` (`crates/common/src/za/search/config.rs`) and its test-mode counter
+  incrementer `count_za_search_blob_read(account_id)` in `crates/common/src/za/test_hooks.rs`;
+  `Server::get_blob(&self, key: &[u8], range: Range<usize>) -> impl Future<Output =
+  trc::Result<Option<Vec<u8>>>>` (`crates/common/src/storage/blob.rs:416-422`, which
+  decodes the blob codec with `core.blob.keys`); `self.store().get_value::<RawValue>(key)`
+  with `RawValue` (`crates/common/src/auth/vault.rs:46-52`) and a `ValueKey { account_id,
+  collection: Collection::Principal.into(), document_id: 0, class: ValueClass::Property
+  (PrincipalField::ZeroAccessSearch.into()) }` as `vault_key` builds field 150's
+  (`vault.rs:60`); the codec's error shapes (`crates/store/src/write/blob_codec/mod.rs:216-
+  238`: `StoreEvent::DecryptError` with `Key::Id` set for a missing codec key, `DecryptError`
+  without it for a truncated blob, `StoreEvent::DecompressError`); `trc::Error::matches
+  (EventType)`, `value(Key)` (`crates/trc/src/event/mod.rs:142, 216`); `vault::session::
+  SessionKeys::swk()` (Task 2); `store::write::now()` (`write/mod.rs:1338`); the
+  invalidation arms (`invalidate.rs:609-616, 633-642`); `SwapCached` (`crates/common/src/
+  cache/swap/evict.rs:16-30`: `ZaSearchCache` and `LoadedIndex` never implement it, F16).
+- Produces (`error.rs`):
+  - `pub enum LossClass { ManifestMissing, StubAbsent, BlobAbsent, Aead, Parse, Tag, OlderFormat }`
+  - `pub enum TransientClass { Store, BlobStore, Budget, AbsentWithinWindow, CodecKey, Validation }`
+  - `pub enum NoMapReason { NewerFormat, Destroying, Transient(TransientClass) }`
+  - `pub enum LoadFailure { Loss(LossClass), Transient(TransientClass), NoMap(NoMapReason), OverCap }`
+    (all `Copy`, `Eq`, `Debug`; each with `pub fn as_str(&self) -> &'static str`, the reason
+    class the traces carry, invariant 54)
+- Produces (`cache.rs`):
+  - `pub enum PartKind { Thread, Content }`, `pub enum EvictReason { Idle, Budget, Invalidation }`
+  - `pub struct ZaSearchCache { .. }` with `pub fn new(config: Result<ZaSearchConfig, String>) -> Self`
+    (Task 2's skeleton; this task adds the fields and methods below), `pub fn config(&self) -> &ZaSearchConfig`
+    (the boot value; `Server::za_search_config()` is the effective value with the test-mode override, Task 2), `pub fn entry(&self, account_id: u32) ->
+    Arc<IndexEntry>` (get or create, touches `last_used`, then `sweep_idle`), `pub fn get
+    (&self, account_id: u32) -> Option<Arc<IndexEntry>>`, `pub fn remove_account(&self,
+    account_id: u32, reason: EvictReason)` (drops the entry, subtracts its bytes, traces
+    `ZA_SEARCH_EVICTED` with the reason), `pub fn drop_content(&self, account_id: u32,
+    reason: EvictReason)`, `pub fn make_room(&self, part: PartKind, bytes: u64, keep: u32)
+    -> bool` (evicts least-recently-used parts not in use and not `keep`'s, content parts of
+    every account before any thread part; `true` when `used + bytes <= budget` afterwards),
+    `pub fn sweep_idle(&self)` (every entry whose `last_used` is older than `idle_secs`),
+    `pub fn thread_used(&self) -> u64`, `pub fn content_used(&self) -> u64`, and under `test_mode` `pub fn set_content_bytes_for_test(&self, account_id: u32, bytes: u64)` (records a content part's size without a load, for the budget tests)
+  - `pub struct IndexEntry { pub account_id: u32, pub index: Arc<tokio::sync::RwLock<Option<LoadedIndex>>>, pub pass_lock: tokio::sync::Mutex<()>, pub load_flight: tokio::sync::Mutex<()>, .. }`
+    (`za_search_entry` returns an entry whose `index` is `Some`; a holder takes `entry.index.clone().read_owned().await` and maps it with `tokio::sync::OwnedRwLockReadGuard::map(guard, |o| o.as_ref().expect("loaded"))`, so where Tasks 8, 10 and 11 write `OwnedRwLockReadGuard<LoadedIndex>` they mean the mapped guard `OwnedRwLockReadGuard<Option<LoadedIndex>, LoadedIndex>`; `pub type LoadedGuard = tokio::sync::OwnedRwLockReadGuard<Option<LoadedIndex>, LoadedIndex>` and `pub async fn read_loaded(self: &Arc<IndexEntry>) -> Option<LoadedGuard>` are this task's)
+    with `pub fn touch(&self)`, `pub fn in_use(&self) -> bool` (a reader holds the lock or a
+    pass holds `pass_lock`), and the H6 window `pub fn absent_since(&self, hash: &BlobHash,
+    now: u64) -> u64` (records the first absence, returns it) and `pub fn seen(&self, hash:
+    &BlobHash)` (clears it)
+  - `pub struct LoadedIndex { pub manifest_bytes_hash: [u8; 32], pub manifest: Manifest, pub thread: ThreadPart, pub thread_segments: Vec<SegmentId>, pub content: Option<LoadedContent>, pub scanned_to: u64, pub update_records: usize, pub thread_bytes: u64 }`
+    with `pub fn identity_version(&self) -> (u64, u32)` and `pub fn empty(manifest: Manifest) -> LoadedIndex` (a zero hash, empty parts, `scanned_to = manifest.indexed_to.change_id`; the first load's seed and the unit tests' base)
+  - `pub struct LoadedContent { pub part: ContentPart, pub segments: Vec<SegmentId>, pub bytes: u64 }`
+    (`segments` head first, the chain as loaded)
+- Produces (`load.rs`):
+  - `pub trait BlobSource: Sync { fn fetch(&self, hash: &BlobHash) -> impl Future<Output = trc::Result<Option<Vec<u8>>>> + Send; }`
+    implemented for `Server` (`self.get_blob(hash.as_slice(), 0..usize::MAX)`, counting
+    `za_search_blob_reads` in test mode) and, in tests, for `AHashMap<BlobHash, Vec<u8>>`
+  - `pub fn classify_blob_error(err: &trc::Error) -> LoadFailure` (`DecryptError` with
+    `Key::Id` → `Transient(CodecKey)`; `DecryptError` without, or `DecompressError` → `Loss
+    (Parse)`; anything else → `Transient(BlobStore)`)
+  - `pub fn absence_class(first_seen: u64, now: u64, window_secs: u64) -> LoadFailure`
+    (`Transient(AbsentWithinWindow)` while `now - first_seen < window_secs`, else `Loss
+    (BlobAbsent)`)
+  - `pub enum ReloadPlan { Unchanged, Append { thread: Vec<ThreadBlobEntry>, content_head_moved: bool }, Whole }`
+    and `pub fn plan_reload(loaded: &LoadedIndex, manifest: &Manifest) -> ReloadPlan`
+    (`Whole` when a held thread segment is absent from the manifest; `Append` when
+    every held thread segment is still listed, with the unheld entries in manifest order)
+  - `pub async fn load_thread_part<S: BlobSource>(source: &S, entry: &IndexEntry, key: &Secret, manifest_bytes: &[u8], manifest: Manifest, window_secs: u64, now: u64) -> Result<LoadedIndex, LoadFailure>`
+    (fetch each thread blob, `parse_thread_blob` against `BlobHeader { kind: Thread, tier: 0, segment: entry.segment, predecessor: None }` (every thread blob has tier 0 and no predecessor), `ThreadPart::
+    extend` in manifest order, tombstones applied, then `extend([], [], [manifest.newest_row], [])` so that `revision_at` sees the newest publication, whose row the manifest carries and no blob does; `scanned_to = manifest.indexed_to.change_id`, `update_records = 0`)
+  - `pub async fn load_content<S: BlobSource>(source: &S, entry: &IndexEntry, key: &Secret, manifest: &Manifest, stop_at: Option<&[SegmentId]>, window_secs: u64, now: u64) -> Result<LoadedContent, LoadFailure>`
+    (walk from the head by each header's predecessor; stop when the next segment is in
+    `stop_at`, the incremental case, and when the walk ends at `predecessor: None` without meeting one, replace the loaded content whole (a content compaction happened); `parse_content_blob` with the expected segment of the
+    descriptor or the predecessor; `ContentPart::extend`; apply the thread part's tombstones
+    by removing their documents)
+  - `impl Server`:
+    - `pub async fn za_search_read_manifest_raw(&self, account_id: u32) -> trc::Result<Option<Vec<u8>>>`
+    - `pub async fn za_search_read_manifest(&self, account_id: u32, key: &ZaSearchKey) -> Result<Option<(Vec<u8>, ManifestValue)>, LoadFailure>`
+      (store error → `Transient(Store)`; `ManifestError::{Tag, Parse}` → `Loss(Tag)` /
+      `Loss(Parse)`; `OlderFormat` → `Loss(OlderFormat)`; `NewerFormat` → `NoMap(NewerFormat)`)
+    - `pub async fn za_search_entry(&self, account_id: u32, keys: &SessionKeys) -> Result<Arc<IndexEntry>, LoadFailure>`
+      (the entry, loaded under `load_flight` when `index` is `None`: a missing manifest is
+      `Loss(ManifestMissing)`, a `Destroying` marker `NoMap(Destroying)`; the thread budget
+      is asked for `3 × the manifest's thread blob sizes` and refused loads proceed with
+      `ZA_SEARCH_OVER_BUDGET`, H8; the loaded part's `thread_bytes` is `thread.loaded_bytes()`)
+    - `pub async fn za_search_reload_if_moved(&self, entry: &IndexEntry, keys: &SessionKeys) -> Result<bool, LoadFailure>`
+      (reads the manifest; `manifest_hash` equal → `Ok(false)`; else `plan_reload` and apply
+      under `index.write()`; `Whole` reloads the thread part and, when content was loaded,
+      the content too; `Append` extends; the new `manifest_bytes_hash`, `manifest` and
+      `scanned_to = max(old, indexed_to.change_id)` are set; `Ok(true)`)
+    - `pub async fn za_search_load_content(&self, entry: &IndexEntry, keys: &SessionKeys) -> Result<(), LoadFailure>`
+      (`Err(OverCap)` when `manifest.content.size > account_max_mb << 20`; `make_room
+      (Content, 3 × size, account)` or `Err(Transient(Budget))`; `load_content` from the
+      head; sets `content` under `index.write()`)
+  - Each `Server` method returns at once with `Err(NoMap(Transient(..)))`-free semantics: a
+    transient fault is `Err(Transient(..))`, and the caller (Tasks 8, 9, 11) decides between
+    "no map" and the unavailable refusal.
+
+- [ ] **Step 1: Write the failing unit tests** in `crates/common/src/za/search/load_tests.rs`
+  (declared from `load.rs`; `#[tokio::test]`). Fixture: `fn fixture() -> (Secret, u32, AHashMap
+  <BlobHash, Vec<u8>>, Vec<u8> /* manifest bytes */, Manifest)` building two thread blobs
+  (pass 1: records 1 to 3 in one thread, row (1, 100); pass 2: record 4 joining with alias
+  none, a tombstone of 2 at 150, row (2, 200)) and a content chain of two nodes (node 1
+  with records 1 to 3, node 2 with record 4, predecessor node 1), hashes `blake3` of the
+  bytes as `BlobHash`, every blob inserted into the map, and the `Manifest` naming them;
+  `fn counting(map) -> CountingSource` wraps the map and counts fetches per hash. Tests:
+  - `s43_round_trip_a_populated_index`: `load_thread_part` → `thread.present_members(1) ==
+    [1, 3, 4]`, `record(2).deleted == Some(150)`, `rows() == [(1, 100), (2, 200)]`,
+    `scanned_to == manifest.indexed_to.change_id`; `load_content` → `part.contains(1)`,
+    `contains(4)`, `!contains(2)` (tombstone applied), `segments == [seg2, seg1]`.
+  - `r9_thread_load_fetches_no_content_blob`: after `load_thread_part`, the counter of both
+    content hashes is 0.
+  - `r11_chain_is_walked_from_the_head_descriptor`: `load_content` fetches node 2 then node
+    1 and nothing else; a map where node 1's bytes are replaced by a blob of another segment
+    → `Err(Loss(Parse))`.
+  - `f20_incremental_reload_equals_a_fresh_load`: load v1; build v2 = v1 + a third thread
+    blob (record 5) + a third chain node (record 5, predecessor node 2); `plan_reload` is
+    `Append { thread: [entry3], content_head_moved: true }`; applying it (the same code path
+    `za_search_reload_if_moved` uses, factored as `pub async fn apply_reload<S: BlobSource>(source: &S, entry: &IndexEntry, key: &Secret, config: &ZaSearchConfig, manifest_bytes: &[u8], manifest: Manifest, now: u64) -> Result<(), LoadFailure>`) fetches
+    exactly the two new blobs, and the result equals a fresh load of v2 in `thread.records()`,
+    `aliases()`, `rows()`, `content.part.document_ids()` and `manifest_bytes_hash`.
+  - `f20_compaction_reloads_whole`: v3 replaces the three thread blobs with one and the chain
+    with one node: `plan_reload == Whole`; after applying, held segments are `[seg_new]`
+    and the result equals a fresh load of v3.
+  - `r18_a_deletion_only_change_moves_the_hash_and_reloads`: v2' = v1 + a non-publishing
+    blob (tombstone of 3, no hidden section, no row): identity versions equal, `manifest_hash`
+    differs, `plan_reload` is `Append`, and after it `thread.is_present(3) == false`.
+  - `r2_identity_version_distinguishes_epochs`: two manifests with `revision 5` and epochs
+    `100` and `900`: `identity_version()` differs; equal revision and epoch → equal.
+  - `f3_h6_error_classes`: `classify_blob_error(&trc::StoreEvent::BlobNotFound.into_err())`
+    → `Transient(BlobStore)`; `DecryptError` with `.ctx(trc::Key::Id, 7u64)` → `Transient
+    (CodecKey)`; `DecryptError` with details only → `Loss(Parse)`; `DecompressError` →
+    `Loss(Parse)`; `absence_class(100, 105, 10) == Transient(AbsentWithinWindow)`;
+    `absence_class(100, 111, 10) == Loss(BlobAbsent)`; a manifest naming a hash the map
+    lacks: the first `load_thread_part` at `now = 100` → `Err(Transient(AbsentWithinWindow))`,
+    at `now = 111` → `Err(Loss(BlobAbsent))`; inserting the blob between the two calls →
+    `Ok` and `entry.absent_since` cleared.
+  - `h11_f7_g12_manifest_outcomes`: `za_search_read_manifest`'s mapping tested on the pure
+    function `pub fn classify_manifest(decoded: Result<ManifestValue, ManifestError>) ->
+    Result<ManifestValue, LoadFailure>`: `Err(NewerFormat(2))` → `NoMap(NewerFormat)`,
+    `Err(OlderFormat(0))` → `Loss(OlderFormat)`, `Err(Tag)` → `Loss(Tag)`, `Err(Parse)` →
+    `Loss(Parse)`, `Ok(Destroying(..))` stays `Ok` for the caller to map to `NoMap
+    (Destroying)` (assert `za_search_entry`'s mapping through a `pub fn entry_outcome
+    (value: Option<ManifestValue>) -> Result<Manifest, LoadFailure>`: `None` → `Loss
+    (ManifestMissing)`, `Destroying` → `NoMap(Destroying)`).
+  - `f18_budget_counts_the_transient_and_evicts_idle_content_first`: `ZaSearchCache::new
+    (config with mem_mb = 1, thread_mem_mb = 1)`; entries for accounts 1 and 2 with content
+    of 300 KiB each recorded through `make_room(Content, 900 KiB, 1)` then `make_room
+    (Content, 900 KiB, 2)` (the second evicts account 1's content: `get(1).index...content
+    .is_none()`, `content_used` back under the budget); when account 1's reader holds
+    `index.read()` (`in_use`), `make_room` for a third account returns `false`.
+  - `h8_thread_parts_are_never_refused`: `make_room(Thread, ..)` returning `false` does not
+    stop `za_search_entry`'s path: tested on `pub fn thread_budget_outcome(fits: bool) ->
+    Option<&'static str>` returning `Some(ZA_SEARCH_OVER_BUDGET)` when `!fits`; and thread
+    parts are never chosen by `make_room(Content, ..)`.
+  - `g6_loads_are_single_flight`: two `tokio::spawn`ed loads of one entry through the
+    counting source with a `tokio::time::sleep(50ms)` inside the source's first fetch; the
+    counter of the first thread blob is 1 and both tasks see the same `manifest_bytes_hash`.
+  - `s43_idle_sweep_and_invalidation_drop_entries`: `sweep_idle` with `idle_secs = 1` after
+    `last_used` set 2 s back drops the entry and subtracts its bytes; `remove_account(1,
+    Invalidation)` drops it; `get(1) == None`.
+  - `f16_never_swapped_is_pinned_by_the_type`: a compile-time check: `fn assert_not_swap
+    <T>() {}` cannot express a negative bound on stable, so this test is a doc test of the
+    reviewer's duty instead: the test asserts that `SwapCached`'s implementors in
+    `crates/common/src/cache/swap/evict.rs` are exactly `MessageStoreCache` and
+    `GroupwareResources` by reading the file with `include_str!` and counting `impl
+    SwapCached for` occurrences (2). A third implementation fails the test.
+
+- [ ] **Step 2: Run the tests to see them fail**
+  ```bash
+  cargo test -p common --lib za::search::load 2>&1 | tail -10
+  ```
+  Expected: compile error, `could not find load in search`.
+
+- [ ] **Step 3: Implement `error.rs` and `cache.rs`.** Byte accounting: `make_room` reads
+  `thread_bytes` and `content.bytes` of each entry under a short read lock try
+  (`try_read`), treating an entry whose lock is held as in use. `sweep_idle` uses
+  `store::write::now()` seconds. Traces: `ZA_SEARCH_EVICTED` through the fixed-constant
+  convention (`za_search_trace!(ZA_SEARCH_EVICTED, AccountId = account_id, Reason = reason.as_str())`, Task 2's macro on the event the release 5
+  constants use, `crates/common/src/za/imip.rs`, with `AccountId` and `Details = constant`
+  and `Reason = reason.as_str()`; never an id other than the account's).
+
+- [ ] **Step 4: Implement `load.rs`.** The `Server` methods take `SessionKeys` and derive
+  `za_search_key(keys.swk())` for the manifest and pass `keys.swk()` to the section
+  functions. `za_search_entry` loads under `load_flight` and re-checks `index` after taking
+  it (the second waiter finds it loaded, G6). `plan_reload` compares `loaded.thread_segments`
+  with `manifest.thread_blobs` by segment id in order. The `Append` path fetches the unheld
+  thread entries and, when content is loaded and the head moved, calls `load_content` with
+  `stop_at = &loaded.content.segments`. After a `Whole` reload with content previously
+  loaded, content is reloaded only if `make_room` succeeds; otherwise `content` is dropped
+  with `ZA_SEARCH_EVICTED` (`Budget`) and the next content request reloads it (4.3).
+
+- [ ] **Step 5: Wire the cache**: `pub za_search: crate::za::search::cache::ZaSearchCache,`
+  in `Caches` after `za_keys` (`lib.rs:230`); in `config/inner.rs:140` after the `za_keys`
+  line: `za_search: ZaSearchCache::new(ZaSearchConfig::from_env())` (Task 2's line, unchanged: the refusal is checked in `main`, plan call A5) (the `Failed` trait of `utils`, `crates/utils/src/lib.rs:71-95`,
+  exits the process with the refusal's message, which is the boot refusal of 4.4 that Task
+  2 specified; if Task 2 placed the refusal elsewhere, call its function here instead);
+  `cache.za_search.remove_account(*id, EvictReason::Invalidation);` after each
+  `cache.za_keys.remove_account(*id);` at `invalidate.rs:615` and `:642`.
+
+- [ ] **Step 6: Run the tests to see them pass**
+  ```bash
+  cargo test -p common --lib za::search 2>&1 | tail -10
+  ```
+  Expected: `test result: ok.` with 14 load tests and Task 5's seal tests.
+
+- [ ] **Step 7: Format, check (shipping configuration), commit**
+  ```bash
+  cargo fmt -p common -- --check
+  log="${TMPDIR:-/tmp}/za-check.log"; cargo check -p stalwart --no-default-features --features rocks > "$log" 2>&1 || { tail -40 "$log"; echo BUILD FAILED; false; }
+  grep -E "^(warning|error)" -A3 "$log" | grep -E "crates/common/src/za/search|crates/store/src/za_search|crates/common/src/lib.rs|crates/common/src/config/inner.rs|crates/common/src/cache/invalidate.rs" || echo clean
+  git add crates/common/src/lib.rs crates/common/src/config/inner.rs crates/common/src/cache/invalidate.rs crates/common/src/za/search/
+  git commit -m "Search index: per-process cache with budgets and eviction, loader with incremental reload and error classes (release 7, task 6)"
+  ```
+
+### Task 7: The record reader, the openers and the `K` capture
+
+**Files:**
+- Modify: `crates/store/src/query/log.rs:117-184` (add `Store::za_changes_records`, `Store::za_changes_records_range`, `Store::za_log_first_retained` and `ZaChangeRecords` beside `changes`; include the tests with `#[cfg(test)] #[path = "log_za_tests.rs"] mod za_tests;`)
+- Create: `crates/store/src/query/log_za_tests.rs`
+- Create: `crates/email/src/message/za/search/mod.rs` (declares `fields`, `open`; later tasks add `pass`, `write`, `ensure`, `snapshot`, `changes`, `rebuild`, `compact`)
+- Create: `crates/email/src/message/za/search/fields.rs`, `crates/email/src/message/za/search/open.rs`
+- Modify: `crates/email/src/message/za/mod.rs:9-14` (add `pub mod search;`)
+- Test: unit tests inline in `fields.rs` and `open.rs` (`#[cfg(test)] mod tests`)
+
+**Interfaces:**
+- Consumes: `Checkpoint { change_id: u64, position: u32, complete: bool }` (Task 5; `complete == true` means the whole record is consumed and `position` is `u32::MAX`); `ThreadFieldsK { hashes: Vec<u128>, subject_hash: u128, sent_at: Option<i64> }` and `K` (Task 3); `LossClass`, `TransientClass` (Task 6, `crates/common/src/za/search/error.rs`); the hooks `SEARCH_OPEN_FAIL_ONCE`, `SEARCH_BLOB_FAIL_ONCE` and the counter `za_search_message_opens` (Task 2, `common::za::test_hooks`); upstream: `Change` and `Changes::{deserialize, finalize}` (`crates/store/src/query/log.rs:25-35, 432-455, 418-430`), `LogCollection::{log_key, is_prefixed}` (`crates/store/src/write/mod.rs:600-650`), the truncation marker (an empty value at the first retained key, `crates/common/src/storage/transaction.rs:228-244`), `ZaMailView::{za_open_metadata_row, za_open_message_blob}` (`crates/email/src/message/za/view.rs:95-118`), `za_has_attachment` (`view.rs:411`), `ZA_REASON_UNREADABLE` (`view.rs:43`), `ThreadFields::scan` (`crates/email/src/message/thread.rs:30-64`), `BlobKeyring::unavailable_key`'s `DecryptError` with `Key::Id` (`crates/store/src/write/blob_codec/mod.rs:216-222`).
+- Produces (store):
+  ```rust
+  pub struct ZaChangeRecords {
+      pub records: Vec<(u64, Vec<Change>)>, // (change id, the record's changes, unfolded), ascending
+      pub truncated: bool,                   // a marker (empty value) was met in the range read
+      pub resumed_record_lost: bool,         // the marker sits at the resumed partial record's own change id
+      pub first_retained: Option<u64>,       // the truncation marker's change id (the oldest surviving key, `truncate_change_log`'s empty value); `None` when the log holds no marker
+  }
+  impl Store {
+      pub async fn za_changes_records(&self, account_id: u32, collection: SyncCollection, from: Option<Checkpoint>, max_records: usize) -> trc::Result<ZaChangeRecords>;
+      pub async fn za_changes_records_range(&self, account_id: u32, collection: SyncCollection, from_exclusive: u64, to_inclusive: u64) -> trc::Result<ZaChangeRecords>;
+      pub async fn za_log_first_retained(&self, account_id: u32, collection: SyncCollection) -> trc::Result<Option<u64>>;
+  }
+  ```
+  An item id in an Email record is `(thread_id << 32) | document_id` (`build_id`, `crates/store/src/write/log.rs:299-314`); consumers take `id as u32`.
+- Produces (email, `crates/email/src/message/za/search/`):
+  ```rust
+  pub fn za_thread_fields_k(message: &mail_parser::Message<'_>) -> ThreadFieldsK;      // fields.rs
+  pub struct OpenedMessage { pub row: MetadataRow, pub raw: Zeroizing<Vec<u8>>, pub bytes: usize } // open.rs
+  impl OpenedMessage { pub fn parse(&self) -> Option<mail_parser::Message<'_>>; }    // MessageParser::new().parse(&self.raw)
+  pub enum OpenFailure { Loss(LossClass), Transient(TransientClass) }
+  pub fn classify_open_error(err: &trc::Error) -> OpenFailure;                           // open.rs, pure
+  impl Server { pub async fn za_open_for_index(&self, account_id: u32, document_id: u32, keys: &SessionKeys) -> Result<OpenedMessage, OpenFailure>; }
+  ```
+
+- [ ] **Step 1: Write the failing store tests** in `crates/store/src/query/log_za_tests.rs` (set the store up as `crates/store/src/search/index_za_tests.rs` does; read its first 40 lines first). Log through `BatchBuilder` with `with_account_id(7).with_collection(Collection::Email).with_document(d).log_item_insert(SyncCollection::Email, Some(PendingId::Assigned(d)))` and `log_item_delete` the same way, one `write_batch` per record:
+
+```rust
+#[tokio::test]
+async fn records_are_whole_and_unfolded() {
+    // record c1: insert 1, insert 2; record c2: insert 3, delete 1
+    let read = store.za_changes_records(7, SyncCollection::Email, None, 10).await.unwrap();
+    assert_eq!(read.records.len(), 2);
+    assert!(!read.truncated && !read.resumed_record_lost);
+    let (c1, r1) = &read.records[0];
+    assert_eq!(r1.iter().filter(|c| matches!(c, Change::InsertItem(_))).count(), 2);
+    let (c2, r2) = &read.records[1];
+    assert!(c2 > c1);
+    assert!(r2.contains(&Change::InsertItem((3u64 << 32) | 3)));
+    assert!(r2.contains(&Change::DeleteItem((1u64 << 32) | 1)), "unfolded: the delete of 1 is kept");
+    // the folded reader cancels the pair
+    let folded = store.changes(7, SyncCollection::Email.into(), Query::All).await.unwrap();
+    assert!(!folded.changes.iter().any(|c| c.item_id() == Some((1u64 << 32) | 1)));
+    assert_eq!(read.first_retained, None, "no marker: the log was never truncated");
+}
+
+#[tokio::test]
+async fn resume_is_inclusive_for_a_partial_record_and_exclusive_for_a_complete_one() {
+    let partial = Checkpoint { change_id: c1, position: 1, complete: false };
+    let read = store.za_changes_records(7, SyncCollection::Email, Some(partial), 10).await.unwrap();
+    assert_eq!(read.records[0].0, c1);
+    let complete = Checkpoint { change_id: c1, position: 0, complete: true };
+    let read = store.za_changes_records(7, SyncCollection::Email, Some(complete), 10).await.unwrap();
+    assert_eq!(read.records[0].0, c2);
+}
+
+#[tokio::test]
+async fn the_truncation_marker_is_reported_and_the_lost_record_named() {
+    // three records c1 < c2 < c3; truncate as `truncate_change_log` does: an empty value at c2, the range below c2 deleted
+    let read = store.za_changes_records(7, SyncCollection::Email, None, 10).await.unwrap();
+    assert!(read.truncated);
+    assert_eq!(read.first_retained, Some(c2));
+    assert_eq!(read.records.iter().map(|(c, _)| *c).collect::<Vec<_>>(), vec![c3]);
+    let resumed = store.za_changes_records(7, SyncCollection::Email, Some(Checkpoint { change_id: c2, position: 0, complete: false }), 10).await.unwrap();
+    assert!(resumed.truncated && resumed.resumed_record_lost);
+    let after = store.za_changes_records(7, SyncCollection::Email, Some(Checkpoint { change_id: c2, position: 0, complete: true }), 10).await.unwrap();
+    assert!(!after.truncated, "an exclusive resume at the marker skips it, as upstream's `Since` does");
+    assert_eq!(store.za_log_first_retained(7, SyncCollection::Email).await.unwrap(), Some(c2));
+    assert_eq!(store.za_log_first_retained(8, SyncCollection::Email).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn max_records_bounds_the_read_and_the_range_form_is_closed_at_its_end() {
+    let read = store.za_changes_records(7, SyncCollection::Email, None, 1).await.unwrap();
+    assert_eq!(read.records.len(), 1);
+    let range = store.za_changes_records_range(7, SyncCollection::Email, c1, c2).await.unwrap();
+    assert_eq!(range.records.iter().map(|(c, _)| *c).collect::<Vec<_>>(), vec![c2]);
+}
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH" && cargo test -p store --lib za_changes`
+Expected: compile error, `no method named za_changes_records`.
+
+- [ ] **Step 3: Implement the reader** in `log.rs` after `changes` (`:184`). Procedure, the same iteration `changes` makes (`:142-179`) without `Changes`' cross-record folding:
+  - `let collection = LogCollection::Sync(collection); let is_prefixed = collection.is_prefixed();`
+  - `za_changes_records`: `(from_change_id, inclusive) = match from { None => (0, true), Some(cp) => (cp.change_id, !cp.complete) }`; keys `collection.log_key(account_id, from_change_id)` to `collection.log_key(account_id, u64::MAX)`, ascending. For each `(key, value)`: `change_id = key.deserialize_be_u64(key.len() - U64_LEN)?`; if `!inclusive && change_id == from_change_id` → `Ok(true)` (skip the from-key); set `first_retained` if `None`; if `value.is_empty()` → `truncated = true`, and `resumed_record_lost = true` when `inclusive && change_id == from_change_id`, `Ok(true)`; else `let mut record = Changes::default(); record.deserialize(value, is_prefixed).ok_or_else(|| trc::Error::corrupted_key(key, value.into(), trc::location!()))?; record.finalize(); records.push((change_id, record.changes));` and `Ok(records.len() < max_records)`. (Within one record an id sits in one list only, `log_item_insert` at `write/log.rs:369-382`, so a fresh `Changes` per record is unfolded.)
+  - `za_changes_records_range`: the same with keys `log_key(account_id, from_exclusive)` to `log_key(account_id, to_inclusive)`, skipping `change_id == from_exclusive`, no `max_records`.
+  - `za_log_first_retained`: `IterateParams::new(log_key(account_id, 0), log_key(account_id, u64::MAX)).ascending().only_first()` with values, `Some(change_id)` only when the first key's value is the empty marker, else `None`, as `get_last_change_id` does descending (`:308-333`).
+
+- [ ] **Step 4: Run the store tests**
+
+Run: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH" && cargo test -p store --lib za_changes`
+Expected: 4 passed.
+
+- [ ] **Step 5: Write the failing email tests** in `fields.rs` and `open.rs`:
+
+```rust
+// fields.rs
+#[test]
+fn the_capture_keeps_own_id_parent_then_nearest_references_before_any_sort() {
+    // Message-ID <m>, In-Reply-To <p>, References <r1> .. <r20>, Resent-Message-ID <x>
+    let fields = za_thread_fields_k(&message);
+    assert_eq!(fields.hashes.len(), K);
+    let h = |id: &str| xxh3_128(format!("<{id}>").as_bytes());
+    let mut expected = vec![h("m"), h("p")];
+    expected.extend((7..=20).rev().map(|i| h(&format!("r{i}")))); // r20 .. r7
+    assert_eq!(fields.hashes, expected, "none of r1..r6 and not x");
+}
+#[test]
+fn a_short_chain_keeps_everything_once_and_resent_last() {
+    // References <r1> <r2> <r3>, In-Reply-To <r3>, Resent-Message-ID <x>
+    assert_eq!(fields.hashes, vec![h("m"), h("r3"), h("r2"), h("r1"), h("x")]);
+}
+#[test]
+fn subject_and_sent_at_are_upstreams() {
+    let scanned = ThreadFields::scan(&message);
+    assert_eq!(fields.subject_hash, xxh3_64(scanned.subject.as_bytes()));
+    assert_eq!(fields.sent_at, scanned.sent_at);
+}
+// open.rs
+#[test]
+fn open_errors_are_classified() {
+    assert!(matches!(classify_open_error(&trc::StoreEvent::NotFound.into_err()), OpenFailure::Loss(LossClass::StubAbsent)));
+    assert!(matches!(classify_open_error(&za_unreadable(SealError::Aead, 1, 2) /* `crates/email/src/message/za/view.rs:378` */), OpenFailure::Loss(LossClass::Aead)));
+    assert!(matches!(classify_open_error(&trc::StoreEvent::DecryptError.into_err().ctx(trc::Key::Id, 3u32)), OpenFailure::Transient(TransientClass::CodecKey)));
+    assert!(matches!(classify_open_error(&trc::StoreEvent::DecryptError.into_err()), OpenFailure::Loss(LossClass::Parse)));
+    assert!(matches!(classify_open_error(&trc::StoreEvent::DecompressError.into_err()), OpenFailure::Loss(LossClass::Parse)));
+    assert!(matches!(classify_open_error(&trc::StoreEvent::UnexpectedError.into_err()), OpenFailure::Transient(TransientClass::Store)));
+}
+```
+
+- [ ] **Step 6: Run them to see them fail**
+
+Run: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH" && cargo test -p email --lib --features test_mode za::search`
+Expected: compile errors, `za_thread_fields_k` and `classify_open_error` not found.
+
+- [ ] **Step 7: Implement `za_thread_fields_k`** (G10). Take `subject` and `sent_at` from `ThreadFields::scan(message)` (`thread.rs:30-64`); `subject_hash = xxh3_128(scanned.subject.as_bytes())` (`u128`, upstream's `thread_hash` width, `ingest.rs:1330-1338`; mail_parser's Message-ID values carry no angle brackets, and `scan` hashes `id.as_bytes()` as given). Then build `hashes` in header order, not `scan`'s reversed one: the own Message-ID is `scanned.message_id` (the one `scan` chose) hashed with `xxh3_128`; then every `In-Reply-To` value in header order; then every `References` value from the last to the first; then every `Resent-Message-Id` value; each `visit_text` value with the brackets as `scan` hashes them (`id.as_bytes()` of the raw id string); dedup keeping the first occurrence; `truncate(K)`.
+
+- [ ] **Step 8: Implement `za_open_for_index` and `classify_open_error`**. Procedure:
+  1. Test mode: `if (search_open_fail_all(account_id) || take_search_open_fail(account_id)) { return Err(Loss(LossClass::Aead)) }`; `if take_search_blob_fail(account_id) { return Err(Transient(TransientClass::BlobStore)) }`.
+  2. Read the stored row: `self.store().get_value::<MetadataRow>(ValueKey::immutable(account_id, Collection::Email, document_id, EmailField::Metadata))` (as `tests/src/za/mail/mod.rs`'s `metadata_key` builds it; find the production reader with `grep -n "EmailField::Metadata" crates/email/src/message/*.rs`): `Ok(None)` → `Loss(StubAbsent)`; `Err(e)` → `classify_open_error(&e)`.
+  3. `self.za_open_metadata_row(&stored, Some(keys), account_id, document_id).await`: `Ok(Some(row))` is the opened row; `Ok(None)` uses `stored` as it is; `Err(e)` → `classify_open_error(&e)`.
+  4. `self.get_blob(row.unarchive()?.blob_hash().as_slice(), 0..usize::MAX).await`: `Ok(None)` → `Transient(AbsentWithinWindow)` (the pass turns it into `Loss(BlobAbsent)` past the window, Task 8); `Err(e)` → `classify_open_error(&e)`.
+  5. `self.za_open_message_blob(opened, Some(keys), account_id, document_id, bytes).await`: `Err(e)` → `classify_open_error(&e)`; `Ok(raw)`: `bytes = raw.len()`; in test mode `count_za_search_message_open(account_id)`; `Ok(OpenedMessage { row, raw, bytes })`.
+  - `classify_open_error`: `Store(NotFound)` → `Loss(StubAbsent)`; `Store(DataCorruption)` with `Key::Reason == ZA_REASON_UNREADABLE` → `Loss(Aead)`, any other `DataCorruption` → `Loss(Parse)`; `Store(DecryptError)` with a `Key::Id` value → `Transient(CodecKey)` (the keyring's missing key, `blob_codec/mod.rs:216-222`), without one → `Loss(Parse)` (a truncated encrypted blob, `:224-230`); `Store(DecompressError)` → `Loss(Parse)`; everything else → `Transient(Store)`.
+
+- [ ] **Step 9: Run the email tests**
+
+Run: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH" && cargo test -p email --lib --features test_mode za::search`
+Expected: 4 passed.
+
+- [ ] **Step 10: Compile check and format**
+
+Run: `cargo check -p stalwart --no-default-features --features rocks` (the Global Constraints form) and `cargo fmt -p store -p email -- --check`.
+Expected: clean.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add crates/store/src/query/log.rs crates/store/src/query/log_za_tests.rs crates/email/src/message/za/mod.rs crates/email/src/message/za/search/
+git commit -m "Search: the unfolded change-log reader, the index openers and the K-bounded thread fields"
+```
+
+### Task 8: The pass and setup's empty manifest
+
+**Files:**
+- Create: `crates/email/src/message/za/search/pass.rs` (steps 0–2: `za_search_pass`, `Opener`, `Staging`, `plan_pass`), `crates/email/src/message/za/search/write.rs` (step 3: `stage_blobs`, `build_batch`, `commit_and_swap`)
+- Modify: `crates/email/src/message/za/search/mod.rs` (declare `pass`, `write`)
+- Modify: `crates/common/src/auth/vault.rs:202-237` (`vault_batch_write`), `:363-372` (`vault_commit_store`), `:518-528` (`za_vault_commit`): a trailing `extra: Option<ZaVaultExtra>` parameter; every other caller passes `None` (find them with `grep -rn "za_vault_commit\|vault_commit_store" crates`)
+- Create: `crates/common/src/za/search/setup.rs` (`za_setup_manifest`)
+- Modify: `crates/http/src/api/vault.rs:485-507` (`za_commit` gains `extra`), `:1081-1139` (`za_setup` builds the manifest)
+- Modify: `crates/common/src/za/test_hooks.rs` (the pause points of `SEARCH_SWEEP_PAUSE`, `SEARCH_PASS_PAUSE`, `SEARCH_COMMIT_PAUSE`, `SEARCH_SWAP_PAUSE`, `SEARCH_HOLD_EXPIRE`, `SEARCH_BLOB_SLOW` are called from `pass.rs`/`write.rs`; the statics are Task 2's)
+- Create: `tests/src/za/mail/index.rs`; Modify: `tests/src/za/mail/mod.rs` (`pub mod index;`), `tests/src/za/mod.rs:224` (`mail::index::test(&mut test).await;` after `mail::search::test`), `tests/src/utils/za.rs` (helpers below)
+- Test: unit tests inline in `pass.rs`; the za cases in `tests/src/za/mail/index.rs`
+
+**Interfaces:**
+- Consumes: Task 7's reader, `OpenedMessage`, `OpenFailure`, `za_thread_fields_k`; Task 3's `ThreadPart::{assign, tombstone, exists_at, current_thread}`, `Assignment`, `ThreadRecord`, `Alias`, `Tombstone`, `RevisionRow`; Task 4's `ContentRecord::new(IndexDocument, u32, SortKeys, Option<i64>, bool)` and `SortKeys` (this task implements `From<&MessageSortKeys> for SortKeys` in `email`); Task 5's `BlobHeader`, `BlobKind`, `SectionKind`, `SegmentId::random()`, `HiddenSection`, `PublicSection`, `PadTarget`, `build_thread_blob`, `build_content_blob`; Task 2's `padded_len`, `reservation()`; `Manifest`, `ManifestValue`, `ManifestWrite::new(value, key, ManifestFill)`, `manifest_hash`, `ZaSearchKey`, `ContentHead`, `ThreadBlobEntry`, `ContentTo`, `FailingDocument`; Task 6's `Server::{za_search_entry, za_search_read_manifest, za_search_reload_if_moved}`, `IndexEntry { index: Arc<RwLock<Option<LoadedIndex>>>, pass_lock, .. }` with `IndexEntry::{absent_since(&BlobHash, now) -> u64, seen(&BlobHash), read_loaded()}`, `LoadedIndex { manifest_bytes_hash, manifest, thread, content, scanned_to }`, `LoadFailure`, `seal_section`; Task 2's `Server::za_search_config()`, the traces (`za_search_trace!`, `ZA_SEARCH_PASS`, `ZA_SEARCH_SKIPPED`, `ZA_SEARCH_ABORTED`, `ZA_SEARCH_LOST`, `ZA_SEARCH_SUSPENDED`), the hooks; upstream: `index_document` (`crates/email/src/message/index/search.rs:43-153`) called as the index queue calls it (`crates/services/src/index_queue/document.rs:81-101`: `row.raw_headers()`, `row.unarchive().index_document(account_id, document_id, &headers, raw, core.email.index_fields[&SearchIndex::Email], core.email.default_language, &core.email.extract_limits)`), `MessageSortKeys::from_message` (`sortkeys.rs:452-469`), `za_has_attachment(row.unarchive())` (`view.rs:411`), `hold_blob` (`crates/common/src/storage/blob.rs:308-360`), `BlobHold::release` (`:108-122`), `BlobOp::Link`/`BlobLink::Document` (`crates/store/src/write/mod.rs:1296-1306`; key `hash | account_id | Collection::Principal (7) | 0`, `key.rs:410-421`), `BlobLinkValue::new(len)` (as `za/ingest.rs:230-236` writes a `Document` link), `AssertValue::Hash(xxh3_64(bytes))` (`assert.rs:63`; the vault's `cas`, `vault.rs:117`), `SetValue::serializable` (`write/mod.rs:1192-1198`), `AssignedIds::change_id(account_id, SyncCollection::Email.change_group())` (`write/mod.rs:1625-1635`), `Server::commit_batch` (`transaction.rs:27`), `log_item_update(SyncCollection::Email, Some(PendingId::Assigned(w)))` (as `merge_keywords`, `messagedata.rs:618`), `log_container_property_change(collection, PendingId)` (`batch.rs:463-474`), `MessageStoreCache::{last_change_id, mailboxes.items[i].document_id}` (`common/src/lib.rs:288-296, 337-342, 399-401`), `get_cached_messages` (`crates/email/src/cache/mod.rs:59-68`), `core.jmap.upload_tmp_ttl` (`crates/common/src/config/mailstore/jmap.rs:34`), `BlobOpts::new(CompressionAlgo::None, core.blob.email.encryption.clone())` (`za/ingest.rs:176-179`), `is_assertion_failure()`.
+- Produces:
+  ```rust
+  // pass.rs
+  pub enum PassOutcome { Current, Advanced { published: bool, indexed_to: Checkpoint }, Running, Aborted(TransientClass), Lost, NoMap(NoMapReason), Recovery(RecoveryCause) }
+  pub enum RecoveryCause { Loss(LossClass), Truncated } // with `pub fn as_str(&self) -> &'static str` for the traces
+  impl Server { pub async fn za_search_pass(&self, account_id: u32, keys: &SessionKeys) -> trc::Result<PassOutcome>; }
+  pub(crate) struct PassLimits { pub cap: usize, pub hidden_bytes: usize, pub message_bytes: u64, pub elapsed: Duration, pub checkpoint: usize, pub skip_after: u8, pub content_allowed: bool }
+  pub(crate) struct Indexed { pub fields: ThreadFieldsK, pub content: Option<ContentRecord>, pub bytes: usize }
+  pub(crate) trait Opener { async fn open(&mut self, document_id: u32) -> Result<Indexed, OpenFailure>; }
+  pub(crate) enum PassDecision { Nothing, ManifestOnly, NonPublishing, Publishing, ContentOnly, Abort { class: TransientClass, document_id: u32 } } // ContentOnly: a content cursor's pass (Task 14), a content blob and a manifest update, no thread blob, no revision, no log entry
+  pub(crate) struct Staging { pub revision: u32, pub records: Vec<ThreadRecord>, pub aliases: Vec<Alias>, pub tombstones: Vec<Tombstone>, pub content: Vec<(u32, ContentRecord)>, pub skipped: Vec<(u32, LossClass)>, pub checkpoint: Checkpoint, pub cursor_next: Option<u32>, pub scanned_to: u64, pub update_records: usize, pub witness: Option<u32>, pub decision: PassDecision, pub failing: Option<FailingDocument> }
+  pub(crate) async fn plan_pass(base: &LoadedIndex, cursor_items: Vec<u32>, records: &ZaChangeRecords, limits: &PassLimits, started: Instant, opener: &mut impl Opener) -> Staging;
+  // write.rs
+  pub(crate) async fn write_pass(server: &Server, account_id: u32, keys: &SessionKeys, entry: &IndexEntry, previous_bytes: &[u8], base_hash: [u8; 32], base_manifest: Manifest, staging: Staging) -> trc::Result<PassOutcome>;
+  // common/src/za/search/setup.rs
+  pub fn za_setup_manifest(swk: &vault::keys::Secret, indexed_to: u64) -> Vec<u8>;
+  // common/src/auth/vault.rs
+  pub struct ZaVaultExtra { pub field: PrincipalField, pub value: Vec<u8> } // asserted `AssertValue::None` and set in the vault batch
+  ```
+  Test helpers (`tests/src/utils/za.rs`): `run_search_pass(test: &TestServer, account_id: u32, password: &str) -> PassOutcome` (`za_unlock` then `za_search_pass`); `read_manifest(test, account_id) -> Option<ManifestValue>` (field 152 through `store().get_value::<RawValue>(ValueKey::property(account_id, Collection::Principal, 0, PrincipalField::ZeroAccessSearch))`, decoded with `ManifestValue::decode_unverified`, so a destroying marker reads too; the tag's verification is the loader's and has Task 5's unit tests); `simulate_restart(test: &TestServer, account_id: u32)` (evicts the account's search entry through `ZaSearchCache::remove_account(account_id, EvictReason::Invalidation)`, removes its resident keys with `za_keys.remove_account`, and invalidates its message cache with `CacheInvalidation::MessageCache`: every in-memory state a restart loses, plan call C7); `manifest_bytes(test, account_id) -> Option<Vec<u8>>`; `principal_blob_links(test, account_id) -> Vec<(BlobHash, usize)>` (hash and the link value's stored size, `BlobLinkValue`; iterate the blob-link subspace, keep keys whose suffix is `account_id | 7 | 0`; model it on `tests/src/utils/cleanup.rs`'s link scan); `index_holds(test, account_id, document_id) -> bool` (`cache.za_search.get(account_id)` and its loaded index, then `thread.exists_at(document_id, u64::MAX) == Some(true)`); `log_records_since(test, account_id, collection: SyncCollection, since: u64) -> Vec<(u64, Vec<Change>)>` (`za_changes_records` from `Checkpoint { change_id: since, position: 0, complete: true }`, or `None` when `since == 0`, with `usize::MAX` records).
+
+**Rules this task implements** (spec 5.1, stated as procedures; the implementer follows them and does not reopen them):
+- **Order.** A pending cursor's items first, oldest document id first, and no log record in a pass that worked cursor items; then records in change-id order; within a record, inserts in document-id order, then its deletions; a record may be left part-way at an insert boundary, and its deletions are applied only when it completes.
+- **Discard.** A tombstoned message keeps only its identity (document id, assignment, creation and deletion change ids): `ThreadPart::tombstone` drops its hashes. Nothing else is discarded here (compaction is Task 15).
+- **Checkpoints.** `indexed_to = (c, p, complete)`: records below `c` whole; of `c`, inserts up to `p`; `complete` when `c`'s inserts and deletions are done. A pass resumes a partial `c` inclusively (Task 7's reader does), skips its inserts `<= p`, finishes its inserts, applies its deletions. `scanned_to` (memory only) is the highest change id the pass read whole.
+- **Error classes.** Loss of a message (Task 7's `Loss`) skips it: traced `ZA_SEARCH_SKIPPED` with account id, document id and the class, recorded in `skipped`, never retried. A transient error aborts: nothing indexed this pass is written; the one write is a manifest-only checkpoint carrying `failing = FailingDocument { document_id, attempts: previous + 1 }` (previous = the manifest's `failing` for the same document, else 0); when `attempts` reaches `ZA_SEARCH_SKIP_AFTER` the document is skipped as loss instead (`ZA_SEARCH_SKIPPED` with the transient class as the reason) and the pass continues. A message blob reported absent is `Transient(AbsentWithinWindow)` while `entry.absent_since(&blob_hash, now)` (Task 6's window, keyed by the message blob's hash from the stub) is younger than `ZA_SEARCH_ABSENT_RETRY_SECS`, and `Loss(BlobAbsent)` after.
+- **Charges.** Every admitted item (a cursor item or an insert that was opened, whatever happened next) adds `reservation()` to `reserved`, 1 to `items` and the raw size to `bytes`. Before admitting an item, if `items >= 1` and (`items >= cap` or `reserved >= hidden_bytes` or `bytes >= message_bytes` or `started.elapsed() >= elapsed`), stop at this insert boundary. Nothing about a record's aliases or its actual size enters the decision.
+- **Keyless writes** (spec 6.3, invariant 53): for a publishing pass exactly one Email item update of the witness `W` (the lowest document id among the messages this pass indexed, computed from `records`' ids alone), one Thread container property change of `W`, one Email container property change per mailbox of the account; nothing for a non-publishing or manifest-only pass.
+
+- [ ] **Step 1: Write the failing unit tests** in `pass.rs` with a `FakeOpener` (`HashMap<u32, Result<Indexed, OpenFailure>>`; a fake `Indexed` has `fields.hashes` chosen per fixture, `subject_hash` fixed, `content: None`, `bytes: 1000`) and a `base` built from `LoadedIndex::empty(manifest)` (Task 6's constructor; `indexed_to` complete at change id 10, `epoch 0`, `revision 3`). Limits: `cap 4, hidden_bytes 32 * 1024, message_bytes 32 MiB, elapsed 2 s, checkpoint 1000, skip_after 8, content_allowed true`. Records are built as `(change_id, vec![Change::InsertItem((d as u64) << 32 | d as u64), ..])`.
+
+```rust
+#[tokio::test]
+async fn equal_public_inputs_stop_at_the_same_checkpoint_whatever_the_probe_merged() { // R21
+    // 37 fillers (docs 1..=37, distinct subjects, no references) in records c11..c47, then a probe (doc 38) whose two
+    // references name docs 5 and 6: in fixture A, 5 and 6 share subject and thread; in B they are distinct threads.
+    // cap 48 > 38, hidden budget lowered to 38 * reservation() - 1 so the budget, not the count, binds.
+    let a = plan_pass(&base, vec![], &records_a, &limits, Instant::now(), &mut opener_a).await;
+    let b = plan_pass(&base, vec![], &records_b, &limits, Instant::now(), &mut opener_b).await;
+    assert_eq!(a.checkpoint, b.checkpoint);
+    assert_eq!(a.witness, b.witness);
+    assert_ne!(a.aliases.len(), b.aliases.len(), "the fixtures differ only in what merged");
+}
+#[tokio::test]
+async fn a_record_larger_than_the_cap_is_left_part_way() { // R20, R1
+    // one record c11 with inserts 1..=10, cap 4
+    let s = plan_pass(&base, vec![], &records, &limits, Instant::now(), &mut opener).await;
+    assert_eq!(s.records.len(), 4);
+    assert_eq!(s.checkpoint, Checkpoint { change_id: c11, position: 4, complete: false });
+    assert!(s.tombstones.is_empty(), "the record's deletions wait for its completion");
+    // resumed: base.indexed_to = that checkpoint, records read inclusively hold c11 again
+    let s2 = plan_pass(&resumed_base, vec![], &records, &limits, Instant::now(), &mut opener).await;
+    assert_eq!(s2.records.iter().map(|r| r.document_id).collect::<Vec<_>>(), vec![5, 6, 7, 8]);
+}
+#[tokio::test]
+async fn a_partial_record_finishes_then_applies_its_deletions() { // R29
+    // record c11: inserts 1..=5, delete 9 (held present in base); cap 10; base.indexed_to = (c11, 3, false)
+    assert_eq!(s.records.iter().map(|r| r.document_id).collect::<Vec<_>>(), vec![4, 5]);
+    assert_eq!(s.tombstones, vec![Tombstone { document_id: 9, deleted: c11 }]);
+    assert_eq!(s.checkpoint, Checkpoint { change_id: c11, position: 0, complete: true });
+}
+#[tokio::test]
+async fn the_witness_is_the_lowest_indexed_id_whatever_threaded() { // R4
+    // inserts 20, 7, 13 in one record; in fixture A 7 replies to a base message 2, in B nothing threads
+    assert_eq!(a.witness, Some(7)); assert_eq!(b.witness, Some(7));
+}
+#[tokio::test]
+async fn a_logged_deletion_is_applied_unconditionally() { // R17
+    // base holds 3 present; record c11: delete 3; the opener is never consulted
+    assert_eq!(s.tombstones, vec![Tombstone { document_id: 3, deleted: c11 }]);
+    assert!(matches!(s.decision, PassDecision::NonPublishing));
+    // a deletion of a document the index does not hold stages nothing but counts as consumed
+    assert!(matches!(s_unknown.decision, PassDecision::ManifestOnly));
+}
+#[tokio::test]
+async fn the_decision_follows_what_changed() { // R13, R22, R26, F4, G19
+    assert!(matches!(update_only.decision, PassDecision::Nothing));                 // 5 UpdateItem records
+    assert_eq!(update_only.scanned_to, c15);
+    assert!(matches!(many_updates.decision, PassDecision::ManifestOnly));         // 1000 UpdateItem records (limits.checkpoint)
+    assert!(matches!(skipped_only.decision, PassDecision::ManifestOnly));         // one insert whose opener answers Loss(Aead)
+    assert_eq!(skipped_only.skipped, vec![(1, LossClass::Aead)]);
+    assert!(matches!(cursor_only.decision, PassDecision::ManifestOnly));          // cursor_items [4, 5] all Loss(StubAbsent)
+    assert_eq!(cursor_only.cursor_next, Some(6));
+    assert!(matches!(published.decision, PassDecision::Publishing));              // one indexed insert
+    assert_eq!(published.revision, base.manifest.revision + 1);
+}
+#[tokio::test]
+async fn a_transient_open_aborts_with_the_attempt_count() { // F3, R34, H5
+    // record c11: inserts 1 (ok), 2 (Transient(BlobStore)), 3 (ok)
+    assert!(matches!(s.decision, PassDecision::Abort { class: TransientClass::BlobStore, document_id: 2 }));
+    assert_eq!(s.failing, Some(FailingDocument { document_id: 2, attempts: 1 }));
+    assert!(s.records.is_empty(), "nothing of an aborted pass is written");
+    // base.manifest.failing = Some((2, 7)), skip_after 8: document 2 is skipped as loss and the pass goes on
+    assert_eq!(s8.skipped, vec![(2, LossClass::Parse)]); // a transient skip records BlobAbsent for AbsentWithinWindow, else Parse (plan call C8)
+    assert_eq!(s8.records.iter().map(|r| r.document_id).collect::<Vec<_>>(), vec![1, 3]);
+    assert_eq!(s8.failing, None);
+}
+#[tokio::test]
+async fn cursor_items_come_first_and_take_the_epoch_as_creation() { // 5.4 order, R10
+    // base.manifest.cursor = Some(RebuildCursor { next: 3, end: 6 }), epoch 100; cursor_items [3, 5, 6]; records c11.. present
+    assert_eq!(s.records.iter().map(|r| (r.document_id, r.created)).collect::<Vec<_>>(), vec![(3, 100), (5, 100), (6, 100)]);
+    assert_eq!(s.cursor_next, Some(7));
+    assert_eq!(s.checkpoint, base.manifest.indexed_to, "no record is consumed in a cursor pass");
+}
+#[tokio::test]
+async fn the_time_cap_stops_at_an_insert_boundary_with_at_least_one_item() { // G18
+    // limits.elapsed = Duration::ZERO, started = Instant::now() - 1 s; record c11 inserts 1..=3
+    assert_eq!(s.records.len(), 1);
+    assert_eq!(s.checkpoint, Checkpoint { change_id: c11, position: 1, complete: false });
+}
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH" && cargo test -p email --lib --features test_mode za::search::pass`
+Expected: compile errors (`plan_pass`, `Staging` not found).
+
+- [ ] **Step 3: Implement `plan_pass`** in `pass.rs` by the rules above. Sketch of the state: `items, reserved, bytes: usize`, `consumed: bool`, `update_records: usize`, `staged: ThreadPart` overlay (clone `base.thread` once; `ThreadPart: Clone`; a copy per pass is the thread part's size, megabytes at most, and only on the pass's task), `witness: Option<u32>`, `checkpoint = base.manifest.indexed_to`, `revision = base.manifest.revision + 1` used for assignments (kept only if `Publishing`). Cursor items: `for d in cursor_items { if cap → break; admit(d, created = base.manifest.epoch) }`, `cursor_next = Some(the last admitted or skipped id + 1)` (the cursor's own `next` when the list was empty), return without reading records. Records: `for (change_id, changes)`: `let partial = Some(change_id) == Some(base.manifest.indexed_to.change_id) && !base.manifest.indexed_to.complete`; inserts `= changes InsertItem ids as u32, sorted, filtered(> position if partial)`; `deletes` likewise; if both empty → `update_records += 1`, `checkpoint = complete(change_id)`, continue; for each insert: `held = staged.exists_at(d, u64::MAX).is_some()` → skip (`consumed = true`); cap check → set `checkpoint = Checkpoint { change_id, position: last_done, complete: false }` where `last_done` is the previous insert's id (or `position` when resuming) and return; `admit(d, created = change_id)`; after the inserts, for each delete `d`: if `staged.exists_at(d, u64::MAX) == Some(true)` → `staged.tombstone(d, change_id)`, push `Tombstone`; `consumed = true`; `checkpoint = complete(change_id)`. `admit`: `items += 1; reserved += reservation(); match opener.open(d)`: `Ok(indexed)` → `bytes += indexed.bytes; let a = staged.assign(&indexed.fields, d, revision, created); records.push(the record staged.assign created); aliases.extend(a.aliases); if let Some(c) = indexed.content { content.push((d, c)) }; witness = min`; `Err(Loss(class))` → `skipped.push((d, class))`; `Err(Transient(class))` → attempts rule: `prev = base.manifest.failing.filter(|f| f.document_id == d).map_or(0, |f| f.attempts)`; if `prev + 1 >= limits.skip_after` → `skipped.push((d, loss_of(class)))` where `loss_of(AbsentWithinWindow) = BlobAbsent`, otherwise `Parse`; else `decision = Abort { class, document_id: d }; failing = Some(FailingDocument { document_id: d, attempts: prev + 1 })`, discard `records`, `aliases`, `tombstones`, `content`, keep `checkpoint = base.manifest.indexed_to`, return. Decision at the end: `Publishing` if `!records.is_empty()`; else `ContentOnly` if `!content.is_empty()` (a content cursor's pass, Task 14: content records for documents already indexed); else `NonPublishing` if `!tombstones.is_empty()`; else `ManifestOnly` if `consumed || cursor_next.is_some() || base.update_records + update_records >= limits.checkpoint` (`LoadedIndex.update_records`, memory only, counts the update-only records read whole since `indexed_to` across this node's passes; a `ManifestOnly` checkpoint reached this way sets `indexed_to = complete(scanned_to)` and the swap resets the count; a `Nothing` decision adds this pass's count to it); else `Nothing`. `scanned_to = last change id read whole` (`checkpoint.change_id` when complete, else the previous record's).
+
+- [ ] **Step 4: Run the unit tests**
+
+Run: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH" && cargo test -p email --lib --features test_mode za::search::pass`
+Expected: 9 passed.
+
+- [ ] **Step 5: Implement `za_search_pass`** (steps 0–2 glue) in `pass.rs`:
+  0. `let config = self.za_search_config();` `let entry = match self.za_search_entry(account_id, keys).await { Ok(e) => e, Err(LoadFailure::Loss(l)) => return Ok(PassOutcome::Recovery(RecoveryCause::Loss(l))), Err(LoadFailure::Transient(t)) => return Ok(PassOutcome::Aborted(t)), Err(LoadFailure::NoMap(r)) => return Ok(PassOutcome::NoMap(r)), Err(LoadFailure::OverCap) => unreachable!("a thread load never answers OverCap") };` `let Ok(_pass) = entry.pass_lock.try_lock() else { return Ok(PassOutcome::Running) };` Shortcut: `let cache = self.get_cached_messages(account_id).await?;` read `(cursor, reconciliation, indexed_to, scanned_to, hash)` under `entry.index.read()`; if `cursor.is_none() && reconciliation.is_none() && cache.last_change_id <= scanned_to.max(indexed_to.change_id if complete)` → `Current`. `search_sweep_pause_point(account_id).await` (`SEARCH_SWEEP_PAUSE`). `let Some((bytes, value)) = (match self.za_search_read_manifest(account_id, &za_search_key(keys.swk())).await { Ok(v) => v, Err(LoadFailure::Loss(l)) => return Ok(Recovery(Loss(l))), Err(LoadFailure::Transient(t)) => return Ok(Aborted(t)), Err(LoadFailure::NoMap(r)) => return Ok(NoMap(r)), Err(LoadFailure::OverCap) => unreachable!("the manifest read never answers OverCap") }) else { return Ok(Recovery(Loss(LossClass::ManifestMissing))) /* H11 */ };` `ManifestValue::Destroying(_)` → `NoMap(NoMapReason::Destroying)`; if `manifest_hash(&bytes) != loaded hash` → `self.za_search_reload_if_moved(&entry, keys).await` (map its `LoadFailure` as above), then re-read the loaded state. Snapshot the base: `let base = entry.index.read().await.clone()` is too large; instead hold the read guard only to clone `manifest` and `thread` into `plan_pass`'s `base` (a `LoadedIndex` view with `content: None`), as `plan_pass` takes `&LoadedIndex`.
+  1. Cursor items: `if let Some(c) = base.manifest.cursor { cache.emails.document_ids().filter(|d| *d >= c.next && *d <= c.end).sorted() }` else empty. Records: `if cursor_items.is_empty() { self.store().za_changes_records(account_id, SyncCollection::Email, Some(if base.scanned_to > base.manifest.indexed_to.change_id { Checkpoint { change_id: base.scanned_to, position: 0, complete: true } } else { base.manifest.indexed_to }), config.checkpoint.max(config.pass_cap + 1)).await? }` else an empty `ZaChangeRecords` (the records in `(indexed_to, scanned_to]` were read whole by an earlier pass of this node and held only updates, so the read resumes after `scanned_to`; it is wide enough that a run of update-only records is consumed in `ZA_SEARCH_CHECKPOINT`-sized steps instead of being re-read on every pass, and inserts beyond the cap are left unconsumed); if `records.truncated` → `Ok(PassOutcome::Recovery(RecoveryCause::Truncated))`. `limits = PassLimits { cap: config.pass_cap, hidden_bytes: config.pass_hidden_kb * 1024, message_bytes: config.pass_mb << 20, elapsed: Duration::from_millis(config.pass_ms), checkpoint: config.checkpoint, skip_after: config.skip_after, content_allowed: !base.manifest.content_to.suspended && base.manifest.content.map_or(0, |c| c.size) < config.account_max_mb << 20 }`. `let mut opener = ServerOpener { server: self, account_id, keys, entry: &entry, limits: &limits, config: &config }` whose `open` runs `za_open_for_index` (mapping `Transient(AbsentWithinWindow)` to `Loss(BlobAbsent)` when `entry.absent_since(&blob_hash, now)` is older than `config.absent_retry_secs` (the method records the first absence itself) when absent), then `index_document` as `document.rs:88-101` calls it, `MessageSortKeys::from_message(&parsed)`, `za_has_attachment(row.unarchive()?)`, `za_thread_fields_k(&parsed)`, `content = limits.content_allowed.then(|| ContentRecord::new(document, d, SortKeys::from(&sort_keys), fields.sent_at, has_attachment))`; a parse failure (`parse()` is `None`) is `Loss(Parse)`. `let staging = plan_pass(&base, cursor_items, &records, &limits, Instant::now(), &mut opener).await;` Trace `ZA_SEARCH_SKIPPED` for each `skipped` (account id, document id, the class) and `ZA_SEARCH_ABORTED` for an `Abort`.
+  2. `match staging.decision { Nothing => { let mut g = entry.index.write().await; if let Some(i) = g.as_mut() { i.scanned_to = staging.scanned_to; i.update_records += staging.update_records; } Ok(Current) }, _ => write_pass(self, account_id, keys, &entry, &bytes, hash, base.manifest.clone(), staging).await }`.
+
+- [ ] **Step 6: Implement `write_pass`** in `write.rs` (step 3):
+  - `let key = za_search_key(keys.swk()); let config = ...; let cache = server.get_cached_messages(account_id).await?;`
+  - **New manifest** from `base.manifest` (the `base_manifest` argument): `new.indexed_to = staging.checkpoint` unless `Abort`; `new.cursor = staging.cursor_next.map(|next| if next > c.end { None } else { Some(RebuildCursor { next, end: c.end }) })` when a cursor was pending (a cursor finished exactly when `next > end`; Task 14 adds the finishing rule for the content cursor and the reconciliation marker); `new.failing = staging.failing` (an `Abort`) or `None` when the previous failing document was indexed or skipped this pass; `Publishing` → `new.revision += 1; let previous_row = replace(&mut new.newest_row, RevisionRow { revision: new.revision, change_id: 0 })` (filled at commit); `new.scanned` nothing (memory only).
+  - **Blobs** (`NonPublishing` and `Publishing`): `header = BlobHeader { kind: BlobKind::Thread, tier: 0, segment: SegmentId::random(), predecessor: None }`; `hidden = HiddenSection { records: staging.records.clone(), aliases: staging.aliases.clone() }`; `public = PublicSection { tombstones: staging.tombstones.clone(), rows: if publishing { vec![previous_row] } else { vec![] } }`; `blob = build_thread_blob(keys.swk(), account_id, &header, publishing.then_some((&hidden, PadTarget::Publishing)), &public, config.pad_min)?` (Task 5's builder frames, pads and seals both sections and writes the layout; a `NonPublishing` pass passes `None`, so its blob has no hidden section, H13; `AllowanceExceeded` cannot occur for `PadTarget::Publishing`); `hold_for = if search_hold_expire(account_id) { 0 } else { server.core.jmap.upload_tmp_ttl }` (G15: the upload TTL class, an hour by default); `if let Some(d) = search_blob_slow(account_id) { tokio::time::sleep(d).await }` (`SEARCH_BLOB_SLOW`); `let (hash, hold) = server.hold_blob(account_id, BlobHash::generate(&blob), &blob, hold_for, &BlobOpts::new(CompressionAlgo::None, server.core.blob.email.encryption.clone())).await?` (a store error here → trace `ZA_SEARCH_ABORTED`, return `Aborted(TransientClass::BlobStore)`); `search_pass_pause_point(account_id).await` (`SEARCH_PASS_PAUSE`, "a pass paused on its blob I/O"); `new.thread_blobs.push(ThreadBlobEntry { segment: header.segment, hash: hash.clone(), size: blob.len() as u32 })`. Content, when the decision is `Publishing` or `ContentOnly` and `!staging.content.is_empty()`: `header = BlobHeader { kind: Content, tier: 0, segment: random, predecessor: new.content.as_ref().map(|h| (h.hash.clone(), h.segment)) }`; `let encoded: Vec<Vec<u8>> = staging.content.iter().map(|(_, c)| c.encode()).collect(); let refs: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect(); blob = build_content_blob(keys.swk(), account_id, &header, &refs)`; hold it the same way; `new.content = Some(ContentHead { hash, segment, length: prev.length + 1, size: prev.size + blob.len() as u64 })`; `new.content_to.checkpoint = new.indexed_to` whenever `base.content_to.checkpoint == base.indexed_to` and every record this pass indexed has a content record (`staging.content.len() == staging.records.len()`, vacuously true for a pass that indexed none, so deletion-only and manifest-only passes carry `content_to` along with `indexed_to`); it stays behind only when a record was indexed without content (over the cap) or was already behind. When `Publishing` and `!limits.content_allowed` (over the cap or suspended): `new.content_to.suspended = true`, trace `ZA_SEARCH_SUSPENDED` (account id, the chain's size) once per transition.
+  - **Batch**:
+    ```rust
+    let mut batch = BatchBuilder::new();
+    batch.with_account_id(account_id).with_collection(Collection::Principal).with_document(0)
+        .assert_value(PrincipalField::ZeroAccessSearch, AssertValue::Hash(xxh3_64(previous_bytes)))
+        .set(PrincipalField::ZeroAccessSearch, SetValue::serializable(ManifestWrite::new(
+            ManifestValue::Index(new.clone()), key.clone(), ManifestFill { newest_row: publishing, epoch: false })));
+    for hold in holds { hold.release(&mut batch); }           // clears the Temporary link, writes BlobOp::Commit
+    for (hash, len) in &new_blobs {                           // release reset the account only; re-select
+        batch.with_account_id(account_id).with_collection(Collection::Principal).with_document(0)
+            .set(BlobOp::Link { hash: hash.clone(), to: BlobLink::Document }, BlobLinkValue::new(*len));
+    }
+    if publishing {
+        let w = staging.witness.expect("a publishing pass indexed a message");
+        batch.with_collection(Collection::Email).with_document(w)
+            .log_item_update(SyncCollection::Email, Some(PendingId::Assigned(w)))
+            .log_container_property_change(SyncCollection::Thread, PendingId::Assigned(w));
+        for mailbox in cache.mailboxes.items.iter() {
+            batch.log_container_property_change(SyncCollection::Email, PendingId::Assigned(mailbox.document_id));
+        }
+    }
+    ```
+    `search_commit_pause_point(account_id).await` (`SEARCH_COMMIT_PAUSE`). `match server.commit_batch(batch).await`: `Err(e) if e.is_assertion_failure()` → trace `ZA_SEARCH_LOST` (account id), drop the staging, `server.za_search_reload_if_moved(entry, keys).await` (its error traced, not returned), `Ok(PassOutcome::Lost)`; `Err(e)` → trace `ZA_SEARCH_ABORTED` (class `Store`), `Ok(PassOutcome::Aborted(TransientClass::Store))`; `Ok(assigned)` → continue.
+  - **Committed bytes**: `if publishing { new.newest_row.change_id = assigned.change_id(account_id, SyncCollection::Email.change_group()).expect("the witness update allocated a change id") }`; `let committed = ManifestValue::Index(new.clone()).encode(&key); let new_hash = manifest_hash(&committed);` (plan call C3: `ManifestWrite` serializes exactly this).
+  - **Swap** (I4): `search_swap_pause_point(account_id).await` (`SEARCH_SWAP_PAUSE`); `if search_swap_skip(account_id) { return Ok(PassOutcome::Advanced { published: publishing, indexed_to: new.indexed_to }) }` (`SEARCH_SWAP_SKIP`, plan call D4: the store holds the publication and this node's index does not, as another node's would); `let mut guard = entry.index.write().await; if let Some(index) = guard.as_mut() && index.manifest_bytes_hash == base_hash { index.thread.extend(staging.records, staging.aliases, publishing.then_some(new.newest_row), staging.tombstones); if let Some(content) = index.content.as_mut() { for (_, c) in staging.content { content.part.insert(c) } } index.manifest = new.clone(); index.manifest_bytes_hash = new_hash; index.scanned_to = staging.scanned_to.max(new.indexed_to.change_id); index.update_records = 0; index.thread_segments = new.thread_blobs.iter().map(|e| e.segment).collect(); if let (Some(c), Some(h)) = (index.content.as_mut(), new.content.as_ref()) && c.segments.first() != Some(&h.segment) { c.segments.insert(0, h.segment) } index.thread_bytes = index.thread.loaded_bytes(); } else { /* evicted, or a validated snapshot reloaded meanwhile and holds this content or newer */ }` (Task 3's `extend`, Task 4's `insert`). Trace `ZA_SEARCH_PASS` (account id, inserts `= records.len()`, tombstones, `published`, revision, `indexed_to`, content bytes written, bytes merged by a compaction, 0 when none). `Ok(PassOutcome::Advanced { published: publishing, indexed_to: new.indexed_to })`. A `ManifestOnly` or `Abort` decision writes the manifest alone (no blob, no log entry) and swaps only `manifest`, `manifest_bytes_hash`, `scanned_to` and `update_records`; an `Abort` returns `Aborted(class)` after that write. A `ContentOnly` decision writes the content blob and the manifest (`content`, `content_to`, Task 14's cursor), no thread blob, no revision row and no log entry, and returns `Advanced { published: false, .. }`. `failing` is cleared only when the failing document was indexed or skipped this pass; a pass that did not reach it leaves it unchanged.
+
+- [ ] **Step 7: Setup's empty manifest.** In `crates/common/src/za/search/setup.rs`: `za_setup_manifest(swk, indexed_to)` returns `ManifestValue::Index(Manifest { revision: 0, newest_row: RevisionRow { revision: 0, change_id: 0 }, indexed_to: Checkpoint { change_id: indexed_to, position: 0, complete: true }, epoch: 0, thread_blobs: vec![], content: None, content_to: ContentTo { checkpoint: <the same checkpoint>, suspended: false, cursor: None }, cursor: None, reconciliation: None, failing: None }).encode(&za_search_key(swk))`. In `vault_batch_write` (`vault.rs:202-237`): after the pin assertions, `if let Some(extra) = &extra { batch.assert_value(extra.field, AssertValue::None); }` and after the pin set `if let Some(extra) = extra { batch.set(extra.field, extra.value); }`; thread the parameter through `vault_commit_store` and `za_vault_commit`; every other caller passes `None`. In `za_setup` (`http/src/api/vault.rs:1081`), after `let mk = Secret::random();`: `let swk = vault::keys::derive_search_key(&mk); let indexed_to = server.store().get_last_change_id(account_id, SyncCollection::Email.into()).await?.unwrap_or(0); let extra = ZaVaultExtra { field: PrincipalField::ZeroAccessSearch, value: za_setup_manifest(&swk, indexed_to) };` and pass `Some(extra)` through `za_commit` (`:485-507`, a new trailing parameter; `za_password`, `za_recover` and the others pass `None`). The vault path never touches field 152 again (F22).
+
+- [ ] **Step 8: Compile check and format**
+
+Run: the Global Constraints check and `cargo fmt -p email -p common -p store -- --check; cargo fmt --manifest-path crates/http/Cargo.toml -- --check`.
+Expected: clean.
+
+- [ ] **Step 9: Write the za cases** in `tests/src/za/mail/index.rs` (`pub async fn test(test: &mut TestServer)`, accounts `keymail46`, `keymail47` created with `key_mail_account` and password `"Keymail-46!"` etc., `plainmail50` a plain control created with `create_test_user`). Deliveries go over LMTP with `deliver` (`mail/mod.rs`); flag changes through JMAP `Email/set` as a keyed request (the key account's JMAP client with its password, as `search.rs`'s `Fixture` does). Each case ends by deleting the messages it added (`Email/set` destroy over JMAP, then `run_search_pass`), so the next case starts from an empty index. Cases, in order, each a `async fn case_<tag>(test: &mut TestServer, key: &Account, ..)`:
+  - `case_setup_manifest`: right after `key_mail_account`, `read_manifest` is `Some(Index(m))` with `m.revision == 0`, `m.epoch == 0`, `m.thread_blobs.is_empty()`, `m.indexed_to.complete`; `run_search_pass` answers `Current`; `manifest_bytes` unchanged after it ("the manifest is created at setup and no account without mail ever rebuilds").
+  - `case_persistence_and_thread_only_load` (R9, persistence): deliver 3 messages (one reply among them); `run_search_pass` → `Advanced { published: true, .. }`; `read_manifest` has `revision 1`, one thread blob, a content head with `length 1`; `principal_blob_links` has 2 hashes equal to the manifest's; `simulate_restart`; `reset_za_search_counters`; `run_search_pass` → `Current` (the shortcut after a thread-only load) and `za_search_blob_reads(id) == 1` (the thread blob only, no content blob, no message blob: `za_search_message_opens(id) == 0`); `index_holds` true for all 3 documents.
+  - `case_catch_up_after_offline_deliveries`: deliver 5 messages with no keyed request in between; `run_search_pass` once → every document held, `indexed_to.change_id == cache.last_change_id`; the log (`log_records_since`, Email) gained exactly one item update (of the lowest of the 5 document ids), the Thread log one container property change of that id, and the Email log one container property change per mailbox of the account (count `cache.mailboxes.items.len()`), nothing else beyond the deliveries' own records (R4, invariant 53). A plain control (`plainmail50`) receiving the same 5 shows no such entries.
+  - `case_multiappend_split_record_with_restart` (R1, R20): `set_search_config_override(Some(ZaSearchConfig { pass_cap: 3, ..ZaSearchConfig::from_env().unwrap() }))`; an IMAP MULTIAPPEND of 8 messages in one command on a keyed IMAP session (`imap_session` as `search.rs:244` builds it; the APPEND's own post-commit pass is Task 9's, so here the record is consumed by `run_search_pass`); pass 1 → `Advanced`, `read_manifest().indexed_to == Checkpoint { change_id: c, position: p3, complete: false }` with 3 held; `simulate_restart` (the restart); pass 2 → 3 more held, still partial; pass 3 → `complete == true`, all 8 held, `revision == 3`; `log_records_since` of the pass entries: three item updates (one per publishing pass). Clear the override.
+  - `case_flag_changes_write_nothing` (F4): bytes `= manifest_bytes`, links `= principal_blob_links`; 100 keyword changes over JMAP (each request runs the dispatcher's pass from Task 9; before Task 9, call `run_search_pass` after each); `manifest_bytes` equal, `principal_blob_links` equal, and `peek`'s `scanned_to >= cache.last_change_id`.
+  - `case_update_only_checkpoints` (G19): override `checkpoint: 10`; 25 flag changes with a pass after each; `manifest_bytes` changed twice (checkpoints after the 10th and the 20th update), `indexed_to.change_id` at the 20th update's change id and `scanned_to` (`za_search.get(id)`'s loaded index) at the 25th, no new blob (`principal_blob_links` equal), no pass entry in the log (the Email log's new records are exactly the 25 updates).
+  - `case_unreadable_insert_is_consumed_once` (R26): deliver one message, `corrupt_blob(its hash)` (`mail/mod.rs`); `Traced::start(&[ZA_SEARCH_EVENT_TYPE])`; pass → `Advanced { published: false, .. }` with the manifest's `indexed_to` past the insert, no blob written; one `ZA_SEARCH_SKIPPED` event whose text holds the account id and document id and no subject; `reset_za_search_counters`; `run_search_pass` twice more and after `simulate_restart` → `za_search_message_opens == 0` (never reopened); a second, readable delivery is indexed by the next pass.
+  - `case_transient_blob_error_aborts_then_indexes` (F3, R34): deliver one message; `set_search_blob_fail_once(Some(id))`; pass → `Aborted(BlobStore)`; `read_manifest().failing == Some(FailingDocument { document_id: d, attempts: 1 })`, `indexed_to` unchanged, `principal_blob_links` unchanged; next pass → `Advanced { published: true, .. }`, `failing == None`, `index_holds(d)`; then with `set_search_config_override(skip_after: 2)` and `SEARCH_BLOB_FAIL_ONCE` armed before each of two passes on a fresh delivery: the first aborts with `attempts 1`, the second skips it as loss (`ZA_SEARCH_SKIPPED`), `failing == None`, the document not held.
+  - `case_lost_assertion` (5.6): deliver one message; `HookParked::start(id, set_search_commit_pause, run_search_pass(..))`; while parked, write a manifest-only change to field 152 directly (`read_manifest`, bump nothing but re-encode with `indexed_to` unchanged and a different `failing` of a nonexistent document, store it with `BatchBuilder` as `vault_batch_write` sets field 150) so the stored bytes differ; `finish` → `Lost`; `principal_blob_links` unchanged (the staged blob holds only a temporary link); `read_manifest` is the competing write; the next pass → `Advanced` and `index_holds(d)`.
+  - `case_invalidation_between_commit_and_swap` (Review Focus): deliver one message; `HookParked::start(id, set_search_swap_pause, run_search_pass(..))` parks the pass after its commit and before its swap; while parked, `test.server.inner.cache.za_search.remove_account(id, EvictReason::Invalidation)` and `test.server.inner.cache.za_keys.remove_account(id)`, as the `CacheInvalidation::Account` arm does for a password change on another connection; `finish` → the pass returns `Advanced` and inserts no stale entry: `za_search.get(id)` is `None` or holds no loaded index, or its `manifest_bytes_hash` equals `manifest_hash(&manifest_bytes(test, id).unwrap())`; the next `run_search_pass` → `Current` and `index_holds(test, id, the message)`.
+  - `case_slow_store_hold_outlives_the_wait` (G15): `set_search_blob_slow(Some((id, 2000)))` with `set_search_config_override(wait_secs: 1)`; deliver, pass → `Advanced`; `expire_and_purge_blobs(test, &admin)` (`utils/za.rs:1028`); the manifest's blobs still exist (`stored_blob` succeeds for each hash in the manifest), `principal_blob_links` equal to the manifest's set.
+  - `case_deletion_only_pass_writes_no_entry` (R13): with 2 messages indexed, destroy one over JMAP; `log_records_since` lengths before; pass → `Advanced { published: false, .. }`; the manifest gained a thread blob entry whose blob is `header + 4 + 0 + sealed public` bytes long (no hidden section: the blob's length is below `config.pad_min`); no new Email item update and no Thread entry beyond the destroy's own records; `index_holds(deleted) == false` while `peek`'s `thread.exists_at(deleted, u64::MAX) == Some(false)` (a tombstone).
+  - `case_repeated_delta_changes_nothing`: with the index current, re-run `run_search_pass` five times → `Current` each time, `manifest_bytes` equal; then with a delivery replayed (`deliver` the same bytes again: a new document id, a new insert; the first is already held and the second is indexed once): every document held exactly once (`thread.present_members` counts).
+  Account cleanup at the end: destroy every message of `keymail46`, `keymail47`, `plainmail50` and run a last pass, so `assert_is_empty`'s exemptions (field 152 and the principal-linked blobs) are the only remains.
+
+- [ ] **Step 10: Run the suite**
+
+Run: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH" && STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture`
+Expected: passes through `mail::index::test` and `assert_is_empty` at the end (with Task 2's exemptions in place).
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add crates/email/src/message/za/search/ crates/common/src/auth/vault.rs crates/common/src/za/search/setup.rs crates/common/src/za/search/mod.rs crates/common/src/za/test_hooks.rs crates/http/src/api/vault.rs tests/src/za/mail/index.rs tests/src/za/mail/mod.rs tests/src/za/mod.rs tests/src/utils/za.rs
+git commit -m "Search: the pass (consume, decide, write, swap) and the empty manifest written at setup"
+```
+
+### Task 9: Triggers and the content wait
+
+**Files:**
+- Create: `crates/email/src/message/za/search/ensure.rs` (`za_search_pass_hook`, `za_search_ensure_current`, `is_current`)
+- Modify: `crates/email/src/message/za/search/mod.rs` (declare `ensure`)
+- Modify: `crates/jmap/src/api/request.rs:89-104` (`handle_jmap_request`, one pass before the method loop)
+- Modify: `crates/imap/src/core/client.rs:113-128` (the request loop, one pass before `match request.command`)
+- Modify: `crates/imap/src/op/append.rs:248-258` (after `group.flush`, before the response), `crates/jmap/src/email/set.rs:1116-1128` (after `flush`), `crates/jmap/src/email/import.rs` (after its grouped flush; find it with `grep -n "flush" crates/jmap/src/email/import.rs`)
+- Modify: `tests/src/za/mail/index.rs` (the cases below), `tests/src/utils/za.rs` (`search_config_guard`)
+- Test: the za cases
+
+**Interfaces:**
+- Consumes: Task 8's `za_search_pass`, `PassOutcome`, `RecoveryCause`; Task 6's `IndexEntry::pass_lock`, `Server::za_search_load_content`, `LoadFailure`; Task 2's `Server::za_search_config()` (`wait_secs`), traces (`ZA_SEARCH_UNAVAILABLE`, `ZA_SEARCH_REBUILD` for a `Recovery` outcome until Task 14 replaces the arm), `SEARCH_PASS_PAUSE`; upstream: `AccessToken::za_keys_for` (`crates/common/src/auth/access_token.rs:555-559`), `Session::za_key_session` and `SessionData::za_key_session` (`crates/imap/src/core/mod.rs:282-286, 305-307`), `MethodObject` (`crates/jmap-proto/src/request/method.rs:24-47`), `Call { name: MethodName { obj, .. } }` (`request/mod.rs:68-72`, `method.rs:18-21`).
+- Produces:
+  ```rust
+  impl Server {
+      /// Runs one pass and never fails the request: every outcome is traced where section 8 says and swallowed.
+      pub async fn za_search_pass_hook(&self, account_id: u32, keys: &SessionKeys);
+      /// 5.2: for a content request. Runs passes, or waits on the running one, until the index is current (7.4) with its content part loaded, or `deadline`.
+      pub async fn za_search_ensure_current(&self, account_id: u32, keys: &SessionKeys, deadline: Instant) -> Result<Arc<IndexEntry>, Unavailable>;
+  }
+  pub enum Unavailable { Rebuilding, Transient(TransientClass), OverCap, Budget, NewerFormat, NotCurrent, Unresolved }
+  pub(crate) fn is_mail_method(obj: MethodObject) -> bool; // Email | Thread | Mailbox | SearchSnippet | EmailSubmission | Blob
+  pub(crate) fn is_current(index: &LoadedIndex, state: u64) -> bool;
+  ```
+  Test helper: `search_config_guard!(field: value, ..)` (a `macro_rules!` in `tests/src/utils/za.rs` expanding to `SearchConfigGuard::new(ZaSearchConfig { field: value, .., ..test.server.za_search_config() })`) over `SearchConfigGuard::new(ZaSearchConfig) -> SearchConfigGuard` (sets the override, restores the prior value on drop, as `PauseSlotGuard` does for a pause slot).
+
+**Rules** (spec 5.2, 7.4): one pass per keyed request and account, before the methods or the command; `IDLE`, `NOOP` and `LOGOUT` run none; POP3 runs none; a keyed write that adds a message runs one more after its commit and before its response: on JMAP once per request, after the last `Email/set` create or `Email/import` call of the request has committed, so a request runs at most two (H20); on IMAP once per APPEND command; a request that finds the pass lock held proceeds without waiting; only a content request waits, up to `ZA_SEARCH_WAIT_SECS`, and is never answered from an index behind the request's view; **current** against the state `E` the request reads means `scanned_to >= E`, `indexed_to.complete`, `content_to.checkpoint == indexed_to`, `!content_to.suspended`, `cursor.is_none()`, `reconciliation.is_none()` (G14; `scanned_to` is the highest change id a pass read whole, so every record in `(indexed_to, scanned_to]` was update-only or checkpointed).
+
+- [ ] **Step 1: Write the failing za cases** in `tests/src/za/mail/index.rs` (accounts `keymail48`, `keymail49`, control `plainmail51`):
+  - `case_triggers`: deliver one message to `keymail48` (no keyed request yet; `read_manifest().indexed_to` is below the delivery's change id). (a) JMAP `Mailbox/get` from the keyed client → the manifest's `indexed_to` now covers the delivery and `index_holds(d)`. Deliver again. (b) IMAP `NOOP` on a keyed session → `indexed_to` unchanged; `SELECT INBOX` → advanced. Deliver again. (c) POP3 `STAT` (a keyed POP3 session, `mail/login.rs` shows how) → unchanged. (d) `Email/set` keyword update over a WebSocket session (keyless, `tests/src/za/websocket.rs` shows how) → unchanged (a keyless request runs no pass). (e) IMAP `APPEND` of one message on the keyed session: right after the tagged `OK [APPENDUID ..]`, `read_manifest().indexed_to` covers the appended document and `index_holds(appended)` (the post-commit pass); the same for `Email/import` (its response's `created` present and the manifest covering the id) and `Email/set` create.
+  - `case_reads_do_not_wait_for_a_pass` (F5): `search_config_guard!(pass_cap: 1)`; deliver 2 messages to `keymail49`; `HookParked::start(id, set_search_pass_pause, <a keyed JMAP Email/get of an existing id>)`; while parked (the pass holds its blob I/O), from a second keyed client: `Email/set` keyword update and `Mailbox/get` each complete within 2 s (`tokio::time::timeout`), and `run_search_pass` from a third task answers `Running` at once; `finish`.
+  - `case_content_wait_budget` (7.4): `search_config_guard!(wait_secs: 1, pass_cap: 1)`; deliver 6 messages; `HookParked::start(id, set_search_pass_pause, run_search_pass(..))`; while parked, `za_search_ensure_current(id, &keys, Instant::now() + Duration::from_secs(1))` → `Err(Unavailable::NotCurrent)` after about 1 s; `finish`; then `za_search_ensure_current(.., now + 30 s)` → `Ok(entry)` after the remaining passes (`read_manifest().indexed_to.change_id == cache.last_change_id`), and `is_current(&entry.index.read().await, cache.last_change_id)`. The parked pass's work is not lost by the waiter's timeout (Review Focus): after `finish` releases it, `read_manifest().indexed_to.change_id` has advanced by that pass, and the second call needs fewer passes than the full backlog of six (count the `ZA_SEARCH_PASS` traces).
+  - `case_time_cap_bounds_the_command` (G18): `search_config_guard!(pass_ms: 1)`; deliver 12 messages each with a 300 KiB `text/plain` attachment (`index_document` extracts it inline, `search.rs:91-99`); a keyed IMAP `SELECT INBOX` returns within 5 s and the manifest's `indexed_to` advanced by at least one insert and fewer than 12 (`position` partial or a change id below the last delivery); repeated `SELECT`s finish the backlog.
+  - `case_plain_control_unaffected`: the same deliveries to `plainmail51`; its `Mailbox/get`, `NOOP` and `SELECT` leave no field 152 (`manifest_bytes == None`) and no principal link.
+
+- [ ] **Step 2: Run the suite to see them fail**
+
+Run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture`
+Expected: `case_triggers` fails at (a): the manifest did not advance (no trigger yet).
+
+- [ ] **Step 3: Implement `ensure.rs`**:
+  - `za_search_pass_hook`: `match self.za_search_pass(account_id, keys).await { Ok(Current | Advanced { .. } | Running | Lost) => {}, Ok(Aborted(_)) => {} /* traced by the pass */, Ok(NoMap(reason)) => za_search_trace!(ZA_SEARCH_UNAVAILABLE, AccountId = account_id, Reason = reason.as_str()), Ok(Recovery(cause)) => za_search_trace!(ZA_SEARCH_REBUILD, AccountId = account_id, Reason = cause.as_str()) /* Task 14 starts the recovery here */, Err(err) => trc::error!(err.account_id(account_id)) }`.
+  - `is_current(index, state)`: the six conditions above.
+  - `za_search_ensure_current`: `let config = self.za_search_config(); loop { match self.za_search_pass(account_id, keys).await { Ok(Running) => { let entry = self.za_search_entry(account_id, keys).await.map_err(map_load)?; match tokio::time::timeout_at(deadline.into(), entry.pass_lock.lock()).await { Ok(guard) => drop(guard), Err(_) => return Err(Unavailable::NotCurrent) } }, Ok(Current) | Ok(Advanced { .. }) | Ok(Lost) => { let entry = self.za_search_entry(..).map_err(map_load)?; let state = self.get_cached_messages(account_id).await.map_err(|_| Unavailable::Transient(TransientClass::Store))?.last_change_id; let current = is_current(&*entry.index.read().await, state); if current { if entry.index.read().await.manifest.content.as_ref().map_or(0, |c| c.size) > (config.account_max_mb << 20) { return Err(Unavailable::OverCap) } self.za_search_load_content(&entry, keys).await.map_err(map_load)?; return Ok(entry) } tokio::time::sleep(Duration::from_millis(20)).await }, Ok(Aborted(class)) => { if Instant::now() >= deadline { return Err(Unavailable::Transient(class)) } tokio::time::sleep(Duration::from_millis(50)).await }, Ok(NoMap(NoMapReason::NewerFormat)) => return Err(Unavailable::NewerFormat), Ok(NoMap(NoMapReason::Destroying)) => return Err(Unavailable::Transient(TransientClass::Store)), Ok(NoMap(NoMapReason::Transient(t))) => return Err(Unavailable::Transient(t)), Ok(Recovery(_)) => return Err(Unavailable::Rebuilding), Err(_) => return Err(Unavailable::Transient(TransientClass::Store)) } if Instant::now() >= deadline { return Err(Unavailable::NotCurrent) } }` with `map_load: LoadFailure → Unavailable` (`Loss → Rebuilding`, `Transient(Budget) → Budget`, `Transient(t) → Transient(t)`, `NoMap(NewerFormat) → NewerFormat`, other `NoMap → Transient(Store)`). The caller passes `deadline = Instant::now() + Duration::from_secs(config.wait_secs)`. Every `Err` is traced `ZA_SEARCH_UNAVAILABLE` with the reason class by the caller (Task 10).
+
+- [ ] **Step 4: Place the triggers.**
+  - JMAP (`request.rs:89-104`): before `for mut call in request.method_calls` add `if let Some(keys) = access_token.za_keys_for(access_token.account_id()) && request.method_calls.iter().any(|call| is_mail_method(call.name.obj)) { self.za_search_pass_hook(access_token.account_id(), keys).await; }` (the owner's account only, I7; a keyless token has no keys and runs none).
+  - IMAP (`client.rs:113-128`): after `assert_selected_readable` and before `let result = match request.command`: `if !matches!(request.command, Command::Idle | Command::Noop | Command::Logout) && let State::Authenticated { data } | State::Selected { data, .. } = &self.state && let Some(keys) = data.access_token.za_keys_for(data.account_id) { data.server.za_search_pass_hook(data.account_id, keys).await; }`.
+  - IMAP APPEND (`append.rs:248-258`): after the `match group.flush(..)` arm succeeds and before the broadcast: `if let Some(keys) = self.access_token.za_keys_for(account_id) { self.server.za_search_pass_hook(account_id, keys).await; }` (the `SessionData`'s token; check its field name at the top of `append_messages`).
+  - `Email/set` create (`set.rs:1116-1128`): after `flush(..)` returns `Ok` and `recheck.finish`, before the updates are processed: `if let Some(keys) = access_token.za_keys_for(account_id) { self.za_search_pass_hook(account_id, keys).await; }`. `Email/import`: the same after its grouped flush and before `response` is returned.
+  - POP3: nothing.
+
+- [ ] **Step 5: Run the suite**
+
+Run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture`
+Expected: `mail::index::test` passes, every earlier module unchanged (a key account's existing JMAP and IMAP cases now run a pass per request; `mail::search`'s refused tables are unaffected until Task 10).
+
+- [ ] **Step 6: Mail-suite regression, both modes** (ordinary accounts share the dispatcher and the IMAP command loop): `imap::imap_tests` and `jmap::jmap_tests` plain and with `ZA_KEY_ACCOUNTS=1`, then the za suite with `BLOB_STORE=FileSystem` (the end of phase D).
+
+Run: `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests jmap::jmap_tests -- --nocapture` and the same for `imap::imap_tests`.
+Expected: pass (the pass runs on every keyed request and writes only ids; a variant that fails here is a regression in Task 8 or 9, not a variant to adjust).
+
+- [ ] **Step 7: Compile check, format, commit**
+
+Run: the Global Constraints check; `cargo fmt -p email -p jmap -p imap -p tests -- --check`.
+
+```bash
+git add crates/email/src/message/za/search/ crates/jmap/src/api/request.rs crates/jmap/src/email/set.rs crates/jmap/src/email/import.rs crates/imap/src/core/client.rs crates/imap/src/op/append.rs tests/src/za/mail/index.rs tests/src/utils/za.rs
+git commit -m "Search: the pass runs before every keyed mail request and after keyed writes; content requests wait for a current index"
+```
+
+### Task 10: Search serving: `Email/query`, IMAP SEARCH and SORT, snippets, the unavailable refusal
+
+Implementer: `sonnet` (integration into upstream's query engine; the content model and the pass exist).
+
+**Files:**
+- Create: `crates/email/src/message/za/search/query.rs` (`ZaContentGuard`, `za_resolve_residual`: the store-typed part, shared by jmap and imap), `crates/jmap/src/email/za_search.rs` (the resolution of a key account's content leaves and sorts; `pub mod za_search;` in `crates/jmap/src/email/mod.rs:20-27`)
+- Create: `crates/imap/src/op/za_search.rs` (the IMAP side of the same; declared in `crates/imap/src/op/mod.rs`)
+- Modify: `crates/jmap/src/email/za.rs` (`za_refuse_content_query` `:148-171` becomes `za_content_query`; `za_refuse_snippet_terms` `:176-189` and `first_snippet_term` `:136-144` are deleted with their tests; the classifiers `filter_needs_content` `:27-61`, `query_filter_needs_content` `:70`, `sort_needs_content` `:79`, `first_refused_filter` `:118`, `first_refused_sort` `:126` stay)
+- Modify: `crates/jmap/src/email/query.rs:112-124` (the refusal call), `:148-154` (`QueryFilter::parse` gains the content argument), `:165-179` (`windowed = None` for a key account), `:181-196` (the `filter_account` call replaced), `:631-688` (`sort_comparators` gains the content argument for `from`, `to`, `subject`, `sentAt`)
+- Modify: `crates/jmap/src/email/query/filter.rs:212-291` (`QueryFilter::parse`: one fork arm before `row.absorb`), `:112-175` (`RowFilter::absorb`'s `HasAttachment` `:152` and `SentBefore`/`SentAfter` `:168-171` arms are bypassed by that fork arm for a key account; unchanged otherwise)
+- Modify: `crates/jmap/src/changes/query.rs:74-82` (the early call becomes `za_content_query`, result dropped: the early check keeps the "unchanged state returns before the query" reason)
+- Modify: `crates/jmap/src/email/snippet.rs:61` (the refusal call removed; `terms` are now read for a key account with keys at `:164-172`)
+- Modify: `crates/imap/src/op/search.rs:310-319` (the refusal becomes the content guard), `:401-410` (`Keyword`) and `:501` (`Unkeyword`) for `$HasAttachment`/`$HasNoAttachment`, `:431-458` (`SentBefore`, `SentOn`, `SentSince`), `:740-775` (`Sort::Date`, `From`, `DisplayFrom`, `Subject`, `To`, `DisplayTo`), `:777-782` (the `query_emails` call: the residual resolved first)
+- Modify: `tests/src/za/mail/search.rs` (the turnaround: `imap_refused_keys` `:454`, `refused_commands` `:413`, `jmap_refused_filters_and_sorts` `:845` become served tables; `nested_search_refused` `:252`, `visible_field_document` `:1143`, `query_changes_collapse_threads` `:764` stay; two new cases)
+- Test: `cargo test -p jmap --lib za_search`, `cargo test -p imap --lib za_search`, the za suite's `mail::search`
+
+**Interfaces:**
+- Consumes (Task 9): `Server::za_search_ensure_current(&self, account_id: u32, keys: &SessionKeys, deadline: Instant) -> Result<Arc<IndexEntry>, Unavailable>`; `Unavailable::{Rebuilding, Transient(TransientClass), OverCap, Budget, NewerFormat, NotCurrent, Unresolved}`.
+- Consumes (Task 6): `IndexEntry { index: Arc<RwLock<Option<LoadedIndex>>>, .. }` with `read_loaded()`, `LoadedIndex { manifest, content: Option<LoadedContent>, scanned_to, .. }` (`content.as_ref().map(|c| &c.part)` is the `ContentPart`), the `Manifest` fields `indexed_to`, `content_to`, `cursor`, `reconciliation`.
+- Consumes (Task 4): `ContentPart::resolve(&self, filters: &[SearchFilter]) -> Result<Vec<SearchFilter>, ResolveError>` (plans each `Leaf` inside `store`, since `Leaf::plan` is `pub(crate)`, `crates/store/src/search/leaf.rs:51`, and returns the list with every `Text` and `KeyValue` leaf replaced by a `DocumentSet`; `ResolveError::{Unresolvable(LeafKind), TooLarge(trc::Error), Corrupt(u32)}`), `ContentPart::sort_ranks(&self, field: SortField, documents: &RoaringBitmap) -> AHashMap<u32, u32>` with `SortField::{From, To, Subject, SentAt}` (dense ranks over `documents`, as `message_sort_ranks` computes them, `sortkeys.rs:202-218`), `ContentPart::sent_at(&self, document_id: u32) -> Option<i64>`, `ContentPart::has_attachment(&self, document_id: u32) -> bool`, `ContentPart::documents(&self) -> &RoaringBitmap` (every document with a content record).
+- Consumes (Task 2): `ZA_MAIL_SEARCH_UNAVAILABLE` (the text), `ZA_SEARCH_UNAVAILABLE`, `ZA_SEARCH_UNRESOLVED` (`common::za::search::trace`), `ZA_MAIL_SEARCH_REFUSED` (`common::za`, `crates/common/src/za/mod.rs:31`), the test-mode configuration override (`set_search_config_override`, Task 2; `search_config_guard`, Task 9; plan call D3).
+- Consumes (upstream): `SearchQuery::new(SearchIndex::Email).with_filters(..).with_mask(..).filter() -> QueryResults` and `QueryResults::into_bitmap()` (`crates/store/src/search/local.rs:16-77, 176-204`: a pure in-memory evaluation of `DocumentSet` leaves; `Text`, `Integer` and `KeyValue` leaves are skipped by `filter`, `:109-113`, which is why every leaf must be a `DocumentSet` before the call), `SearchFilter::is_in_set` (`document.rs:292`), `SearchComparator::sorted_set`, `MessageComparator::{Search, SortKey, Cache}` (`sortkeys.rs:46-61`), `query_emails` (`sortkeys.rs:66-130`: for a key account it receives only `Search` comparators, so `message_sort_ranks`, `:134-200`, which reads the store's sort keys a stub does not hold, is never called for one).
+- Produces, in `email::message::za::search::query` (`ZaContentGuard` and `za_resolve_residual`, since `imap` does not depend on `jmap`) and in `jmap::email::za_search` (the rest):
+  - `pub struct ZaContentGuard { pub entry: Arc<IndexEntry>, pub index: LoadedGuard }` (Task 6's mapped guard) with `pub fn content(&self) -> &ContentPart` (the content part, present by construction: the guard is built only when `ensure_current` returned and the part is loaded).
+  - `pub async fn za_content_query(server: &Server, access_token: &AccessToken, account_id: u32, filters: &[Filter<EmailQueryFilter>], sorts: &[Comparator<EmailComparator>], end: u64) -> trc::Result<Option<ZaContentGuard>>`: `Ok(None)` when no filter or sort needs content (`first_refused_filter`, `first_refused_sort`) or the account is not a key account; for a key account without keys on the token (`za_mail_keys` is `Err`), the keyless refusal of today: `UnsupportedFilter`/`UnsupportedSort` naming the first property with `ZA_MAIL_SEARCH_REFUSED`; with keys, `za_search_ensure_current(account_id, keys, now + ZA_SEARCH_WAIT_SECS)`, then `za_content_current(&index, end)` (below) and the guard, or the unavailable refusal (below) with `ZA_SEARCH_UNAVAILABLE` traced carrying the account id and the reason class.
+  - `pub use email::message::za::search::ensure::is_current as za_content_current;` (7.4, G14: Task 9's six conditions, re-exported, not a second definition).
+  - `pub fn za_unavailable(property: &dyn Display, is_sort: bool, reason: &Unavailable) -> trc::Error`: `trc::JmapEvent::UnsupportedSort` when `is_sort`, else `UnsupportedFilter`, `.details(format!("{property}: {ZA_MAIL_SEARCH_UNAVAILABLE}"))`.
+  - `pub fn za_resolve_residual(filters: Vec<SearchFilter>, content: &ContentPart) -> Result<Vec<SearchFilter>, Unavailable>`: strips `Integer{field: SearchField::AccountId, ..}`, calls `content.resolve(&filters)` (Task 4), and maps any `ResolveError` to `Err(Unavailable::Unresolved)` traced `ZA_SEARCH_UNRESOLVED` with the leaf's kind as `text`, `key-value` or `integer` and never its field or value (G9); operators and `DocumentSet`s pass through.
+  - `pub fn za_resolve_condition(condition: &EmailFilter, content: &ContentPart, cache: &MessageStoreCache) -> Option<RoaringBitmap>`: `SentBefore(t)` → documents with `Some(s) if s < t`; `SentAfter(t)` → `Some(s) if s > t` (a `None` `sent_at` matches neither) (the comparisons `RowFilter::absorb` makes on the cache, `filter.rs:168-171`, over the index's `sent_at` instead); `HasAttachment(b)` → the attachment bit equal to `b`; `HasKeyword(k)`/`NotKeyword(k)` with `is_attachment_keyword(k)` (`za.rs:103-110`) → the bit set or clear (`$hasattachment` set, `$hasnoattachment` clear, and the complements); `AllInThreadHaveKeyword`/`SomeInThreadHaveKeyword`/`NoneInThreadHaveKeyword` of an attachment keyword → `thread_keywords`'s rule (`email/cache/email.rs:279`) with the bit in place of the keyword, grouped by the cache's `thread_id()` until Task 12 switches it to the map; every other condition → `None` (upstream's path).
+  - `pub fn za_content_condition(condition: &EmailFilter) -> bool`: true for exactly the conditions `za_resolve_condition` answers.
+  - `pub fn za_sort_comparator(property: &EmailComparator, ascending: bool, content: &ContentPart, documents: &RoaringBitmap) -> Option<MessageComparator>`: `From`/`To`/`Subject` → `MessageComparator::Search(SearchComparator::sorted_set(content.sort_ranks(field, documents), ascending))`; `SentAt` → the same over `SortField::SentAt`; others `None`.
+- Produces, in `imap::op::za_search`: `pub async fn za_imap_content_guard(data: &SessionData<T>, mailbox: &SelectedMailbox, filters: &[Filter], sorts: &[Comparator], end: u64) -> trc::Result<Option<ZaContentGuard>>` (the IMAP form of `za_content_query`: `za_filter_needs_content` and `za_sort_needs_content`, `search.rs:797, 853`, decide; the session's keys are `data.access_token.za_keys_for(account_id)`; the keyless case is `ImapEvent::Error` with `ZA_MAIL_SEARCH_REFUSED` and `ResponseCode::Cannot` as today, `:316-319`; the unavailable case the same shape with `ZA_MAIL_SEARCH_UNAVAILABLE`), `pub enum SentOp { Before, On, Since }` and `pub fn za_imap_sent(content: &ContentPart, op: SentOp, date: i64) -> RoaringBitmap` for `SENTBEFORE` (`sent_at < date`), `SENTON` (`date <= sent_at < date + 86400`, `:438-450`), `SENTSINCE` (`sent_at >= date`), `pub fn za_imap_attachment(content: &ContentPart, has: bool) -> RoaringBitmap`.
+
+- [ ] **Step 1: Write the failing unit tests in `za_search.rs`'s `mod tests`**
+
+```rust
+#[test]
+fn every_text_and_key_value_leaf_becomes_a_document_set() {
+    let content = fixture_content(); // the module's one fixture: subjects 1 "bravo", 2 "alpha", 3 "alpha"; header X-Private: yes on 1; sent_at 1 → 100, 2 → 200, 3 → 300; the attachment bit on 2
+    let filters = vec![SearchFilter::And,
+        SearchFilter::has_english_text(EmailSearchField::Subject, "alpha"),
+        SearchFilter::has_key_value(EmailSearchField::Headers, "x-private", KeyValueMatch::Exists),
+        SearchFilter::End];
+    let resolved = za_resolve_residual(filters, &content).unwrap();
+    assert!(matches!(resolved[1], SearchFilter::DocumentSet(ref s) if s.iter().eq([2, 3])));
+    assert!(matches!(resolved[2], SearchFilter::DocumentSet(ref s) if s.iter().eq([1])));
+    assert_eq!(SearchQuery::new(SearchIndex::Email).with_filters(resolved).with_mask((1..=3).collect()).filter().into_bitmap().len(), 0);
+}
+
+#[test]
+fn an_unresolvable_leaf_refuses_instead_of_widening() {
+    let content = fixture_content();
+    let filters = vec![SearchFilter::integer_eq(EmailSearchField::Size, 7)];
+    assert!(matches!(za_resolve_residual(filters, &content), Err(Unavailable::Unresolved)));
+}
+
+#[test]
+fn sent_and_attachment_conditions_read_the_index_not_the_cache() {
+    let content = fixture_content(); // sent_at: 1 → 100, 2 → 200, 3 → 300; attachment on 2
+    let cache = empty_cache(); // the stub's sent_at is 0 for every key message (mail spec 5.4)
+    assert_eq!(za_resolve_condition(&EmailFilter::SentBefore(UTCDate::from_timestamp(200)), &content, &cache).unwrap().iter().collect::<Vec<_>>(), [1]);
+    assert_eq!(za_resolve_condition(&EmailFilter::SentAfter(UTCDate::from_timestamp(200)), &content, &cache).unwrap().iter().collect::<Vec<_>>(), [3]);
+    assert_eq!(za_resolve_condition(&EmailFilter::HasAttachment(true), &content, &cache).unwrap().iter().collect::<Vec<_>>(), [2]);
+    assert_eq!(za_resolve_condition(&EmailFilter::NotKeyword(Keyword::HasAttachment), &content, &cache).unwrap().iter().collect::<Vec<_>>(), [1, 3]);
+    assert!(za_resolve_condition(&EmailFilter::InMailbox(Id::from(1u32)), &content, &cache).is_none());
+}
+
+#[test]
+fn sort_comparators_are_dense_ranks_over_the_result_set() {
+    let content = fixture_content(); // subjects: 1 "bravo", 2 "alpha", 3 "alpha"
+    let MessageComparator::Search(SearchComparator::SortedSet { set, ascending }) =
+        za_sort_comparator(&EmailComparator::Subject, true, &content, &(1..=3).collect()).unwrap() else { panic!() };
+    assert!(ascending);
+    assert_eq!((set[&2], set[&3], set[&1]), (1, 1, 2));
+}
+
+#[test]
+fn current_means_scanned_past_the_end_with_content_at_indexed_to() {
+    let mut index = loaded_index_at(Checkpoint { change_id: 40, position: 0, complete: true }, 40);
+    index.scanned_to = 45;
+    assert!(za_content_current(&index, 45));
+    assert!(!za_content_current(&index, 46));
+    index.manifest.content_to.suspended = true;
+    assert!(!za_content_current(&index, 45));
+}
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `cargo test -p jmap --lib za_search`
+Expected: compile errors naming `za_search`, `za_resolve_residual`, `za_content_current`.
+
+- [ ] **Step 3: Implement `za_search.rs` and the five `query.rs` insertions**
+
+In `email_query` (`query.rs:105-246`): read the cache first (`:124-128`), then `let za = za_content_query(self, access_token, account_id, &request.filter, request.sort.as_deref().unwrap_or_default(), cache.last_change_id).await?;` in place of `za_refuse_content_query` (`:112-124`; the cache read moves above it so `end` is the state the response returns, `query_state = cache.get_state(false)` `:156`); pass `za.as_ref().map(ZaContentGuard::content)` into `QueryFilter::parse` (`:148-154`) and `sort_comparators` (`:155`); `windowed = None` when `za.is_some()` (`:165-179`: the PostgreSQL walk never runs for a key account, `window.rs:242-354`); replace the `filter_account` block (`:181-196`) with `let residual = match &za { Some(za) => SearchQuery::new(SearchIndex::Email).with_filters(za_resolve_residual(residual_filters, za.content()).map_err(|r| za_unavailable(&"residual", false, &r))?).with_mask(filter.readable(&cache)).filter().into_bitmap(), None => <upstream's call> };`. In `QueryFilter::parse` (`filter.rs:212-291`): the fork arm before `row.absorb(condition)` and before the non-top-level `push_condition`: `if let Some(content) = za && za_content_condition(&condition) { residual.push(SearchFilter::is_in_set(za_resolve_condition(&condition, content, cache).unwrap())); continue; }` (a condition that is not top level goes to `residual` as upstream puts it, so the operator structure is kept). In `sort_comparators` (`:631-688`): for a key account, `From`, `To`, `Subject`, `SentAt` go through `za_sort_comparator` with `documents = filter.readable(&cache)`; the `threadId` sort stays `unsupportedSort` (`:681-685`). `query_changes` (`changes/query.rs:74-82`) calls `za_content_query` with `end = 0` and drops the guard: the early refusal, keyless or unavailable, keeps its reason.
+
+- [ ] **Step 4: Write the IMAP unit test and the insertions**
+
+```rust
+#[test]
+fn senton_is_a_day_window_over_the_index() {
+    let content = fixture_dates(); // a second fixture for the day window: sent_at 1 → 86_400, 2 → 172_799, 3 → 172_800
+    assert_eq!(za_imap_sent(&content, SentOp::On, 86_400).iter().collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(za_imap_sent(&content, SentOp::Since, 172_800).iter().collect::<Vec<_>>(), [3]);
+    assert_eq!(za_imap_sent(&content, SentOp::Before, 172_800).iter().collect::<Vec<_>>(), [1, 2]);
+}
+```
+
+In `SessionData::query` (`search.rs:292`): `let za = za_imap_content_guard(self, mailbox, &imap_filter, &imap_comparator, cache.last_change_id).await?;` replaces `:310-319`; the `Filter::Keyword`/`Unkeyword` arms (`:401`, `:501`) push `za_imap_attachment` for the two attachment flags when `za` is some; `SentBefore`/`SentOn`/`SentSince` (`:431-458`) push `za_imap_sent`; `Header` (`:615`), `Text` (`:676`) and the address and body filters keep upstream's `SearchFilter` construction; before `query_emails` (`:777`) the fork runs `za_resolve_residual` over `filters` and converts `Sort::Date` (`:753`, `MessageCacheField::SentAt`), `From`/`DisplayFrom` (`:757`), `Subject` (`:767`), `To`/`DisplayTo` (`:771`) through `za_sort_comparator`'s IMAP twin with `documents = message_ids` (`:324`). `Sort::Cc` stays refused (`:749-753`, upstream). The `NO [CANNOT]` keyless text stays `ZA_MAIL_SEARCH_REFUSED`; the unavailable text is `ZA_MAIL_SEARCH_UNAVAILABLE`.
+
+- [ ] **Step 5: Lift the snippet refusal**
+
+Remove the call at `snippet.rs:61` and its import `:7`; delete `za_refuse_snippet_terms`, `first_snippet_term` and their tests in `za.rs`. A key account's request now reaches `za_mail_keys` (`:167`), which refuses a keyless token as it does every content read (mail spec 10). The supplied `emailIds` keep `email_by_jmap_id` (`:183`, `:213`); Task 11 translates them.
+
+- [ ] **Step 6: Turn `tests/src/za/mail/search.rs` around**
+
+`imap_refused_keys` becomes `imap_served_content_keys`: every command of `refused_commands()` (`:413-446`) is sent to both fixtures and the key fixture's result line equals the plain fixture's (`served`, `:296`), the `THREAD REFERENCES UTF-8 FROM x` line included (singletons until Task 12 groups them, so compare the sorted UID set, not the grouping); the `Traced` assertion stays: no `SecurityEvent::Unauthorized`, and `TERM` (`:456`) appears in no event. `jmap_refused_filters_and_sorts` becomes `jmap_served_content_filters_and_sorts`: each filter of `:847-880` and each content sort runs on both fixtures and the key account's subject list equals the plain account's (the seeds' headers at `:42-90` decide the expected sets: `text`/`subject`/`body` on a word of one seed, `from`/`to`/`cc`/`bcc` on the seeds' addresses, `header` on a header only `fifth()` carries, `hasAttachment` true and false, `sentBefore`/`sentAfter` on the seeds' `Date` headers, the attachment keywords in `hasKeyword`/`notKeyword` and the three thread forms); the `metadataExists` filter stays refused (ruling 57, unchanged). New cases: `keyless_search_refused` (a Bearer token on `Email/query` with `{"text": "x"}` answers `unsupportedFilter` with `ZA_MAIL_SEARCH_REFUSED`; the token is obtained as `gates.rs:84-213` obtains its `Keyless::Bearer`); `unavailable_refusal` (`search_config_guard!(wait_secs: 1)`; deliver one message; park a first keyed IMAP session's pass on `SEARCH_PASS_PAUSE` (`HookParked`); on a second keyed IMAP session of the account, whose pre-command pass finds `Running` and waits on the budget, `SEARCH SUBJECT alpha` answers `NO [CANNOT] <ZA_MAIL_SEARCH_UNAVAILABLE>` within 2 s; JMAP `Email/query` `{"text": "alpha"}` answers `unsupportedFilter` with the same text; `SEARCH OR SUBJECT alpha SEEN` is refused whole; release the pause and clear the override; both are served). `visible_field_document` (`:1143`) stays: `key.terms == 0` and `documents_are_ids_only()` (invariant 27).
+
+- [ ] **Step 7: Run the tests and checks** (including `imap::imap_tests` and `jmap::jmap_tests` plain and with `ZA_KEY_ACCOUNTS=1`: ordinary accounts share `email_query`, the filter parser and IMAP's `query`)
+
+Run: `cargo test -p jmap --lib za_search`; `cargo test -p imap --lib za_search`; the per-task compile check; `cargo check -p tests --tests`; `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture`.
+Expected: pass; `clean`; clean; the za suite passes with `mail::search`'s served tables.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add crates/jmap/src/email/za_search.rs crates/jmap/src/email/za.rs crates/jmap/src/email/mod.rs crates/jmap/src/email/query.rs crates/jmap/src/email/query/filter.rs crates/jmap/src/changes/query.rs crates/jmap/src/email/snippet.rs crates/imap/src/op/za_search.rs crates/imap/src/op/mod.rs crates/imap/src/op/search.rs tests/src/za/mail/search.rs
+git commit -m "Release 7: search and sorts served from the sealed index, with the unavailable refusal"
+```
+
+### Task 11: Ids and the validated snapshot
+
+Implementer: `opus` (a kernel: the consistency rule between a response's state and the thread map, and the gate that keeps singleton ids off every keyed response).
+
+**Files:**
+- Create: `crates/email/src/message/za/search/snapshot.rs` (`ZaSnapshot`, the procedure, the id helpers)
+- Modify: `crates/jmap/src/email/get.rs:174-199` (the cache and the ids), `:210` (keys, already read), `:229-236`, `:257-262`, `:272-277` (`email_by_jmap_id` on supplied ids), `:415-425` (`Id`, `ThreadId`)
+- Modify: `crates/jmap/src/email/query.rs:484-492` (`Page::emit`), `:600-603` (`Page::top`), `:456-461` (`count_matches`, Task 12 completes it): the prefix passed to `builder.add` is the map's
+- Modify: `crates/jmap/src/email/set.rs:1172-1174` (update's prefix filter), `:1620-1623` (destroy's lookup), `:1758` (create's response)
+- Modify: `crates/jmap/src/email/import.rs:347` (the response), `crates/jmap/src/email/mod.rs:29-37` (`ingested_into_object` gains the thread id to use)
+- Modify: `crates/jmap/src/email/snippet.rs:183, 213` (supplied ids)
+- Modify: `crates/jmap/src/thread/get.rs:35-106` (state after the manifest, I5; members by the map are Task 12's), `crates/jmap/src/blob/get.rs:188-193`, `crates/jmap/src/submission/set.rs:449-450`, `crates/jmap/src/submission/get.rs:237-249`
+- Modify: `crates/jmap/src/api/request.rs:296` (`Mailbox/get`), `:304` (`Thread/get`), `:318` (`EmailSubmission/get`), `:439` (`Email/query`), `:455` (`EmailSubmission/query`), `:816` (`Blob/lookup`): `za_assert_mail_route` becomes `za_assert_mail_keys`; `crates/jmap/src/changes/get.rs:217-229` (`Email`, `Thread`, `EmailSubmission` changes need keys; `Mailbox` keeps the route)
+- Modify: `crates/imap/src/op/fetch/mod.rs:585-592` (`ObjectId`), `crates/imap/src/op/search.rs:565-586` (`EmailId`, `ThreadId`)
+- Modify: `crates/email/src/cache/mod.rs:59-70` (`get_cached_messages`: the test-mode `SEARCH_CACHE_HOLD` line), `crates/common/src/za/search/load.rs` (`za_search_read_manifest`: the test-mode `SEARCH_MANIFEST_FAIL_ONCE` line)
+- Create: `tests/src/za/mail/threads.rs` (`pub mod threads;` in `tests/src/za/mail/mod.rs:50-59`; called in `tests/src/za/mod.rs` after `mail::search::test` and before `mail::traces::test`)
+- Test: `cargo test -p email --lib --features test_mode za::search::snapshot`, the za suite's `mail::threads`
+
+**Interfaces:**
+- Consumes (Task 6): `Server::za_search_entry(&self, account_id, keys) -> Result<Arc<IndexEntry>, LoadFailure>`, `Server::za_search_read_manifest(&self, account_id, key: &ZaSearchKey) -> Result<Option<(Vec<u8>, ManifestValue)>, LoadFailure>`, `Server::za_search_reload_if_moved(&self, entry, keys) -> Result<bool, LoadFailure>`, `LoadedIndex { manifest_bytes_hash, manifest, thread: ThreadPart, .. }`, `NoMapReason::{NewerFormat, Destroying, Transient(TransientClass)}`.
+- Consumes (Task 3): `ThreadPart::current_thread(&self, document_id) -> u32`, `present_members(&self, thread_id) -> &[u32]`.
+- Consumes (Task 5): `manifest_hash`, `Manifest { newest_row: RevisionRow { change_id, .. }, epoch, .. }`.
+- Consumes (upstream): `MessageStoreCache { last_change_id, emails, .. }` (`crates/common/src/lib.rs:288-296`), `MessageCacheFetch::get_cached_messages` (`crates/email/src/cache/mod.rs:59-70`, revalidating when older than the interval or marked stale, `:55-57`), the stale mark the message cache honours (the call `commit_batch` makes, `crates/common/src/cache/invalidate.rs:49-53`; find the per-account "mark stale" entry point and call it), `StateManager::get_state(account_id, SyncCollection::Thread)` (`crates/jmap/src/changes/state.rs:58-66`, the store counter; Thread shares Email's group, `crates/types/src/collection.rs:228-231`), `Id::from_parts`, `Id::prefix_id`, `Id::document_id` (`crates/types/src/id.rs:67-85`), `email_by_jmap_id` (`crates/email/src/cache/email.rs:620-624`: a lookup by document id filtered on the prefix), `ResponseCode::Unavailable` (`crates/imap-proto/src/protocol/mod.rs:734`), the JMAP mapping of any non-JMAP `trc::Error` to `serverUnavailable` (`crates/jmap-proto/src/error/method.rs:190-198`).
+- Produces, in `email::message::za::search::snapshot`:
+  - `pub struct ZaSnapshot { pub entry: Arc<IndexEntry>, pub index: tokio::sync::OwnedRwLockReadGuard<LoadedIndex>, pub cache: Arc<MessageStoreCache>, pub epoch: u64 }`.
+  - `Server::za_snapshot(&self, account_id: u32, keys: &SessionKeys) -> Result<ZaSnapshot, NoMapReason>` (the procedure below).
+  - `impl ZaSnapshot`: `pub fn map_id(&self, document_id: u32) -> Id` (`Id::from_parts(self.thread_of(document_id), document_id)`); `pub fn thread_of(&self, document_id: u32) -> u32` (`self.index.thread.current_thread(document_id)`: the singleton when the index holds no record); `pub fn check_id(&self, id: Id) -> Option<u32>` (`Some(id.document_id())` when `self.cache.email_by_id(&id.document_id())` is present and `self.thread_of(id.document_id()) == id.prefix_id()`, else `None`); `pub fn thread_members(&self, thread_id: u32) -> Vec<u32>` (`present_members(thread_id)` filtered by `self.cache.email_by_id(..).is_some()`, plus `thread_id` itself when the cache holds it and its record is absent: a never-indexed message is its own singleton); `pub async fn thread_state(&self, server: &Server) -> trc::Result<u64>` (I5: `get_state(account_id, SyncCollection::Thread)` read now, after the manifest; while it is below `max(newest_row.change_id, epoch)` re-read, three times at most, then `Err` of the no-map class).
+  - `pub fn za_no_map_error(reason: NoMapReason) -> trc::Error`: `trc::StoreEvent::UnexpectedError.into_err().details(ZA_SEARCH_UNAVAILABLE).ctx(trc::Key::Reason, reason.as_str())` (a store event maps to `serverUnavailable` on JMAP; the IMAP call sites add `.code(ResponseCode::Unavailable)`), traced once at the site with the account id.
+  - `pub fn za_submission_prefix(document_id: u32) -> u32` = `document_id` (the singleton the submission record stores, 6.2).
+- Produces, in `jmap::email::mod`: `fn ingested_into_object(email: IngestedEmail, thread_id: u32) -> Map<..>` (upstream's callers pass `email.thread_id`; the two key-account sites pass the snapshot's).
+- Places the calls of Task 2's hooks: `search_cache_hold(account_id)` in `get_cached_messages` (while set, the resident cache of that account is returned without revalidating), `take_search_manifest_fail(account_id)` in `za_search_read_manifest` (the next manifest read of the account fails with a store error), and `search_snapshot_pause_point(account_id)` in `za_snapshot` (below).
+
+**The validated snapshot, as a procedure** (6.2; every step is one call):
+
+1. `entry = za_search_entry(account_id, keys)` (loads the thread part when not resident; `Loss` → trace `ZA_SEARCH_REBUILD` and `Err(NoMapReason::Transient(TransientClass::Store))` until Task 14 replaces this arm with `za_search_rebuild_start` and one retry; `Transient` → `Err(NoMapReason::Transient)`; a manifest of a newer format → `Err(NewerFormat)`; the destroying marker → `Err(Destroying)`).
+2. `cache = get_cached_messages(account_id)`; then `search_snapshot_pause_point(account_id).await` (`SEARCH_SNAPSHOT_PAUSE`, plan call D4: the cases park a response here, between its state read and its manifest read).
+3. `(bytes, value) = za_search_read_manifest(account_id, &za_search_key(keys.swk()))` (one point read; `None` on a key account is loss, step 1's path; a transient error → `Err(Transient)`).
+4. If `manifest_hash(&bytes) != entry.index.read().manifest_bytes_hash`: `za_search_reload_if_moved(entry, keys)` (incremental, 4.3), then re-read the hash; a mismatch after the reload is `Err(Transient(Validation))`.
+5. `bound = max(manifest.newest_row.change_id, manifest.epoch)`. If `cache.last_change_id < bound`: mark the account's Email group stale (the per-account stale mark `commit_batch` applies through `crates/common/src/cache/invalidate.rs:49-53`; call that function), `cache = get_cached_messages(account_id)` again, and repeat from step 3; after three rounds `Err(Transient(Validation))`.
+6. Take the read guard (`entry.index.clone().read_owned()`), return `ZaSnapshot { entry, index, cache, epoch: manifest.epoch }`. The handler reads every state it returns from `snapshot.cache` (Email, Mailbox) or through `thread_state` (Thread), and every "is present" from `snapshot.cache`, never from a cache read before step 2.
+
+Handlers of a key account take the snapshot first and use `snapshot.cache` where they used `get_cached_messages`; an ordinary account's path is unchanged (`keys.is_none()`).
+
+- [ ] **Step 1: Write the failing unit tests in `snapshot.rs`'s `mod tests`**
+
+```rust
+#[test]
+fn the_counter_check_rejects_a_cache_below_the_newest_row_and_passes_an_empty_account() {
+    // F2: the cache's counter is behind a publication another node committed.
+    assert!(!counter_at_or_past(/* last_change_id */ 41, &manifest_with(RevisionRow { revision: 3, change_id: 42 }, /* epoch */ 0)));
+    assert!(counter_at_or_past(42, &manifest_with(RevisionRow { revision: 3, change_id: 42 }, 0)));
+    // G3: an empty account whose boundary touched only the mailbox log: the group counter moved, the item state did not.
+    assert!(counter_at_or_past(/* group counter */ 7, &manifest_with(RevisionRow { revision: 1, change_id: 7 }, /* epoch */ 7)));
+    // the epoch binds too
+    assert!(!counter_at_or_past(6, &manifest_with(RevisionRow { revision: 1, change_id: 5 }, 7)));
+}
+
+#[test]
+fn check_id_accepts_the_current_prefix_only() {
+    let snapshot = snapshot_with(/* records */ [(5, /* thread */ 2), (2, 2)], /* present */ [2, 5]);
+    assert_eq!(snapshot.check_id(Id::from_parts(2, 5)), Some(5));
+    assert_eq!(snapshot.check_id(Id::from_parts(5, 5)), None); // the stale singleton prefix
+    assert_eq!(snapshot.check_id(Id::from_parts(2, 9)), None); // not present
+    assert_eq!(snapshot.map_id(7), Id::from_parts(7, 7)); // no record: the singleton
+}
+
+#[test]
+fn thread_members_intersect_the_present_set() {
+    let snapshot = snapshot_with([(5, 2), (2, 2), (8, 2)], /* present */ [2, 5]);
+    assert_eq!(snapshot.thread_members(2), vec![2, 5]); // 8 is a retained tombstone, never emitted (R14)
+}
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `cargo test -p email --lib --features test_mode za::search::snapshot`
+Expected: compile errors naming `ZaSnapshot`, `counter_at_or_past`.
+
+- [ ] **Step 3: Implement `snapshot.rs` and the two hooks**
+
+`counter_at_or_past(last_change_id: u64, manifest: &Manifest) -> bool` is the predicate of step 5, kept as a function for the test. The stale mark of step 5 is the call upstream's `commit_batch` makes for the account's caches (`invalidate.rs:49-53`); name it in a comment at the call.
+
+- [ ] **Step 4: Map on the way out, check on the way in, at every site**
+
+- `Email/get` (`get.rs:174-199`): with keys (`:210` already reads them; move that read above `:174`), `snapshot = za_snapshot(..)` and `cache = snapshot.cache.clone()`; the `all_ids` closure maps `Id::from_parts(snapshot.thread_of(item.document_id()), item.document_id())`; each supplied id goes through `snapshot.check_id(id)` and a `None` is `push_not_found(id)` (`:229-236`, `:257-262`, `:272-277` use `email_by_id(&document_id)` after the check instead of `email_by_jmap_id`); `EmailProperty::Id` and `ThreadId` (`:415-425`) use the mapped id; `state` (`:198`) stays `cache.get_state(false)` of the snapshot's cache.
+- `Email/query` (`query.rs`): `Page::emit` (`:484-492`), `Page::top` (`:600-603`) and `count_matches` (`:456-461`) take the thread id from `snapshot.thread_of(document_id)` when a snapshot is present (a `Option<&ZaSnapshot>` threaded through `Page`); the `anchor` then matches as a whole u64 (`api/query.rs:45, 98`: a stale prefix is `anchorNotFound`, upstream's own outcome). The snapshot is taken after Task 10's content guard and its cache replaces the one read at `:124-128`.
+- `Email/set` (`set.rs`): update (`:1172-1174`): `data.thread_id == id.prefix_id()` becomes `za_prefix_ok(&snapshot, id)`: with keys `snapshot.check_id(id).is_some()`, without keys (the keyless update of the table) `true`; destroy (`:1620-1623`) the same in place of `email_by_jmap_id`; the response echoes the supplied id (upstream). Create (`:1758`): after the post-commit pass (Task 9), `za_snapshot` once for the response and `ingested_into_object(message, snapshot.thread_of(message.document_id))`. `Email/import` (`import.rs:347`) the same.
+- `SearchSnippet/get` (`snippet.rs:183, 213`): `snapshot.check_id(*email_id)` in place of `email_by_jmap_id`; `not_found` on `None`.
+- `Thread/get` (`thread/get.rs:35-45, 80-85`): the snapshot's cache; `state` = `snapshot.thread_state(self).await?` (I5); the members by the map are Task 12's (until then upstream's `thread_map` over the cache stands, under the mapped state).
+- `Blob/lookup` (`blob/get.rs:188-193`): `Id::from_parts(snapshot.thread_of(*document_id), *document_id)` and `Id::from(snapshot.thread_of(*document_id))`.
+- `EmailSubmission/set` (`submission/set.rs:449-450`): for a key account `snapshot.check_id(value)` must be `Some` (else `notFound` for the create), and `submission.thread_id = za_submission_prefix(value.document_id())`; `EmailSubmission/get` (`get.rs:237-249`): `EmailId` = `snapshot.map_id(email_id)`, `ThreadId` = `snapshot.thread_of(email_id)` (G22: the current thread, not the stored prefix).
+- IMAP `FETCH` `ObjectId` (`fetch/mod.rs:585-592`): one snapshot per FETCH command of a `za_key_session()` (`crates/imap/src/core/mod.rs:304-307`), taken before the window loop; `email_id: Id::from_parts(snapshot.thread_of(id), id)`, `thread_id: Id::from(snapshot.thread_of(id))`; `Err` → `NO [UNAVAILABLE]`. `SEARCH EMAILID` (`search.rs:565-574`): `snapshot.check_id(id)` decides the match; `THREADID` (`:576-586`): `snapshot.thread_members(thread_id)`.
+- The gates: `request.rs:296, 304, 318, 439, 455, 816` call `za_assert_mail_keys(self, access_token, req.account_id)`; `changes/get.rs:217-229`: `Email | Thread | EmailSubmission` → `za_assert_mail_keys`, `Mailbox` → `za_assert_mail_route`. The doc comment at `request.rs:853-864` lists the gated methods; extend it with 6.2's table.
+- "No map, no ids": every site above answers `za_no_map_error(reason)` when `za_snapshot` fails, traced `ZA_SEARCH_UNAVAILABLE` with the account id and the reason class, and emits nothing.
+
+- [ ] **Step 5: Write the failing `mail::threads` cases**
+
+`tests/src/za/mail/threads.rs`: `pub async fn test(test: &mut TestServer)` creates `keymail50` and `keymail51` (`key_mail_account`, `mail/mod.rs:60-70`) and runs, in order:
+
+```rust
+/// R2, 5.6: the handler's map is validated after its state read. `SEARCH_SNAPSHOT_PAUSE`
+/// holds `Email/get` between its pass and its snapshot; a publication lands in the
+/// store without this node's swap (`SEARCH_SWAP_SKIP`); the resumed response's ids
+/// reconcile with `Email/changes` since the state it returned.
+async fn case_r2_cross_node(test: &TestServer, key: &Account) {
+    // deliver A, run a keyed Email/get (pass, index A); deliver B with In-Reply-To: A
+    // park Email/get at SEARCH_SNAPSHOT_PAUSE; with SEARCH_SWAP_SKIP set: run_search_pass(test, key) (store has the publication, the loaded index does not)
+    // resume: the response's ids carry A and B under one thread id; its state S
+    // Email/changes since S is empty or renders nothing the response contradicts (no destroyed id the response emitted)
+}
+
+/// F2: the cache is held below the competing publication (`SEARCH_CACHE_HOLD`); the response
+/// fails as "no map", never a mapped id under the stale state; released, it serves.
+async fn case_f2_stale_state(test: &TestServer, key: &Account) {
+    // as above, with set_search_cache_hold(Some(key_id)) before run_search_pass and the resume
+    // assert: methodResponses[0][0] == "error" with type "serverUnavailable"; no "Email/get" response
+    // set_search_cache_hold(None); the same Email/get succeeds and its queryChanges adds no id the client holds
+}
+
+/// G20: a stale prefix is notFound on Email/get, served on a keyless Email/set update and destroy.
+async fn case_g20_stale_prefix(test: &TestServer, key: &Account, bearer: &Keyless) {
+    // old = the singleton id A|A fetched before B merged A's thread under a lower id; after the merge
+    // Email/get [old] → notFound; keyless Email/set update {old: {"keywords/$seen": true}} → updated; destroy [old] → destroyed
+}
+
+/// F8: the method table over a Bearer token (the WebSocket is Task 17's).
+async fn case_f8_keyless_table(test: &TestServer, key: &Account, bearer: &Keyless) {
+    // the gated methods of 6.2's table refused (`Blob/get|upload|copy`, `SearchSnippet/get` and `EmailSubmission/set`, keyed already, stay refused); the keyless ones served; a StateChange still arrives
+    // refused (forbidden, ZA_MAIL_KEYLESS): Email/get, Email/query, Email/changes, Email/queryChanges, Email/import,
+    //   Email/parse, Email/copy, Email/set create, Thread/get, Thread/changes, Mailbox/get, EmailSubmission/get,
+    //   EmailSubmission/query, EmailSubmission/changes, Blob/lookup
+    // served: Mailbox/query, Mailbox/changes, Mailbox/set, Email/set update and destroy, Identity/get,
+    //   VacationResponse/get, PushSubscription/get, Core/echo
+}
+
+/// H21: a FETCH after a keyed APPEND of a reply carries the final EMAILID and THREADID; Email/set
+/// create's response carries the mapped id.
+async fn case_h21_final_ids_after_keyed_writes(test: &TestServer, key: &Account) {
+    // a keyed IMAP APPEND of a reply into an existing thread: APPENDUID, then UID FETCH (EMAILID THREADID) carries the thread's mapped ids, not the singleton
+    // Email/set create of a reply: the response's id carries the thread's prefix and equals a following Email/get's id
+    // EmailSubmission/set for that message, then EmailSubmission/get: emailId and threadId equal the current mapped ids (G22)
+}
+
+/// R2, R3: a failed manifest read fails every thread-valued method and emits no singleton.
+async fn case_failed_manifest_read(test: &TestServer, key: &Account) {
+    // set_search_manifest_fail_once(Some(key_id)); Email/get → serverUnavailable; Thread/get → serverUnavailable;
+    // IMAP FETCH 1 (EMAILID) → NO [UNAVAILABLE]; then each succeeds and the ids match the keyed view
+}
+```
+
+Helpers the module uses from Task 8 (`tests/src/utils/za.rs`): `run_search_pass(test, account_id, password)` and `read_manifest(test, account_id)`; it adds `Keyless` lifted out of `gates.rs:280-330` into `tests/src/utils/za.rs` with its Bearer constructor (`gates.rs:84-213`'s token flow) so `threads.rs` and Task 17 share it.
+
+- [ ] **Step 6: Run the module to see it fail, implement, run the suite**
+
+Run: the za suite.
+Expected before: `case_r2_cross_node` fails (singleton ids, or ids under a state below the publication); after: `mail::threads` passes, `mail::search`, `mail::gates` and `websocket::test` still pass (the gates test's `keyless_tokens_hit_the_dispatcher_gate`, `gates.rs:333`, now expects `Mailbox/get`, `Email/query`, `Thread/get`, `EmailSubmission/get|query`, `Blob/lookup` and the three changes methods refused: adjust it with a comment citing 6.2's table and list the change in the task report).
+
+- [ ] **Step 7: Checks and commit**
+
+Run: `cargo test -p email --lib --features test_mode za::search::snapshot`; the per-task compile check; `cargo check -p tests --tests`; formatting for `email`, `jmap`, `imap`, `common`, `tests`.
+
+```bash
+git add crates/email/src/message/za/search/snapshot.rs crates/email/src/message/za/search/mod.rs crates/email/src/cache/mod.rs crates/common/src/za/search/load.rs crates/common/src/za/test_hooks.rs crates/jmap/src/email/get.rs crates/jmap/src/email/query.rs crates/jmap/src/email/set.rs crates/jmap/src/email/import.rs crates/jmap/src/email/mod.rs crates/jmap/src/email/snippet.rs crates/jmap/src/thread/get.rs crates/jmap/src/blob/get.rs crates/jmap/src/submission/set.rs crates/jmap/src/submission/get.rs crates/jmap/src/api/request.rs crates/jmap/src/changes/get.rs crates/imap/src/op/fetch/mod.rs crates/imap/src/op/search.rs tests/src/za/mail/threads.rs tests/src/za/mail/mod.rs tests/src/za/mod.rs tests/src/za/mail/gates.rs tests/src/utils/za.rs
+git commit -m "Release 7: mapped Email ids under a validated snapshot, the method table's gates, no map no ids"
+```
+
+### Task 12: Thread-valued reads
+
+Implementer: `sonnet` (each site is one substitution of the cache's thread id by the map's, with the control comparisons as the test).
+
+**Files:**
+- Create: `crates/email/src/message/za/search/threads.rs` (`za_mailbox_counters`, `za_thread_keywords`, `za_group_by_thread`)
+- Modify: `crates/jmap/src/thread/get.rs:46-70` (the thread map), `crates/jmap/src/mailbox/get.rs:117-135` (the counters), `crates/jmap/src/email/query.rs:319-335` (`restrict_thread_keywords`), `:456-461` (`count_matches`, completing Task 11's threading of the snapshot), `crates/jmap/src/email/query/filter.rs:621-648` (the three `*InThreadHaveKeyword` arms), `:692-696` (`InThread`), `crates/jmap/src/changes/query.rs:129, 133` (`collapseThreads` re-emission by the map), `crates/jmap/src/submission/query.rs:155-164` (`ThreadIds` filter), `:247-252` (`ThreadId` sort), `crates/imap/src/op/thread.rs:91-104` (`THREAD` grouping)
+- Modify: `crates/jmap/src/email/za_search.rs` (`za_resolve_condition`'s thread forms take the snapshot)
+- Modify: `tests/src/za/mail/threads.rs` (the cases below)
+- Test: `cargo test -p email --lib --features test_mode za::search::threads`, the za suite's `mail::threads`
+
+**Interfaces:**
+- Consumes (Task 11): `ZaSnapshot::{thread_of, thread_members, map_id, cache}`.
+- Consumes (upstream): `MessageCacheAccess::mailbox_counters` (`crates/email/src/cache/email.rs:583-614`, `MailboxCounters::add(thread_id, is_unread, count_threads)` `:362`), `thread_keywords` (`:279-345`), `in_thread` (`:486-490`), `Thread/get`'s map (`thread/get.rs:46-70`), IMAP `THREAD`'s grouping (`thread.rs:91-104`).
+- Produces, in `email::message::za::search::threads`:
+  - `pub fn za_mailbox_counters(snapshot: &ZaSnapshot, mailbox_ids: impl IntoIterator<Item = u32>, count_threads: bool) -> AHashMap<u32, MailboxCounters>`: `mailbox_counters`'s body with `counter.add(snapshot.thread_of(message.document_id()), ..)`.
+  - `pub fn za_thread_keywords(snapshot: &ZaSnapshot, keyword: &Keyword, match_all: bool, documents: Option<&RoaringBitmap>, visible: Option<&RoaringBitmap>) -> RoaringBitmap`: `thread_keywords`'s body with `snapshot.thread_of(item.document_id())` for every `item.thread_id()`.
+  - `pub fn za_group_by_thread<'x>(snapshot: &ZaSnapshot, messages: impl Iterator<Item = MessageRef<'x>>) -> AHashMap<u32, Vec<u32>>` (thread id → present member document ids, ascending).
+
+- [ ] **Step 1: Write the failing unit test**
+
+```rust
+#[test]
+fn counts_and_keyword_threads_group_by_the_map() {
+    // records: 1, 2 in thread 1; 3 in thread 3; the cache's thread_id() is the singleton for all three; 1 and 2 are unread, 3 is seen
+    let snapshot = snapshot_with([(1, 1), (2, 1), (3, 3)], [1, 2, 3]);
+    let counters = za_mailbox_counters(&snapshot, [INBOX_ID], true);
+    assert_eq!((counters[&INBOX_ID].total, counters[&INBOX_ID].threads.len(), counters[&INBOX_ID].unread_threads.len()), (3, 2, 1));
+    // some-in-thread $seen: 1 is seen → thread 1's members 1 and 2
+    assert_eq!(za_thread_keywords(&snapshot, &Keyword::Seen, false, None, None).iter().collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(za_group_by_thread(&snapshot, snapshot.cache.emails.iter())[&1], vec![1, 2]);
+}
+```
+
+- [ ] **Step 2: Run it to see it fail**
+
+Run: `cargo test -p email --lib --features test_mode za::search::threads`
+Expected: compile errors naming `za_mailbox_counters`.
+
+- [ ] **Step 3: Implement the helpers and the eight substitutions**
+
+`Thread/get` (`thread/get.rs:46-70`): with a snapshot, supplied ids → `thread_map[id.document_id()] = snapshot.thread_members(id.document_id())` filtered by `access`; no ids → `za_group_by_thread(&snapshot, cache.emails.iter().filter(access))`; an unknown thread id is `notFound` (`:104-106`, upstream). `Mailbox/get` (`mailbox/get.rs:117-135`): `za_mailbox_counters` when a snapshot is present (the method is keyed from Task 11, so a key account always has one). `restrict_thread_keywords` (`query.rs:319-335`) and the filter arms (`filter.rs:621-648`) call `za_thread_keywords` when `za` is some; `InThread` (`:692-696`) → `snapshot.thread_members(id.document_id())`; `count_matches` (`query.rs:456-461`) → `snapshot.thread_of`. `Email/queryChanges` (`changes/query.rs:129, 133`): `snapshot.thread_of(message.document_id())` in place of `message.thread_id()` (the page's prefixes are mapped by Task 13; until then the touched set is upstream's raw ids, an interim the variants do not run against). `EmailSubmission/query`: the `ThreadIds` filter keeps a submission when `ids.contains(&snapshot.thread_of(s.email_id))` (`:155-164`); the `ThreadId` sort keys by `snapshot.thread_of(s.email_id)` (`:247-252`). IMAP `THREAD` (`thread.rs:98-104`): `threads.entry(snapshot.thread_of(document_id))`.
+
+- [ ] **Step 4: Write the failing `mail::threads` cases**
+
+Accounts: `keymail52` with the plain control `plainmail52`; `keymail53` with `plainmail53`.
+
+```rust
+/// 6.1, 9.2: the same conversation to a key account and a plain control groups the same.
+async fn case_conversation_parity(test: &TestServer, key: &Account, plain: &Account) {
+    // deliver, to both: root R (Message-ID r); reply A (In-Reply-To r); reply B (References r a); forward F (new subject "Fwd: ..", References r); unrelated U;
+    // a reply C with the subject changed and In-Reply-To a (upstream threads by subject thread-name: C joins when its thread name matches, else not: the control decides)
+    // Thread/get (all) : the sets of subjects per thread are equal; Email/query collapseThreads=true sorted by receivedAt: the subject lists are equal;
+    // IMAP THREAD REFERENCES UTF-8 ALL and THREAD ORDEREDSUBJECT UTF-8 ALL: the UID groupings are equal; Thread/get [one id]: emailIds equal by subject
+}
+
+/// 5.2: a reply delivered while no keyed request runs is a singleton until the next keyed request.
+async fn case_singleton_until_keyed_request(test: &TestServer, key: &Account) {
+    // deliver reply A2 to R2 with no keyed request; read_manifest(..).indexed_to.change_id < the Email log's last change id (the store counter)
+    // a keyed Thread/get: R2 and A2 share a thread; read_manifest(..).indexed_to has moved
+}
+
+/// G7: Mailbox/get thread counts match the control.
+async fn case_g7_mailbox_counts(test: &TestServer, key: &Account, plain: &Account) {
+    // Mailbox/get [inbox] totalEmails, unreadEmails, totalThreads, unreadThreads equal on both, after marking one reply $seen on each
+}
+
+/// F1, 7.5: more than K references thread through the nearest ones; the K deviation is pinned.
+async fn case_f1_k_bound(test: &TestServer, key: &Account, plain: &Account) {
+    // 20 roots r1..r20 present on both; message M with References r1..r20 (r20 nearest): M joins on both (the `K = 16` hashes kept are its own id and its fifteen nearest references r6..r20, and those roots are present)
+    // delete r5..r20 on both (keyed Email/set destroy); message N with References r1..r20: the control joins r1's thread, the key account threads N as a singleton:
+    // assert_ne!(key_thread_of(N), key_thread_of(r1)); assert_eq!(plain_thread_of(N), plain_thread_of(r1))  // pinned deviation, 7.5
+}
+```
+
+- [ ] **Step 5: Run, implement, run**
+
+Run: the za suite.
+Expected: `mail::threads` passes; `mail::search`'s `THREAD` line now groups as the plain fixture's (Task 10 compared UID sets; tighten the comparison to the grouping).
+
+- [ ] **Step 6: Checks and commit**
+
+Run: the unit test; the per-task compile check; `cargo check -p tests --tests`; `jmap::jmap_tests` and `imap::imap_tests` plain and with `ZA_KEY_ACCOUNTS=1` (the thread-valued reads are shared paths); formatting.
+
+```bash
+git add crates/email/src/message/za/search/threads.rs crates/email/src/message/za/search/mod.rs crates/jmap/src/thread/get.rs crates/jmap/src/mailbox/get.rs crates/jmap/src/email/query.rs crates/jmap/src/email/query/filter.rs crates/jmap/src/email/za_search.rs crates/jmap/src/changes/query.rs crates/jmap/src/submission/query.rs crates/imap/src/op/thread.rs tests/src/za/mail/threads.rs tests/src/za/mail/search.rs
+git commit -m "Release 7: thread-valued reads group by the sealed thread map"
+```
+
+### Task 13: Changes: `Email/changes`, `Thread/changes`, `Email/queryChanges`
+
+Implementer: `opus` (a kernel: the rendering of thread history as upstream's destroyed and created pairs over a pinned range, with existence decided from raw records first).
+
+**Files:**
+- Create: `crates/email/src/message/za/search/changes.rs` (the stream, pure over records and a present set; the epoch rule; the retained bound)
+- Create: `crates/jmap/src/changes/za.rs` (the key account's page inside `ChangesLookup::changes`; `pub mod za;` in `crates/jmap/src/changes/mod.rs`)
+- Modify: `crates/jmap/src/changes/get.rs:217-229` (after the key gate: `if let Some(keys) = .. && matches!(object, Email | Thread) { return za_changes_page(..).await; }`), `crates/jmap/src/changes/query.rs:65-74` (the page consumed is the fork's for a key account, unchanged call), `:105-137` (the `collapseThreads` block reads the page's mapped prefixes; Task 12 switched the re-emission to the map)
+- Modify: `tests/src/za/mail/threads.rs` (the cases below)
+- Test: `cargo test -p email --lib --features test_mode za::search::changes`, the za suite's `mail::threads`
+
+**Interfaces:**
+- Consumes (Task 7): `Store::za_changes_records(&self, account_id, collection: SyncCollection, from: Option<Checkpoint>, max_records: usize) -> trc::Result<ZaChangeRecords { records: Vec<(u64, Vec<Change>)>, truncated: bool, resumed_record_lost: bool, first_retained: Option<u64> }>` (`from = Some(Checkpoint { change_id: S, position: 0, complete: true })` reads exclusively from `S`; `None` reads from 0; `truncated` is the marker `truncate_change_log` leaves at the oldest surviving key, `crates/common/src/storage/transaction.rs:228-244`, met inside the read; `first_retained` is that marker's change id when the log holds one, else `None`) and `Store::za_log_first_retained(&self, account_id, collection) -> trc::Result<Option<u64>>` (the same marker, read alone).
+- Consumes (Task 3): `ThreadPart::{revision_at, thread_of(document_id, change_id), members_of(thread_id, change_id), exists_at(document_id, change_id) -> Option<bool>, records() -> impl Iterator<Item = &ThreadRecord>}` (`records()` iterates present and tombstoned records; plan call D10).
+- Consumes (Task 11): `ZaSnapshot { index, cache, epoch, .. }`, `ZaSnapshot::{thread_of, thread_state, map_id}`, `za_no_map_error`.
+- Consumes (upstream): `Change::{InsertItem, UpdateItem, UpdateItemMetadata, DeleteItem, InsertContainer, UpdateContainer, UpdateContainerPartial, DeleteContainer}` (`crates/store/src/query/log.rs:25-34`; an item id is `thread << 32 | document`, so the document id is `id as u32`), `State::{Initial, Exact, Intermediate(JMAPIntermediateState { from_id, to_id, items_sent })}` and `State::new_intermediate`, `new_exact` (`crates/jmap-proto/src/types/state.rs:18-30, 83-93`), `ChangesResponse<NullObject>` and `IntermediateChangesResponse` (`changes/get.rs:69-73`), `max_changes` (`:230-238`), `JmapCacheState::get_state(false)` = `cache.emails.change_id` (`changes/state.rs:132-139`), the kind filter (`page.rs:173`: item changes for Email, container changes for Thread), `fill_page`'s classification (`page.rs:365-410`), `Email/queryChanges`'s diff (`changes/query.rs:348-378`).
+- Produces, in `email::message::za::search::changes`:
+  - `pub enum StreamKind { Created, Updated, Destroyed }`; `pub struct StreamItem { pub document_id: u32, pub kind: StreamKind, pub old: Option<Id>, pub new: Option<Id>, pub order: (u64, u32) }` (`Destroyed` carries `old`, `Created` carries `new`, a reassignment is two items, `Destroyed` then `Created`, with the same `order`).
+  - `pub struct RangeView<'x> { pub records: &'x ZaChangeRecords, pub later: &'x ZaChangeRecords, pub present: &'x dyn Fn(u32) -> bool, pub end_is_current: bool }` (`records` = the unfolded records of `(S, E]`; `later` = the records after `E`, empty when `E` is current).
+  - `pub fn za_email_stream(thread: &ThreadPart, view: &RangeView, since: u64, end: u64) -> Vec<StreamItem>` (the decision table below).
+  - `pub struct ThreadStreamItem { pub thread_id: u32, pub kind: StreamKind, pub order: (u64, u32) }`; `pub fn za_thread_stream(thread: &ThreadPart, view: &RangeView, since: u64, end: u64) -> Vec<ThreadStreamItem>`.
+  - `pub fn za_initial_stream(thread: &ThreadPart, present: impl Iterator<Item = u32>) -> Vec<StreamItem>` (the `S = 0` form: every present document as `Created(map)`, document-id order).
+  - `pub fn za_epoch_refuses(records_of_kind: &ZaChangeRecords, is_container: bool, since: u64, epoch: u64) -> bool`: `since > 0 && since < epoch && records_of_kind.records.iter().any(|(id, changes)| *id <= epoch && changes.iter().any(|c| is_kind(c, is_container)))` (the closed interval `(S, epoch]`, R27, H1).
+  - `Server::za_retained_bound(&self, account_id) -> trc::Result<u64>`: `max(first_retained(Email), first_retained(Thread))`, `0` when neither log holds a marker (G4: the shorter log's bound).
+- Produces, in `jmap::changes::za`: `pub async fn za_changes_page(server: &Server, request: ChangesRequest, object: MethodObject, keys: &SessionKeys, max_changes: usize) -> trc::Result<IntermediateChangesResponse>`.
+
+**The stream of `(S, E]`, as a decision table** (6.3). Inputs: `records` (unfolded, `(S, E]`), `later` (unfolded, after `E`; empty for a current `E`), `present(d)` (the snapshot's cache), the thread part. `R(X) = revision_at(X)`.
+
+1. **Candidates** (a set of document ids): every `d` with any raw record in `records` (item changes only; the mailbox container changes do not count); every record `r` of `thread.records()` with `thread.thread_of(r.document_id, S) != thread.thread_of(r.document_id, E)`; every `r` with `r.deleted` in `(S, E]`. A linear scan of the records is the implementation; a revision-indexed shortcut is a later optimization, not this task's.
+2. **Existence at `S`** of `d`: if `records` holds an `InsertItem` of `d` → absent. Else if `records` holds a `DeleteItem` of `d` → present (it existed to be deleted). Else if `!present(d)` and neither `records` nor `later` holds a `DeleteItem` of `d` → absent (I3: deleted at or before `S` by a deletion no pass has consumed, whatever the record says). Else if the index holds `d` (`exists_at(d, S)` is `Some(b)`) → `b` (created at or below `S` and not deleted at or below `S`). Else (no record, no raw entry): `present(d)` or `later` holds a `DeleteItem` of `d` (it exists now or was deleted after `E`, so it existed at `S` too).
+3. **Existence at `E`** of `d`: if `records` holds a `DeleteItem` of `d` → absent (whatever the record says: the record lags the log by the unconsumed backlog). Else if `end_is_current` → `present(d)`. Else → `present(d)` or `later` holds a `DeleteItem` of `d` (H2). The sealed record is never consulted for existence at `E`, and a `d` the cache lacks with no `DeleteItem` anywhere in `records` or `later` is absent at both ends (I3: an unconsumed deletion at or before `S` must not emit a second `destroyed`).
+4. **Threads**: `T0 = thread.thread_of(d, S)`, `T1 = thread.thread_of(d, E)` (the singleton `d` when the index holds no record, or `r0 > R(X)`).
+5. **Outcome**: absent, absent → nothing (R14); absent, present → `Created(T1|d)`; present, absent → `Destroyed(T0|d)`; present, present and `T0 != T1` → `Destroyed(T0|d)` then `Created(T1|d)`; present, present, `T0 == T1` and `records` holds an `UpdateItem` or `UpdateItemMetadata` of `d` → `Updated(T1|d)`; otherwise nothing.
+6. **Order**: by the earliest change id that made `d` a candidate (its first raw entry in `records`, the change id of the earliest revision in `(S, E]` on its chain or assignment, its deletion change id), then by document id.
+7. **`S = 0`**: `za_initial_stream` instead: every `d` with `present(d)` (and, for a pinned `E`, every `d` with a `DeleteItem` in `later`) → `Created(thread_of(d, E)|d)`, document-id order (R31).
+
+**`Thread/changes`** (F14, R25): over the same candidates, `members_of(T, S)` and `members_of(T, E)` for every `T` in `{T0, T1}` of every candidate (members intersected with existence at that end by rules 2 and 3; a candidate `d` the index holds no record for is its own thread at both ends, its only member `d` where it exists): no member at `S`, some at `E` → `Created(T)`; some at `S`, none at `E` → `Destroyed(T)`; some at both → `Updated(T)`; ordered as the Email stream, by the earliest change id, then thread id. For `S = 0`: every thread with a member at `E` (a present document without a record is its own thread), `Created`, ordered by its lowest member's document id.
+
+**The page** (`za_changes_page`), for `object` Email (`is_container = false`, the Email log) or Thread (`true`, the Thread log):
+
+1. `snapshot = za_snapshot(..)` (fails as `za_no_map_error`). `E_email = snapshot.cache.emails.change_id` (`get_state(false)`); for Thread `E = snapshot.thread_state(server).await?` (I5), for Email `E = E_email`.
+2. `S` from `request.since_state`: `Initial` → 0; `Exact(s)` → `s`; `Intermediate { from, to, items_sent }` → `S = from`, `E = to` (pinned), `skip = items_sent`.
+3. Refusals, for `S > 0` only: `S < za_retained_bound(account_id)` → `cannotCalculateChanges` ("Change log is truncated", the text of `changes/get.rs:424-427`); the read of step 5 reports `truncated` → the same; `za_epoch_refuses(kind_records, is_container, S, snapshot.epoch)` where `kind_records` = `za_changes_records(method's collection, from S exclusive)` cut at `epoch` → `cannotCalculateChanges` ("Since state is invalid" is not reused: the detail is `"State predates the index's epoch"`). `from = 0` is never refused (R28, R31).
+4. If `S == E` and the state is `Exact`: the empty response with `new_state = Exact(E)` (upstream's equality return, `:363-369`).
+5. `records = za_changes_records(Email, from S exclusive, cut at E)`; `later = za_changes_records(Email, from E exclusive)` when `E` is pinned, else empty; for Thread the Thread log is read only in step 3 (H18).
+6. `items = za_email_stream(..)` or `za_thread_stream(..)` (or the `S = 0` forms); `page = items.into_iter().skip(skip).take(max_changes)`; `created`, `updated`, `destroyed` filled from the items' ids (`new`/`old`); `has_more_changes = items.len() > skip + max_changes`.
+7. `new_state`: exhausted → `Exact(E)`; more → `Intermediate { from: S, to: E, items_sent: skip + max_changes }` (`State::new_intermediate`). An `Intermediate` request whose stream is exhausted at `skip` continues as `Exact(to)` (step 2 with `S = to`, `E` current), as upstream continues with `Since(to)` (`:393-419`).
+8. `updated_properties`: `None` (a key account's metadata is refused, `:260-268`).
+`Email/queryChanges` (`changes/query.rs:65-74`) receives this page through `self.changes(..)` unchanged; its `collapseThreads` block (`:105-137`) takes `id.prefix_id()` from the page's mapped ids and Task 12's `thread_of` re-emission; the diff (`:348-378`) is upstream's over mapped ids on both sides.
+
+- [ ] **Step 1: Write the failing unit tests in `changes.rs`'s `mod tests`** (a fixture builder: `history()` with records, aliases and revision rows; `records_of(&[(change_id, Change)])`; `present(&[u32])`)
+
+```rust
+// R2, R5: two publications; states before, at, between and after.
+#[test] fn a_first_assignment_from_the_singleton_renders_destroyed_then_created() {
+    // D=7 inserted at 10 (raw), assigned (T0=3, r0=1) by the publication at 12; S=11 (saw 7|7), E=12 current, present {3, 7}
+    let items = za_email_stream(&h, &view(records(&[(12, UpdateItem(witness))]), &none(), present(&[3, 7]), true), 11, 12);
+    assert_eq!(kinds(&items), [(Destroyed, Some(id(7, 7))), (Created, Some(id(3, 7)))]);
+    // S=12: nothing; S=9 (before the insert): Created 3|7 only
+}
+#[test] fn two_merges_render_from_each_state() { /* record 7 assigned (5, r0 at change 5); aliases 5→3 at r1 (change 12), 3→1 at r2 (change 20). (S, E) = (11, 12): Destroyed 5|7, Created 3|7; (12, 15): nothing; (15, 20): Destroyed 3|7, Created 1|7; (20, 21): nothing; (11, 21): Destroyed 5|7, Created 1|7 */ }
+// R3: a deleted message's old mapped id, from a retained pre-delete state
+#[test] fn a_deleted_members_old_mapped_id_is_destroyed() { /* record 7 (T0=3), deleted at 30; S=25, E=30: Destroyed 3|7 */ }
+// R14: created and deleted within the range yields nothing, singleton and threaded
+#[test] fn created_and_deleted_within_the_range_yields_nothing() { /* Insert 9 at 13, Delete 9 at 14, record with assignment; S=12, E=15: [] */ }
+// F10: insert reached by a pass, deletion behind the cap: the unfolded range shows the delete
+#[test] fn a_deletion_the_record_lacks_but_the_range_shows_is_destroyed_once() { /* record 9 present (no deleted), Delete 9 at 14 in range; S=13: Destroyed T|9 once; S=14: nothing */ }
+// H2: a deletion committed between the pass's log read and its commit; pinned E
+#[test] fn a_lagging_record_never_decides_presence_at_a_pinned_end() { /* record 9 present, Delete 9 at 16 in `later`, E=15 pinned, Insert 9 at 13 in range: Created at E (exists at E: later shows the delete); S=15,E=16: Destroyed */ }
+// I3: a deletion logged at or before S and not yet consumed
+#[test] fn an_unconsumed_deletion_before_s_emits_nothing() { /* record 9 present (lagging), cache lacks 9, no DeleteItem in (S, now]: [] */ }
+// R12: paging reproduces every item exactly once with a publication and a deletion between pages
+#[test] fn paging_with_a_small_max_changes_covers_the_stream_once() { /* a five-item (S,E] stream paged by 1 through Intermediate{from: S, to: E, sent} gives five single-item pages equal to the unpaged stream in order, has_more_changes false only on the fifth, and the sixth call continues as Exact(E) with nothing */ }
+// R27, H1: the epoch rule
+#[test] fn the_epoch_refuses_only_when_the_methods_log_holds_a_record_in_s_epoch() {
+    assert!(!za_epoch_refuses(&records(&[]), false, 5, 9));
+    assert!(za_epoch_refuses(&records(&[(9, UpdateItem(1))]), false, 5, 9)); // the boundary's own witness at the epoch
+    assert!(!za_epoch_refuses(&records(&[(9, UpdateContainerPartial(1, counts()))]), false, 5, 9)); // a mailbox entry does not count for Email
+    assert!(!za_epoch_refuses(&records(&[(9, UpdateItem(1))]), false, 0, 9)); // never from 0
+    assert!(!za_epoch_refuses(&records(&[(10, UpdateItem(1))]), false, 5, 9)); // past the epoch
+}
+// R28, R31: Initial paged equals unpaged; a truncation between pages changes nothing
+#[test] fn the_initial_stream_is_every_present_document_in_id_order() { /* present {2, 5, 9} with 5 updated in a retained record: Created 2, Created T|5, Created 9; the same after `records` is emptied */ }
+// R25, F14: thread membership at a pinned end
+#[test] fn thread_members_at_a_pinned_end_count_a_member_deleted_after_it() { /* T=3 members {3, 7} at both S=19 and E=20 (created before 19); 7 deleted at 25 (in `later`); za_thread_stream S=19 E=20 with an UpdateItem of 7 in range: [Updated(3)], and members_of(3, 20) == [3, 7] though 7 is deleted now */ }
+// H10 is Task 3's; the order key
+#[test] fn items_are_ordered_by_the_change_id_that_admitted_them_then_by_id() { /* D=9 updated at 13, D=4 and D=2 reassigned by the publication at 15: order [(13, 9), (15, 2), (15, 4)] */ }
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `cargo test -p email --lib --features test_mode za::search::changes`
+Expected: compile errors naming `za_email_stream`.
+
+- [ ] **Step 3: Implement `changes.rs`, `za.rs` and the branch in `ChangesLookup::changes`**
+
+The branch sits right after the key gate Task 11 placed at `changes/get.rs:217-229`: `if matches!(object, MethodObject::Email | MethodObject::Thread) && let Some(keys) = self.za_mail_keys(access_token, account_id).await? { return za_changes_page(self, request, object, &keys, max_changes).await; }` (`max_changes` computed as `:230-238` computes it, moved above the branch). `Mailbox/changes` and `EmailSubmission/changes` keep upstream's path.
+
+- [ ] **Step 4: Write the failing `mail::threads` cases**
+
+Accounts: `keymail54` with the control `plainmail54` (rendering parity), `keymail55` (backlog, pages, ordering), `keymail56` (deletion-only, pinned pages, G4, G3), `keymail57` with `plainmail55` (`Initial` and truncation). Helpers added to `tests/src/utils/za.rs`: `truncate_changes(test, account_id, keep: usize)` (calls `test.server.delete_changes(account_id, Some(keep), None)`, `transaction.rs:116-139`: both logs cut to `keep` records), `log_records_since(test, account_id, collection, 0)` (Task 8's helper: the unfolded records, for the R4 and R13 assertions), `pop3_delete(account, uid)` (a POP3 session that runs `DELE` and `QUIT`, which runs no pass), `jmap_changes(account, method, since: &str, max: Option<usize>) -> Value` and `collect_pages(account, method, since) -> (created, updated, destroyed, final_state)`.
+
+```rust
+/// 6.3: a merge renders as the control's in Email/changes, Thread/changes and queryChanges with collapseThreads.
+async fn case_merge_rendering_parity(test: &TestServer, key: &Account, plain: &Account) {
+    // on both: A (new thread), B (new thread), state S; bridge C with References a b; a keyed Email/get on the key account
+    // Email/changes since S: both show {created: [C'], destroyed: [the losing member's old id], created: [its new id]} up to id mapping: compare by subject sets per kind
+    // Thread/changes since S: both show the losing thread destroyed, the surviving thread updated (or created/updated per the control)
+    // Email/queryChanges since S, collapseThreads, sort receivedAt: `added` and `removed` subject sets equal
+}
+/// R5: two successive merges from states before, at, between and after the two publications.
+async fn case_r5_two_merges(..) { .. }
+/// R2: the backlog: a capped pass, a fetch of an unindexed message under a state, the catch-up, Email/changes applied, the id set equals Email/query's.
+async fn case_r2_backlog(test: &TestServer, key: &Account) {
+    // search_config_guard!(pass_cap: 2) (plan call D3); deliver 6 replies to one root; one keyed Email/get (indexes 2): the response carries singletons for the 4 unindexed; keep S
+    // repeat keyed requests until read_manifest(..).indexed_to reaches the log; collect_pages(Email/changes since S); apply to the held set; equals Email/query's ids
+}
+/// R12: pages with a tiny maxChanges, a merge and a deletion between pages, reconstruct the query's id set.
+async fn case_r12_pages(..) { .. }
+/// R14: created and deleted within one range renders as the control's folded log; with pages and a publication between; F10 with the deletion behind the cap.
+async fn case_r14_f10_created_and_deleted(..) { .. }
+/// R14 second form: the backlog deletion; T|D destroyed exactly once across paged changes and the finished catch-up.
+async fn case_r14_backlog_deletion(..) { .. }
+/// R16: A, D (reply to A), N (In-Reply-To D only), D deleted through POP3 before the next keyed request; A and N grouped as the control groups them with D absent; repeated with the cap between N's insert and D's deletion.
+async fn case_r16_ordering(..) { .. }
+/// R13: a deletion-only pass writes no log entry and renders the deletion from the retained record, the account's last message included.
+async fn case_r13_deletion_only(..) { /* read_log before and after: no new entry; Email/changes since the pre-delete state: destroyed T|D */ }
+/// R28, R31: Initial and Exact(0) paged with maxChanges=1 equal their unpaged result, after a reload between pages (evict + reload), and after truncate_changes(.., 1) between pages, where the control refuses.
+async fn case_r28_r31_initial(test: &TestServer, key: &Account, plain: &Account) { .. }
+/// R25: a pinned Thread/changes page across the deletion of a thread's last member and a merge after the page's end keeps its items and classification.
+async fn case_r25_pinned_thread_page(..) { .. }
+/// G4: Thread/changes from a state the Thread log retains but the Email log does not is refused (flags churned, then truncate_changes).
+async fn case_g4_two_bounds(..) { .. }
+/// G3: an empty account provisioned on a warm cache with a trailing container-only record serves every Email/* method.
+async fn case_g3_empty_account(..) { /* a fresh key account: Mailbox/set create a mailbox (a container record), then Email/get, Email/query, Email/changes Initial, Thread/get, Mailbox/get all 200 */ }
+/// G7, R6, F15: Mailbox/changes after a publishing pass reports every mailbox with updatedProperties of the counts only; IMAP CHANGEDSINCE does not report the reassigned member; the witness's unsolicited FETCH (FLAGS ..) has an unchanged MODSEQ (all pinned).
+async fn case_g7_r6_f15_pinned(..) { .. }
+```
+
+- [ ] **Step 5: Run, implement, run**
+
+Run: the za suite.
+Expected: `mail::threads` passes; `mail::search`'s `query_changes_collapse_threads` (`search.rs:764`) passes with the page now rendered by the fork.
+
+- [ ] **Step 6: Checks and commit**
+
+Run: `cargo test -p email --lib --features test_mode za::search::changes`; the per-task compile check; `cargo check -p tests --tests`; `jmap::jmap_tests` plain and with `ZA_KEY_ACCOUNTS=1` (`changes/get.rs` and `changes/query.rs` are shared paths); the za suite with `BLOB_STORE=FileSystem` (the end of phase E); formatting.
+
+```bash
+git add crates/email/src/message/za/search/changes.rs crates/email/src/message/za/search/mod.rs crates/jmap/src/changes/za.rs crates/jmap/src/changes/mod.rs crates/jmap/src/changes/get.rs crates/jmap/src/changes/query.rs tests/src/za/mail/threads.rs tests/src/utils/za.rs
+git commit -m "Release 7: Email/changes and Thread/changes rendered from the sealed thread history"
+```
+
+### Task 14: Rebuild, content-only rebuild and reconciliation
+
+**Files:**
+- Create: `crates/email/src/message/za/search/rebuild.rs`
+- Modify: `crates/email/src/message/za/search/mod.rs` (`pub mod rebuild;`), `crates/email/src/message/za/search/pass.rs` (the cursor sources of step 1 and the marker's start position replace Task 8's inline cursor filter), `crates/common/src/za/search/load.rs` (a `Destroying` marker read by a loader is `NoMap(Destroying)`; a lost thread blob or a bad tag is `Loss`, unchanged), `crates/store/src/write/blob.rs` (the link scan, after `user_blob_hashes`, `:291-355`), `tests/src/utils/za.rs` (`simulate_restart`, `lower_changes_history`, `purge_account`), `tests/src/za/mail/index.rs`, `tests/src/za/mail/threads.rs`
+- Test: `crates/email/src/message/za/search/rebuild.rs` (unit, `#[cfg(test)]`), `tests/src/za/mail/index.rs`, `tests/src/za/mail/threads.rs`
+
+**Interfaces:**
+- Consumes: `Manifest`, `ManifestValue`, `ManifestWrite::new(value, key, ManifestFill)`, `manifest_hash`, `RevisionRow`, `RebuildCursor`, `ContentTo`, `ContentCursor`, `ReconciliationMarker` (Task 5); `Checkpoint` (Task 3); `Server::za_search_read_manifest`, `Server::za_search_entry`, `LoadFailure`, `LossClass`, `TransientClass`, `NoMapReason` (Task 6), `ZaSearchConfig` (Task 2); `Store::za_changes_records`, `ZaChangeRecords { records, truncated, resumed_record_lost, first_retained }`, `Store::za_log_first_retained` (Task 7); the pass's staging and batch helpers of Task 8 (`Staging`, `write_pass(..)`), `ZA_SEARCH_REBUILD` (Task 2); `Server::za_vault_record(account_id) -> trc::Result<Option<VaultRead { record, cas: u64 }>>` (`crates/common/src/auth/vault.rs:488`, `cas` = `xxh3_64` of the stored bytes, `:56-57`); `get_cached_messages(account_id) -> Arc<MessageStoreCache>` (`crates/email/src/cache/mod.rs:59-68`; `cache.last_change_id`, `cache.emails.document_ids()`, `cache.emails.contains(id)` at `crates/common/src/cache/email.rs:1484-1493`, `cache.mailboxes.items[..].document_id`); `BatchBuilder::{assert_value, set, clear, log_item_update, log_container_property_change}` (`crates/store/src/write/batch.rs:186, 292, 340, 396, 463`), `PendingId::Assigned(u32)` (`write/mod.rs:104-107`), `AssertValue::{Hash(u64), None}` (`write/assert.rs:11-18`, `Hash` is `xxh3_64` of the bytes, `:63`); `Server::commit_batch`; `Server::get_blob(key, range) -> Option<Vec<u8>>` (`crates/common/src/storage/blob.rs:416`); `BlobHeader::decode` (Task 5).
+- Produces: `Server::za_search_rebuild_start(&self, account_id: u32, keys: &SessionKeys, loss: LossClass) -> trc::Result<RebuildStarted>` with `pub enum RebuildStarted { Written, LostToAnotherNode, Destroying }`; `Server::za_search_content_rebuild_start(&self, account_id: u32, keys: &SessionKeys, reason: ContentRebuildReason) -> trc::Result<()>` with `pub enum ContentRebuildReason { ContentLoss(LossClass), CapRaised, Behind }`; `pub fn za_search_content_needs_rebuild(manifest: &Manifest, config: &ZaSearchConfig) -> Option<ContentRebuildReason>` (Task 9's `za_search_ensure_current` calls it before loading content; Task 6's loader calls `za_search_content_rebuild_start` on a content blob's loss); `Server::za_search_reconcile_start(&self, account_id: u32, keys: &SessionKeys, first_retained: u64) -> trc::Result<()>` (the pass calls it when `za_changes_records` reports `truncated` or `resumed_record_lost`); `pub(crate) fn cursor_items(cursor: &RebuildCursor, cache: &MessageStoreCache) -> Vec<u32>` (ascending); `pub(crate) fn content_cursor_items(cursor: &ContentCursor, index: &LoadedIndex) -> Vec<u32>` (descending, documents with a record and no content record); `pub(crate) struct Difference { pub gap_inserts: Vec<u32>, pub gap_deletes: Vec<u32>, pub retained_from: u64 }` and `pub(crate) fn difference(index: &LoadedIndex, cache: &MessageStoreCache, retained: &ZaChangeRecords) -> Difference`; `Store::za_principal_blob_links(&self, account_id: u32) -> trc::Result<Vec<BlobHash>>`; test helpers `lower_changes_history(test, admin, max: Option<u64>)` (sets `DataRetention { max_changes_history }` through `registry_update_setting(.., &[Property::MaxChangesHistory])` and `reload_settings`, as `tests/src/system/purge.rs:39-46`), `purge_account(test, admin, account) ` (`Task::AccountMaintenance { maintenance_type: TaskAccountMaintenanceType::Purge }` then `wait_for_tasks`, as `purge.rs:144-152`).
+
+Rules this task implements (the implementer applies them as written; spec 5.4, 5.1's error classes, invariants 50, 53, 55, 56):
+
+- **Loss** (and only loss) starts a rebuild: no manifest on a key account; `ManifestError::OlderFormat`; `ManifestError::Tag` or `Parse`; a thread blob absent past `ZA_SEARCH_ABSENT_RETRY_SECS` or failing `open_section`/decode. `NewerFormat` and a `Destroying` marker are `NoMap`, never loss. A content blob's loss is `ContentLoss`, never a rebuild. A transient error is never loss.
+- **The first batch of a rebuild** is one `commit_batch` on `Collection::Principal` document 0 of the account:
+  1. `cache = get_cached_messages(account_id)` (revalidated); `W = cache.emails.document_ids().min()`.
+  2. The manifest: `revision = old.revision + 1`, or `1` when the old manifest was missing or failed its tag or parse (Task 8's rule: after a publication `revision == newest_row.revision`); `newest_row = RevisionRow { revision, change_id: 0 }` with `ManifestFill { newest_row: true, epoch: true }` so both take the batch's change id at commit; `indexed_to = Checkpoint { change_id: cache.last_change_id, position: 0, complete: true }`; `epoch = 0` (filled); `thread_blobs = []`; `content = None`; `content_to = ContentTo { checkpoint: indexed_to, suspended: false, cursor: None }`; `cursor = Some(RebuildCursor { next: 0, end: cache.emails.document_ids().max().unwrap_or(0) })` (no cursor when the account holds no message); `reconciliation = None`; `failing = None`.
+  3. `assert_value(PrincipalField::ZeroAccessSearch, AssertValue::Hash(xxh3_64(old_bytes)))`, or `AssertValue::None` when there were none; when `None`, also `assert_value(PrincipalField::ZeroAccessVault, AssertValue::Hash(vault_read.cas))` (R19: `za_vault_record` read in the same function; no vault record is `Err`, the account is not a key account).
+  4. `set(PrincipalField::ZeroAccessSearch, SetValue::serializable(ManifestWrite::new(ManifestValue::Index(manifest), key, fill)))`.
+  5. The unlinks: for every thread blob of the old inventory and every content blob the chain from the old head reaches (`get_blob(hash, 0..BlobHeader::LEN)` then `BlobHeader::decode`, following `predecessor` until `None`): `clear(ValueClass::Blob(BlobOp::Link { hash, to: BlobLink::Document }))` under `with_collection(Collection::Principal).with_document(0)`. If the old manifest was unreadable, or any node of the chain is absent or does not decode, the unlink set is instead `za_principal_blob_links(account_id)` (every principal-linked blob of the account; R7, F23).
+  6. The boundary entries, when `W` exists: `with_collection(Collection::Email).with_document(W).log_item_update(SyncCollection::Email, None)`; `log_container_property_change(SyncCollection::Thread, PendingId::Assigned(W))`; and for every mailbox of `cache.mailboxes.items`: `log_container_property_change(SyncCollection::Email, PendingId::Assigned(mailbox_id))`. When no message exists, the mailbox entries alone (G3: the boundary still allocates a fresh change id).
+  7. `commit_batch`. An assertion failure (`err.is_assertion_failure()`) is `LostToAnotherNode` (another node's first batch, or destroy's marker): reload and return; nothing else is retried here. The committed batch moves the manifest hash, so this node's next manifest read (the pass's step 0 or the snapshot's step 4) reloads `Whole` (the thread list is empty), which is how the loaded index is replaced.
+  Trace `ZA_SEARCH_REBUILD` with the account id, `"rebuild"`, the loss class, the cursor size (`end + 1 − next` or 0) before the commit and `"boundary"` after it.
+- **The cursor**: `cursor_items` = `cache.emails.document_ids()` filtered to `next ..= end`, sorted ascending. The pass (Task 8) works them before any log record after `indexed_to`, as inserts with `created = epoch`; after each admitted item `cursor.next = id + 1`; when the list is empty the pass clears the cursor in its batch (a manifest-only checkpoint when nothing was staged, R22). Step 0's shortcut does not apply while `cursor.is_some()` (R10). A message that vanished between the snapshot and its turn is absent from the list and needs nothing; one that arrived after the snapshot has an id above `end` and is in the log after `indexed_to` (H15).
+- **Content-only rebuild** (`za_search_content_rebuild_start`): a manifest-only write (assert the previous bytes): `content = None` with the chain's nodes unlinked (walk from the old head; a break takes the scan); `content_to = ContentTo { checkpoint: Checkpoint { change_id: 0, position: 0, complete: true }, suspended: false, cursor: Some(ContentCursor { next_below: u32::MAX }) }`. `content_cursor_items` = the document ids the thread part holds as present, below `next_below`, without a content record, descending (newest first); the pass admits them under the same cap, opening each and staging a content record only (no thread assignment, no alias; the decision is `ContentOnly`, Task 8: a content blob and a manifest update, no thread blob, no revision, no log entry); a content cursor's pass consumes no log record; after each, `next_below = id`; when none is left the pass sets `content_to.checkpoint = indexed_to` and `cursor = None`. No epoch move, no identity change. The content-only rebuild runs on a node whose content part is loaded or loadable under its cap (after a content loss the chain is empty, so there is nothing to load first). `za_search_content_needs_rebuild` answers `Some(CapRaised)` when `manifest.content_to.suspended` and `manifest.content.size <= config.account_max_mb · 1 MiB`; `Some(Behind)` when `content_to.cursor.is_none()` and `content_to.checkpoint.change_id < indexed_to.change_id` and the manifest is not mid-rebuild (`cursor.is_none()`); else `None`. While a content cursor is pending, content requests refuse (`Unavailable::NotCurrent`, Task 9).
+- **Reconciliation** (`za_search_reconcile_start` + `difference`): when `za_changes_records` from `indexed_to` reports `truncated` or `resumed_record_lost`, the pass writes a manifest-only checkpoint with `reconciliation = Some(ReconciliationMarker { bound })`, `bound = max(za_log_first_retained(Email).unwrap_or(0), za_log_first_retained(Thread).unwrap_or(0))` as read now (the shorter log's bound, G4, the same value as Task 13's `za_retained_bound` and Task 15's compaction bound; at least one marker exists when a reconciliation starts, so `bound >= 1` and the stamps `bound − 1` are defined), and `cursor = None` if a rebuild cursor was pending (its remaining items are in the difference; the epoch stays). Each later pass, while the marker is set, works in this order, under the ordinary cap, and never applies step 0's shortcut:
+  1. `retained = za_changes_records(Email, from: None /* every retained record */)`, read once per pass, unfolded; `inserted_in_log` = the document ids of its insert changes, `deleted_in_log` = of its delete changes.
+  2. `gap_inserts` = `cache.emails.document_ids()` minus the index's present set minus `inserted_in_log`, ascending; `gap_deletes` = the index's present set minus the cache's present set minus `deleted_in_log`, any order. Items of the difference the retained log *does* show are not gap items: they take their record's change id when the retained records are consumed (step 4).
+  3. Gap inserts first, each opened and indexed as an insert with `created = bound − 1`; then gap deletes, each tombstoned with `deleted = bound − 1` (F9, H3, I1).
+  4. Then the retained records in change-id order from `retained_from = first_retained` inclusively, by the pass's ordinary rules (an insert the index holds is skipped; a deletion is unconditional), moving `indexed_to` as a pass does.
+  5. When `gap_inserts` and `gap_deletes` are empty and `indexed_to.change_id >= cache.last_change_id` as read at this pass, the batch clears the marker. Aliases are kept; the epoch does not move.
+  The message cache is consulted for existence here and nowhere else in the pass (G11).
+- **Lifecycle of the marker reads** (`load.rs`): `ManifestValue::Destroying` → `NoMap(Destroying)`; the pass and the snapshot return at once.
+
+- [ ] **Step 1: Unit tests for the pure parts** (`rebuild.rs`, `#[cfg(test)]`, no store): `cursor_items_are_the_snapshot_between_next_and_end` (ids `{3, 5, 9, 12}`, cursor `{next: 5, end: 9}` → `[5, 9]`); `content_cursor_items_run_newest_first_and_skip_content_present` (records `{1, 2, 3}`, content `{2}`, `next_below: u32::MAX` → `[3, 1]`); `difference_excludes_what_the_retained_log_shows` (cache `{1, 2, 4}`, index present `{1, 3}`, retained records: insert 4, delete 3 → `gap_inserts = [2]`, `gap_deletes = []`); `difference_orders_gap_inserts_ascending` (`[7, 2, 5]` → `[2, 5, 7]`); `reconciliation_h3_gap_insert_threads_with_gap_deleted` (a `ThreadPart` fixture: `X` present and indexed, gap insert `Y` with `In-Reply-To: X`, gap delete `X`; after the order gap-insert-then-gap-delete `thread_of(Y, now) == thread_of(X record, now)`; applying the delete first leaves `Y` a singleton: the mutant's assertion); `reconciliation_i1_retained_insert_does_not_see_gap_deleted` (gap delete `X`, retained insert `Z` replying to `X`: `Z` is a singleton, as upstream); `first_batch_fields` (build the manifest value with `old = None`, `cache.last_change_id = 40`, ids `{2, 7}` → `revision 1`, `newest_row.revision 1`, `indexed_to == (40, 0, true)`, `cursor == Some({next: 0, end: 7})`, `content_to.checkpoint == indexed_to`, `content == None`; with an old manifest at revision 6 → `revision 7`, row `7`); `content_needs_rebuild_rules` (suspended + size under the cap → `CapRaised`; checkpoint behind `indexed_to` with no cursors → `Behind`; a pending rebuild cursor → `None`).
+- [ ] **Step 2: Run them to see them fail**: `cargo test -p email --lib --features test_mode,enterprise za::search::rebuild` → FAIL with unresolved names (`cursor_items`, `difference`, …).
+- [ ] **Step 3: Implement `rebuild.rs`**: the functions of Produces with the rules above. `za_search_rebuild_start` reads the old manifest with `za_search_read_manifest` (raw bytes for the assertion, decoded or not), the vault record, the cache, walks the chain's headers with `get_blob(hash, 0..BlobHeader::LEN)`, builds the batch field by field as listed, commits through `commit_batch`, and traces. `za_search_content_rebuild_start` and `za_search_reconcile_start` are manifest-only writes asserting the previous bytes. `Store::za_principal_blob_links` iterates, for `shard in 0u8..=255`, the purge's range (`ValueKey { class: ValueClass::Blob(BlobOp::Commit { hash: from }) }` to `BlobOp::Link { hash: to, to: BlobLink::Document }` with the shard in the hash's first byte, `crates/store/src/write/blob.rs:162-182`), keeps the keys of length `BLOB_HASH_LEN + U32_LEN + 1 + U32_LEN` whose suffix is `account_id.to_be_bytes() ‖ Collection::Principal as u8 ‖ 0u32.to_be_bytes()`, and returns their hashes.
+- [ ] **Step 4: Wire the pass** (`pass.rs`): at step 0, `cursor.is_some() || reconciliation.is_some()` disables the shortcut; at step 1 the item source is `cursor_items`, then `content_cursor_items`, then the difference's gap items, then the log (from `first_retained` inclusively while the marker is set, else from `indexed_to`); `truncated || resumed_record_lost` → `za_search_reconcile_start` and return, but only while `reconciliation.is_none()`: with the marker set, the read from the first retained key meets the marker by design, so `truncated` is then expected and the records after it are consumed; a cursor exhausted or a marker finished is cleared in the batch (manifest-only when nothing was staged). In `load.rs`: `Destroying` → `NoMap(Destroying)`. In Task 11's `za_snapshot`, `Err(LoadFailure::Loss(class))` from `za_search_entry` calls `za_search_rebuild_start(account_id, keys, class)` and re-enters once (Task 11 wrote that arm as a trace and `Err(NoMapReason::Transient(TransientClass::Store))`; replace it); the pass's inline cursor filter of step 1 becomes `rebuild::cursor_items`, with `content_cursor_items` and `difference` added beside it. In Task 9's `za_search_pass_hook` and `za_search_ensure_current`, the `Ok(Recovery(cause))` arm calls `za_search_rebuild_start` for `RecoveryCause::Loss(class)` and `za_search_reconcile_start` for `Truncated`, then re-enters the pass once; a second `Recovery` in the same request is traced and left for the next request.
+- [ ] **Step 5: Run the unit tests**: `cargo test -p email --lib --features test_mode,enterprise za::search::rebuild` → PASS; `cargo test -p store --lib za_search` → PASS (nothing there changes).
+- [ ] **Step 6: Suite cases in `mail::index`** (accounts `keymail58` for the rebuild cases, `keymail59` for the content cases, `keymail60` for the reconciliation cases; the control `plainmail56`). Each case is an inner `async fn` called from `test`, in this order; "force a loss" is the helper `force_loss(test, account_id)` this task adds to `tests/src/utils/za.rs` (deletes the manifest's first thread blob from the blob store with `blob_store().delete_blobs(&[hash])`, then `simulate_restart`), unless the case names another loss:
+  - `case_r3_rebuild_moves_the_epoch`: deliver three messages, run a keyed `Email/get` (the pass), record `s0 = Email/changes state`; delete the manifest's first thread blob from the blob store directly (`test.server.blob_store().delete_blobs(&[hash])`) and `simulate_restart`; a keyed `Email/get` succeeds (the rebuild ran: `read_manifest(..).cursor == Some(..)` or already `None`, `epoch > 0`); `Email/changes` with `sinceState: s0` answers `cannotCalculateChanges` (`reply.error_type_at(0) == Some("cannotCalculateChanges")`); `Email/query` then `Email/changes` from the new state is an empty round trip; repeat with the manifest deleted (clear field 152 directly) and with the manifest's format byte lowered to 0 (`OlderFormat`): three rebuilds, three strictly increasing epochs, no mail activity between the last two (`epoch2 != epoch1`).
+  - `case_f7_newer_format_is_no_map`: write field 152 with the format byte set to `SEARCH_FORMAT_V1 + 1` (and a valid tag is not needed: the format check comes first); `Email/get` answers `serverUnavailable`, `Email/query` with a text filter answers `unsupportedFilter` with `ZA_MAIL_SEARCH_UNAVAILABLE`; `read_manifest` still shows the newer byte (no rebuild); restore the bytes.
+  - `case_r10_cursor_finishes_across_restarts`: 200 delivered messages, `ZA_SEARCH_PASS_CAP` honoured (48 per pass); force a loss; after each keyed request `simulate_restart`; count requests until `read_manifest(..).cursor.is_none()` (≤ 6) and every message is in `Email/query` with a text filter (a content request, which waits).
+  - `case_r22_vanished_cursor_checkpoints`: force a loss with 60 messages, run one keyed request (48 indexed), delete the remaining 12 through POP3 `DELE` + `QUIT` (`pop3_delete`, Task 13's helper; a POP3 session runs no pass, so the 12 are never indexed), `simulate_restart`, one more keyed request: `cursor == None`, the manifest's `thread_blobs.len()` unchanged by that request (no blob), and no log entry was written by it (the Email change id moved only by the expunge).
+  - `case_h11_missing_manifest_on_an_empty_account`: a fresh key account, clear field 152 directly, `Mailbox/get` (keyed) succeeds; `read_manifest` is `Some(Index)` with `epoch > 0`, `thread_blobs == []`, `cursor == None`; a second `Mailbox/get` does not change `manifest_hash` (no second rebuild).
+  - `case_h23_content_loss_is_content_only`: with mapped ids recorded from `Email/get`, delete the content head blob from the blob store, `simulate_restart`; `Email/get` returns the same ids (identities unchanged, `epoch` unchanged); the first `Email/query` with a text filter waits for the content cursor and succeeds; `read_manifest(..).content_to.cursor == None` afterwards.
+  - `case_f6_r23_over_the_cap_then_raised`: set `ZA_SEARCH_ACCOUNT_MAX_MB` low for the case (the config is read once at boot, so the test sets `search_config_guard!(account_max_mb: 1)`, plan call D3); deliver until `read_manifest(..).content_to.suspended`; `Thread/get` works, a text search answers `ZA_MAIL_SEARCH_UNAVAILABLE`, `content.length` stops growing across two more deliveries; clear the override, `simulate_restart`, one keyed request starts the content-only rebuild (`content_to.cursor.is_some()`), text searches refuse until `content_to.checkpoint == indexed_to`, then find the messages indexed while suspended; the Email ids of `Email/get` are unchanged throughout.
+  - `case_f9_reconciliation_renders_nothing_seen` (`keymail60`): deliver 30, keyed request, record `s1` and the ids; deliver 20 more without a keyed request; `lower_changes_history(.., Some(5))` and `purge_account` (truncates both logs); keyed request: `read_manifest(..).reconciliation.is_some()` after the first pass or `None` if one pass finished it; run keyed requests until `None`; `Email/changes` since `s1` answers `cannotCalculateChanges` (the truncated log, as upstream); from a fresh `Initial`, every present message is created exactly once; restore `lower_changes_history(.., None)`.
+  - `case_f9_truncation_during_a_pending_rebuild`: force a loss with 100 messages, one keyed request (cursor pending), truncate as above, next keyed request: `cursor == None && reconciliation.is_some()`, the epoch unchanged from the rebuild's; finish; `Email/query` lists all 100.
+  - `case_r24_g2_retained_deletion_rendered_once`: a message `D` indexed and its mapped id recorded at state `s`; truncate the log so that `D`'s later deletion record is retained but `indexed_to` is below the truncation (deliver 12, delete `D`, `lower_changes_history(.., Some(8))`, purge, with no keyed request in between); reconcile; `Email/changes` since `s` lists `T|D` destroyed exactly once and `Email/changes` from the state it returns lists nothing for `D`.
+  - `case_r27_empty_rebuild_keeps_clients`: delete every message of `keymail58`, keyed request, record `s`; force a loss; keyed request (the boundary writes mailbox entries only); `Email/changes` and `Thread/changes` since `s` both succeed and are empty.
+  - `case_g3_loss_with_all_deleted_refuses_holders`: record `s` (`Email/changes` and `Thread/changes` states) while two messages `a`, `b` exist and their mapped ids are held; delete both on a keyed session (their delete records land in the Email log above `s`, and `log_threads_emptied`'s container deletes in the Thread log); force a loss; one keyed `Mailbox/get` runs the boundary, which writes the mailbox entries alone (no message is present) and still allocates a fresh `epoch`; `Email/changes` since `s` answers `cannotCalculateChanges` (the Email log holds item records, the two deletions, in `(s, epoch]`), and `Thread/changes` since `s` answers it too (the Thread log holds the two container deletes there); a client that resyncs from `Initial` gets an empty account. The contrast is `case_r27_empty_rebuild_keeps_clients`, whose `s` is recorded after the deletions, so `(s, epoch]` holds the mailbox entries only and both methods are served.
+  - `case_r2_old_epoch_map_never_served`: `SEARCH_SNAPSHOT_PAUSE` parks a keyed `Email/get` between its pass and its snapshot; in the gap, force a loss and run a keyed request on a second connection (the rebuild); release: the parked response either carries the new epoch's ids (identical to a fresh `Email/get`) or fails `serverUnavailable`; never the old mapped ids under the new state.
+- [ ] **Step 7: Suite cases in `mail::threads`** (`keymail58`, control `plainmail56`): `case_r16_r20_rebuild_form`: chain `A`, `D` (replies to `A`), `N` (replies to `D`) indexed on both accounts; force a loss on the key account; `ZA_SEARCH_PASS_CAP` override 2 so the first rebuild pass indexes `A` and `D` only; delete `D` through POP3 (`Pop3Connection`: `DELE`, `QUIT`; no pass); deliver `N2` with `In-Reply-To: D` to both accounts; keyed requests until the cursor and the log are consumed; `Thread/get` groups `A`, `N`, `N2` as the control groups them with `D` absent; `D` absent from every read; every pass's `ZA_SEARCH_PASS` trace (collected through the suite's trace capture) reports an alias count ≤ `K − 1`. Then its residual, pinned: `D` deleted while still pending in the cursor (cap 1, delete `D` after `A`'s pass), where `N2` stays a singleton on the key account and joins on the control (`assert_ne!`, with the spec's 7.5 bullet cited in a comment).
+- [ ] **Step 8: Run the suite**: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture` → PASS, every case printed; `cargo fmt -p email -p store -p tests -- --check` clean.
+- [ ] **Step 9: Commit**: `git add crates/email/src/message/za/search/ crates/common/src/za/search/load.rs crates/store/src/write/blob.rs tests/src/utils/za.rs tests/src/za/mail/index.rs tests/src/za/mail/threads.rs` and `git commit -m "Search: rebuild, content-only rebuild and reconciliation (spec 5.4)"`.
+
+### Task 15: Compaction
+
+**Files:**
+- Create: `crates/email/src/message/za/search/compact.rs`
+- Modify: `crates/store/src/za_search/thread.rs` (`ThreadPart::compact`, new), `crates/store/src/za_search/mod.rs` (`compaction_allowance` is Task 2's; nothing new), `crates/email/src/message/za/search/pass.rs` (step 4: the two compaction calls between staging and the batch), `crates/email/src/message/za/search/mod.rs`, `tests/src/za/mail/index.rs`, `tests/src/za/mail/threads.rs`
+- Test: `crates/store/src/za_search/thread.rs` (`#[cfg(test)] mod compact_tests`), `crates/email/src/message/za/search/compact.rs` (unit), the suite modules above
+
+**Interfaces:**
+- Consumes: `ThreadPart`, `ThreadRecord`, `Alias`, `RevisionRow`, `Tombstone`, `ThreadPart::{revision_at, thread_of, members_of}` (Task 3); `ContentPart`, `ContentRecord::{encode, decode}` (Task 4); `BlobHeader { kind, tier, segment, predecessor }`, `SectionKind`, `frame_and_pad`, `PadTarget`, `HiddenSection`, `PublicSection`, `build_thread_blob`, `build_content_blob`, `ThreadBlobEntry`, `ContentHead` (Task 5); `padded_len`, `compaction_allowance`, `RECORD_MAX`, `ALIAS_LEN` (Task 2); `seal_section`/`open_section`, `LoadedIndex`, `IndexEntry` (Task 6); `Store::za_log_first_retained` (Task 7); the pass's `Staging` and batch assembly (Task 8: the batch builder is open when step 4 runs, so compaction adds its set/clear/link operations to it); `ZaSearchConfig::segments` (Task 2).
+- Produces: `ThreadPart::compact(&self, bound: u64) -> CompactedThreadPart` with `pub struct CompactedThreadPart { pub part: ThreadPart, pub floor_row: Option<RevisionRow>, pub n_records: usize, pub dropped_aliases: usize, pub folded: usize }`; `Server::za_search_compact_threads(&self, account_id: u32, keys: &SessionKeys, index: &LoadedIndex, staging: &Staging, batch: &mut BatchBuilder, config: &ZaSearchConfig) -> trc::Result<Option<ThreadBlobEntry>>` (called by the pass when `index.manifest.thread_blobs.len() + 1 >= config.segments` after its own blob is staged; `None` when the compaction was refused as a defect, see rule 8); `Server::za_search_compact_content(&self, account_id: u32, keys: &SessionKeys, index: &LoadedIndex, chain: &[ChainNode], new_blob: Option<StagedContent>, cursor_pending: bool, batch: &mut BatchBuilder, config: &ZaSearchConfig) -> trc::Result<ContentChainUpdate>` with `pub struct ChainNode { pub hash: BlobHash, pub segment: SegmentId, pub tier: u8, pub size: u32 }` (the chain young first, from the headers or the loaded content's `segments`), `pub struct StagedContent { pub header: BlobHeader, pub bytes: Vec<u8>, pub hold: BlobHold }` (the pass's own content blob, staged) and `pub struct ContentChainUpdate { pub head: Option<ContentHead>, pub unlinked: Vec<BlobHash> }`; `pub fn tier_merge_plan(tiers_young_first: &[u8], segments: usize) -> Vec<MergeStep>` with `pub struct MergeStep { pub count: usize, pub into_tier: u8 }` (pure; unit-tested).
+
+**Thread compaction, the procedure** (spec 5.5, decision 2 (c), R35; invariants 48 and 56). Input: the loaded thread part merged with the pass's staged records and aliases (the pass's own additions compact with the rest). Steps, in this order:
+
+1. `bound = max(za_log_first_retained(Email).unwrap_or(0), za_log_first_retained(Thread).unwrap_or(0))`: the oldest retained change id of the shorter log (G4: the Thread log keeps older change ids than the Email log, so the higher marker is the shorter log's; a log without a marker contributes 0). Both `/changes` methods refuse every state below this bound (Task 13's `za_retained_bound` is the same value), so nothing a servable state needs is pruned.
+2. `row_change_id(r)` = the change id of revision `r` from the revision table (the manifest's newest row included). Compute it for every record and alias before any row is dropped; a revision below the floor row's (its row dropped by an earlier compaction) takes the floor row's change id, which is below every later bound, so it compares as below the bound.
+3. **Floor row**: `floor = the newest row with change_id < bound`, kept (plan call E2). Every other row with `change_id < bound` is dropped; rows at or above the bound are kept.
+4. **Record pruning (the bridge rule)**: a deleted record (`deleted.is_some()`) is dropped only when `deleted < bound` **and** `row_change_id(record.revision) < bound`. A present record is never dropped. A deleted record kept by this rule keeps its tombstone entry.
+5. **Folding, one hop, ascending**: for each alias with `row_change_id(alias.revision) < bound`, in ascending order of `alias.revision`: every retained record with `thread_id == alias.source` gets `thread_id = alias.target` and `revision = alias.revision`; then the alias is dropped. Ascending order folds every expired hop of a chain before any is discarded (an `A → B` below the bound then `B → C` below the bound moves a record at `A` to `C`, through both); a sub-bound alias never moves a record past an alias at or above the bound.
+6. **Dead-alias rule, to a fixed point**: repeat until no alias drops: drop every remaining alias whose `source` has no retained record with `thread_id == source`.
+7. Rebuild the derived thread table from the retained present records; `n_records` = retained records, present and deleted.
+8. **Encode and pad**: hidden plaintext = the retained records (a deleted record carries no hashes) and the retained aliases; `allowance = compaction_allowance(n_records)`; if `hidden.len() + 4 > allowance`, the compaction is refused as a defect (trace `ZA_SEARCH_ABORTED` with reason `"allowance"`, return `None`; the pass writes its blob uncompacted and the next pass retries), since by the bound of step 6 it cannot happen; else `frame_and_pad(&hidden, PadTarget::Compaction { n_records }, config.pad_min)?` (its `AllowanceExceeded` is this refusal). Public plaintext = one `Tombstone` per retained deleted record and the retained rows (floor and above) except the manifest's newest row. Seal both with `BlobHeader { kind: Thread, tier: 0, segment: fresh, predecessor: None }`.
+9. In the pass's batch: `hold_blob` the new blob (Task 8's staging helper), `BlobHold::release`, `BlobOp::Link` to principal document 0; `clear` the `Document` link of every old thread blob; the manifest's `thread_blobs = vec![new_entry]`; the pass's own thread blob is not written separately (its records, aliases, tombstones and `previous_row` are inputs of the compaction, so the input set is the loaded part plus the whole staging), and after the commit the swap puts `compacted.part` in place of `index.thread`, `[segment]` in place of `thread_segments`, and recomputes `thread_bytes`. The pass's publication rules are unchanged: a compaction does not publish by itself.
+
+**Content compaction** (5.5, R32, G17, H7): every content blob's header carries its `tier`; a pass's own blob is tier 0. After staging the pass's blob, with the chain's tiers listed young first (the new blob first): while the first `segments` entries are all of one tier `t`, merge them into one blob of tier `t + 1` whose predecessor is the entry after the run (or `None`), and continue with the new list (`tier_merge_plan` gives the steps; a cascade within one pass is expected). A merge reads each input blob (from the loaded content part when loaded, else `get_blob` + `open_section` + `decode`), concatenates the record frames (per-record frames, no recompression), drops the records of documents the thread part holds as deleted or does not hold, and writes one blob. When no cursor is pending (`cursor`, `content_to.cursor` and `reconciliation` all `None`) and the chain holds `>= segments` blobs, the full merge replaces the tiered step: every node into one blob with `predecessor: None` and `tier = max input tier + 1`, on a node whose content part is loaded or loadable under the cap; otherwise (over the cap) nothing is merged and nothing is extended (4.2). The manifest's `content = ContentHead { hash, segment, length: new chain length, size: new chain's sealed size }`; the replaced blobs are unlinked in the batch. Bounds, tested: the chain never exceeds `(segments − 1) · ⌈log_segments n⌉ + 1` nodes over a rebuild of `n` passes, and the bytes rewritten over the rebuild are at most `⌈log_segments n⌉` times the content written.
+
+- [ ] **Step 1: Unit tests of `ThreadPart::compact`** (`crates/store/src/za_search/thread.rs`, `mod compact_tests`; fixtures are built with the public constructors of Task 3, publication revisions `r1 < r2 < r3` with rows at change ids `c1 < c2 < c3`):
+  - `r35_three_roots_one_bridge`: roots `a`, `b`, `c` (threads `A`, `B`, `C`, each assigned at `r0`, row `c0`), deleted at `d_a, d_b, d_c` with `c0 < d_* < c1`; bridge `m` indexed at `r1` referencing all three: `assign` gives `thread_id = A`, aliases `B → A (r1)`, `C → A (r1)` (ties lowest); `compact(bound)` with `d_* < bound <= c1` → `n_records == 1` (`m`), `part.aliases.is_empty()`, `thread_of(m, c1) == A`.
+  - `r35_128_families_of_fifteen_roots`: 128 × (15 roots deleted before the bound, one live bridge at `r1`) → `n_records == 128`, aliases `0`, `dropped_aliases == 128 · 14`, and `compaction_allowance(128) <= 65536 − 4` (the hidden section fits one 64 KiB class), `encode_hidden(..).len() + 4 <= compaction_allowance(128)`.
+  - `chain_keeps_the_aliases_surviving_records_use`: threads `T1..T5` as in spec 9.1's chain (bridge `b1` merges `T2 → T1` at `r1`; `b2` with two references into `T3` merges `T1 → T3` at `r2`; `b3` merges `T3 → T5` at `r3`); roots `m1` (of `T1`) and `m3`, `m3'` (of `T3`) deleted before the bound, `c1 < bound <= c2`: after `compact`, `m2`'s assignment is `(T1, r1)` (one hop), aliases `T1 → T3` and `T3 → T5` are kept (their sources have `m2`/`b1` and `b2` assigned), `m1`, `m3`, `m3'` are pruned; for every `X in {c2, c2 + 1, c3, c3 + 1}` and every retained `D`, `compacted.thread_of(D, X) == original.thread_of(D, X)` and `compacted.members_of(T, X) == original.members_of(T, X)` for every `T` named by a retained record.
+  - `fold_is_one_hop`: the same fixture, assert `m2.thread_id == T1`, not `T3` or `T5`; `thread_of(m2, X)` for `c1 <= X < c2` is `T1`, for `c2 <= X < c3` is `T3`, for `X >= c3` is `T5`.
+  - `two_expired_hops_fold_in_order`: `A → B (r1)`, `B → C (r2)`, both below the bound: a record at `A` ends at `(C, r2)`.
+  - `bridge_rule_keeps_a_deleted_bridge`: a bridge deleted at `d` with `d < bound <= row(r_bridge)` is retained, its aliases kept while their sources' records (the bridge itself, assigned to the target) remain; the same bridge with `row(r_bridge) < bound` is pruned and its aliases drop.
+  - `equal_counts_equal_class`: four fixtures with equal `n_records` and tombstone counts (no merge; everything in one thread; a chain through one survivor; bridges deleted after their publication) give equal `padded_len(compaction_allowance(n), 65536)` and encode within the allowance.
+  - `floor_row_defines_revision_at`: rows `(1, 10), (2, 20), (3, 30)`, bound `25` → rows `(2, 20)` (floor) and `(3, 30)` kept; `revision_at(27) == 2`.
+  - `dead_alias_rule_needs_the_bridge_rule` (the two mutation controls, written as positive assertions): with the bridge rule skipped (a test-only flag on a copy of the procedure), the chain fixture loses `T1 → T3`'s witness and `thread_of(m2, c2)` changes; with the dead-alias rule skipped, `r35_128_families` keeps 1,792 aliases and `encode_hidden(..).len() + 4 > compaction_allowance(128)`.
+- [ ] **Step 2: Run to see them fail**: `cargo test -p store --lib za_search::thread::compact_tests` → FAIL (`compact` unresolved).
+- [ ] **Step 3: Implement `ThreadPart::compact`** per the procedure's steps 1–7 (the bound is a parameter; the caller reads the logs). Signature as in Produces; `floor_row` returned for the public section.
+- [ ] **Step 4: Run them**: `cargo test -p store --lib za_search::thread::compact_tests` → PASS.
+- [ ] **Step 5: Unit tests of the content plan** (`compact.rs`): `tier_merge_plan_cascades` (`segments = 4`, tiers young first `[0, 0, 0, 0, 1, 1, 1, 2]` → steps `[{4, 1}, {4, 2}]`: the first merge makes four tier-1 blobs, the second leaves two tier-2 blobs, fewer than `segments`, so the cascade stops); `tier_merge_plan_stops_at_a_mixed_run` (`[0, 0, 1]` → `[]`); `chain_bound_holds` (simulate `n = 4096` passes at `segments = 16`, the chain length never above `(16 − 1) · 3 + 1 = 46`, and the bytes rewritten `<= 3 ×` the content written, with each pass's blob 1 byte); `merge_drops_tombstoned_content` (records for `{1, 2, 3}`, thread part with `2` deleted → the merged blob holds `{1, 3}`).
+- [ ] **Step 6: Implement `compact.rs`**: `za_search_compact_threads` (steps 8–9) and `za_search_compact_content` (the tiered and full merges), and the pass's step 4 calls in `pass.rs` (`thread_blobs.len() + 1 >= segments` → compact threads; the content plan after staging the content blob; the full merge when no cursor is pending and `content.length + 1 >= segments`).
+- [ ] **Step 7: Run**: `cargo test -p email --lib --features test_mode,enterprise za::search::compact` → PASS.
+- [ ] **Step 8: Suite cases** (`mail::index`, account `keymail61`; `mail::threads` reuses `keymail52`'s conversation from Task 12 where noted; `ZA_SEARCH_SEGMENTS` is lowered for the module through `search_config_guard!(segments: 4)` (plan call D3)):
+  - `case_r8_thread_compaction_bounds_the_manifest`: on a node that never loaded content (no content request in the case), run 12 publishing passes (12 deliveries, each followed by one keyed `Mailbox/get`): `read_manifest(..).thread_blobs.len()` never exceeds 3 and drops to 1 at passes 4, 7 and 10 (`len + 1 >= 4` fires on the pass that would make a fourth blob), while `content.length` grows to 3 and the same passes' full merges leave 1 (no cursor is pending; the merged blob's tier, read from its header with `get_blob(hash, 0..BlobHeader::LEN)`, is the inputs' maximum plus one).
+  - `case_content_compaction_leaves_one_blob`: with no cursor pending, after `segments` passes the chain is one blob with `predecessor == None`; the old blobs' `Document` links are gone (`principal_blob_links(test, id)` names the manifest's blobs only) and after `expire_and_purge_blobs` the old hashes answer `None` from `get_blob`.
+  - `case_g17_h7_r32_tiered_merges_during_a_rebuild`: 200 messages, force a loss, `search_config_guard!(pass_cap: 8)` → 25 passes; after each keyed request record `content.length` and, from the `ZA_SEARCH_PASS` traces, the content bytes written and the bytes merged; assert `content.length <= (4 − 1) · ⌈log_4 25⌉ + 1 == 10` at every step, merged bytes `<= 3 × written` at the end, and after the cursor is exhausted, the first pass with content to stage and `content.length + 1 >= 4` leaves `content.length == 1`.
+  - `case_r3_deleted_merged_message_after_compaction` (`mail::threads`): a thread of two, a reply bridging it to another (a merge at `r`), record `s` and the mapped id `T|D` of a member; delete `D` (keyed); run passes until a thread compaction (deliveries + keyed requests), `simulate_restart`; `Email/changes` since `s` lists `destroyed T|D` (the retained tombstone and the bridge rule kept the record, and the alias chain resolves `T` at `s`).
+  - `case_r17_tombstone_gone_after_retention`: `D` deleted with the pass's log read parked by `SEARCH_SWEEP_PAUSE` (Task 8's hook; the deletion commits between the cache comparison and the log iteration), the tombstone persisted (`read_manifest` + a load shows `D` deleted); churn 20 flag changes and `lower_changes_history(.., Some(8))` + purge so both logs' bounds pass `D`'s deletion and its assignment's publication; a thread compaction; a fresh load shows no record for `D` and the content blob after the next content merge holds no record for `D`.
+  - `case_r21_amplified_merge_probe_class` (`mail::threads`): two threads of 40 helper messages each referencing two known Message-IDs, then a bridge referencing both: the publishing pass's thread blob has hidden class exactly `65536` (its sealed length minus the public section's `t · tombstones + rows` is `65536 + the seal's overhead`), the alias table gained exactly one entry (`za_search_thread_part(test, id, password).aliases().count() == 1`; the helper is this task's: `pub async fn za_search_thread_part(test, account_id, password) -> ThreadPart` in `tests/src/utils/za.rs` loads the account's thread blobs with the unlocked keys through `parse_thread_blob`), and the same delivery sequence with the two threads already one thread (the bridge delivered first) gives the same class.
+- [ ] **Step 9: Run the suite**: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture` → PASS; `cargo fmt -p store -p email -p tests -- --check` clean.
+- [ ] **Step 10: Commit**: `git add crates/store/src/za_search/thread.rs crates/email/src/message/za/search/ tests/src/za/mail/index.rs tests/src/za/mail/threads.rs tests/src/za/leak.rs` and `git commit -m "Search: thread compaction with the bridge and dead-alias rules, tiered content compaction (spec 5.5)"`.
+
+### Task 16: Account lifecycle and the operator paths
+
+**Files:**
+- Create: `crates/common/src/za/search/destroy.rs`
+- Modify: `crates/common/src/za/search/mod.rs` (`pub mod destroy;`), `crates/services/src/task_manager/tasks/destroy_account.rs:214` (one line before `destroy_account_blobs(server, account_id).await?;`), `crates/services/src/index_queue/reindex.rs:102-150` (one gated call after the Email loop of `reindex_account`), `crates/store/src/write/blob.rs:333-338` (`user_blob_hashes`: `Collection::Principal` joins the `matches!`), `tests/src/za/mail/index.rs`, `tests/src/za/index_task.rs` (one assertion beside `test_blob_recode_keeps_sealed`, `:636`)
+- Test: `crates/common/src/za/search/destroy.rs` (unit), `tests/src/za/mail/index.rs`, `tests/src/za/index_task.rs`
+
+**Interfaces:**
+- Consumes: `ManifestValue::{decode_unverified, encode_destroying}`, `Inventory { thread_blobs, content }`, `BlobHeader::{LEN, decode}` (Task 5); `Store::za_principal_blob_links` (Task 14); `Server::za_is_key_account(account_id) -> trc::Result<bool>` (`crates/common/src/auth/vault.rs:454`); `AssertValue`, `BatchBuilder::{assert_value, set, clear}`, `BatchBuilder::is_large_bulk_batch` (as `clear_links`, `destroy_account.rs:394-419`); `Server::get_blob`; `SEARCH_DESTROY_PAUSE` (Task 2); the loader's `NoMap(Destroying)` (Task 14); the suite's `destroy_key_accounts` + `assert_is_empty` (`tests/src/za/mod.rs:250-262`), `expire_and_purge_blobs` (`tests/src/utils/za.rs:1028`), `create_blob_codec_key` and `recode_blobs` (`tests/src/za/leak.rs:1977, 1990`), `Task::AccountMaintenance { maintenance_type: TaskAccountMaintenanceType::Reindex }` through `admin.registry_create_object` and `test.wait_for_tasks()` (`tests/src/za/index_task.rs:467-474`).
+- Produces: `Server::za_search_destroy(&self, account_id: u32, clear_field: bool) -> trc::Result<()>` (`clear_field = false` from destroy, where the range delete removes the marker; `true` from the reindex reset); `Server::za_search_reset(&self, account_id: u32) -> trc::Result<()>` = `za_search_destroy(account_id, true)` for a key account, nothing for an ordinary one; test helper `write_manifest_bytes(test, account_id, bytes)`.
+
+**The destroy step** (spec 5.7, invariant 55), `za_search_destroy`:
+
+1. Read field 152 raw (`ValueKey::property(account_id, Collection::Principal, 0, PrincipalField::ZeroAccessSearch)`, as `vault_key` at `vault.rs:60-66` reads field 150). Four cases: `None` → `previous = AssertValue::None`, `inventory = None`; bytes that `decode_unverified` to `Index(m)` → `previous = Hash(xxh3_64(bytes))`, `inventory = Some(Inventory { thread_blobs: m.thread_blobs, content: m.content })`; bytes that decode to `Destroying(inv)` → a previous attempt died after its marker: skip step 2 and continue with `inv`; bytes that do not decode → `previous = Hash(xxh3_64(bytes))`, `inventory = None` (the scan).
+2. Write the marker: one batch on principal document 0, `assert_value(ZeroAccessSearch, previous)`, `set(ZeroAccessSearch, SetValue::fixed(ManifestValue::encode_destroying(&inventory.unwrap_or_default())))`, `write_batch`. An assertion failure means a pass or a rebuild committed between the read and this write: re-read and repeat from step 1 (at most `ZA_PIN_WRITE_ATTEMPTS` times, `vault.rs:240`). From this commit on, every in-flight pass asserting the old bytes and every rebuild asserting `None` loses (R19), and a loader reads `NoMap(Destroying)`.
+3. `SEARCH_DESTROY_PAUSE` pause point (test mode).
+4. Collect the hashes to unlink: when `inventory` is `Some`, its thread blobs plus the chain walked from `content.hash` through each node's header (`get_blob(hash, 0..BlobHeader::LEN)`, `BlobHeader::decode`, follow `predecessor`); if any node is absent or fails to decode, or when `inventory` is `None`, the set is `za_principal_blob_links(account_id)` instead (R7, F23).
+5. Clear each `BlobOp::Link { hash, to: BlobLink::Document }` under `with_account_id(account_id).with_collection(Collection::Principal).with_document(0)`, flushing the batch whenever `is_large_bulk_batch()` (the `clear_links` shape, `destroy_account.rs:394-419`).
+6. When `clear_field`: one more batch asserting `Hash(xxh3_64(marker_bytes))` that clears field 152 (`clear(ZeroAccessSearch)`), so the next keyed request finds no manifest, which is loss on a key account (H11) and rebuilds (I6). Destroy leaves the marker for `danger_destroy_account`'s Property range delete (`crates/store/src/dispatch/store.rs:450-468`).
+
+The call sites: `destroy_account.rs:214` gains `server.za_search_destroy(account_id, false).await?;` as the line before `destroy_account_blobs(server, account_id).await?;` (every account: an ordinary account has no field 152 and no principal links, so the step is one read; the `None` branch writes a marker that the range delete removes, which fences a concurrent rebuild of an account converted in the window). `reindex.rs`, after the Email loop (`:138-150`) and before the groupware loops: `server.za_search_reset(account_id).await?;` (gated inside on `za_is_key_account`). `user_blob_hashes` (`blob.rs:333-338`): `Collection::Email | Collection::SieveScript | Collection::FileNode | Collection::Principal`, so `BlobRecode` (`crates/services/src/task_manager/tasks/blob_recode.rs:93-100`) recodes the index's blobs; the loader reads through `get_blob`, which undoes the codec, so a recoded blob opens unchanged.
+
+- [ ] **Step 1: Unit tests** (`destroy.rs`, `#[cfg(test)]`, pure parts): `marker_bytes_round_trip_the_inventory` (two thread entries and a head → `decode_unverified` gives `Destroying(inv)` equal); `unlink_set_takes_the_inventory_when_the_chain_is_complete` (a fake header reader closure: head → node 2 → node 1 → `None` gives 3 content hashes + the thread hashes); `unlink_set_falls_back_to_the_scan_on_a_broken_chain` (node 2 absent → the scan's result is used, a closure returning a sentinel set); `garbage_bytes_take_the_scan_and_assert_their_hash` (`previous == Hash(xxh3_64(garbage))`).
+- [ ] **Step 2: Run to see them fail**: `cargo test -p common za::search::destroy` → FAIL.
+- [ ] **Step 3: Implement `destroy.rs`**, the two call-site lines and the `user_blob_hashes` edit.
+- [ ] **Step 4: Run**: `cargo test -p common --lib --features test_mode za::search::destroy` → PASS; `cargo test -p services --lib --features test_mode,enterprise za` → PASS; `cargo test -p store --lib write::blob` → PASS (the existing `user_blob_hashes` tests, if any, still pass; a new one asserts a `Collection::Principal` document link is returned).
+- [ ] **Step 5: Suite cases** (`mail::index`; accounts `search-destroy-1` to `-6`, created with `create_key_user_account` at the start of each case and destroyed by it; `keymail62` for the recode case, `keymail63` for the reindex case). After each destroy: `test.wait_for_tasks()`, `expire_and_purge_blobs(test, &admin)`, then `principal_blob_links(test, id).is_empty()`, `read_manifest(test, id).is_none()`, and every hash the case recorded answers `None` from `get_blob`.
+  - `case_r7_interrupted_transitions_leave_nothing` (`search-destroy-1`): deliver 5; for each of the two pause points around the batch (`SEARCH_COMMIT_PAUSE` before `commit_batch`, `SEARCH_SWAP_PAUSE` after it), park a keyed request's pass, record the staged hashes (`principal_blob_links` plus the temporary links read as the purge reads them), release with `SEARCH_HOLD_EXPIRE` set so the holds expire at once, `simulate_restart`; then destroy, purge, assert nothing remains of any recorded hash.
+  - `case_r7_middle_node_break` (`search-destroy-2`): 6 passes with `search_config_guard!(segments: 8)` (no merge yet), delete the chain's third-youngest content blob from the blob store; `simulate_restart`; a text search triggers the content-only rebuild (Task 14) whose unlink set took the scan (the trace `ZA_SEARCH_REBUILD` carries reason `"scan"`); then destroy and purge: nothing remains, including the blobs the scan found that the readable part of the chain did not name.
+  - `case_f23_unparseable_manifest` (`search-destroy-3`): deliver 3, keyed request, overwrite field 152 with 40 random bytes (`write_manifest_bytes`); destroy: the step wrote a marker asserting the garbage's hash (observed through `SEARCH_DESTROY_PAUSE`: at the pause `read_manifest` is `Destroying` with an empty inventory), took the scan, and after purge nothing remains.
+  - `case_f23_pre_release_account_without_a_manifest` (`search-destroy-4`): a key account provisioned, field 152 cleared directly, never a keyed mail request; destroy takes the `None` branch (the marker at the pause has an empty inventory), finds no link, leaves nothing.
+  - `case_r19_paused_pass_loses_to_the_marker` (`search-destroy-5`): park a keyed request's pass after staging (`SEARCH_COMMIT_PAUSE`, before the batch); destroy the account on the admin's connection with `SEARCH_DESTROY_PAUSE` set; release the pass first: its batch fails its assertion (`ZA_SEARCH_LOST` traced, the pass returns `Lost`), its holds expire; release the destroy; purge; nothing remains and no `Document` link of the pass's blobs ever existed (`principal_blob_links` taken at the destroy pause named only the manifest's).
+  - `case_g12_destroy_dies_after_the_marker` (`search-destroy-6`): destroy with `SEARCH_DESTROY_PAUSE`; at the pause, `read_manifest == Destroying(inv)` with `inv` naming every blob; abort the task's first run by making the step return a store error after the pause (`SEARCH_DESTROY_FAIL_ONCE`, Task 2's one-shot, taken right after the pause point; the task's `Outcome` on `Err` is a retry, `destroy_account.rs:54-66`); the retry reads the marker, skips the marker write, unlinks from `inv`; purge; nothing remains.
+  - `case_blob_recode_recodes_the_index` (`keymail62`): deliver 3, keyed request; `let codec_key = create_blob_codec_key(&admin).await; recode_blobs(test, &admin, TaskBlobRecodeCompression::Zstd, TaskBlobRecodeEncryption::Encrypt(TaskBlobRecodeKey { key_id: codec_key })).await;` then every hash of the manifest's blobs read raw from the blob store carries the codec's encrypted trailer (`BlobFormat::of(raw).key_id == Some(..)`, `crates/store/src/write/blob_codec/mod.rs:127-150`), `simulate_restart`, and `Email/get` plus a text search still succeed (the seal opened through the codec). Add the same `BlobFormat::of` assertion for an index blob to `index_task::test_blob_recode_keeps_sealed` so the two tests pin the rule together.
+  - `case_i6_reindex_resets_the_index` (`keymail63`): deliver 4, keyed request (indexed); set `SEARCH_OPEN_FAIL_ALL` for the account, deliver 3 more, run keyed requests until the three are skipped as loss (`ZA_SEARCH_SKIPPED` × 3; a text search for their words finds nothing; `Thread/get` shows them as singletons); clear the hook (the "repair"); `admin.registry_create_object(Task::AccountMaintenance { account_id: key.id(), maintenance_type: TaskAccountMaintenanceType::Reindex, status: TaskStatus::now() })` and `test.wait_for_tasks()`: `read_manifest(test, id).is_none()` and `principal_blob_links(..).is_empty()` (the reset unlinked everything; the vault record and the mail are untouched: `za_vault_record(..).is_some()`, `mail_count == 7`); the next keyed `Email/get` rebuilds (`epoch` moved), and a text search finds all seven.
+- [ ] **Step 6: The suite's end** (`tests/src/za/mod.rs:230-231`): `destroy_key_accounts` already runs before `assert_is_empty`; insert `expire_and_purge_blobs(&test, &admin).await;` between them so the destroy-then-purge-then-assert order holds for the index's blobs (the vault/pin exemption of `cleanup.rs:407-418` does not cover blobs; Task 2 exempted field 152 and principal-linked blobs only while their account exists).
+- [ ] **Step 7: Run**: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture` → PASS (the suite's final `assert_is_empty` included); the same with `BLOB_STORE=FileSystem` → PASS; `cargo fmt -p common -p services -p store -p tests -- --check` clean.
+- [ ] **Step 8: Commit**: `git add crates/common/src/za/search/ crates/services/src/task_manager/tasks/destroy_account.rs crates/services/src/index_queue/reindex.rs crates/store/src/write/blob.rs tests/src/za/mail/index.rs tests/src/za/index_task.rs tests/src/za/mod.rs tests/src/utils/za.rs` and `git commit -m "Search: destroy fences with a marker and unlinks the index, reindex resets it, BlobRecode recodes it (spec 5.7)"`.
+
+### Task 17: Variants that narrow
+
+Implementer: `sonnet` (test-harness work; every expected outcome is upstream's own body, cited by file and line).
+
+The key-mode variants of mail spec 11 assert, today, the refusals and singletons that release 3 required. With the index served they assert upstream's outcomes (spec 9.3). Rule (plan 13 R44): where a variant becomes upstream's body plus one difference, the variant says so in its doc comment and either calls upstream's public body or mirrors it line for line; the one difference for JMAP is the index wait (a keyed content request in place of `test.wait_for_tasks()`'s queue wait) and the keyless refusal on a keyless token (6.2's table); for IMAP there is none, since a key account's IMAP session always holds keys (mail spec 3.3).
+
+**Files:**
+- Modify: `tests/src/jmap/za_variants.rs` (`query` `:254-331`, `query_refusals` `:333-445`, `query_served` `:447-666`, `query_options` `:668-731`, `search_snippet` `:733-833`, `query_changes` `:835-1165`, `thread_get` `:1291-1332`, `thread_merge` `:1360-1565`; the module doc `:7-16`)
+- Modify: `tests/src/imap/za_variants.rs` (delete `search` `:87-276` and `thread` `:545-649`; `fetch` `:278-465` and `store` `:467-543` lose their refused-`FROM` lines; the module doc `:7-12`)
+- Modify: `tests/src/imap/mod.rs:258-275` (the `search` and `thread` dispatch)
+- Modify: `tests/src/za/mail/gates.rs:333-551` (`keyless_tokens_hit_the_dispatcher_gate`)
+- Modify: `tests/src/za/websocket.rs` (one new case)
+- Modify: `tests/src/za/tracing.rs:562-599` (`ws_send` and `ws_recv` become `pub(super)`)
+- Create (helpers): `tests/src/utils/za.rs` gains `za_index_current` and `imap_index_current`
+
+**Interfaces:**
+- Consumes: Task 9's trigger (every keyed JMAP mail method and every keyed IMAP command but IDLE, NOOP and LOGOUT runs a pass; `Email/import`, `Email/set` create and APPEND run one after their commit); Task 10's content serving and `ZA_MAIL_SEARCH_UNAVAILABLE`; Task 11's gates (`za_assert_mail_keys` on the table's methods) and `za_keyless_refusal` (`crates/common/src/za/mail.rs:28`), asserted by the existing `assert_keyless` (`za_variants.rs:121`) and `assert_refused` (`gates.rs:186`); Task 12's `Thread/get` members and `collapseThreads`; Task 13's `Email/changes` and `Email/queryChanges` pages; `za_bearer_token(server, name) -> String` (`tests/src/utils/za.rs:2081`); `ws_connect`, `ws_call`, `ws_close` (`tests/src/za/tracing.rs:600, 642, 658`).
+- Produces: `pub async fn za_index_current(account: &Account)` (`tests/src/utils/za.rs`): one `Email/query` with `{"text": "za-index-current"}` over the account's keyed JMAP client; returns when the method answers a result list (the index is current, 7.4), panics with the reply when it answers `unsupportedFilter` carrying `ZA_MAIL_SEARCH_UNAVAILABLE` (the wait budget ran out) or any other error. `pub async fn imap_index_current(imap: &mut ImapConnection)`: `SEARCH TEXT za-index-current`, `OK` expected, `NO [CANNOT]` panics. Both are the suite's replacement for upstream's index-queue wait. (If Tasks 10 to 13 defined an equivalent helper first, use theirs and delete these.)
+
+- [ ] **Step 1: The IMAP dispatch runs upstream's bodies**
+
+In `tests/src/imap/mod.rs:258-275` the two `if key_accounts_mode()` arms for `search` and `thread` go: `search::test(&mut imap, &mut imap_check, &test).await` and `thread::test(&mut imap, &mut imap_check, &test).await` run in both modes (the `fetch`, `store`, `acl` and `antispam` arms stay). Delete `za_variants::search` and `za_variants::thread`. In `za_variants::fetch`, replace `assert_search_refused(imap, "UID SEARCH RETURN (SAVE) FROM \"nathaniel\"").await;` (`:436`) and the rebuilt `UID SEARCH RETURN (SAVE) UID 1,4,6` (`:437`) with upstream's `fetch.rs` lines for that step (the served `FROM` search saves 1, 4 and 6, the same UIDs); in `za_variants::store`, replace `assert_search_refused(imap, "SEARCH RETURN (SAVE) FROM nathaniel").await;` (`:519`) and the `SEARCH RETURN (SAVE) SEEN` beneath it with upstream's `store.rs` step. If no other difference remains in `fetch`, delete it too and run `fetch::test` in both modes (say so in the task report); `store`'s other differences (the training steps) stay. Rewrite the module doc (`:7-12`): searches, sorts and threads are served (release 7 spec 9.3); the remaining variants are sharing, copying and training.
+
+Run: `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests imap::imap_tests -- --nocapture`
+Expected: `search::test` reaches `* SEARCH 1 3 4 6` for `UID SEARCH OR FROM nathaniel SUBJECT argentina` (`tests/src/imap/search.rs:40-46`) and `thread::test` reaches `(1 2 3 4)`, `(5 6 7 8)`, `(9 10 11 12)` (`thread.rs:76-81`) on key accounts; the suite passes.
+
+- [ ] **Step 2: The `query` variant calls upstream's `query` and `query_options`**
+
+In `za_variants::query` (`:254-331`): keep the virtual-mailbox batch and `create_query_corpus`; replace the singleton assertion (`:290-299`, "Spec 5.4: one thread per message") with upstream's, `MAX_THREADS` distinct `threadId`s read through `Email/get` of every id (the cache's `thread_id()` column stays the singleton for a key account, 6.1, so the count is taken from the mapped ids, not from `get_cached_messages`), after `za_index_current(account)`; keep `test.wait_for_tasks()` beside it (the ids-only index documents still queue). Then `crate::jmap::mail::query::query(&client, true).await` and `crate::jmap::mail::query::query_options(&client).await` (`tests/src/jmap/mail/query.rs:117, 421`, both `pub`; `can_stem` is `true` for a key account: its content part is upstream's own stemmed term set whatever the search store, 7.5). Delete `query_refusals`, `query_served`, the variant's `query_options`, `load_corpus`, `CorpusMessage`, `email_query`, `ids` and `date` where nothing else uses them (`search_snippet` uses none; check with the compiler). Add `keyless_query_refused(test, account)`: a Bearer token (`za_bearer_token`) calling `Email/query` without a filter, `Email/query` with `{"text": "study"}` and `SearchSnippet/get` with that filter and one id each answer the keyless refusal (`assert_keyless`); the same three over the account's keyed client answer results. The doc comment: "`mail::query::test` in key mode: upstream's corpus, assertions and options, with the index made current by a keyed content request in place of the queue wait; a keyless token is refused on `Email/query` and `SearchSnippet/get` (release 7 spec 6.2)."
+
+- [ ] **Step 3: The `search_snippet`, `thread_get` and `thread_merge` variants mirror upstream's bodies**
+
+`search_snippet` (`:733-833`): the imports stay; `za_index_current(account)` replaces nothing (each `Email/import` ran its own pass, H20) but is called once before the table as a guard; the refusal table (`:768-806`) becomes upstream's table of `(filter, email_name, snippet_subject, snippet_preview)` rows mirrored from `tests/src/jmap/mail/search_snippet.rs:54-170`, with `can_stem = true`, asserting `snippet.subject()` and `snippet.preview()` equal to upstream's values and `preview.len() <= 255`; the bare-snippet block (`:808-825`) stays; add the keyless refusal of `SearchSnippet/get` over a Bearer token.
+
+`thread_get` (`:1291-1332`): mirror `tests/src/jmap/mail/thread_get.rs:10-52`: five imports with `References: <1234>` share one thread; `thread_id` is the last response's `threadId` (the import's response carries the final id, 6.2); `expected_result[num − 1]` is each import's id; `Thread/get` of that thread returns `expected_result` in that order; plus `Thread/get` over a Bearer token is refused. Delete the per-import singleton assertion.
+
+`thread_merge` (`:1360-1565`): the per-account part keeps its client selection (`:1372-1398`) and the admin's refused `Mailbox/set` (`:1399-1405`); after the imports call `za_index_current` on each key account's client and `test.wait_for_tasks()`; the assertion at `:1468-1476` becomes upstream's for every account, `assert_eq!(messages_per_thread_db, messages_per_thread)`, with the `is_key` branch removed. The multi-threaded part keeps the store-level pin `cached.emails.iter().all(|m| m.thread_id() == m.document_id())` (6.1: the stored thread id stays the singleton) and adds, after `za_index_current(account)`: the mapped ids of `Email/query` are consistent with `Thread/get` (the union of `Thread/get(prefix).email_ids()` over the distinct prefixes of the query's ids equals the query's id set), no claim on the thread count. Doc comments say which body each mirrors.
+
+- [ ] **Step 4: The `query_changes` variant renders merges a key account can make**
+
+`query_changes` (`:835-1165`) mirrors `tests/src/jmap/mail/query_changes.rs:30-355` with two differences. (a) The `from` filter is served: the `test_num == 1` branch (`:1081-1093`) that counted `refused` goes, and `test_num == 1` takes upstream's assertions (`query_changes.rs:280-303`: `removed ⊆ removed_ids`, `added ⊆ type1_ids`); `assert!(refused > 0)` goes. (b) Upstream's `Move(from, to)` (`:1040-1079`) simulates a thread merge by rewriting the stored `MessageData.thread_id`, which a key account's renderer never reads (6.2, 6.3); in key mode `Move(from, to)` instead makes a real merge: import a bridge `From: test_1\nSubject: test_{from}\nIn-Reply-To: <{from's Message-ID}>\nReferences: <{older's Message-ID}> <{from's Message-ID}>` into `mailbox1_id` with keyword `"1"` and `received_at = Some(1000 + to)`, where `older` is the type-1 message with the lowest id still present and the imports carry `Message-ID: <qc-{id}@za.test>` so the bridge can name them (add the header to the `Insert` arm's message). The bridge's import runs a pass (H20) that merges `from`'s thread into `older`'s (ties go to the lowest thread id, H10). Bookkeeping as upstream's `Move`: `removed_ids.insert(old id of from)`; `id_map[to] = ` the id `Email/get` now returns for `from`'s document (read it back: `Id::from_parts(new prefix, from.document_id())`); the bridge's own id joins `id_map` under a fresh key `100 + to` and `type1_ids`; `thread_id_map` keeps `older`'s entry (the first email of that thread is `older`, so test 4's "first email per thread" holds without the overwrite upstream does at `:1075`). Everything else (`Update` through the raw log write and `mark_cache_stale`, `Delete`, the five queries, the four state checks) stays upstream's. Doc comment: "`mail::query_changes::test` in key mode: upstream's log and its five queries per state; a thread change is made by a bridging reply, since the stored thread id is not what a key account's clients see (release 7 spec 6.3)."
+
+- [ ] **Step 5: Run the JMAP and IMAP suites in both modes** (`imap/mod.rs`'s dispatch changed for plain mode too)
+
+Run: `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests jmap::jmap_tests -- --nocapture`
+Expected: passes; the output shows `passed test# 0/1` through `2/5` for every account of `thread_merge`, and `Skipping the JMAP compliance tests in key mode.` stays (out of scope).
+
+- [ ] **Step 6: `mail::gates` and `websocket.rs` carry 6.2's table**
+
+In `keyless_tokens_hit_the_dispatcher_gate` (`gates.rs:333-551`): move from `keyless` (`:447-500`) to `key_needing` (`:391-437`) the entries `Mailbox/get`, `Email/query`, `Email/queryChanges`, `Email/changes`, `Thread/get`, `Thread/changes`; add to `key_needing` `Blob/lookup` (`{ "accountId", "ids": [&missing_blob], "typeNames": ["Email"] }`) and `EmailSubmission/get` (`{ "accountId", "ids": [] }`); add to `keyless` `Mailbox/query` (`{ "accountId" }`), `Mailbox/changes` (`{ "accountId", "sinceState": mailbox_state }`, the state read beforehand with keys through `Mailbox/get`), `Mailbox/set` (create then destroy a mailbox named `keyless-mailbox` in two calls), `Core/echo` (`{ "hello": true }`). `email_state`, `thread_state` and `query_state` are still read with keys before the loop. The count assertion (`:510-514`) stays `2 * key_needing.len()`. Then the push check on the WebSocket channel, before `ws_close`: send `{"@type":"WebSocketPushEnable","dataTypes":["Email"]}` with `ws_send` (no reply is defined for it, RFC 8887 §4.3.5), set `$flagged` on `email_id` over the keyed HTTP client, and `ws_recv` the next text frame within 5 s: its `@type` is `StateChange`, `changed[account]` names `Email`, and the frame's text contains neither `email_id` nor `thread_id`. `ws_send` and `ws_recv` (`tracing.rs:562, 584`) become `pub(super)`.
+
+In `tests/src/za/websocket.rs` add `keyless_socket_after_setup(test, &account)`, called at the end of `test` once the account is set up: `ws_connect("ws1@example.com", STRONG)` (a password login yields a socket that the HTTP layer strips of keys, `crates/http/src/request.rs:383`), then one gated call (`Email/query`) answers the keyless refusal (`first_response` gives `("error", "forbidden")`-shaped arguments: assert as `gates.rs`'s `assert_refused` does, by `description == ZA_MAIL_KEYLESS` or the fixed type the dispatcher uses; copy the predicate from `assert_refused`) and one keyless call (`Mailbox/query`) answers `Mailbox/query`; then the same push-enable and state-only frame check as above after a keyed `Mailbox/set` over HTTP.
+
+Run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture`
+Expected: `keyless_tokens_hit_the_dispatcher_gate` and the WebSocket conversion test pass; the za suite passes.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add tests/src/jmap/za_variants.rs tests/src/imap/za_variants.rs tests/src/imap/mod.rs tests/src/za/mail/gates.rs tests/src/za/websocket.rs tests/src/za/tracing.rs tests/src/utils/za.rs
+git commit -m "Release 7: the key-mode variants assert upstream's outcomes; the method table's keyless cases"
+```
+
+### Task 18: Leak coverage and the differential test
+
+Implementer: `sonnet` (the rules, the controls and the corpus are specified; the comparisons are mechanical). Reviewer: `opus`.
+
+**Files:**
+- Modify: `tests/src/za/leak.rs` (`Scan` `:340-375`; the `BlobLink` arm `:1347-1363`; the blob decode loop `:1518-1535`; a new field-152 arm in the `Property` match `:1380-1395`; `test_mail` `:2265-2572`; `purge_blobs` `:1946` becomes `pub(super)`)
+- Create: `tests/src/za/leak_search.rs` (`pub async fn test(test: &mut TestServer)`: the membership review case and the oracle attempts of 9.4), declared in `tests/src/za/mod.rs` (`pub mod leak_search;` in the module list, `:16-51`) and called between `leak::test_mail(&mut test).await;` (`mod.rs:203`) and `leak::test_imip(&mut test).await;` (`:204`)
+- Create: `tests/src/za/mail/differential.rs`, declared in `tests/src/za/mail/mod.rs` and called in `tests/src/za/mod.rs` after `mail::index::test` and before `mail::traces::test` (the sheet's order `threads`, `index`, `differential`)
+- Modify: `tests/src/za/mod.rs` (the two calls; `leak::purge_blobs` between `destroy_key_accounts` and the final `assert_is_empty`, `:230-232`)
+- Modify: `tests/src/utils/za.rs` (helpers below)
+
+**Interfaces:**
+- Consumes: `SEARCH_FORMAT_V1`, `BlobKind` (`store::za_search`, Task 5: the blob's first byte is the format byte and its second the kind byte, `BlobHeader::encode`); `ManifestValue::decode_unverified(bytes) -> Result<ManifestValue, ManifestError>` (Task 5; the destroy path of 5.7 reads the manifest without a key); `Store::za_changes_records` (Task 7) for the log check; `read_manifest(test, account_id) -> Option<ManifestValue>` and `principal_blob_links(test, account_id) -> Vec<(BlobHash, usize)>` (hash and stored size; Task 8's helpers, `tests/src/utils/za.rs`); `za_index_current` (Task 17); `za_unlock(test, account_id, password) -> Arc<SessionKeys>` (`za.rs:408`); `Server::za_search_entry` and `LoadedIndex` (Task 6) through Task 15's helper `za_search_thread_part(test, account_id, password) -> ThreadPart`; the test-mode configuration override (`search_config_guard`, Task 9; plan call D3); `plant_plain_message` (`za.rs:888`); `BlobOp::Link { hash, to: BlobLink::Document }` under `Collection::Principal` document 0 (`crates/store/src/write/mod.rs:1296-1306`, key `hash | account_id | collection | document_id`, `key.rs:410-421`, 41 bytes).
+- Produces: `Scan.index_blobs: usize` (principal-linked blobs that passed the index-blob rule), `Scan.manifests: usize` (0 or 1); `pub async fn compaction_class(test, account_id) -> usize` (the size of the single thread blob the manifest lists after a thread compaction).
+
+- [ ] **Step 1: The scan's rules (9.4)**
+
+In `scan` (`leak.rs:1257`):
+- `BlobLink` arm: a key of 41 bytes whose suffix is `account_id (BE) | Collection::Principal as u8 | 0u32` is a principal `Document` link: push its hash into `principal_links: Vec<Vec<u8>>` beside `blob_hashes`.
+- Blob loop: for every hash in `principal_links` that decodes, `scan.index_blobs += 1` when `blob.first() == Some(&SEARCH_FORMAT_V1)` and `blob.get(1)` is `BlobKind::Thread as u8` or `BlobKind::Content as u8`, else a violation `"{what}: principal-linked blob is not a sealed index blob"`; a `VISIBLE_CANARIES` hit inside such a blob is a violation (`"{what}: index blob contains {canary}"`), not a `found` entry (a keyword or mailbox name is visible in the clear elsewhere, never inside the index).
+- `Property` arm, `of_account`, key length `U32_LEN + 2 + U32_LEN`, `key[U32_LEN] == Collection::Principal as u8`, `key[U32_LEN + 1] == PrincipalField::ZeroAccessSearch as u8`: `scan.manifests += 1`; `ManifestValue::decode_unverified(&value)` must be `Ok`, else `"{what}: field 152 does not parse as a manifest: {err:?}"`; a `VISIBLE_CANARIES` hit in its raw value is a violation (`"{what}: manifest contains {canary}"`). The existing `check_index_property` (`Threading`, `:481`) and `check_search` (`:531`: no term, ids-only documents) stay as the "as today" rules.
+
+- [ ] **Step 2: `test_mail`'s assertions and controls**
+
+After the scan assertions at `:2401-2425`: `assert_eq!(result.manifests, 1)`; `assert!(result.index_blobs >= 1, "{result:?}")` (the `Email/query` and `Email/set` at `:2286-2310` ran passes that indexed the two messages, so a thread blob exists). Before them, the log check: `let since = ` the Email log's change id read before the two JMAP calls (`email_state` as `gates.rs:252` reads it, parsed), and after them `log_records_since(test, id, SyncCollection::Email, since)` holds exactly one record of the pass's batch (the one that follows the delivery and APPEND records): one `Change::UpdateItem` whose document id is the lowest of `documents` and one container property change per mailbox of the account (the default set: INBOX, Drafts, Junk, Sent, Trash, and `mailbox-canary`, created in the same `Mailbox/set` call; count the account's mailboxes through `Mailbox/get` rather than hard-coding), nothing naming `documents[1]`; and `log_records_since(.., SyncCollection::Thread, since)` holds one container property change of that same id (R4). Negative controls, after the planted-message control (`:2439-2487`) and before the ordinary-account control: on the plain account `plainmail59@example.com` (created here beside `MAIL_PLAIN`), (a) a fresh scan shows `manifests == 0` and `index_blobs == 0`; (b) `put_blob` a plaintext blob holding `mailbody-canary` and link it with `BlobOp::Link { hash, to: BlobLink::Document }` under `Collection::Principal` document 0 in a `BatchBuilder` batch, scan: a violation ending `principal-linked blob is not a sealed index blob` and one ending `decoded blob contains mailbody-canary`; clear the link, `purge_blobs`; (c) write field 152 as the bytes `b"mailbox-canary"` with `BatchBuilder::set(PrincipalField::ZeroAccessSearch, ..)` on principal document 0, scan: `field 152 does not parse as a manifest` and `manifest contains mailbox-canary`; clear the field. The ordinary-account control's rule list (`:2520-2535`) is unchanged (an ordinary account has no index blob and no manifest: assert both counts are 0 for it).
+
+- [ ] **Step 3: The suite's end**
+
+In `tests/src/za/mod.rs:230-232`: `destroy_key_accounts(&test).await; leak::purge_blobs(&test).await; test.assert_is_empty().await;` (`purge_blobs` made `pub(super)`). `assert_is_empty` (Task 2 exempted field 152 and the principal links while an account exists) then finds no field 152, no principal `Document` link and no blob of any destroyed key account; the `cleanup.rs` `Leftover` rules report any.
+
+Run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture`
+Expected: `Mail leak scan: ... ` prints and the two new counts are asserted; the suite ends clean.
+
+- [ ] **Step 4: `leak_search::test`, the membership review case and the oracle attempts**
+
+Accounts: `keymail65@example.com` (the target), `keymail66@example.com` (the twin whose bridge merges nothing), `keymail67@example.com` and `keymail68@example.com` (the compaction-class case and its twin), key accounts through `key_mail_account`. Messages are `message_with`/`reply_to` (`tests/src/za/mail/mod.rs`) delivered over LMTP with `deliver`; a keyed pass is one `Email/get` with `ids: []` over the account's client (Task 9: every keyed mail method runs one), a content wait `za_index_current`. Each sub-case prints its name and ends with the account's mail destroyed (`destroy_all_mailboxes`).
+
+(a) **The membership case (R4, F1), `membership`.** On `keymail65`: thread A, three messages (`A1`, replies `A2`, `A3`), then thread B, three messages, all delivered, then one keyed pass; record `state0` (the Email change id). Deliver the bridge `X`: `reply_to(A3, ..)` with `References` naming `A3`'s and `B3`'s Message-IDs (thread name `Re: ` of A's subject; B's subject must be the same thread name, so thread B is `message_with` of the same subject with different Message-IDs). One keyed pass. On `keymail66`: the same six messages and a seventh `X'` with the same byte length and two References naming two Message-IDs that no message of the account carries (public inputs equal: seven messages of equal sizes, the same reference counts), one keyed pass. Assert, for both accounts: `log_records_since(.., Email, state0)` after the bridge's pass holds one `UpdateItem` of `X`'s document id (the only message the pass indexed, so the witness), one container property change per mailbox, nothing else of the pass; the Thread log holds one container property change of `X`'s id; the manifest's newest thread blob entry has the same `size` on both accounts; `principal_blob_links` sizes are pairwise equal; `za_search_thread_part(.., keymail65)` holds one alias and `keymail66`'s none (the hidden difference); and the plain `Thread/get` groupings differ as expected (one thread of seven on 65, two of three plus a singleton on 66).
+
+(b) **F1: a filler of a thousand references, `f1_filler_references`.** On `keymail65`, deliver a probe `P` and a filler `F` whose `References` holds 1,000 generated Message-IDs, then one keyed pass: the newest thread blob's `size` equals the one of the account `keymail66` gets for two plain messages of the same sizes with two references (the hidden section pads to `M = 65536` either way, 4.2: `Task 5::padded_len`), and `za_search_thread_part`'s record for `F` holds exactly `K = 16` hashes.
+
+(c) **G1: a thousand junk messages expunged beside a probe, `g1_junk_expunged`.** On `keymail65`: deliver 1,000 one-line messages (`message_with("junk", "x")`) and one probe with no keyed request between (`deliver` waits for delivery only); then `za_index_current` (about 21 passes of 48 items); then destroy the 1,000 junk ids in one keyed `Email/set` (the pass before the method finds nothing new; the next keyed request's pass tombstones them); one keyed pass; read the newest thread blob entry: its `size` is `BlobHeader::LEN + 4 + public_len(1000, 0) + SEAL_OVERHEAD` (a non-publishing blob: no hidden section and no revision row; Task 5's `public_len` and `SEAL_OVERHEAD`), asserted to the byte, no hidden section (`len = 0`, a deletion-only pass, H13).
+
+(d) **R21: two helper cohorts around two known Message-IDs with a bridge, `r21_cohorts`.** On `keymail65`: `M1` and `M2` (two messages, distinct subjects' thread names made equal), twenty helpers each replying to `M1` and twenty to `M2`, one keyed pass per cohort of 20 (two passes; both publishing, hidden `M`); then the bridge replying to both; one keyed pass: the bridge's thread blob entry has `size` equal to the entry a single plain message of the same size produced earlier in the case (the first pass of `M1` alone), and `za_search_thread_part` holds exactly one alias more than before the bridge.
+
+(e) **The compaction class (decision 2 (c)), `compaction_class_is_public_counts`.** With `search_config_guard!(segments: 4)` for the case (restored on drop): on `keymail67` deliver 10 messages and run a keyed pass, three times, then a fourth group of 10 that includes a bridge merging two of the earlier threads; the fourth pass compacts (its own blob makes four, Task 15's `thread_blobs.len() + 1 >= segments`) and `compaction_class(test, keymail67)` is `padded_len(compaction_allowance(40), 65536)` (Task 2's functions). Repeat on a fresh `keymail68` with the same counts and no bridge: the same class (a fresh account, since `keymail66` holds tombstoned records from (a) to (d) that would change `n_records`). Then the twin assertions that the mutation rows of Task 19 rely on: the folded or dropped aliases are not observable here, so the case asserts the class alone; `mail::threads`'s R35 cases (Task 15) carry the resolution checks.
+
+Run: the za suite.
+Expected: every sub-case passes; the run prints `leak_search: membership`, `F1`, `G1`, `R21`, `compaction class`.
+
+- [ ] **Step 5: The differential test (9.5)**
+
+`tests/src/za/mail/differential.rs`: `keymail64@example.com` (key) and `plainmail58@example.com` (plain control). The corpus: every message of `tests/resources/mailbox.gz` (`crate::store::deflate_test_resource("mailbox.gz")`, `MessageIterator`, as `thread_merge`'s multi-threaded part reads it) plus seventeen generated messages: four with a `text/plain` attachment part carrying a distinct word each (`attword-alpha` .. `-delta`), three with non-ASCII subjects (`Ärger im Büro`, `孫子兵法 heute`, `café résumé`), three with a body phrase (`"the quick brown fox"` and two variants that share the words in another order), and two for the `K` bound: `K1` with `References` of 20 ids whose oldest, `<k-root@za.test>`, is a message delivered earlier and whose other 19 are absent (upstream threads it with the root, the index does not: the pinned deviation of 7.5), and `K2` with 20 references of which the newest is present (both thread it); and five for the Review Focus: two without a `Date` header, one with `Date: yesterday` (unparsable), one whose body holds 1.2 MiB of distinct words (above `MAX_DOCUMENT_SIZE`, `crates/store/src/search/mod.rs:39`, so upstream truncates its term set and the key account must truncate the same way), and one with a whitespace-only `Subject` and no `Message-ID`. Each message is delivered once to both recipients in one LMTP transaction (`SmtpConnection::ingest(from, &[KEY, PLAIN], message)`), so both hold the same bytes and Message-IDs; then `za_index_current(key)` and `test.wait_for_tasks()` (the control's index queue). Identity is by `Message-ID`: `by_message_id(account) -> BTreeMap<String, Id>` from `Email/get` with `properties: ["id", "messageId"]` over every id; two result lists compare equal when their Message-ID sequences do.
+
+JMAP forms, each run on both accounts with `collapseThreads` false and true, `sort` `receivedAt` unless the form is a sort: the filters of `za_variants::query_refusals` as they stood at this plan's base (`git show za-search-design:tests/src/jmap/za_variants.rs`, since Task 17 rewrites the function;`from`, `to`, `cc`, `bcc`, `subject`, `body`, `text`, `header` `[name, value]` and `[name]`, `hasAttachment` true and false, `sentBefore`, `sentAfter`, and the five `AND` combinations with `after`, `inMailbox`, `hasKeyword`/`NOT`, `before`, and a quoted phrase) with values taken from the corpus's first message's From, To, Subject and a body word, the attachment words, the non-ASCII subjects and the phrase; the sorts `from`, `to`, `cc`, `subject`, `sentAt`, each ascending and descending, with and without `receivedAt` as the second key; the thread-keyword sorts (`hasKeyword`, `allInThreadHaveKeyword`, `someInThreadHaveKeyword` with `$seen` after flagging the first ten messages on both accounts). For each form: equal Message-ID sequences; for at least one form per filter kind the result is non-empty (`assert!(!ids.is_empty(), "{form}: the corpus has no match")`). Threads: the partition of Message-IDs into threads by `Thread/get` over every distinct prefix is equal for every thread except `K1`'s: on the control `K1` is in `k-root`'s thread, on the key account `K1` is a singleton (assert exactly that). `SearchSnippet/get`: for every text-bearing form, on each result id, `subject` and `preview` equal by Message-ID.
+
+IMAP forms, over two IMAP sessions on INBOX with UID→Message-ID maps from `UID FETCH 1:* (UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])`: every search of `mail::search`'s `imap_served_keys` list (`search.rs:322-352`) and every command of `refused_commands()` (`search.rs:413-452`) with the corpus's values (`FROM <word>`, `SUBJECT <word>`, `BODY <word>`, `TEXT <word>`, `HEADER Message-ID <id>`, `SENTBEFORE`/`SENTON`/`SENTSINCE` on the corpus's dates, `OR FROM <word> SEEN`, `KEYWORD $HasAttachment`, `UNKEYWORD $HasNoAttachment`), the sorts `SORT (SUBJECT|DATE|FROM|DISPLAYFROM|TO|DISPLAYTO|CC|REVERSE SIZE|ARRIVAL) UTF-8 ALL`, `THREAD REFERENCES UTF-8 ALL` and `THREAD REFERENCES UTF-8 FROM <word>`: equal Message-ID sequences (for THREAD, equal nested groupings after mapping UIDs, with `K1`'s pinned difference). The mixed form `UID SEARCH NOT (FROM <word> ANSWERED)` included, and two Review Focus forms: `UID SEARCH CHARSET ISO-8859-1 SUBJECT {4+}\r\ncaf\xe9` (a literal in a non-UTF-8 charset, the `é` as the single Latin-1 byte `0xE9`) and `UID SORT (REVERSE SUBJECT DATE) UTF-8 ALL` (a reversed content key before a second key). `case_g5` (mutation M41's catcher): the same twenty generated messages are delivered to the key account twice, once beside a twenty-first message that shares their vocabulary and once beside one with a disjoint vocabulary, each delivery followed by one keyed pass; the two passes' content blobs (`read_manifest(..).content` after each) have equal sealed sizes, since nothing is compressed across records (G5).
+
+Run: the za suite.
+Expected: `differential: N forms compared, 0 differences beyond the pinned K deviation` printed; the module leaves both accounts empty.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add tests/src/za/leak.rs tests/src/za/leak_search.rs tests/src/za/mail/differential.rs tests/src/za/mail/mod.rs tests/src/za/mod.rs tests/src/utils/za.rs
+git commit -m "Release 7: leak rules for the sealed index, the membership and oracle cases, the differential test"
+```
+
+### Task 19: System benchmark, mutation sample, documentation, outcome note, full verification
+
+Implementer: `sonnet` (measurements by a given method, mechanical mutation runs, documentation whose text this task carries). Reviewer: `opus`.
+
+**Files:**
+- Modify: `tests/src/za/search_bench.rs` (Task 1's file; `#[tokio::test(flavor = "multi_thread")] #[ignore] pub async fn system()`)
+- Modify: `CLAUDE.md` (the release 7 status and the sections named in Step 3)
+- Modify: `docs/README-dev.md` (a section after "Operating zero-access accounts", `:31-38`)
+- Modify: `docs/zero-access/manual-checklist.md` (item 8 of "## Mail", `:65`; a new section after "## Invitations by email (release 5)")
+- Modify: `docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md` (created by Task 1 with the format benchmark's table)
+
+**Interfaces:**
+- Consumes: everything above; Task 1's corpus generator (`search_bench::corpus(seed: u64, count: usize) -> Vec<Generated>`, `Generated { raw, attachment_bytes, references }`; the no-attachment run keeps the items with `attachment_bytes == 0`) and its delivery loop; `read_manifest`, `principal_blob_links`, `za_index_current`; the trace constants `ZA_SEARCH_PASS`, `ZA_SEARCH_REBUILD` on their event with `Traced` (`tests/src/za/mail/mod.rs`, `Traced::start`); `Server::za_search_pass` through the keyed requests; `search_config_guard!`.
+- Produces: the outcome note later plans read; the `CLAUDE.md` text every later session reads.
+
+- [ ] **Step 1: The system benchmark (9.6, second half)**
+
+`za::search_bench::system`, its own `TestServerBuilder::new("search_bench")`, the account `search-bench@example.com` (Task 1's; the two benchmarks never run in one process), run by name: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::search_bench::system -- --ignored --nocapture`. It prints one table, copied into the outcome note under "## Benchmarks", and the implementer records the machine (CPU, RAM, disk) beside it. Each row's method:
+
+| Figure | Method |
+|---|---|
+| Pass rate, messages/s, without and with attachment text | Deliver 2,000 generated messages (`generate(2000, false)`, then a second run with `true`) with no keyed request; then one keyed `Email/get` (`ids: []`) every 100 ms until `read_manifest` shows `indexed_to` at the account's current change id; rate = messages / (sum of the request latencies that ran a pass, from `ZA_SEARCH_PASS` traces' count and the wall clock) |
+| Thread compaction time | During the run above, the latency of the requests whose pass compacted (every `ZA_SEARCH_SEGMENTS`th publishing pass; the manifest's thread-blob count drops to 1), at the design size reached by the rebuild row below |
+| Content compaction time, tiered and full | The same requests' latencies where the chain's tier count changed, and the full merge after the rebuild's cursor is exhausted |
+| Validation read cost per request | Median and p99 latency of 500 keyed `Email/get` of one id with the index current, against the same 500 for the plain control account `search-bench-plain@example.com` holding one message; and the raw `store().get_value` of field 152 timed 500 times. On RocksDB locally; if `STORE=PostgreSQL` is available (Docker, as `directory_tests` uses it), repeat and record; else the networked figure is recorded as pending |
+| Mailbox property changes per publishing pass | With 10 mailboxes, then 100 (`Mailbox/set` creates): the latency of a publishing pass's request, and `Mailbox/changes` since the state before it (count of `updated` and the response time) |
+| First-search latency after a day's volume | 200 messages delivered with no keyed request, then one `Email/query` with `{"text": <a word of the last message>}`: time to the result, and the number of passes it ran (`ZA_SEARCH_PASS` traces) |
+| Design-size rebuild end to end (H7, R32) | With 30,000 messages present and indexed (`generate(30000, true)`, indexed by the pass-rate method), delete field 152 with a `BatchBuilder` `clear`; a client loop issues a keyed `Email/get` every 2 s until `read_manifest` shows no cursor, while a second loop issues `Email/query` `{"text": ..}` every 5 s and counts the refusals (`unsupportedFilter` with `ZA_MAIL_SEARCH_UNAVAILABLE`) before the first success; record: wall time, pass count (expected about 625 at `C = 48`), thread compactions, tiered content compactions by tier, bytes rewritten by content compactions (the sum of content blob sizes the manifest's head went through, read after every request from `principal_blob_links`) against `⌈log_16 625⌉ = 3` times the content bytes written by the passes (R32: the ratio must not exceed 3 plus the final full merge), the chain's maximum length against `(S − 1) · ⌈log_S n⌉ + 1 = 46`, the content requests refused before the first success, and the loaded thread part's bytes against the thread blob's class (about 2×, decision 2 (c)) |
+
+After the table, the task records in the outcome note, under "## Defaults", one line per knob of 4.4 (`ZA_SEARCH_MEM_MB` .. `ZA_SEARCH_PAD_MIN`): confirmed, or the value the figures recommend and why (a 48-item pass over 2,000 ms recommends a lower `ZA_SEARCH_PASS_CAP` or a higher `ZA_SEARCH_PASS_MS`; a thread part transient over 256 MB at 30,000 messages recommends a higher `ZA_SEARCH_THREAD_MEM_MB`). A default changes only on Jay's decision: the task stops with the recommendation and the controller puts it to him before Step 2.
+
+- [ ] **Step 2: The mutation sample (9.7)**
+
+Procedure, plan 15's (its outcome note, "Mutation runs (plan 15)"): against the committed branch head, one row at a time, an exact string replacement that matches once (the edit written down in the row), the named test run (the za suite stops at its first panic; a unit row runs its crate's test by name), the edited files restored with `git checkout -- <file>` and `git status --short crates/ tests/` empty before the next row; nothing committed; the first failing assertion (`file:line`, message, left and right) recorded whether or not it is the named catcher; where an earlier module fails first, a follow-up run with that assertion relaxed by a tests-only edit (applied and reverted with the mutation) until the named catcher is reached or the row is a finding. Logs `t19-mut-<id>.log` and diffs `t19-mut-<id>.diff` in the git-ignored workspace. The rows are 9.7's sites; the test names are those the owning tasks gave their cases (the sub-case named after the review tag):
+
+| Id | Site (9.7) | Mutant | Named catcher |
+|---|---|---|---|
+| M1 | the AAD's segment id, kind and predecessor (Task 5 `seal_section`) | drop the header bytes from the AAD | unit: a blob sealed for another segment id, kind or predecessor opens; `mail::index` R11 chain reload |
+| M2 | the assertion on the manifest write (Task 8) | `AssertValue::Hash` becomes no assertion | `mail::index` lost-assertion case (`SEARCH_COMMIT_PAUSE` with a competing write): `indexed_to` or the revision advances twice |
+| M3 | the record boundary (Task 8) | the cap stops inside a record without recording `(c, p)` | `mail::index` R1 split MULTIAPPEND record: a message indexed never or twice |
+| M4 | the revision row's change id filled at commit (Task 5 `ManifestFill`) | the row takes the change id read at step 0 | `mail::threads` R2 backlog case; a tag computed before the fill fails R33's reload (unit) |
+| M5 | the validation read and its state check (Task 11) | skip the manifest read; separately, skip the counter check | `mail::threads` cross-node case (`SEARCH_SNAPSHOT_PAUSE`); the stale-state case (`SEARCH_CACHE_HOLD`) |
+| M6 | the manifest-hash comparison (Task 6) | compare `(epoch, revision)` instead of the hash | Task 6's unit `r18_a_deletion_only_change_moves_the_hash_and_reloads` |
+| M7 | the history lookup's direction (Task 3 `revision_at`) | newest row at or above `X` | `mail::threads` R5 states before/at/between/after |
+| M8 | the range end of the stream (Task 13) | `now` in place of `E` | `mail::threads` R12 paging with a merge and a deletion between pages |
+| M9 | the exhaustive leaf resolution (Task 10) | an unresolved leaf is dropped instead of refusing | `mail::search`: a search mixing a served and an unresolvable key widens instead of refusing |
+| M10 | the prefix check on supplied ids (Task 11) | accept any prefix | `mail::threads` G20: a stale prefix is served on `Email/get` |
+| M11 | the key gates of 6.2's table (Task 11) | `Mailbox/get` keyless | `mail::gates` F8: the keyless token is served |
+| M12 | the witness rule (Task 8) | the witness is the lowest reassigned id | `leak_search` membership case: the log names a losing member |
+| M13 | the publishing rule (Task 8) | publish only when an assignment changed | `leak_search` membership case: the twin's log differs |
+| M14 | the retention of a deleted record (Task 15) | prune a deleted record at its deletion change id alone | `mail::threads` R3 deleted merged message, compaction, changes from a pre-delete state |
+| M15 | the epoch's fresh change id (Task 14) | `epoch` = the change id current at the loss | `mail::index` R3: the latest pre-loss state is served |
+| M16 | the cursor's precedence over the shortcut (Task 8 step 0) | the shortcut applies with a cursor pending | `mail::index` R10 rebuild of several passes over an idle mailbox |
+| M17 | the chain header's segment id (Task 5) | a content blob's header omits its predecessor's segment id | unit: the chain reloads from the head with the descriptor alone (R11) |
+| M18 | the staging swap after commit (Task 8) | swap before the batch | `mail::index` lost-assertion case: a mapped id in memory after a failed batch |
+| M19 | the links in the manifest's batch (Task 8) | `BlobOp::Link` written before the batch | `mail::index` R7 interrupted transitions: a permanent link survives |
+| M20 | the scan on an incomplete traversal (Task 16) | skip the scan when the chain breaks | `mail::index` R7 middle-node case: an older blob survives destroy and purge |
+| M21 | the existence rule (Task 13) | classify by the entry that made the document a candidate | `mail::threads` R14 created-and-deleted in range |
+| M22 | the unfolded overlay (Task 13) | read the range with `Store::changes` | `mail::threads` F10: the deletion behind the cap resurrects |
+| M23 | the strict order (Task 8) | apply a record's deletions before its inserts | `mail::threads` R16 ordering case |
+| M24 | the cursor evidence (Task 8) | drop a tombstone's fields with a cursor pending (apply a log deletion before the cursor is exhausted) | `mail::threads` R16/R20 rebuild form |
+| M25 | the unconditional tombstone (Task 8) | skip a deletion the cache still shows | `mail::index::case_r17_tombstone_gone_after_retention` |
+| M26 | the destroying marker (Task 16) | inventory and unlinks before the marker | `mail::index` R19 paused pass losing to destroy: a link survives |
+| M27 | the error classes (Tasks 6, 7) | a store timeout is loss | `mail::index` F3: `SEARCH_BLOB_FAIL_ONCE` rebuilds |
+| M28 | the empty-staging rule (Task 8) | write a blob for an update-only delta; separately, move the cursor without a checkpoint | `mail::index` F4 hundred flag changes (blob count); R22 vanished cursor |
+| M29 | the record bound, the hidden budget and `M` (Tasks 4, 5, 8) | unbounded references; tombstones in the padded section; `M` under the inequality | `leak_search` F1; `leak_search` G1; unit: the configuration refusal |
+| M30 | the reservation charge (Task 8) | charge actual alias bytes | Task 8's unit `equal_public_inputs_stop_at_the_same_checkpoint_whatever_the_probe_merged`; `mail::threads::case_r21_amplified_merge_probe_class` |
+| M31 | the cursor order (Task 8) | newest first | Task 3's unit `r16_r20_cursor_chronological_order_threads_as_the_control`; `mail::threads::case_r16_r20_rebuild_form` |
+| M32 | the intra-record checkpoint (Task 8) | whole-record stops only | `mail::index` R1 MULTIAPPEND case (a record larger than the cap never completes) |
+| M33 | the skipped checkpoint (Task 8) | a skipped-only pass is a no-op | `mail::index` R26 unreadable insert reopened on every pass |
+| M34 | the epoch rule (Task 13) | refuse every state below the epoch; separately, an open interval `(S, epoch)` | `mail::index::case_r27_empty_rebuild_keeps_clients`; Task 13's unit `the_epoch_refuses_only_when_the_methods_log_holds_a_record_in_s_epoch` (the boundary's own entry at the epoch) |
+| M35 | the `Initial` rule (Task 13) | a continuation refused below the retained bound | `mail::threads` R28/R31 paged `Initial` after a truncation loops |
+| M36 | the inclusive resume (Tasks 7, 8) | exclusive resume of a partial record | unit R29; `mail::index` R1 restart between passes loses a suffix |
+| M37 | the existence rule's cache step (Task 13) | the record consulted before the cache | Task 13's unit `a_lagging_record_never_decides_presence_at_a_pinned_end` |
+| M38 | the reconciliation order (Task 14) | tombstones before the gap inserts; separately, gap deletions after the retained records | unit H3 fixture; unit I1 fixture |
+| M39 | the survivor rule (Task 3) | most members instead of most matching candidates | unit H10 fixture |
+| M40 | the manifest tag (Task 5) | accept an unverified manifest | unit H9 rewrite accepted; `mail::index` R3 bad-tag loss not detected |
+| M41 | per-record compression (Task 4) | one frame over the blob | `differential`'s G5 twin: the content blob's size differs between a corpus with and without a shared-vocabulary neighbour (`mail::differential::case_g5`: Task 18 delivers the same twenty messages twice, once beside a message sharing their vocabulary and once beside a disjoint one, and asserts the two passes' content blobs have equal sealed sizes) |
+| M42 | the thread blob's padding (Task 5) | unpadded; separately, rounded to a 256-byte multiple | unit R15 byte-class checks |
+| M43 | the alias resolution (Tasks 3, 15) | a member rewritten at merge; separately, an alias dropped without folding | `mail::threads` R25 pinned page |
+| M44 | the reconciliation's attribution (Task 14) | stamp without reading the retained records | `mail::index::case_r24_g2_retained_deletion_rendered_once` (rendered twice) |
+| M45 | the shorter log's bound (Task 15) | prune by the Email log alone | `mail::threads` G4 `Thread/changes` refusal |
+| M46 | the counter comparison (Task 11) | compare the item state | `mail::threads` G3 empty account refused |
+| M47 | the vault assertion on creation (Task 14) | the creating batch asserts `None` alone | `mail::index` R19 second form: the manifest recreated after destroy |
+| M48 | the skip of an already-held insert (Task 8) | re-index a held document | `mail::index` repeated-delta case: the record count or the blob count moves |
+| M49 | the destroy step's chain walk and scan (Task 16) | unlink the head only | `mail::index` R7 destroy and purge: an older content blob survives |
+| M50 | the bridge rule (Task 15) | prune a deleted record when its deletion alone is below the bound | unit: the chain fixture's resolution fails (R35) |
+| M51 | the dead-alias rule (Task 15) | keep every alias above the bound | unit: R35's 128-family fit fails the class |
+| M52 | one-hop folding (Task 15) | fold to the end of the chain | unit: the pre-merge rendering fails (R35) |
+
+Expected: every row killed, or recorded as a finding with the test that should have caught it; an equivalent mutant is argued in the note as plan 13's row 3 was.
+
+- [ ] **Step 3: `CLAUDE.md`**
+
+Text to add, in the file's voice (edit the sentences the executing session finds changed by Tasks 2 to 18; the controller adds the merge status at merge time):
+
+- In "## Zero-access fork", "Where the code lives", after the release 5 bullet: "New at release 7 (search and threads, issue #23; spec `docs/superpowers/specs/2026-11-04-zero-access-search-design.md`, revision 18; plan `docs/superpowers/plans/2026-11-07-zero-access-16-search.md`; outcome note `docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md`): the index model in `crates/store/src/za_search/` (`ThreadPart`, `ContentPart`, `BlobHeader`, `Manifest`, `ManifestWrite`, the padding formula `padded_len` and `compaction_allowance`, `SEARCH_FORMAT_V1`, `K = 16`), the record reader `Store::za_changes_records` beside `changes` in `crates/store/src/query/log.rs`; the sealed sections, the cache `Caches::za_search` (`ZaSearchCache`, `IndexEntry`, `LoadedIndex`), the loader, `ZaSearchConfig::from_env` and the `ZA_SEARCH_*` trace constants in `crates/common/src/za/search/`; the pass (`Server::za_search_pass`), the openers, the `K` capture `za_thread_fields_k`, the validated snapshot `ZaSnapshot`, the changes stream, the rebuild, the reconciliation, the compactions and the content wait `za_search_ensure_current` in `crates/email/src/message/za/search/`; the query resolution in `crates/jmap/src/email/za_search.rs` and `crates/imap/src/op/za_search.rs`, the changes page in `crates/jmap/src/changes/za.rs`; the search key `SessionKeys::swk()` (`crates/vault/src/session.rs`, HKDF label `za/v1/search`); the manifest field `PrincipalField::ZeroAccessSearch = 152`."
+- Invariants, one bullet after the release 5 one: "Search and threads (release 7 spec section 10, 48-56): a key account's terms, positions, sort keys, threading fields, thread ids and thread history exist outside process memory only in blobs sealed under the search key, bound to the account, segment id, kind and predecessor; the manifest (field 152, in the clear, keyed-tagged) holds versions, change ids, segment ids, hashes, sizes and counts only; the stored thread id, the `Thread` container and every change-log entry stay the message's own document id; a publishing pass's thread blob pads its hidden section to the smallest class (`ZA_SEARCH_PAD_MIN`, 64 KiB) and a compacted one to a function of the public record count (decision 2 (c)), the public section being a multiple of the tombstone count; the one residual is the time cap (48); the index is loaded, built and written only inside a request holding the account's keys, on that request's task, dropped on every invalidation and never swapped (49); the pass is a deterministic function of the mail and the log in chronological order, advancing only in one batch that asserted the previous manifest (50); every content leaf is resolved from a current content part or the query is refused with `ZA_MAIL_SEARCH_UNAVAILABLE` (51); a thread id leaves the server only mapped from a map validated after the response's state was read, and a request with no loadable or validated map fails rather than emit a singleton (52); the pass's keyless writes are the manifest, the links and, for a publishing pass, one Email item update and one Thread property change of the lowest indexed id and a container property change of every mailbox (53); traces carry ids, counts and reason classes (54); destroy fences with the marker and unlinks before the range delete (55); identities are retained until their change id leaves the shorter log, and a rebuild's epoch refuses every earlier state whose method log holds a record in `(S, epoch]`, never `Initial` (56). The method table of release 7 spec 6.2 amends mail spec 3.3: for a key account `Email/get|query|changes|queryChanges|import|parse|copy`, `Email/set` create, `Thread/*`, `Mailbox/get`, `EmailSubmission/get|query|changes` and `Blob/lookup` require keys; a keyless session keeps `Mailbox/query|changes|set`, `Email/set` update and destroy (prefix unchecked), identities, vacation, Sieve, push and `Core/echo`."
+- The Registry paragraph's environment list gains `ZA_SEARCH_MEM_MB`, `ZA_SEARCH_THREAD_MEM_MB`, `ZA_SEARCH_ACCOUNT_MAX_MB`, `ZA_SEARCH_IDLE_SECS`, `ZA_SEARCH_PASS_CAP`, `ZA_SEARCH_PASS_MB`, `ZA_SEARCH_PASS_HIDDEN_KB`, `ZA_SEARCH_PASS_MS`, `ZA_SEARCH_WAIT_SECS`, `ZA_SEARCH_SEGMENTS`, `ZA_SEARCH_CHECKPOINT`, `ZA_SEARCH_SKIP_AFTER`, `ZA_SEARCH_ABSENT_RETRY_SECS`, `ZA_SEARCH_PAD_MIN` (defaults as spec 4.4; the three boot refusals).
+- The test-harness paragraph: the pauses `SEARCH_COMMIT_PAUSE`, `SEARCH_SWAP_PAUSE`, `SEARCH_SNAPSHOT_PAUSE`, `SEARCH_SWEEP_PAUSE`, `SEARCH_PASS_PAUSE`, `SEARCH_DESTROY_PAUSE`, the flags `SEARCH_CACHE_HOLD`, `SEARCH_SWAP_SKIP`, `SEARCH_OPEN_FAIL_ALL`, `SEARCH_HOLD_EXPIRE`, the one-shots `SEARCH_BLOB_FAIL_ONCE`, `SEARCH_OPEN_FAIL_ONCE`, `SEARCH_MANIFEST_FAIL_ONCE`, `SEARCH_DESTROY_FAIL_ONCE`, the delay `SEARCH_BLOB_SLOW` (`common::za::test_hooks`, each with its setter), the counters `za_search_blob_reads` and `za_search_message_opens`, the configuration override `set_search_config_override` read by `Server::za_search_config()`; the helpers `run_search_pass`, `read_manifest`, `manifest_bytes`, `principal_blob_links`, `index_holds`, `simulate_restart`, `search_config_guard`, `lower_changes_history`, `purge_account`, `za_index_current`, `imap_index_current`, `za_search_thread_part`, `log_records_since`, `compaction_class` in `tests/src/utils/za.rs`.
+- The za suite paragraph: "the mail modules of release 3 ... `search` (its tables now served, the keyless cases and `nested_search_refused` kept), then release 7's `threads`, `index` and `differential` (`tests/src/za/mail/{threads,index,differential}.rs`: the thread, changes and id cases of spec 9.2 by review tag; the pass, rebuild, compaction and lifecycle cases; the parity corpus of 9.5), then `traces` and `gateway`; `leak_search::test` after `leak::test_mail` (the membership case and the oracle attempts of 9.4); the benchmarks `za::search_bench::{format,system}` are `#[ignore]`d and run by name. The mail modules' next free names are `keymail69` and `plainmail60`" (replacing both occurrences of `keymail46`/`plainmail50`).
+- The key-mode suites sentence: the `za_variants` `query`, `search_snippet`, `query_changes`, `thread_get` and `thread_merge` assert upstream's outcomes with `za_index_current` in place of the queue wait; IMAP's `search` and `thread` run upstream's bodies in both modes (and `fetch`, if Task 17 deleted it).
+- Merge hotspots and silent dependencies: spec 11's two paragraphs in substance, as a new paragraph "Release 7 (search and threads) added merge hotspots ..." in the style of the release 5 one, listing every file of spec 11's first paragraph and every dependency of its second (the term set from `index_document` and `tokenize`; the leaf semantics from `Leaf::plan` and `SearchFilter::has_text`; the thread rules mirroring `find_thread_id` and `ThreadMerge::merge`; the change rendering mirroring `merge_index`, 1.0.2's `Email/queryChanges` and upstream's paging; `push_change`'s folding; the Mailbox state on container changes; the cache's 5 s revalidation; `commit_batch`'s broadcast; `SetValue::Serializable` resolving at commit; the one ordered change-id space of Email and Thread; document ids never reused; `Id::from_parts`, `build_id`, `email_by_jmap_id`; `message_sort_ranks` and `query_emails`' comparators; `SearchQuery::filter`'s unresolved-leaf widening; the purge's and `hold_blob`'s rules; `user_blob_hashes`'s walk; `destroy_account_blobs`'s order; the swap tier's `SwapCached` set; `sync_view` and `View::sync`), each with the spec's file and line citations re-verified on the branch.
+- Status, release 3's open question 2 (`emailQuerySortOptions`) is marked closed by release 7; mail spec section 8's refusals are described as the keyless and unavailable fallbacks.
+
+- [ ] **Step 4: `docs/README-dev.md` and the manual checklist**
+
+README-dev, a section "## Searching key accounts" after "## Operating zero-access accounts": the index is per account, sealed under a key derived from the master key, stored as blobs linked to the principal document plus the clear manifest in field 152, built inside keyed requests and loaded into process memory while the account is in use; the knobs (the fourteen `ZA_SEARCH_*` variables with defaults and one clause each; `K = 16` is a format constant; the three boot refusals and their messages); memory sizing (`ZA_SEARCH_MEM_MB` for content parts, `ZA_SEARCH_THREAD_MEM_MB` for thread parts, which are never refused for budget; the account cap); what the operator sees (`ZA_SEARCH_*` traces: ids, counts, reason classes); the remedies: a lost or corrupt index rebuilds on the next keyed request with every client resynced; after repairing a blob store that answered "not found", run upstream's per-account reindex task, which for a key account writes the destroying marker so the next keyed request rebuilds; the unavailable text `Search for this account is not available right now; try again shortly.`; the benchmarks' two commands and that their figures are in the plan 16 outcome note; the test commands (the za suite's `threads`, `index`, `differential`, `leak_search` modules run inside `za::za_tests`).
+
+Manual checklist: item 8 of "## Mail" (`:65`) becomes: "Search on the server for a word in a subject and in a body, then for a sender; confirm the client shows the matching messages (release 7: the server searches the sealed index built during the session; record the first search's latency after a fresh login and whether the client ever shows `Search for this account is not available right now; try again shortly.`), and that the client's local search agrees. A search on flags, size or date still works." Add "## Search and threads (release 7)" after the release 5 section: the spec and the plan named; clients Apple Mail (macOS, iOS), Thunderbird, an Android client, and the web client over JMAP; items: 1. search by subject word, body word, sender and recipient; a phrase in quotes; a word inside a PDF attachment; a non-ASCII subject; 2. sort by sender, subject and date on the server (IMAP SORT clients: Thunderbird's server-side sort setting); 3. the conversation view groups a reply with its original, and a reply received while the client was closed appears in the thread after the next sync; 4. a second client of the same account shows the same thread; 5. delete one message of a thread, then the whole thread; 6. move a thread's message to another folder and confirm the thread view follows; 7. an import of a large mailbox (IMAP APPEND of a few thousand messages, or the client's migration tool), then the first search: record the latency and any unavailable text; 8. restart the server and search again without re-login: the index persists; 9. change the password through the account page, reconnect, search again; 10. a WebSocket-only web client stays connected for push while its calls go over HTTP. Server-side: the za suite and both key-mode suites pass against the build; the `Mail leak scan` line shows `index blobs` and `manifests` counts for the key accounts. Native status: pending, as for release 5.
+
+- [ ] **Step 5: Full verification on the branch head**
+
+In order, one at a time, each recorded with its result and time: `cargo fmt --all --check` (and the http form if the http crate changed); the per-task compile check of Global Constraints (shipping configuration; warning-free in every file this plan touched); `cargo check -p tests --tests`; `cargo test -p vault`; `cargo test -p store --lib --features test_mode za_search`; `cargo test -p store --lib --features test_mode za_test`; `cargo test -p common --lib za::`; `cargo test -p email --features test_mode za::`; `cargo test -p jmap --lib za` and `cargo test -p imap --lib za` where unit tests exist; `cargo test -p http@1.0.3 --lib --bins --features test_mode,enterprise`; `cargo test -p smtp --lib --bins --features test_mode`; `cargo test -p tests za::leak::tests::try_archive_short_values_are_not_archives -- --exact`; the za suite; the za suite with `BLOB_STORE=FileSystem`; `za::cache_swap::cache_swap_tests -- --exact` alone without `BLOB_STORE`; `webdav::webdav_tests` plain and with `ZA_KEY_ACCOUNTS=1`; `imap::imap_tests` and `jmap::jmap_tests` plain and key mode; `cargo test -p tests smtp` with the six known flakes rerun by name; the upstream suites (`webdav::cal_query::`, `store::store_tests`, `store::blob::blob_tests`, `store::lookup::lookup_tests`, `store::search_tests`, `telemetry::telemetry_tests`, `system::system_tests`; `automation_tests` and `directory` if Docker is up, else recorded as left to CI); `python3 -I scripts/tests/ci_steps.py` and `python3 -I scripts/tests/test_gates.py` (no gated step changed: the new modules run inside `za::za_tests`); the product build `cargo build --release -p stalwart --no-default-features --features rocks` in the background with no other cargo command alongside; the two benchmarks by name (Step 1 and Task 1, repeated on the head).
+Expected: every one passes, or a known flake passes on its one rerun; the product build is warning-free in the fork's files.
+
+- [ ] **Step 6: The outcome note**
+
+`docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md`, in plan 15's shape, with: **Where things stand** (the branch, every commit by task, each suite's result and time from Step 5); **What changed and why** (one paragraph per task naming the spec sections); **Benchmarks** (Task 1's format table and Step 1's system table, the machine, and the per-knob **Defaults** lines with Jay's decisions); **Spec questions / plan calls** (the plan header's list with what execution found); **Rulings** (every `Ruling:` line of the ledger); **Mutation runs (plan 16)** (Step 2's table with the observed lines, the follow-up runs, "No mutation survived" or the exceptions, and the kill checks the tasks recorded); **Other harnesses** (the key-mode suites, the CalDAV client and the fresh-store gate if they ran, as plan 15's Task 8 recorded them); **Adjusted assertions** (every existing assertion a task changed, with its reason: Task 17's variants, `mail::search`'s turned tables, `mail::gates`'s table move, `leak::test_mail`'s counts); **Accepted residuals** (spec 7.5's list verbatim in substance; section 2's time-cap channel, R30/H4; 5.8's two missing-evidence residuals; the `K` deviation; the IMAP `CHANGEDSINCE` difference; the networked-store figure if pending); **Deferred findings** (anything a review deferred, by task); **Merge hotspots** (spec 11 plus Step 3's additions); **Open questions for Jay** (the defaults recommended and not yet taken; the differential test's corpus coverage; anything Task 19 found).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add tests/src/za/search_bench.rs CLAUDE.md docs/README-dev.md docs/zero-access/manual-checklist.md docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md
+git commit -m "Plan 16 outcome note, the system benchmark, mutation runs, the release 7 checklist, CLAUDE.md"
+```
