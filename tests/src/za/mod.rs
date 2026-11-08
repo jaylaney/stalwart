@@ -230,6 +230,7 @@ pub async fn za_tests() {
     index_task::test_mid_pass_deletion(&mut test).await;
 
     destroy_key_accounts(&test).await;
+    crate::utils::za::expire_and_purge_blobs(&test, test.account("admin@example.com")).await;
     test.assert_is_empty().await;
     test_hooks::clear_drain_skip(test_hooks::DRAIN_SKIP_ALL);
 

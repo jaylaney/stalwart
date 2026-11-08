@@ -6,6 +6,7 @@
 
 pub mod cache;
 pub mod config;
+pub mod destroy;
 pub mod error;
 pub mod load;
 pub mod seal;

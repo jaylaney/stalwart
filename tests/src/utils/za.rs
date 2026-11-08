@@ -441,6 +441,20 @@ pub async fn manifest_bytes(test: &TestServer, account_id: u32) -> Option<Vec<u8
         .map(|value| value.0)
 }
 
+pub async fn write_manifest_bytes(test: &TestServer, account_id: u32, bytes: Option<Vec<u8>>) {
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::Principal)
+        .with_document(0);
+    if let Some(bytes) = bytes {
+        batch.set(PrincipalField::ZeroAccessSearch, bytes);
+    } else {
+        batch.clear(PrincipalField::ZeroAccessSearch);
+    }
+    test.server.store().write_batch(&mut batch).await.unwrap();
+}
+
 pub async fn read_manifest(test: &TestServer, account_id: u32) -> Option<ManifestValue> {
     manifest_bytes(test, account_id)
         .await
@@ -492,6 +506,34 @@ pub async fn principal_blob_links(test: &TestServer, account_id: u32) -> Vec<(Bl
         .await
         .unwrap();
     links
+}
+
+pub async fn temporary_blob_hashes(test: &TestServer, account_id: u32) -> Vec<BlobHash> {
+    let range = |byte, len| AnyKey {
+        subspace: Subspace::BlobLink,
+        key: vec![byte; len],
+    };
+    let mut hashes = Vec::new();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(
+                range(0, 1),
+                range(u8::MAX, BLOB_HASH_LEN + U32_LEN + U64_LEN),
+            )
+            .no_values(),
+            |key, _| {
+                if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN
+                    && key.deserialize_be_u32(BLOB_HASH_LEN)? == account_id
+                {
+                    hashes.push(BlobHash::try_from_hash_slice(&key[..BLOB_HASH_LEN]).unwrap());
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    hashes
 }
 
 pub async fn index_holds(test: &TestServer, account_id: u32, document_id: u32) -> bool {

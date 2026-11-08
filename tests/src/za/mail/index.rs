@@ -17,24 +17,28 @@ use crate::{
         server::TestServer,
         za::{
             HookParked, expire_and_purge_blobs, index_holds, log_records_since, manifest_bytes,
-            principal_blob_links, read_manifest, run_search_pass, simulate_restart, za_unlock,
+            principal_blob_links, read_manifest, run_search_pass, simulate_restart,
+            temporary_blob_hashes, write_manifest_bytes, za_setup_token, za_unlock,
         },
     },
     za::user_permissions,
 };
+use common::auth::vault::ZaVaultExtra;
 use common::za::{
     search::{
         ZaSearchConfig,
         cache::EvictReason,
-        error::TransientClass,
+        error::{LoadFailure, NoMapReason, TransientClass},
+        load::entry_outcome,
         seal::za_search_key,
-        trace::{ZA_SEARCH_EVENT_TYPE, ZA_SEARCH_SKIPPED},
+        setup::za_setup_manifest,
+        trace::{ZA_SEARCH_EVENT_TYPE, ZA_SEARCH_LOST, ZA_SEARCH_SKIPPED},
     },
     test_hooks::{
         reset_za_search_counters, set_search_blob_fail_once, set_search_blob_slow,
-        set_search_commit_pause, set_search_config_override, set_search_hold_expire,
-        set_search_pass_pause, set_search_swap_pause, za_search_blob_reads,
-        za_search_message_opens,
+        set_search_commit_pause, set_search_config_override, set_search_destroy_fail_once,
+        set_search_destroy_pause, set_search_hold_expire, set_search_pass_pause,
+        set_search_swap_pause, set_search_swap_skip, za_search_blob_reads, za_search_message_opens,
     },
 };
 use email::{
@@ -42,18 +46,24 @@ use email::{
     message::za::search::pass::{PassOutcome, ZaSearchPass},
 };
 use imap_proto::ResponseType;
+use registry::{schema::prelude::ObjectType, types::EnumImpl};
 use serde_json::{Value, json};
 use std::time::Duration;
 use store::{
+    ValueKey,
     query::log::{Change, PartialChange},
-    write::{BatchBuilder, BlobLink, BlobOp},
+    write::{
+        BatchBuilder, BlobLink, BlobOp, RegistryClass, ValueClass, assert::AssertValue,
+        blob::BlobLinkValue, blob_codec::BlobOpts,
+    },
     za_search::{
         BlobHeader, Checkpoint,
-        manifest::{FailingDocument, Manifest, ManifestValue, manifest_hash},
+        manifest::{FailingDocument, Inventory, Manifest, ManifestValue, manifest_hash},
     },
 };
-use trc::{Key, Value as TraceValue};
+use trc::{EventType, Key, StoreEvent, Value as TraceValue};
 use types::{
+    blob_hash::BlobHash,
     collection::{Collection, SyncCollection},
     field::PrincipalField,
     id::Id,
@@ -120,27 +130,8 @@ pub async fn test(test: &mut TestServer) {
         test.destroy_all_mailboxes(account).await;
     }
     test.wait_for_tasks().await;
-    for account in [&key, &split] {
-        unlink_index_fixture_blobs_until_task16(test, account_id(account)).await;
-    }
+    destroy_cases(test, &admin).await;
     println!("Zero-access mail index pass tests finished");
-}
-
-async fn unlink_index_fixture_blobs_until_task16(test: &TestServer, id: u32) {
-    // Task 16 adds production account-destroy handling for these links.
-    // Until then, teardown only the two fixture accounts' index blob links.
-    let mut batch = BatchBuilder::new();
-    batch
-        .with_account_id(id)
-        .with_collection(Collection::Principal)
-        .with_document(0);
-    for (hash, _) in principal_blob_links(test, id).await {
-        batch.clear(BlobOp::Link {
-            hash,
-            to: BlobLink::Document,
-        });
-    }
-    test.server.store().write_batch(&mut batch).await.unwrap();
 }
 
 fn account_id(account: &Account) -> u32 {
@@ -911,4 +902,675 @@ async fn case_repeated_delta_changes_nothing(test: &TestServer, key: &Account) {
     let view = loaded(test, id).await;
     let thread = view.thread.current_thread(ids[0]);
     assert_eq!(view.thread.present_members(thread), ids);
+}
+
+async fn destroy_cases(test: &TestServer, admin: &Account) {
+    case_stale_permanent_destroy_creates_no_marker(test, admin).await;
+    case_double_absence_removes_only_exact_orphan_links(test, admin).await;
+    case_double_absence_scan_refuses_new_state(test, admin, false).await;
+    case_double_absence_scan_refuses_new_state(test, admin, true).await;
+    case_r7_interrupted_transitions_leave_nothing(test, admin).await;
+    case_r7_middle_node_break(test, admin).await;
+    case_f23_unparseable_manifest(test, admin, false).await;
+    case_f23_pre_release_account_without_a_manifest(test, admin).await;
+    case_r19_paused_pass_loses_to_the_marker(test, admin).await;
+    case_g12_destroy_dies_after_the_marker(test, admin).await;
+    case_empty_marker_retry_scans(test, admin).await;
+    case_reset_clears_a_live_account(test, admin).await;
+    case_reset_cannot_clear_after_registry_deletion(test, admin).await;
+    case_reset_after_destroy_creates_no_marker(test, admin).await;
+    case_stale_reset_scan_keeps_new_links(test, admin).await;
+}
+
+async fn destroy_fixture(admin: &Account, name: &'static str) -> Account {
+    // These fixtures destroy their own accounts and therefore stay out of
+    // TestServer's end-of-suite list of live accounts.
+    admin
+        .create_key_user_account(
+            name,
+            "Destroy-Search-46!",
+            "Search destroy",
+            &[],
+            user_permissions(),
+        )
+        .await
+}
+
+async fn assert_destroyed_index(test: &TestServer, admin: &Account, id: u32, hashes: &[BlobHash]) {
+    tokio::time::timeout(Duration::from_secs(30), test.wait_for_tasks())
+        .await
+        .expect("search fixture's destroy task did not finish");
+    expire_and_purge_blobs(test, admin).await;
+    assert!(
+        principal_blob_links(test, id).await.is_empty(),
+        "orphaned index links for account {id}"
+    );
+    assert!(read_manifest(test, id).await.is_none());
+    for hash in hashes {
+        assert!(
+            test.server
+                .get_blob(hash.as_slice(), 0..usize::MAX)
+                .await
+                .unwrap()
+                .is_none(),
+            "orphaned index blob {hash:?} for account {id}"
+        );
+    }
+}
+
+async fn case_r7_middle_node_break(test: &TestServer, admin: &Account) {
+    let key = destroy_fixture(admin, "search-destroy-2@example.com").await;
+    let id = account_id(&key);
+    set_search_config_override(Some(ZaSearchConfig {
+        segments: 8,
+        ..ZaSearchConfig::from_env().unwrap()
+    }));
+    for number in 1..=6 {
+        deliver_one(test, &key, &format!("Broken chain fixture {number}")).await;
+        advanced(test, &key, true).await;
+    }
+    set_search_config_override(None);
+
+    let manifest = index(test, id).await;
+    assert_manifest_links(test, id, &manifest).await;
+    let head = manifest.content.unwrap();
+    assert_eq!(head.length, 6);
+    let mut middle = head.hash;
+    for _ in 0..2 {
+        let bytes = stored_blob(test, &middle).await;
+        middle = BlobHeader::decode(&bytes).unwrap().0.predecessor.unwrap().0;
+    }
+    let hashes = principal_hashes(test, id).await;
+    assert!(hashes.len() > 6 && hashes.contains(&middle));
+    assert!(
+        test.server
+            .blob_store()
+            .delete_blob(middle.as_slice())
+            .await
+            .unwrap()
+    );
+    simulate_restart(test, id).await;
+    admin.destroy_account(key).await;
+    assert_destroyed_index(test, admin, id, &hashes).await;
+}
+
+async fn principal_hashes(test: &TestServer, id: u32) -> Vec<BlobHash> {
+    principal_blob_links(test, id)
+        .await
+        .into_iter()
+        .map(|(hash, _)| hash)
+        .collect()
+}
+
+async fn staged_hashes(test: &TestServer, id: u32, before: &[BlobHash]) -> Vec<BlobHash> {
+    let staged = temporary_blob_hashes(test, id)
+        .await
+        .into_iter()
+        .filter(|hash| !before.contains(hash))
+        .collect::<Vec<_>>();
+    assert_eq!(staged.len(), 2, "expected one thread and one content hold");
+    staged
+}
+
+async fn park_destroy(admin: &Account, key: &Account) -> HookParked<()> {
+    let id = account_id(key);
+    let admin = admin.clone();
+    let key = key.clone();
+    HookParked::start(id, set_search_destroy_pause, async move {
+        admin.destroy_account(key).await;
+    })
+    .await
+}
+
+async fn park_reset(test: &TestServer, id: u32) -> HookParked<trc::Result<()>> {
+    let server = test.server.clone();
+    HookParked::start(id, set_search_destroy_pause, async move {
+        // Reindex's admission gate will be wired in Task 16b.
+        assert!(server.za_is_key_account(id).await.unwrap());
+        server.za_search_destroy(id, true).await
+    })
+    .await
+}
+
+async fn assert_failed_first_destroy(traces: Traced, id: u32) {
+    let events = traces.finish().await;
+    assert!(
+        events.iter().any(|event| {
+            event.typ == EventType::Store(StoreEvent::AssertValueFailed)
+                && event.account_id == Some(u64::from(id))
+                && event.text.contains("Failed to destroy account")
+        }),
+        "the injected first destroy must fail: {events:?}",
+    );
+}
+
+async fn case_r7_interrupted_transitions_leave_nothing(test: &TestServer, admin: &Account) {
+    let key = destroy_fixture(admin, "search-destroy-1@example.com").await;
+    let id = account_id(&key);
+    for number in 1..=5 {
+        deliver_one(
+            test,
+            &key,
+            &format!("Interrupted publication fixture {number}"),
+        )
+        .await;
+    }
+    let holds = temporary_blob_hashes(test, id).await;
+
+    // Expiry is sampled during staging. The pre-commit interruption must
+    // leave only temporary links, with no publication to recover.
+    set_search_hold_expire(Some(id));
+    let parked = park(test, &key, set_search_commit_pause).await;
+    let mut hashes = staged_hashes(test, id, &holds).await;
+    for hash in &hashes {
+        assert!(!stored_blob(test, hash).await.is_empty());
+    }
+    assert!(principal_hashes(test, id).await.is_empty());
+    assert_eq!(
+        parked.finish().await,
+        PassOutcome::Aborted(TransientClass::BlobStore)
+    );
+    set_search_hold_expire(None);
+    simulate_restart(test, id).await;
+
+    // The other interruption happens after publication, before resident
+    // state can be installed. Those blobs are already permanently linked.
+    set_search_swap_skip(Some(id));
+    let parked = park(test, &key, set_search_swap_pause).await;
+    let committed = principal_hashes(test, id).await;
+    assert_eq!(committed.len(), 2);
+    assert!(committed.iter().all(|hash| !hashes.contains(hash)));
+    assert_manifest_links(test, id, &index(test, id).await).await;
+    hashes.extend(committed);
+    assert!(matches!(
+        parked.finish().await,
+        PassOutcome::Advanced {
+            published: true,
+            ..
+        }
+    ));
+    set_search_swap_skip(None);
+    simulate_restart(test, id).await;
+
+    admin.destroy_account(key).await;
+    assert_destroyed_index(test, admin, id, &hashes).await;
+}
+
+async fn case_f23_unparseable_manifest(test: &TestServer, admin: &Account, retry: bool) {
+    let name = if retry {
+        "search-destroy-garbage-retry@example.com"
+    } else {
+        "search-destroy-3@example.com"
+    };
+    let key = destroy_fixture(admin, name).await;
+    let id = account_id(&key);
+    for number in 1..=3 {
+        deliver_one(
+            test,
+            &key,
+            &format!("Unparseable manifest fixture {number}"),
+        )
+        .await;
+    }
+    advanced(test, &key, true).await;
+    let hashes = principal_hashes(test, id).await;
+    assert_eq!(hashes.len(), 2);
+    write_manifest_bytes(test, id, Some(vec![0x55; 40])).await;
+
+    let traces = retry.then(|| Traced::start(&[EventType::Store(StoreEvent::AssertValueFailed)]));
+    let parked = park_destroy(admin, &key).await;
+    assert_eq!(
+        read_manifest(test, id).await,
+        Some(ManifestValue::Destroying(Inventory::default()))
+    );
+    assert_eq!(principal_hashes(test, id).await, hashes);
+    if retry {
+        set_search_destroy_fail_once(Some(id));
+    }
+    parked.finish().await;
+    assert_destroyed_index(test, admin, id, &hashes).await;
+    if let Some(traces) = traces {
+        set_search_destroy_fail_once(None);
+        assert_failed_first_destroy(traces, id).await;
+    }
+}
+
+async fn case_empty_marker_retry_scans(test: &TestServer, admin: &Account) {
+    case_f23_unparseable_manifest(test, admin, true).await;
+}
+
+async fn case_f23_pre_release_account_without_a_manifest(test: &TestServer, admin: &Account) {
+    let key = destroy_fixture(admin, "search-destroy-4@example.com").await;
+    let id = account_id(&key);
+    write_manifest_bytes(test, id, None).await;
+    assert!(read_manifest(test, id).await.is_none());
+
+    // No keyed pass ran. Seed an orphan to distinguish the fallback scan
+    // from an empty-inventory no-op when field 152 is missing.
+    let hash = seed_orphan_link(test, id, b"orphaned search index fixture").await;
+    assert_eq!(principal_hashes(test, id).await, vec![hash.clone()]);
+
+    let parked = park_destroy(admin, &key).await;
+    assert_eq!(
+        read_manifest(test, id).await,
+        Some(ManifestValue::Destroying(Inventory::default()))
+    );
+    parked.finish().await;
+    assert_destroyed_index(test, admin, id, &[hash]).await;
+}
+
+async fn case_r19_paused_pass_loses_to_the_marker(test: &TestServer, admin: &Account) {
+    let key = destroy_fixture(admin, "search-destroy-5@example.com").await;
+    let id = account_id(&key);
+    deliver_one(test, &key, "Previously committed index").await;
+    advanced(test, &key, true).await;
+    let manifest = index(test, id).await;
+    let committed = principal_hashes(test, id).await;
+    assert_eq!(committed.len(), 2);
+
+    deliver_one(test, &key, "Staged before destroy").await;
+    let holds = temporary_blob_hashes(test, id).await;
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let pass = park(test, &key, set_search_commit_pause).await;
+    let staged = staged_hashes(test, id, &holds).await;
+    let destroy = park_destroy(admin, &key).await;
+
+    assert_eq!(
+        read_manifest(test, id).await,
+        Some(ManifestValue::Destroying(manifest.inventory()))
+    );
+    assert_eq!(principal_hashes(test, id).await, committed);
+    // Keep the holds live through the CAS. Expiry would abort before
+    // reaching the assertion and would not demonstrate the marker fence.
+    assert_eq!(pass.finish().await, PassOutcome::Lost);
+    assert_eq!(principal_hashes(test, id).await, committed);
+    let holds = temporary_blob_hashes(test, id).await;
+    assert!(staged.iter().all(|hash| holds.contains(hash)));
+    let events = traces.finish().await;
+    assert!(events.iter().any(|event| event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_LOST), "{events:?}");
+
+    destroy.finish().await;
+    let hashes = committed.into_iter().chain(staged).collect::<Vec<_>>();
+    assert_destroyed_index(test, admin, id, &hashes).await;
+}
+
+async fn case_g12_destroy_dies_after_the_marker(test: &TestServer, admin: &Account) {
+    let key = destroy_fixture(admin, "search-destroy-6@example.com").await;
+    let id = account_id(&key);
+    for number in 1..=3 {
+        deliver_one(test, &key, &format!("Destroy retry fixture {number}")).await;
+        advanced(test, &key, true).await;
+    }
+    let manifest = index(test, id).await;
+    assert_manifest_links(test, id, &manifest).await;
+    let hashes = principal_hashes(test, id).await;
+    let traces = Traced::start(&[EventType::Store(StoreEvent::AssertValueFailed)]);
+    let parked = park_destroy(admin, &key).await;
+    assert_eq!(
+        read_manifest(test, id).await,
+        Some(ManifestValue::Destroying(manifest.inventory()))
+    );
+    assert_eq!(principal_hashes(test, id).await, hashes);
+    set_search_destroy_fail_once(Some(id));
+    parked.finish().await;
+
+    assert_destroyed_index(test, admin, id, &hashes).await;
+    set_search_destroy_fail_once(None);
+    assert_failed_first_destroy(traces, id).await;
+}
+
+async fn case_reset_cannot_clear_after_registry_deletion(test: &TestServer, admin: &Account) {
+    let key = destroy_fixture(admin, "search-destroy-reset-deleted@example.com").await;
+    let id = account_id(&key);
+    let document = deliver_one(test, &key, "Reset racing permanent account deletion").await;
+    let index_bytes = manifest_bytes(test, id).await.unwrap();
+    // A genuine empty index and no links ensure no unlink batch can
+    // reject the reset before it reaches the final marker-clear guard.
+    assert_eq!(index(test, id).await.inventory(), Inventory::default());
+    assert!(principal_hashes(test, id).await.is_empty());
+    assert_eq!(message_ids(test, id).await, vec![document]);
+    let vault_cas = test.server.za_vault_record(id).await.unwrap().unwrap().cas;
+    let reset = park_reset(test, id).await;
+    let marker = manifest_bytes(test, id).await.unwrap();
+    assert_eq!(
+        read_manifest(test, id).await,
+        Some(ManifestValue::Destroying(Inventory::default()))
+    );
+
+    // Let the real destroy task adopt the marker while range deletion
+    // is still unable to make the reset's marker assertion fail.
+    let destroy = park_destroy(admin, &key).await;
+    let account = ValueKey::from(ValueClass::Registry(RegistryClass::Item {
+        object_id: ObjectType::Account.to_id(),
+        item_id: u64::from(id),
+    }));
+    assert!(!test.server.store().key_exists(account).await.unwrap());
+    assert_eq!(
+        test.server.za_vault_record(id).await.unwrap().unwrap().cas,
+        vault_cas
+    );
+    assert_eq!(
+        manifest_bytes(test, id).await.as_deref(),
+        Some(marker.as_slice())
+    );
+    assert!(principal_hashes(test, id).await.is_empty());
+    let result = reset.finish().await;
+    assert!(
+        result.as_ref().is_err_and(|err| err.is_assertion_failure()),
+        "reset with a deleted Account Item must refuse"
+    );
+    assert_eq!(
+        manifest_bytes(test, id).await.as_deref(),
+        Some(marker.as_slice())
+    );
+    assert_eq!(
+        entry_outcome(read_manifest(test, id).await),
+        Err(LoadFailure::NoMap(NoMapReason::Destroying))
+    );
+
+    // The would-be manifest creator still has the current vault assertion.
+    // It must lose its absence assertion against the retained marker.
+    let mut create = BatchBuilder::new();
+    create
+        .with_account_id(id)
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .assert_value(
+            PrincipalField::ZeroAccessVault,
+            AssertValue::Hash(vault_cas),
+        )
+        .assert_value(PrincipalField::ZeroAccessSearch, AssertValue::None)
+        .set(PrincipalField::ZeroAccessSearch, index_bytes);
+    assert!(
+        test.server
+            .store()
+            .write_batch(&mut create)
+            .await
+            .unwrap_err()
+            .is_assertion_failure()
+    );
+
+    destroy.finish().await;
+    assert_destroyed_index(test, admin, id, &[]).await;
+}
+
+async fn case_reset_clears_a_live_account(test: &TestServer, admin: &Account) {
+    let key = destroy_fixture(admin, "search-destroy-reset-live@example.com").await;
+    let id = account_id(&key);
+    let document = deliver_one(test, &key, "Live account reset").await;
+    advanced(test, &key, true).await;
+    let hashes = principal_hashes(test, id).await;
+    assert_eq!(hashes.len(), 2);
+    let vault_cas = test.server.za_vault_record(id).await.unwrap().unwrap().cas;
+
+    test.server.za_search_destroy(id, true).await.unwrap();
+    assert!(principal_hashes(test, id).await.is_empty());
+    assert!(read_manifest(test, id).await.is_none());
+    assert_eq!(
+        test.server.za_vault_record(id).await.unwrap().unwrap().cas,
+        vault_cas
+    );
+    assert_eq!(message_ids(test, id).await, vec![document]);
+
+    admin.destroy_account(key).await;
+    assert_destroyed_index(test, admin, id, &hashes).await;
+}
+
+async fn case_reset_after_destroy_creates_no_marker(test: &TestServer, admin: &Account) {
+    let key = destroy_fixture(admin, "search-destroy-reset-after@example.com").await;
+    let id = account_id(&key);
+    let server = test.server.clone();
+    let (admitted, admission) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let reset = tokio::spawn(async move {
+        assert!(server.za_is_key_account(id).await.unwrap());
+        admitted.send(()).unwrap();
+        released.await.unwrap();
+        server.za_search_destroy(id, true).await
+    });
+    admission.await.unwrap();
+
+    admin.destroy_account(key).await;
+    test.wait_for_tasks().await;
+    assert!(test.server.za_vault_record(id).await.unwrap().is_none());
+    assert!(read_manifest(test, id).await.is_none());
+    release.send(()).unwrap();
+    let result = reset.await.unwrap();
+    assert!(result.as_ref().is_err_and(|err| err.is_assertion_failure()));
+    assert!(
+        read_manifest(test, id).await.is_none(),
+        "the stale reset must not recreate field 152"
+    );
+    assert_destroyed_index(test, admin, id, &[]).await;
+}
+
+async fn case_stale_reset_scan_keeps_new_links(test: &TestServer, admin: &Account) {
+    let key = destroy_fixture(admin, "search-destroy-reset-stale@example.com").await;
+    let id = account_id(&key);
+    let empty_index = manifest_bytes(test, id).await.unwrap();
+    write_manifest_bytes(test, id, None).await;
+    let reset = park_reset(test, id).await;
+    assert_eq!(
+        read_manifest(test, id).await,
+        Some(ManifestValue::Destroying(Inventory::default()))
+    );
+
+    // Supply the starting manifest a different reset/rebuild could leave.
+    // The new links and their committed inventory come from the real pass.
+    write_manifest_bytes(test, id, Some(empty_index)).await;
+    deliver_one(test, &key, "New links after stale reset").await;
+    advanced(test, &key, true).await;
+    let committed = manifest_bytes(test, id).await;
+    let links = principal_blob_links(test, id).await;
+    assert_eq!(links.len(), 2);
+    let result = reset.finish().await;
+    assert!(
+        result.as_ref().is_err_and(|err| err.is_assertion_failure()),
+        "the stale reset must lose its unlink assertion"
+    );
+    assert_eq!(manifest_bytes(test, id).await, committed);
+    assert_eq!(
+        principal_blob_links(test, id).await,
+        links,
+        "the stale scan must leave new links intact"
+    );
+
+    let hashes = links.into_iter().map(|(hash, _)| hash).collect::<Vec<_>>();
+    admin.destroy_account(key).await;
+    assert_destroyed_index(test, admin, id, &hashes).await;
+}
+
+async fn case_stale_permanent_destroy_creates_no_marker(test: &TestServer, admin: &Account) {
+    let key = destroy_fixture(admin, "search-destroy-stale-permanent@example.com").await;
+    let id = account_id(&key);
+    deliver_one(test, &key, "Stale permanent worker fixture").await;
+    advanced(test, &key, true).await;
+    let hashes = principal_hashes(test, id).await;
+    assert_eq!(hashes.len(), 2);
+    admin.destroy_account(key).await;
+    assert_destroyed_index(test, admin, id, &hashes).await;
+    assert!(test.server.za_vault_record(id).await.unwrap().is_none());
+
+    // The duplicate worker has already started the task. It reaches this
+    // helper only after the peer removed the account properties and task.
+    test.server.za_search_destroy(id, false).await.unwrap();
+    assert!(
+        read_manifest(test, id).await.is_none(),
+        "stale permanent destroy recreated field 152 after task completion"
+    );
+
+    set_search_destroy_fail_once(Some(id));
+    let result = test.server.za_search_destroy(id, false).await;
+    set_search_destroy_fail_once(None);
+    assert!(result.as_ref().is_err_and(|err| err.is_assertion_failure()));
+    assert!(
+        read_manifest(test, id).await.is_none(),
+        "failed stale permanent destroy recreated field 152"
+    );
+}
+
+async fn seed_orphan_link(test: &TestServer, id: u32, bytes: &[u8]) -> BlobHash {
+    let hash = BlobHash::generate(bytes);
+    let (_, hold) = test
+        .server
+        .hold_blob(id, hash.clone(), bytes, 60, &BlobOpts::PLAIN)
+        .await
+        .unwrap();
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Principal)
+        .with_document(0);
+    hold.release(&mut batch).set(
+        BlobOp::Link {
+            hash: hash.clone(),
+            to: BlobLink::Document,
+        },
+        BlobLinkValue::new(bytes.len()),
+    );
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    hash
+}
+
+async fn passwordless_destroy_fixture(admin: &Account, name: &'static str) -> Account {
+    admin
+        .create_passwordless_user_account(
+            name,
+            "Destroy-Search-46!",
+            "Search destroy",
+            &[],
+            user_permissions(),
+        )
+        .await
+}
+
+async fn case_double_absence_removes_only_exact_orphan_links(test: &TestServer, admin: &Account) {
+    let key = passwordless_destroy_fixture(admin, "search-destroy-no-vault@example.com").await;
+    let neighbor = passwordless_destroy_fixture(admin, "search-destroy-neighbor@example.com").await;
+    let id = account_id(&key);
+    let bytes = b"double absence orphan fixture";
+    let hash = seed_orphan_link(test, id, bytes).await;
+    let document_link = BlobOp::Link {
+        hash: hash.clone(),
+        to: BlobLink::Document,
+    };
+    let neighbors = [
+        (id, Collection::Principal, 1),
+        (id, Collection::Email, 0),
+        (account_id(&neighbor), Collection::Principal, 0),
+    ];
+    let mut batch = BatchBuilder::new();
+    for (account, collection, document) in neighbors {
+        batch
+            .with_account_id(account)
+            .with_collection(collection)
+            .with_document(document)
+            .set(document_link.clone(), BlobLinkValue::new(bytes.len()));
+    }
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    assert_eq!(principal_hashes(test, id).await, vec![hash.clone()]);
+    assert!(read_manifest(test, id).await.is_none());
+    assert!(test.server.za_vault_record(id).await.unwrap().is_none());
+
+    let parked = park_destroy(admin, &key).await;
+    assert!(read_manifest(test, id).await.is_none());
+    parked.finish().await;
+    test.wait_for_tasks().await;
+    expire_and_purge_blobs(test, admin).await;
+    assert!(principal_hashes(test, id).await.is_empty());
+    assert!(read_manifest(test, id).await.is_none());
+    assert_eq!(stored_blob(test, &hash).await, bytes);
+
+    let mut clear_neighbors = BatchBuilder::new();
+    for (account_id, collection, document_id) in neighbors {
+        let key = ValueKey {
+            account_id,
+            collection: collection as u8,
+            document_id,
+            class: ValueClass::Blob(document_link.clone()),
+        };
+        assert!(test.server.store().key_exists(key).await.unwrap());
+        // These are deliberately fabricated neighboring links, outside the
+        // destroyed account's index. Clear just the three fixture controls.
+        clear_neighbors
+            .with_account_id(account_id)
+            .with_collection(collection)
+            .with_document(document_id)
+            .clear(document_link.clone());
+    }
+    test.server
+        .store()
+        .write_batch(&mut clear_neighbors)
+        .await
+        .unwrap();
+    admin.destroy_account(neighbor).await;
+    assert_destroyed_index(test, admin, id, &[hash]).await;
+}
+
+async fn case_double_absence_scan_refuses_new_state(
+    test: &TestServer,
+    admin: &Account,
+    vault_appears: bool,
+) {
+    let name = if vault_appears {
+        "search-destroy-vault-appears@example.com"
+    } else {
+        "search-destroy-manifest-appears@example.com"
+    };
+    let key = passwordless_destroy_fixture(admin, name).await;
+    let id = account_id(&key);
+    let hash = seed_orphan_link(test, id, name.as_bytes()).await;
+    assert_eq!(principal_hashes(test, id).await, vec![hash.clone()]);
+    let server = test.server.clone();
+    let parked = HookParked::start(id, set_search_destroy_pause, async move {
+        server.za_search_destroy(id, false).await
+    })
+    .await;
+    assert!(read_manifest(test, id).await.is_none());
+    assert!(test.server.za_vault_record(id).await.unwrap().is_none());
+
+    let pending = if vault_appears {
+        // Use the normal setup-token path to obtain a real PendingSetup
+        // record while keeping the search field absent.
+        za_setup_token(admin, key.name()).await;
+        assert!(read_manifest(test, id).await.is_none());
+        Some(test.server.za_vault_record(id).await.unwrap().unwrap())
+    } else {
+        // The persisted search-field sentinel exercises the assertion
+        // separately, with no vault that could make the chunk fail first.
+        write_manifest_bytes(test, id, Some(vec![0x55; 40])).await;
+        assert!(test.server.za_vault_record(id).await.unwrap().is_none());
+        None
+    };
+    let result = parked.finish().await;
+    assert!(
+        result.as_ref().is_err_and(|err| err.is_assertion_failure()),
+        "{} appearance must stop the old unlink batch",
+        if vault_appears { "vault" } else { "manifest" }
+    );
+    assert_eq!(principal_hashes(test, id).await, vec![hash.clone()]);
+
+    if pending.is_none() {
+        write_manifest_bytes(test, id, None).await;
+    }
+    admin.destroy_account(key).await;
+    assert_destroyed_index(test, admin, id, &[hash]).await;
+
+    if let Some(pending) = pending {
+        // This is the actual combined vault/manifest transaction used
+        // by setup, with the read PendingSetup record from before destroy.
+        let mut record = pending.record.clone();
+        let extra = ZaVaultExtra {
+            field: PrincipalField::ZeroAccessSearch,
+            value: za_setup_manifest(&vault::keys::Secret::random(), 0),
+        };
+        assert!(
+            test.server
+                .za_vault_commit(id, &mut record, Some(&pending), None, Some(extra))
+                .await
+                .is_err_and(|err| err.is_assertion_failure())
+        );
+        assert!(test.server.za_vault_record(id).await.unwrap().is_none());
+        assert!(read_manifest(test, id).await.is_none());
+    }
 }
