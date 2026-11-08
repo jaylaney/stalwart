@@ -1,6 +1,13 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 25 (2026-11-08), execution correction.
+Date: 2026-11-04. Status: revision 26 (2026-11-08), execution correction.
+Revision 26 closes the stale permanent-destroy marker gap (P2-DUPLICATE).
+When both the manifest and vault are absent, destroy scans and unlinks under
+atomic absence assertions without recreating a marker. When only the manifest
+is absent, marker creation also asserts the exact raw vault hash. This is a
+bounded search-lifecycle correction, not a general account-lifetime mechanism;
+stale setup-token issuance remains outside its proof (5.7). No wire change.
+
 Revision 25 closes the reset/destroy overlap found during implementation
 (P1-RESET), without a marker-format change. Every reset mutation batch asserts
 the live Account registry Item, including the initial marker write and final
@@ -1645,43 +1652,60 @@ does not already prevent, and a lease would add a sweep.
   this runs: an IMAP session's token and keys outlive the principal
   until a command refreshes the token, and the pass asserts only the
   manifest it read. The fork adds one step before `destroy_account_blobs`,
-  and it fences first: it writes field 152 as a **destroying marker**
-  that carries the inventory of the manifest it replaces (G12),
-  asserting the previous bytes (or `None` when the account has no
-  manifest), so that every in-flight pass, and a rebuild asserting
-  `None`, loses its assertion from then on, and a loader that reads the
-  marker treats it as "no map"; then it unlinks, from the marker's
-  inventory, every thread blob and every content blob the chain from
-  its head reaches, so a destroy that dies after the marker retries from
-  the marker with nothing lost. If the manifest was missing or did not
-  parse, a resumed marker has an empty inventory, or the chain cannot
-  be traversed to its end (R7), the step
-  instead scans the blob-link subspace for this account's `Document`
-  links on `Collection::Principal` document 0 and clears each in chunks
-  (F23: a walk of the link keys with the account, collection and
-  document in their suffix, shaped like the purge's shard iteration,
-  `crates/store/src/write/blob.rs:159-287`, and not `user_blob_hashes`,
-  which returns hashes without their links; the keys are hash-first, so
-  the walk reads every link of every account once, a cost stated here
-  and paid only on this path). An empty resumed inventory takes this scan
-  because the marker has no bit distinguishing a truly empty index from a
-  missing or unreadable manifest. Every unlink chunk asserts the same marker
-  bytes captured by this attempt before clearing links; a stale attempt whose
-  marker has moved cannot remove links found by a delayed scan. An assertion
-  failure stops the attempt; it does not refresh the marker for the old scan. The range delete then removes the marker.
-  A batch that *creates* a manifest where none exists (a rebuild's first
-  batch, `AssertValue::None`) also asserts the vault record's presence
-  (field 150, `AssertValue::Hash`), since the range delete takes marker
-  and vault record together and a pass admitted before the destroy
-  could otherwise recreate the manifest after it (R19, second form).
-  Blobs a failed pass staged hold only expiring links (4.2) and need no
-  step. The scan is the ordinary path for one class of account (F23): a
-  key account provisioned before this release that never ran a keyed
-  request afterwards has no manifest, and its destroy takes the scan,
-  finding nothing. The za suite's
-  `assert_is_empty` exempts field 152 and the index's blobs while their
-  account exists, as it exempts fields 150 and 151, and the suite's
-  destroy-then-purge-then-assert order verifies that nothing remains.
+  and normally fences first: it writes field 152 as a **destroying marker**
+  that carries the inventory of the manifest it replaces (G12), asserting the
+  previous bytes. If field 152 is absent, permanent destroy reads field 150
+  raw: when present, the marker batch asserts both field-152 absence and the
+  exact raw vault hash. Assertion loss re-reads under the bounded retry policy;
+  an unreadable vault is present, not absent. Thus an admitted destroy cannot
+  create this marker after a peer removed the vault it read. A loader reads
+  the marker as "no map"; in-flight passes asserting the old manifest and
+  rebuilds asserting absence lose. The step unlinks every thread blob and every
+  content blob reachable from the marker's inventory, so a retry retains that
+  inventory after an interrupted attempt.
+
+  **Double absence (P2-DUPLICATE).** If permanent destroy reads both fields
+  absent, it writes no marker. It still scans exact Principal/document-0 blob
+  links, and every nonempty unlink chunk atomically asserts absence of BOTH
+  field 150 and field 152. Appearance of either field stops that attempt; it
+  must not refresh assertions and continue the old scan. Empty input emits no
+  batch. This covers ordinary/damaged accounts and a stale worker whose peer
+  completed the Property range delete. Otherwise the stale worker could create
+  an empty marker, then fail after its task row had already been removed, with
+  no persisted retry left to clean the marker. This exception applies only to
+  permanent destroy; reset retains all live-Account and marker guards below.
+
+  If a manifest is missing or unreadable, a resumed marker has empty inventory,
+  or the content chain cannot be traversed to its end (R7), the step scans the
+  blob-link subspace for this account's `Document` links on
+  `Collection::Principal` document 0 and clears each in chunks. The walk uses
+  the account, collection and document suffix and purge's shard iteration
+  (`crates/store/src/write/blob.rs`), not `user_blob_hashes`, which returns
+  hashes without their links. Hash-first keys require reading every account's
+  links once on this path (F23). Empty resumed inventory scans because the
+  marker cannot distinguish an empty index from a missing/unreadable manifest.
+  Outside double absence, every unlink chunk asserts the same marker bytes
+  captured by this attempt. Assertion loss stops the attempt, without refreshing
+  the marker for an old scan. The Property range delete removes the marker.
+
+  A batch that *creates* an index manifest from absence also asserts the exact
+  vault record hash (field 150): the range delete removes marker and vault
+  together, so a creator admitted against the removed vault cannot recreate the
+  index afterwards (R19). Setup uses its read PendingSetup vault in that same
+  atomic batch; existing passes assert their old manifest. These are the creator
+  contracts on which the double-absence path relies. Its absence assertions
+  protect its own unlink chunks, not a permanent fence after the final chunk.
+  Field-150 absence is not a universal account-lifetime predicate: existing
+  initial setup-token issuance can write a pending vault from absence and fail
+  its later registry update after deletion. This change does not redesign that
+  path or claim general resurrection safety across arbitrary stale vault writers
+  and future rebuilds. Permanent destroy runs only after the Account Item is
+  absent; reset requires it present. Blobs a failed pass staged have expiring
+  holds and need no step. A pre-release key account with no manifest takes the
+  raw-vault-guarded marker and scan path, normally finding nothing. The za
+  suite exempts field 152 and index blobs only while their account exists, and
+  destroy-then-purge-then-assert verifies the normal cleanup outcome and the
+  specified stale-destroy cases.
 - **Reindex reset** (P1-RESET). For a key account the operator's reindex
   performs the same marker and unlink steps, then clears field 152 so the next
   keyed request rebuilds. Every reset mutation batch asserts the live Account
@@ -3043,16 +3067,16 @@ Added:
 54. Traces of the index carry account and document ids, counts, change
     ids, revisions and reason classes, never a term, header, Message-ID,
     sort key, query string or thread membership.
-55. Destroying a key account fences first, with the destroying marker in
-    the manifest carrying the replaced manifest's inventory, then
-    unlinks every blob that inventory names or its chain reaches, or
-    every principal-linked blob of the account when the manifest cannot
-    be read or the chain cannot be walked to its end, before the
-    Property range is removed; a batch that creates a manifest asserts
-    the vault record's presence; every unlink chunk asserts the marker;
-    every reset mutation batch asserts the live Account registry Item;
-    an empty resumed inventory scans; and the blob purge then holds nothing
-    of the index.
+55. Destroy uses the inventory-carrying marker before unlinking, or scans
+    after missing/unreadable inventory, a broken chain, or an empty resumed
+    marker. Each unlink chunk asserts its captured marker. The sole permanent-
+    destroy exception is absent fields 150 AND 152: write no marker, still scan,
+    and assert both absent in every nonempty unlink chunk. With only field 152
+    absent, marker creation also asserts the exact raw vault hash. Assertion
+    loss stops a captured unlink attempt. Every reset mutation asserts the live
+    Account Item. Index manifest creation asserts its read vault hash. The
+    Property range removes the marker, and purge holds no index blobs, within
+    the search creator contract and stale-vault-writer limit in 5.7.
 56. A deleted message's identity is retained, sealed, with its deletion
     change id, and an alias with its revision, until that change id
     leaves the shorter of the Email and Thread logs; a rebuild that
