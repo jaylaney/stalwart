@@ -540,3 +540,221 @@ are unchanged (this section is the only edit). Tasks the diff did not touch (1, 
 19) were not re-read beyond the lines the findings cite; the Codex findings' closures were not
 re-verified. FS1's likelihood (the marker landing on a partially consumed record) was reasoned
 from `truncate_change_log`'s placement and the purge cadence, not measured.
+
+## Scoped re-review of plan revision 4 (794915249)
+
+Date: 2026-11-07. Plan commit: `794915249` (branch `za-search-design`), revision 4, answering
+FS1 to FS10 above. Spec: revision 19, unchanged. Scope: the ten corrections, the interfaces
+they renamed or added, and what the revision-4 diff touched (`git diff b536b87aa 794915249` on
+the plan, every hunk); the Codex findings and the two earlier Fable sections stand.
+
+**Verdict: APPROVE.** FS1 is closed: the `<=` resume rule and the bound-based second-truncation
+test terminate on a marker that lands on a partial `indexed_to` and restart once on a genuine
+second truncation (traced below). FS2 to FS10 are closed as stated. No P1 remains. Two P2s:
+FS8's narrowed `Thread/changes` rule contradicts a Task 13 unit test the diff did not update,
+which now fails on correct code (FT1); and the `Staging` steps FS2 added have no production path,
+since `plan_pass`'s signature carries no content-cursor items, gap items or stamp, and `admit`
+has no content-only mode (FT2, which predates revision 4 and is exposed by it). The rest is
+wording and interface bookkeeping.
+
+Counts: 0 P1, 2 P2, 7 P3 (9 findings). FT2, FT4 and part of FT6 predate revision 4.
+
+### Per-finding assessment of revision 4 (FS1 to FS10)
+
+| Finding | Closed as stated? | New defect introduced? |
+|---|---|---|
+| FS1 (resume at the marker's record; second truncation by the bound) | Yes. Traced the P1 input: `indexed_to = (c, p, false)`, the purge puts the marker on `c` (`transaction.rs:196-248`: the empty value lands on the `max_entries + 1`-th newest key). The pass's inclusive read from `c` meets it, `truncated && resumed_record_lost`, `za_search_reconcile_start(bound = c)`. Next pass: step 1 reads from `None`, meets the marker (`truncated`, `first_retained = c`), `bound_now = c == marker.bound` → not a second truncation; `retained_from = None` since `c <= c`; the record loop sees only records above `c` (`partial` is false for each, since none has change id `c`), consumes them, `indexed_to` moves past `c`; the following pass has `retained_from = Some(indexed_to)`, its exclusive read never meets the marker, and the marker clears by step 5 once the checkpoint reaches the cache's counter. Record `c`'s unfinished inserts are gap items (in the cache, not in the index, in no retained record), stamped `bound − 1`. A genuine second truncation whose marker lands on a partial `indexed_to` during the reconciliation: the step-1 read reports `bound_now > marker.bound` → one restart with the new bound and `gap_next = 0`; the next pass has `bound_now == marker.bound`, `retained_from = None` by `<=`, and consumes on. The complete case `(40, 0, true) → None` is unreachable while a marker is set (the probe and the exclusive read both pass a complete `indexed_to` at the marker's key) and harmless when hit (reading from `None` and from `40` exclusive yield the same records). | None in construction. FT5 (P3): a bound move that lost nothing (the marker rose but stayed at or below `indexed_to`) also restarts, re-opening skipped gap inserts below the old `gap_next` once. FT6 (P3): `za_retained_bound` and `second_truncation` are not in Task 14's interface lists, and the attribution read's `max_records` is unstated. |
+| FS2 (one step per completion; three arms) | Yes. `Staging.{cursor, content_cursor: CursorStep, marker: MarkerStep}`, `bookkeeping` derived, `write_pass` applies each arm from its own step only. Traced both cursors pending: a pass with the rebuild cursor `Advanced` leaves `content_cursor = None` (the content block is gated on the rebuild cursor being `None` or exhausted this pass), so the content arm does nothing; the pass that exhausts the rebuild cursor clears it alone; the content cursor's `Exhausted` sets `content_to.cursor = None` and `content_to.checkpoint = new.indexed_to` (already `staging.checkpoint` by the first line) and the Behind rule stays quiet afterwards. Traced the marker and a content cursor pending: the content block runs first (rebuild cursor `None`), the marker stays `Untouched`, and gap items follow once the content cursor is `None`; a `GapNext` is produced only while the base manifest carries a marker, so the `expect` cannot fire, and a stale base loses its assertion before the write. | FT2 (P2, pre-existing): nothing in `plan_pass`'s signature delivers the content-cursor items, the gap inserts, the gap deletes or the stamp that produce `content_cursor` and `marker`. FT8 (P3): Task 8's "return without reading records" after the cursor block against Task 14's content block running in the pass that exhausted the rebuild cursor. |
+| FS3 (attribution over every retained record) | Yes. Step 1 reads every retained record; `difference_attributes_over_every_retained_record` (`indexed_to = (49, 0, true)`, `first_retained = 45`, 48 skipped) gives `gap_inserts == []` and `retained_from == Some((49, 0, true))`; `case_pl6` traced to exactly two `ZA_SEARCH_SKIPPED` (35 in the gap passes, 48 in the first retained pass; pass F's `inserted_in_log = {46..50}` keeps 48 out). The header's FR2 line and the case-map row are rewritten. | None. |
+| FS4 (probe on a cursor pass) | Yes. Traced `case_f9_truncation_during_a_pending_rebuild` with `Some(1)`: after the loss, the first keyed request's hook starts the rebuild (`indexed_to = L`, the cache's counter; the boundary batch takes `L + 1`) and re-enters the pass once, which indexes 48 cursor items and writes its witness at `L + 2`; the Thread log has the same two keys. `truncate_change_log(.., 1)` on each log: the descending iteration stops at the second-newest key, `L + 1`, writes the marker there and deletes below; `za_retained_bound = max(L + 1, L + 1) = L + 1 > L` → the next keyed request's probe calls `za_search_reconcile_start` (cursor `None`, marker `{L + 1, 0}`) and returns `Recovery(Truncated)`; the assertion `cursor == None && reconciliation.is_some()` holds with the epoch unchanged. The re-entered pass then has 52 gap inserts (the cache minus the 48 indexed minus `inserted_in_log = {}`, since `L + 2` is update-only), admits 48 under the cap with `created = L`, `GapNext(97)`; the pass after admits the last four and consumes `L + 2 ..` from `None` (`L <= L + 1`), and the marker clears when the checkpoint reaches the counter. With `Some(5)` the marker lands below `L` and the probe is silent, as the case says. The probe's `bound == indexed_to.change_id && !complete` arm matches the spec's "a record `c` found replaced by the truncation marker" and the `> ` arm the lost records; a stale cache (up to 5 s) that puts `indexed_to` below a fresh marker starts a reconciliation that is needed (the lost records' messages are in neither the cursor's snapshot nor the retained log). | FT3 (P3): the pass and Task 9's `Recovery(Truncated)` arm both call `za_search_reconcile_start`. FT9 (P3): the case rests on the re-entered cursor pass publishing its witness, so that two keys sit above `indexed_to`; say so. |
+| FS5 (`CursorStep::None`; the block gated on a pending cursor; an abort moves nothing) | Yes. The cursor block runs only when `base.manifest.cursor.is_some()`; `update_only` asserts `None && !bookkeeping` on the shared base; `cursor_only` and `s_empty` carry a base with the cursor; an `Abort` leaves all three steps and `bookkeeping` at their defaults, and `write_pass`'s `None` arm keeps the manifest's cursor, so the discarded items are re-admitted from `next` and the failing one is skipped at `skip_after`. | None. |
+| FS6 (content loss inside the wait) | Yes. Traced `case_h23` with `absent_retry_secs: 0`: the keyed `Email/get` loads the thread part, its pass consumes the last witness record (update-only, `Nothing`, `scanned_to` moves); the text query's `ensure_current` finds the index current, `za_search_load_content` meets the absent head, `absence_class(.., 0)` is `Loss(BlobAbsent)` at once, `za_search_content_rebuild_start(ContentLoss(BlobAbsent))` writes `content = None`, `content_to = {(0, 0, true), false, Some(u32::MAX)}` (the chain walk breaks at the missing head and takes the scan minus the thread blobs), `continue`; the next pass sees the moved hash, `plan_reload` is an `Append` with no thread entry (content not loaded, nothing to walk), the content block admits every present document (none has a content record in a `None` chain), `ContentOnly` passes until `Exhausted` sets `content_to.cursor = None` and `checkpoint = indexed_to`; `is_current` then holds, `load_content` walks the new chain, `Ok(entry)`. `content_recovered` makes a second `Loss` return `Rebuilding`. No guard is held across the rebuild start or the load (`is_current`'s and the OverCap read's guards are statement temporaries). `continue` skips the bottom deadline check once; the next iteration's check bounds it. | None. FT4 (P3, pre-existing): the Produces sentence says `ensure_current` calls `za_search_content_needs_rebuild` before loading content, and the rewritten sketch does not. |
+| FS7 (step 5 against `staging.checkpoint`) | Yes; the FS1 and FS4 traces above clear the marker through it on an idle account. | None. |
+| FS8 (D13's citations; `State::from(Option)`; the member-set rule) | Yes. D13 names 6.2's I5, 6.3's sentence and the revision-16 summary line (spec lines 41-64); `State::from((s != 0).then_some(s))` matches `crates/jmap-proto/src/types/state.rs:33-40`; Task 11's Files and Consumes lines describe the view's counter. The member-set rule traced against `case_merge_rendering_parity`'s new step: a flag-only `UpdateItem` of `U` at `s + 1` makes `U` a candidate with `T0 == T1` and `members_of(T, s) == members_of(T, s + 1)` → nothing, while the plain control's Thread log holds no record for the flag change → both empty; `Email/changes` keeps `Updated(T|U)` on both. Against R25's pinned page: a deleted last member (some at `S`, none at `E`) and a merge (sets differ) still classify as before, and a pinned `E` still counts a member deleted in `later`. Residual, same class as R14: a member created and deleted within the range leaves the sets equal, so the fork renders nothing where upstream's folded Thread container records may say `Updated`; no client-visible difference in members. | FT1 (P2): the Task 13 unit test `thread_members_at_a_pinned_end_count_a_member_deleted_after_it` still asserts `[Updated(3)]` for a range whose only record is a flag-only `UpdateItem` with equal member sets. |
+| FS9 (the clone's charge in step 5) | Yes: `let _clone_charge = self.inner.cache.za_search.charge(PartKind::Thread, base.thread.loaded_bytes() as u64)` before `plan_pass`, a named binding that lives past `write_pass`; `charge` is Task 6's and H8 holds. | None. |
+| FS10 (both thread tables) | Yes at the three sites (Task 3's interface and step 4, compaction step 7). | FT7 (P3): Task 3 step 4's storage list still declares `threads` and `buckets` only, so "`threads` and `members`" names a field the sketch lacks. |
+
+### New findings
+
+#### FT1 — P2 — `thread_members_at_a_pinned_end_count_a_member_deleted_after_it` fails under FS8's rule (Task 13)
+
+Confidence: high. Plan lines 2742 (the rule: "some at both and the sets equal → nothing") and
+2790 (the test: "T=3 members {3, 7} at both S=19 and E=20 (created before 19); 7 deleted at 25
+(in `later`); za_thread_stream S=19 E=20 with an UpdateItem of 7 in range: [Updated(3)]").
+
+The fixture's only record in `(19, 20]` is a flag-only `UpdateItem` of 7. Existence of 7 at
+`S = 19`: no insert or delete in range, `later` holds a delete, the index holds it with
+`created < 19` → present; at `E = 20`: no delete in range, `E` pinned, `later` holds the delete at
+25 → present. `members_of(3, 19) == members_of(3, 20) == [3, 7]`: the sets are equal, so revision
+4's rule yields `[]`, and the assertion `[Updated(3)]` fails on the prescribed construction. The
+revision-4 diff changed the rule and left the test as revision 1 wrote it. The second assertion,
+`members_of(3, 20) == [3, 7]`, is R25's claim and still holds.
+
+Correction: give the range a membership change and keep the pinned-end claim: 7 inserted at 20
+(`InsertItem(7)` in range, its record created at 20 with a revision whose row is at 20), so
+`members_of(3, 19) == [3]`, `members_of(3, 20) == [3, 7]`, `za_thread_stream == [Updated(3)]`,
+and `members_of(3, 20) == [3, 7]` though 7 is deleted at 25 in `later`; or keep the fixture and
+assert `[]` with a comment citing FS8. Add the FS8 variant to the case-map row.
+
+#### FT2 — P2 — `Staging.content_cursor` and `Staging.marker` have no production path through `plan_pass` (Tasks 8 and 14; predates revision 4)
+
+Confidence: medium (an executor can invent the missing parameters, but the plan is silent on
+them and `admit`'s one mode is wrong for content items). Plan lines 2004-2005 (`Staging`,
+`plan_pass(base, cursor_items, records, limits, started, opener)`), 2146 (step 3: `admit` always
+calls `staged.assign` and pushes a record; `content_cursor` and `marker` "are Task 14's, `None`
+and `Untouched` until it sets them"), 2866 (Task 14 modifies `pass.rs` for "the content cursor's
+and the marker's steps"), 2886 ("the pass admits them under the same cap, opening each and
+staging a content record only (no thread assignment, no alias)"), 2890 (gap inserts "opened and
+indexed as an insert with `created = bound − 1`", gap deletes "tombstoned with `deleted = bound −
+1`"), 2899 ("the item source is `cursor_items`, then `content_cursor_items`, then the
+difference's gap items, then the log").
+
+`plan_pass` receives one `Vec<u32>` and the records. Nothing in its signature carries the
+content-cursor list (whose items must be opened and yield `content.push` only, no `assign`, no
+record, no alias, no `witness`), the gap inserts (admitted with `created = bound − 1`, a value
+`plan_pass` cannot derive from `base`), the gap deletes (tombstoned with `deleted = bound − 1`,
+outside any record) or the marker's `gap_next` to produce `GapNext(id + 1)`. Revision 3 had the
+same gap; FS2's new fields make it concrete, since the fields now exist and no text says how
+they are set. Counterexample of the wrong-mode risk: an executor who feeds content-cursor items
+through `cursor_items` has `admit` assign each a record at `revision + 1` for a document the
+part already holds, the decision becomes `Publishing`, and the pass writes a thread blob and a
+witness entry for a content-only step, which 5.4 forbids ("no thread blob, no revision, no log
+entry").
+
+Correction: in Task 8's Produces, replace `cursor_items: Vec<u32>` with a sources struct that
+Task 14 fills, for example `pub(crate) struct PassSources { pub cursor: Vec<u32>, pub content:
+Vec<u32>, pub gap_inserts: Vec<u32>, pub gap_deletes: Vec<u32>, pub gap_stamp: Option<u64> /*
+bound − 1 while a marker is set */ }` (Task 8 passes empty content and gap lists), add an
+`admit_content(d)` beside `admit` (open, `content.push((d, c))`, `items += 1`, `reserved`,
+`bytes`; a `Loss` counts as skipped and still advances the cursor; a `Transient` aborts as
+`admit` does), and state in Task 14 step 4 which source sets which step: the content loop sets
+`content_cursor`, the gap-insert loop sets `marker = GapNext(id + 1)` after each item, the gap
+deletes call `staged.tombstone(d, stamp)`, and step 5 sets `marker = Finished`.
+
+#### FT3 — P3 — Two starters for one reconciliation (Tasks 9 and 14)
+
+Confidence: medium-high. Plan lines 2887 ("the pass writes a manifest-only checkpoint with
+`reconciliation = Some(..)`"), 2899 ("`truncated || resumed_record_lost` →
+`za_search_reconcile_start` and return `Recovery(Truncated)`"; the probe: "→
+`za_search_reconcile_start` ... and return `Recovery(Truncated)`"; and "In Task 9's
+`za_search_pass_hook` and `za_search_ensure_current`, the `Ok(Recovery(cause))` arm calls ...
+`za_search_reconcile_start` for `Truncated`, then re-enters the pass once"), 2265 (Task 9's arm).
+
+Read together, the pass writes the marker and returns `Recovery(Truncated)`, and the hook writes
+it again before re-entering: two manifest writes, the second re-reading the bound and resetting
+`gap_next` to 0, harmless on a fresh start but a redundant write and hash move on every start
+and on every FS1 restart. Revision 4 made the pass's return value explicit, which makes the
+duplication explicit. Correction: one starter. The pass starts it (it has the bound and, for the
+probe, the cursor in hand) and `Recovery(Truncated)` means "started, re-enter"; Task 9's
+`Truncated` arm only re-enters. Or the pass returns without starting and the hook starts it with
+`za_retained_bound`; the former keeps the probe's clearing of the cursor in one write.
+
+#### FT4 — P3 — `za_search_content_needs_rebuild` has a named caller that does not call it (Tasks 9 and 14; predates revision 4)
+
+Confidence: medium. Plan lines 2871 ("Task 9's `za_search_ensure_current` calls it before
+loading content"), 2267 (the rewritten sketch: OverCap check, then `za_search_load_content`,
+no call), 2886 (`CapRaised` and `Behind`), 2909 (`case_f6_r23`: "clear the override,
+`simulate_restart`, one keyed request starts the content-only rebuild").
+
+`is_current` is false while `content_to.suspended` or `content_to.checkpoint != indexed_to`, so
+without the call the wait spins to `NotCurrent` and nothing starts the `CapRaised` or `Behind`
+rebuild; `case_f6_r23` expects "one keyed request" (not a content request) to start it, which
+points at the pass hook rather than the wait. Revision 4 rewrote the `ensure_current` line in
+full and kept the Produces sentence. Correction: name the site in Task 14 step 4. The pass
+(`za_search_pass` step 0, after the shortcut is refused and the manifest read): `if let Some(r)
+= za_search_content_needs_rebuild(&base.manifest, &config) { self.za_search_content_rebuild_start
+(account_id, keys, r).await?; return Ok(Advanced { published: false, indexed_to }) }`, which
+serves both the case and the wait (the next loop iteration runs the content cursor); and drop
+or correct the Produces sentence.
+
+#### FT5 — P3 — A bound move that lost nothing restarts the reconciliation (Task 14)
+
+Confidence: medium. Plan line 2891 ("when a read reports `truncated` and the log's bound now
+read ... is above `marker.bound`, the pass restarts").
+
+The step-1 read from `None` always reports `truncated`, so every pass compares bounds. A purge
+during the reconciliation that moves the marker up but not past `indexed_to` (the records
+between were consumed) restarts with `gap_next = 0`, and every gap insert skipped as loss below
+the old `gap_next` is re-opened once (PL6's cost, bounded, no suite case counts skips across a
+second truncation). Not wrong; one pass and one open per skipped item more than needed.
+Correction, optional: restart only when the move lost records, `bound_now > indexed_to.change_id
+|| (bound_now == indexed_to.change_id && !indexed_to.complete)` (the probe's test), and otherwise
+rewrite `marker.bound = bound_now` in the pass's manifest so the comparison is quiet next pass
+(later stamps then use the new bound, which is still below every servable state).
+
+#### FT6 — P3 — Interface bookkeeping around FS1 and FS4 (Task 14)
+
+Plan lines 2870-2871 (Consumes and Produces), 2888 (step 1), 2896 (`second_truncation`), 2899.
+`Server::za_retained_bound` is Task 13's and is consumed by the probe and by rule 4, but is
+absent from Task 14's Consumes (`Store::za_log_first_retained` is listed instead); `pub(crate)
+fn second_truncation(marker_bound: u64, bound_now: u64) -> bool` appears only in the unit test's
+description, not in Produces; and step 1's attribution read ("every retained record, read once
+per pass") names no `max_records`, while Task 8's read passes `config.checkpoint.max(pass_cap +
+1)`. A capped attribution read would turn a retained insert above the cap into a gap insert
+stamped `bound − 1`, which a client at a state between the record and `E` would never be shown
+as created. Say `max_records: usize::MAX` (the retained log is at most `maxChangesHistory`
+records), add the two names to the lists.
+
+#### FT7 — P3 — Task 3 step 4's storage sketch lacks the `members` table (Task 3)
+
+Plan lines 1113-1117 (storage: `records`, `aliases`, `rows`, `threads`, `buckets`) and 1131
+("rebuilds both thread tables (`threads` and `members`, FS10)"). The interface at line 988 and
+`loaded_bytes` already count two tables; the sketch declares one. Add `members: AHashMap<u32,
+Vec<u32>>` (every record, present or tombstoned, by `current_thread`, ascending) to the storage
+list, and say that `assign` inserts into both and `tombstone` removes from `threads` only.
+
+#### FT8 — P3 — The cursor block's `return` against the content block's "or was exhausted this pass" (Tasks 8 and 14)
+
+Plan lines 2146 (Task 8 step 3: after the cursor loop, "return without reading records") and
+2886 (Task 14: the content block "runs only while `base.manifest.content_to.cursor.is_some()` and
+the rebuild cursor is `None` or was exhausted this pass"). Read literally, Task 8's `return`
+precedes any content block Task 14 adds after it, so "was exhausted this pass" cannot happen;
+Task 8's own rule ("no log record in a pass that worked cursor items") is about records, not
+content items. Say in Task 8 that the cursor block returns "before the record loop, after the
+sources Task 14 adds", or drop "or was exhausted this pass" and let the content cursor wait one
+pass.
+
+#### FT9 — P3 — `case_f9_truncation_during_a_pending_rebuild` rests on an unstated key count (Task 14)
+
+Plan line 2912. The `Some(1)` fixture works because exactly two Email keys sit above
+`indexed_to = L` after the first keyed request: the boundary at `L + 1` and the re-entered
+cursor pass's witness at `L + 2`, so the second-newest key is `L + 1`. If the hook did not
+re-enter, or the re-entered pass were not publishing, the marker would land on `L` itself
+(complete) and the probe would be silent. Say so in the case and assert it before truncating
+(`read_manifest(..).thread_blobs.len() == 1` and `cursor == Some(..)` after the first keyed
+request, or `log_records_since(.., L).len() == 2`).
+
+### Method and limits
+
+A reading review of the revision-4 diff (`git diff b536b87aa 794915249` on the plan, all 253
+lines, every hunk), of the tasks the hunks touch in full where the hunk's rule depends on them
+(Tasks 3, 6, 7, 8, 9, 11, 13, 14, 15, the header, the plan calls and the case map), and of the
+spec passages the corrections rest on (4.2's manifest fields, 5.1's checkpoints and error
+classes, 5.4, 6.3, 7.5). The five traces the brief asked for were walked by hand against the
+plan's own rules: FS1 on a marker landing on a partial `indexed_to` and on a genuine second
+truncation; FS2's three arms with a rebuild cursor and a content cursor pending and with a
+marker and a content cursor pending; FS4's probe on `case_f9_truncation_during_a_pending_rebuild`
+with `Some(1)` and `Some(5)`; FS6's re-entry on `case_h23`; FS8's rule on
+`case_merge_rendering_parity`'s flag step, on R25's pinned page and on Task 13's unit tests.
+Source checked where a closure rested on it: `crates/common/src/storage/transaction.rs:116-248`
+(`delete_changes` truncates each sync collection to `max_entries`; `truncate_change_log` places
+the empty value on the `max_entries + 1`-th newest key and deletes below), `crates/store/src/
+query/log.rs:117-184, 308-333` (the exclusive skip of the from-key before the empty-value check,
+so a complete `indexed_to` at the marker's key never reports `truncated`),
+`crates/jmap-proto/src/types/state.rs:15-95` (`From<Option<ChangeId>>` only),
+`crates/services/src/task_manager/tasks/maintenance.rs:425-435` and
+`crates/email/src/message/delete.rs:155-180` (the purge task's `purge_account` calls
+`delete_changes`), `tests/src/system/purge.rs:35-50, 140-155` (`max_changes_history: Some(1)`
+through `DataRetention`). The Thread-log bound was reasoned, not measured: every Thread log key
+of a key account is also an Email log key (the stub ingest's container insert, the emptied-thread
+delete and the witness's property change share their batch's change id with an Email item
+record), so after a purge at one `max_entries` the Thread marker is at or below the Email marker
+and `za_retained_bound` is the Email marker; the FS4 trace depends on that.
+
+Not done: no build, test or runtime probe; no subagents; the plan, the spec and every other file
+are unchanged (this section is the only edit). Tasks the diff did not touch (1, 2, 4, 5, 10, 12,
+16 to 19) were not re-read beyond the lines the findings cite; the Codex findings' and FR1 to
+FR14's closures were not re-verified beyond what the FS traces exercised. Task 7's
+`first_retained` sketch (set on every key read, against its doc comment and test, which say the
+marker's key only) was noted as a pre-existing ambiguity outside this scope; FS1's rule reads it
+from a from-`None` read, whose first key is the marker whenever one exists.
