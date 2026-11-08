@@ -1685,3 +1685,365 @@ with a manifest whose `content` is `None`; FW6 on the source-order sentence read
 cost on a whole-chain load taking seconds at the default cap, not measured. The closures of FU1
 to FU13, FS1 to FS10, FR1 to FR14, FT1 to FT9 and the Codex findings were not re-verified beyond
 what these traces exercised.
+
+## Scoped re-review of plan revision 11 (c6a032796), Opus
+
+Date: 2026-11-08. Plan commit: `c6a032796` (branch `za-search-design`), revision 11. Spec:
+revision 20. Scope: the text `git diff 5a24dcbac c6a032796` changes in the plan (every hunk),
+the closure of FW1 to FW14, the traces the brief named ((a) to (f)), the names revision 11
+introduced or changed and their consumers, and collateral damage in text the diff did not mean to
+change. The Codex rounds and the six earlier sections stand and were not reopened.
+
+**Verdict: APPROVE** under the stopping rule. No P1 remains. The pass no longer loads the content
+part. A content block it cannot run is skipped without aborting, so records, cursors and gap items
+are worked on every node. The content wait loads the part and refuses `OverCap` at once. Rule 5
+and the bound move are decided inside `plan_pass`. FW1, FW2 and FW4 to FW7 are closed on every
+trace the brief named. Four P2s remain, and three of them should be fixed before execution:
+- FX1: FW3's reload drop sits in the `Whole` clause, but FW3's counterexample reloads as `Append`,
+  so the durable hole can come back.
+- FX2: neither FS6 re-entry refreshes the loaded index after it starts the content-only rebuild.
+  The re-entered loop reads the old manifest, and `case_h23` fails at its first text query. The
+  original arm has had this since revision 4. The fourth section's trace missed that the
+  shortcut answers before the manifest is read.
+- FX3: a content load that races a pass's swap leaves the part one head behind. The swap then
+  prepends the new head, so the part passes FW3's currency test. The result is a spin at the
+  loop-top load, or duplicate content records, or a search answered without a committed message.
+  The root predates revision 11. Revision 11 makes the currency test, and the new load, depend on
+  it. If adjudication reads Task 6 as walking the chain outside the lock (the natural reading),
+  FX3's effect on 7.4 is a correctness defect.
+
+The fourth P2 is a test: FX4, `case_f6_r23`'s `segments: 255` is dropped with the guard before
+the backfill it was added for. Ten P3s.
+
+Counts: 0 P1, 4 P2, 10 P3 (14 findings).
+
+### Assessment of the revision 11 changes
+
+| Change | Assessment | Findings |
+|---|---|---|
+| FW1, FW2, FW7, FW12, Tasks 8 and 14 (header 70, E10 187; `PassSources` 2096; step 3 2276; step 5's 0 and 1, 2284-2285; Task 14 3027, 3040). The pass never loads the content part. `content_runnable` gates the block, and the items are computed under the base guard. | Closed. Trace (a), the cursor pending and the part not resident: `content_cursor_items` answers `None` and the block is skipped. Under the cap nothing is suspended. Over the cap FU6 writes its one transition. The gap blocks and the records run, and on an idle account the pass decides `Nothing`, so nothing is written per request. FW1's counterexample: after the restart, a new delivery is indexed without content and a text search refuses `OverCap` at once. FW2: no non-content request loads the part. Steps 0 and 1 take no `index.write()` and hold no guard across an await. | FX5, FX9, FX12 |
+| FW2, FW4, FW11, Task 9 (2397). The load at the head of the loop, the condition `size > cap \|\| (suspended && size >= cap)`, and `OverCap → OverCap` in `map_load`. | FW4 and FW11 closed. Trace (d): the just-crossed unsuspended account is refused, suspended accounts at and over the cap are refused, a suspended account under the cap is served after its `CapRaised` backfill within the wait, and an ordinary under-cap account is not refused. Trace (b) of the new load: a cold node (one iteration on the pre-start loaded manifest, then the load, then the backfill passes), `OverCap`, `Budget`, a head that moves (the pass's `Append` reload extends the loaded part), and a swap that drops the part (reloaded at the next iteration, with progress every round). No guard is held across an await. However, its FS6 arm re-enters onto a stale loaded manifest, as the original arm does, and it relies on a loader contract that Task 6 does not state. | FX2, FX3, FX6, FX7, FX8 |
+| FW3, FW13, Tasks 6 and 14 (1751, 3012, 3037) | `content_cursor_items` keyed on the manifest: closed, and the four unit rows pin it. The reload's drop of a stale part: not closed (FX1). The currency test `segments.first() == head.segment` can be defeated by the swap's unconditional prepend (FX3). | FX1, FX3, FX14 |
+| FW5, Tasks 8 and 14 (2096, 2253, 2276, 3032-3033) | Closed. Trace (e): a bound-move-only pass decides `ManifestOnly` through `marker_bound`. A finish-only pass decides `ManifestOnly` through `bookkeeping`. A pass with both is `s3`. A pass whose gap lists were non-empty but exhausted this pass finishes on the next pass, since rule 5 reads the input lists. An `Abort` returns before rule 5. | FX10 |
+| FW6, Task 8 (2276, 2240-2241) | Closed. "Did not run this pass" releases the gap blocks and the records behind a skipped content block, and `s_over_gap` pins it. | — |
+| FW8, FW10, Task 14 (3048, 3050) | FW8 (a) and (c) closed. The count from the suspending pass matches the trace (three opens with two further deliveries), and the start runs on a `Mailbox/get`. FW8 (b) not closed (FX4). FW10's assertions are present (the 2 s timeouts, the unlinked chain). `case_h23` fails before its new assertion matters (FX2). | FX2, FX4 |
+| FW9, Task 8 (2098, 2256, 2280-2281) | Closed. The helper and fixture are named, step 6 factors the arms, and "14 passed, then 1 passed" matches the fifteen tests. | FX11 |
+| FW14, Tasks 8, 9 and 14 | The wording is fixed and the OverCap read uses `read_loaded()`. The `is_current` argument beside it still passes the raw guard. | FX8 |
+
+### New findings
+
+#### FX1 — P2 — FW3's reload drop sits in the `Whole` clause, but FW3's own counterexample reloads as `Append` (Task 6)
+
+Confidence: high on the placement, medium on the outcome. The outcome depends on what `load_content`
+does with a manifest that names no head, which Task 6 does not say.
+
+Plan lines:
+- 1747-1752: the drop is inside the parenthetical of "`Whole` reloads the thread part and, when
+  content was loaded, the content too (...)", followed by "`Append` extends".
+- 1865-1867, step 4: "The `Append` path ... when content is loaded and the head moved, calls
+  `load_content` with `stop_at = &loaded.content.segments`".
+- 1730-1734: `load_content` walks from the head.
+- 71: the header's general statement, "a reload to a manifest with no head drops the stale part".
+- 2316: the swap's prepend.
+- 3012: `content_cursor_items`.
+
+Counterexample (two nodes):
+1. Node A holds account X's content part: segments `[s3, s2, s1]`, records for documents 1 to 100.
+2. Node B's content request finds `s2` absent past the window and starts `ContentLoss`. The
+   manifest's `content` becomes `None`, `content_to` becomes `{(0, 0, true), false,
+   Some(u32::MAX)}`, and the chain is unlinked.
+3. A's next keyed pass sees the moved hash. `plan_reload` answers `Append { thread: [],
+   content_head_moved: true }`, because the thread segments are unchanged. As Task 6 is written,
+   the drop belongs to `Whole`, and step 4's `Append` sentence asks for a walk from a head that
+   does not exist. An implementer who guards that walk on `manifest.content.is_some()` keeps the
+   stale part.
+4. `content_cursor_items` sees no head on the manifest and lists `[100..=1]`, which is correct.
+   The pass admits 48 (100 to 53) and writes `n1`.
+5. The swap inserts those 48 records into the stale part and prepends `n1`, giving
+   `[n1, s3, s2, s1]`.
+6. A's next pass: `segments.first() == Some(n1)` equals the manifest's head, so the backfill skips
+   every document the stale part holds. The list below 53 is empty and the pass ends `Exhausted`.
+
+The chain now holds 53 to 100, while `content_to` promises content up to `indexed_to` (I7). Every
+node that later loads the chain answers text searches without documents 1 to 52, and no further
+loss can be detected to repair it. If `load_content` instead "replaces whole" on an empty walk,
+the part becomes empty and nothing goes wrong. The plan leaves the choice to the implementer.
+
+Correction:
+- State the drop as a rule of `apply_reload` before its arms: when `manifest.content.is_none()`,
+  `index.content = None` (and its charge), whatever `plan_reload` answers.
+- In step 4, the `Append` path calls `load_content` only when the manifest names a head.
+- Add the load test `fw3_a_reload_to_a_manifest_without_content_drops_the_part`: v1 loaded with
+  content; v2 the same thread blobs with `content: None`. Expect `plan_reload == Append`, and after
+  `apply_reload`, `content.is_none()` and `content_used() == 0`. Step 6 then expects 20 load tests.
+
+#### FX2 — P2 — Both FS6 arms of `za_search_ensure_current` re-enter onto the stale loaded manifest, so a content loss met in the wait is refused instead of rebuilt (Tasks 9 and 14; the original arm predates revision 11)
+
+Confidence: high.
+
+Plan lines:
+- 2397: both arms.
+- 2284: step 0's shortcut reads the loaded state only.
+- 3027 and 3039: `za_search_content_rebuild_start` is "a manifest-only write", and nothing
+  refreshes the loaded index after it.
+- 3012: FS6, "then re-enters its loop once".
+- 3048: `case_h23`, "the first `Email/query` with a text filter waits for the content cursor and
+  succeeds".
+- 2467-2473: Task 10's view calls the wait at its step 1, before its own reload at step 5.
+
+Source: a batch without log entries records no changed collection (`BatchBuilder::changes`,
+`crates/store/src/write/batch.rs:872-882`), so the manifest-only start allocates no Email change id
+and leaves `cache.last_change_id` where it was.
+
+Trace through `case_h23`, original arm, `absent_retry_secs: 0`:
+1. After `simulate_restart`, the keyed `Email/get`'s pass reads the last witness record
+   (update-only, `Nothing`, `scanned_to = last_change_id`).
+2. The text query's pre-method pass takes the shortcut and answers `Current`.
+3. The wait's loop top skips (no content cursor in memory). Its pass answers `Current`.
+   `is_current` holds. `za_search_load_content` walks from the deleted head and gets
+   `Loss(BlobAbsent)`. `content_recovered` is set, the start writes `content = None` and a
+   cursor at `u32::MAX` to the store, and the loop continues.
+4. The loop top reads the same loaded manifest, which has no cursor, and skips.
+5. The pass's shortcut holds again: nothing in memory is pending and the counter has not moved. It
+   answers `Current`. `is_current` holds on the stale manifest, the load walks the stale head again
+   and gets `Loss`, and since `content_recovered` is set, `map_load` answers `Rebuilding`.
+
+The case fails on correct code. Every later text search on the node repeats the sequence. Each one
+rewrites the manifest (the start resets the cursor) and is refused, until a thread-valued view
+(Task 10, step 5) or a delivery makes this node reload. Until then no pass runs the content
+cursor, since every pass takes the shortcut.
+
+The new loop-top arm fails the same way. Its condition needs a content cursor in memory, so a pass
+would refuse the shortcut, but `continue` returns to the loop top before any pass runs. The loop
+top re-reads the stale head and loads the lost chain again, and the answer is `Rebuilding`.
+
+If `za_search_load_content` re-read the store's manifest instead, the second load would succeed
+with an empty part on a `None` head. The view's hash check would then send the request round
+again, so no wrong answer results, but the arm still does not do what FS6 says.
+
+Correction: after `za_search_content_rebuild_start` returns `Ok(())` in either arm, call
+`self.za_search_reload_if_moved(&entry, keys).await.map_err(map_load)?` before `continue`. The
+loaded manifest then names no head and a pending cursor: the loop top skips, the cursor refuses the
+shortcut, and the content block lists every present document. Treat an assertion failure from the
+start as FU12's `Lost` (trace, reload, `continue`), not as `Transient(Store)`. With a stale
+resident part, this depends on FX1.
+
+#### FX3 — P2 — A content load that races a pass's swap leaves the part one head behind, and the swap's prepend then lets it pass FW3's currency test (Tasks 6, 8 and 9; the root predates revision 11)
+
+Confidence: medium-high. Task 6 does not say whether the loader walks outside the lock or
+re-checks the manifest.
+
+Plan lines:
+- 1753-1759: `za_search_load_content` "`load_content` from the head; ... sets `content` under
+  `index.write()`". The content load has no single flight: `load_flight` belongs to the thread load
+  (1741, 1863).
+- 2316: the swap inserts nothing when `index.content` is `None`. When the part is present it
+  prepends the new head whenever `c.segments.first() != Some(&h.segment)`, without checking that
+  the part was current.
+- 3012: `segments.first() == Some(&head.segment)` is the currency test.
+- 2397: the loop-top condition, and the load after `is_current`.
+- 2473: the view's step 7 checks `content.is_none()` and `is_current`, never the head.
+
+Counterexample (one node, account X, chain head `h1`, part not resident):
+1. Content request R1 calls `za_search_load_content`. It reads `h1` and walks the chain, which
+   takes seconds at the design size.
+2. Meanwhile message M1 is delivered. A keyed IMAP `SELECT` (R2) on another connection runs a
+   pass. The pass indexes M1 with content and writes `h2` (predecessor `h1`). Its swap finds
+   `index.content == None`, inserts nothing, and sets the manifest head to `h2`.
+3. R1 installs a part with segments `[h1, ..]`. The part is one head behind and lacks M1.
+
+What follows depends on the loader:
+- If it answers at once whenever `content.is_some()`, R1's loop top sees
+  `segments.first() != h2` on every iteration. It calls the no-op loader, its pass finds the block
+  not runnable and decides `Nothing`, and it sleeps 20 ms until the deadline (`NotCurrent`). Every
+  content request spins this way, without progress, during a pending backfill.
+- Without a backfill, R1's own wait finds `is_current` true after one more pass reads R2's
+  witness. The view finds the hash equal, and the request is answered from a part without M1,
+  although its cache holds M1. Spec 7.4 says a content request is "never answered from an index
+  that is behind the request's view".
+- If M2 then arrives, any keyed pass indexes it with content (`h3`). Its swap inserts M2 into the
+  `h1`-based part and prepends `h3`, so the part passes FW3's test while M1's record is missing. A
+  backfill then re-opens M1 if `M1 < next_below` (a duplicate record in the chain). Otherwise the
+  search misses M1 on this node until the part is evicted.
+
+Correction:
+- Task 6: `za_search_load_content` returns at once only when the resident part's head equals the
+  loaded manifest's head, and otherwise loads and replaces. It walks outside the lock. Under
+  `index.write()` it installs the part only when `index.manifest.content`'s head is the head it
+  walked from. Otherwise it walks again from the new head with `stop_at` set to the segments it
+  holds, and installs once they agree.
+- Task 8: the swap prepends only when `c.segments.first()` equals the base manifest's head, and
+  otherwise sets `index.content = None`.
+- Add a load test in the `g6` pattern: a source whose fetch parks while the test swaps a newer
+  manifest in. Expect the installed part's head to equal the index's manifest head.
+
+#### FX4 — P2 — `case_f6_r23`'s `segments: 255` is dropped with the guard before the backfill it protects (Task 14)
+
+Confidence: high on the text. Whether the case fails depends on the message size, which the case
+does not state: it fails when the pre-suspension chain has 15 or more nodes.
+
+Plan lines:
+- 3050: "`search_config_guard!(account_max_mb: 1, segments: 255)` ... clear the override,
+  `simulate_restart`, one keyed `Mailbox/get` starts ... the first text search ... `content.length`
+  grew by the backfill's blobs only".
+- 2378: the guard restores the prior override on drop.
+- 3085: while a cursor is pending, "while the first `segments` entries are all of one tier `t`,
+  merge them".
+
+Counterexample. Messages whose content records are about 20 KiB cross 1 MiB in about 50 deliveries,
+so phase 1 lays 50 tier-0 nodes under `segments: 255`. "Clear the override" drops the guard, and
+`segments` is 16 again. The backfill's pass stages its blob, finds 51 tier-0 entries young first,
+and merges the youngest 16 into one tier-1 blob, unlinking 15 pre-suspension nodes.
+`content.length` goes from 50 to 36, and the assertion fails on correct code.
+
+Separately, the suspended phase's "two more deliveries" are not said to be followed by a keyed
+request. One left unconsumed at the clear is indexed with content by the text search's first pass,
+and that open is not in the counted number.
+
+Correction:
+- For the backfill phase, replace "clear the override" with "replace the guard by
+  `search_config_guard!(segments: 255)`", and say what the FU1 variant uses.
+- State the message size: bodies of distinct words large enough to cross the cap in at most ten
+  deliveries.
+- Follow each delivery of the suspended phase with a keyed `Mailbox/get`.
+
+#### FX5 — P3 — In a cluster whose nodes disagree on the cap, the suspended flag now alternates (Tasks 8 and 14, E10)
+
+Confidence: medium. This is a consequence of spec 4.2 and 9.2 (a shared `suspended` flag with
+per-node caps). FW1's correction makes it reachable again.
+
+Plan lines: 2276 (FU6), 3027 (`CapRaised` resets `next_below` to `u32::MAX`), 3012 (the start's
+pass returns `Advanced` without running the block).
+
+Trace. Node L has a cap of 1 MiB, node H 4 MiB, and the chain is 2 MiB. H's `CapRaised` start
+clears `suspended`. L's next keyed pass finds `!content_allowed` with the cursor pending, so FU6
+writes `suspended = true`. H's next pass finds `CapRaised` due and starts again (a write), then
+returns before the block. With requests alternating between L and H, every request writes the
+manifest. H's backfill advances only on H's second consecutive pass, which H's content waits
+provide.
+
+Revision 10 suppressed this (L aborted), and revision 9 was worse (H dropped the chain). The cursor
+reset is needed: L indexes new mail without content above `next_below`. So this note proposes no
+change to the reset. Correction: a sentence in E10 or in the outcome note, saying a cluster's nodes
+should share `ZA_SEARCH_ACCOUNT_MAX_MB`, or a ruling from Jay.
+
+#### FX6 — P3 — The loop-top load condition uses `<=` where `content_allowed` uses `<` (Task 9)
+
+Plan line 2397 (`head.size <= (config.account_max_mb << 20)`) against 2285
+(`content_allowed: .. size < cap`). At exactly the cap the load runs, the pass then suspends
+(FU6), and the request refuses `OverCap`, so the load was wasted. Correction: use `<`.
+
+#### FX7 — P3 — The loop-top block is Task 14's work written into Task 9 (Tasks 9 and 14)
+
+Plan line 2397: the comment "until then this arm is `Err(map_load(e))`" covers only the arm after
+`is_current`. The loop-top block also calls `za_search_content_rebuild_start` and names
+`ContentRebuildReason`, which are Task 14's. It also only ever fires on a content cursor, which
+only Task 14 writes. This is FV5's and FW12's pattern. Correction: Task 14 step 4 adds the loop-top
+block. Alternatively, say that both arms are `Err(map_load(e))` until Task 14.
+
+#### FX8 — P3 — Two type and panic slips beside FW14's fix (Task 9)
+
+Plan lines 2397 and 2385:
+- `is_current(&*entry.index.read().await, state)` in `za_search_ensure_current`, and
+  `is_current(&entry.index.read().await, ..)` in `case_content_wait_budget`, still pass
+  `&Option<LoadedIndex>` to `is_current(index: &LoadedIndex, ..)`. FW14 named this neighbour.
+- `entry.read_loaded().await.expect("loaded")` panics if `make_room` evicted the unheld thread part
+  between `za_search_entry` and the read.
+
+Correction: use `let Some(g) = entry.read_loaded().await else { continue };` and pass `&*g` to
+`is_current`.
+
+#### FX9 — P3 — No suite assertion pins FW1's and FW2's wiring (Tasks 8 and 14)
+
+Plan lines 2242-2243 and 3050. `s_not_resident` passes `content_runnable: false` by hand. A mutant
+that reintroduced a content load in the pass would still pass `case_f6_r23`, because the pre-method
+pass would then run the backfill with the same open count. FW1's suggested sibling case was not
+added.
+
+Correction: in `case_f6_r23`, after the `Mailbox/get` start and before `reset_za_search_counters`:
+`simulate_restart`, deliver one message, run one keyed `Mailbox/get`. Assert that `index_holds` is
+true for it, that `indexed_to` covers it, and that `za_search_blob_reads(id)` counts the thread
+blobs only (no content blob read by a non-content request). Then reset the counters.
+
+#### FX10 — P3 — `s3` names no `gap_stamp`, and the timing of the `marker_bound` copy is unstated (Task 8)
+
+Plan lines 2253 and 2276.
+- `s3`'s sources (`{ marker_bound: Some(43), finish_at: Some(60), gap lists empty }`) omit
+  `gap_stamp`. With the base's marker set, the gap gate's
+  `sources.gap_stamp.expect("a marker is set")` panics if it is evaluated before the lists are
+  checked. Name `gap_stamp: Some(42)` (`bound_now − 1`).
+- "`plan_pass` copies `sources.marker_bound`" should say at the start, before any block, so that an
+  `Abort` keeps it, as FV10 says.
+
+#### FX11 — P3 — Placement and wording in Task 8's interface
+
+Plan lines 2098, 2081 and 2285:
+- `apply_marker_arms` sits under the Produces block's `// pass.rs` comment, with a trailing
+  "write.rs" note. Move it under `// write.rs`.
+- The Files "Test:" line names only `pass.rs`'s inline tests. Add `write.rs`'s `mod tests`.
+- Step 1 says `limits` is "computed first from that guard's manifest" and then defines `limits`
+  again after the records read. State it once.
+
+#### FX12 — P3 — "The pass never loads the content part" overstates against spec 5.5 (header, E10, Tasks 8 and 14)
+
+Plan lines 70, 187, 2284-2285 and 3027 against spec 5.5 (1532-1536: the full merge, "a node that
+has the content part loaded, or that can load it ..., loads it for this") and Task 15 (3085: a merge
+reads its inputs from the loaded part or through `fetch_verified`). Correction: say "never loads it
+for the backfill; Task 15's merges read their inputs (spec 5.5)".
+
+#### FX13 — P3 — Task 14's last rule sentence contradicts the case revision 11 rewrote (Task 14)
+
+Plan line 3027 ("While a content cursor is pending, content requests refuse
+(`Unavailable::NotCurrent`, Task 9)") against 3050 ("the first text search loads the content part
+and waits while its passes run the backfill ..., then is served"). Correction: "content requests
+wait up to `ZA_SEARCH_WAIT_SECS` while their passes run the cursor, and refuse `NotCurrent` if it
+is still pending".
+
+#### FX14 — P3 — Case map rows (header)
+
+Plan lines 517-528. FW3 (the items keyed on the manifest, and the reload's drop, which has no test,
+FX1) and FW4 (the not-yet-suspended refusal that `case_f6_r23` now asserts) have no rows. The FS6
+row cites `case_h23`, which fails at its first query (FX2). Correction: add the two rows and keep
+FS6's row once FX2 is fixed.
+
+### Method and limits
+
+This was a reading review. It covered `git diff 5a24dcbac c6a032796` on the plan (every hunk), the
+sixth section (FW1 to FW14), and the plan passages the hunks depend on:
+- the header's plan calls (99-200) and the case map (510-536);
+- Task 6's cache, loader and reload (1625-1892);
+- Task 8 in full (2071-2351);
+- Task 9's rules, cases and `ensure.rs` (2353-2423);
+- Task 10's validated view (2464-2476);
+- Task 14's Produces, rules, steps and cases (3003-3060);
+- Task 15's content compaction (3085).
+
+The traces the brief named were walked by hand:
+- (a): the pass with a pending content cursor and the part absent, under and over the cap, with
+  gap items, with records, and FU6's transition.
+- (b): the new load on a cold node, `OverCap`, `Budget`, a moved head, a dropped part, and the FS6
+  arm with `content_recovered` (FX2).
+- (c): `content_cursor_items` after another node's `ContentLoss` start (FX1), during a `CapRaised`
+  backfill, and one head behind (FX3).
+- (d): FW4's four account states.
+- (e): FW5's five pass shapes.
+- (f): `case_f6_r23` end to end (the FW4 moment, the `Mailbox/get` start, the backfill inside the
+  first text search's wait, the open count, `segments: 255`) and `case_h23` from its loss to its
+  first query.
+
+Spec passages read: 4.3 (805-897), 5.4 (1295-1445), 5.5 (1447-1539), 7.4 (2220-2255), 9.2
+(2618-2637). Source consulted: `crates/store/src/write/batch.rs:396-410, 872-882` and
+`crates/common/src/storage/transaction.rs:27-80`, showing that a batch with no log entry allocates
+no change id (FX2).
+
+Not done: no build, test or runtime probe, and no subagents. This section is the only edit.
+
+Limits:
+- FX1's outcome depends on what `load_content` does with a manifest that names no head.
+- FX3 depends on where the loader walks and whether it answers at once on a resident part; Task 6
+  states neither.
+- FX4 depends on the case's message size.
+- FX5 is a cluster configuration.
+
+The closures of FV1 to FV13 and the earlier rounds were not re-verified beyond what these traces
+exercised.
