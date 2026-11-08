@@ -2,6 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Plan revision 21** (2026-11-08) pairs keyed queryChanges
+with one validated view and the page's effective endpoint (spec revision 28).
+Tasks 10 and 11 stage the borrowed query path and the existing bounded
+cache floor. Task 13 sets the floor from the supplied token and composes
+the page, endpoint projection and query with that view. The query uses
+upstream current-row values and projects identities and membership at E.
+
 **Plan revision 20** (2026-11-08) incorporates the bounded Content-view
 corrections (spec revision 27). Task 10 refreshes a cache below the applied
 indexing checkpoint after a deletion-only pass (P2-CONTENT-FLOOR), checks the
@@ -2571,7 +2578,8 @@ snapshot reuses (PL3); the rest is integration into upstream's query engine.
 - Modify: `crates/jmap/src/email/za.rs` (`za_refuse_content_query` `:148-171` becomes `za_content_query`; `za_refuse_snippet_terms` `:176-189` and `first_snippet_term` `:136-144` are deleted with their tests; the classifiers `filter_needs_content` `:27-61`, `query_filter_needs_content` `:70`, `sort_needs_content` `:79`, `first_refused_filter` `:118`, `first_refused_sort` `:126` stay)
 - Modify: `crates/jmap/src/email/query.rs:112-124` (the refusal call), `:148-154` (`QueryFilter::parse` gains the content argument), `:165-179` (`windowed = None` for a key account), `:181-196` (the `filter_account` call replaced), `:631-688` (`sort_comparators` gains the content argument for `from`, `to`, `subject`, `sentAt`)
 - Modify: `crates/jmap/src/email/query/filter.rs:212-291` (`QueryFilter::parse`: one fork arm before `row.absorb`), `:112-175` (`RowFilter::absorb`'s `HasAttachment` `:152` and `SentBefore`/`SentAfter` `:168-171` arms are bypassed by that fork arm for a key account; unchanged otherwise)
-- Modify: `crates/jmap/src/changes/query.rs:74-82` (the early call becomes `za_content_query`, result dropped: the early check keeps the "unchanged state returns before the query" reason)
+- Modify: crates/jmap/src/changes/query.rs:74-103 (acquire the content
+  view before the unchanged-state return and lend it to the query evaluator).
 - Modify: `crates/jmap/src/email/snippet.rs:61` (the refusal call removed; `terms` are now read for a key account with keys at `:164-172`)
 - Modify: `crates/imap/src/op/search.rs:310-319` (the refusal becomes the content guard), `:401-410` (`Keyword`) and `:501` (`Unkeyword`) for `$HasAttachment`/`$HasNoAttachment`, `:431-458` (`SentBefore`, `SentOn`, `SentSince`), `:740-775` (`Sort::Date`, `From`, `DisplayFrom`, `Subject`, `To`, `DisplayTo`), `:777-782` (the `query_emails` call: the residual resolved first)
 - Modify: `tests/src/za/mail/search.rs` (the turnaround: `imap_refused_keys` `:454`, `refused_commands` `:413`, `jmap_refused_filters_and_sorts` `:845` become served tables; `nested_search_refused` `:252`, `visible_field_document` `:1143`, `query_changes_collapse_threads` `:764` stay; two new cases)
@@ -2622,7 +2630,7 @@ read-side reload may discard optional content, but leaves the old committed
 manifest/thread coherent for a later load. Test-only pauses retain their
 existing placement.
 
-`rounds > 3` → `NoMap(Transient(Validation))` for `Map`, `Unavailable(Transient(Validation))` for `Content`. The handler then reads its content from `view.content()`, its map from `view.index` (Task 11) and every read-response state and every "is present" from `view.cache`; write responses use Task 11's final view for `newState`, preserving pre-mutation `oldState`; for a content request the content was checked current against that same cache, so the results and the state the response reports describe one moment. A view lives for one method call or one IMAP command and is dropped before the call returns; no path that runs a pass, a reload or a content load (Task 9's triggers, the post-commit pass of `Email/set` create, `Email/import` and APPEND) is reached while one is held, since each takes `index.write()`; and a request task holds one view or snapshot at a time, never two (tokio's `RwLock` is write-preferring, so a second read guard taken behind a queued writer waits for that writer, which may be a pass waiting for the first guard; FR8).
+`rounds > 3` → `NoMap(Transient(Validation))` for `Map`, `Unavailable(Transient(Validation))` for `Content`. The handler reads selected content from `view.content()`, its map from `view.index` (Task 11) and its cache-based state and presence from `view.cache`. Write responses use Task 11's final view for `newState`, preserving pre-mutation `oldState`. Content is checked current against that same cache. Standalone content-query results and state use that view. Keyed queryChanges follows section 6.3's combination of current readable rows and content with its effective historical identity endpoint. A view lives for one method call or one IMAP command and is dropped before the call returns; no path that runs a pass, a reload or a content load (Task 9's triggers, the post-commit pass of `Email/set` create, `Email/import` and APPEND) is reached while one is held, since each takes `index.write()`; and a request task holds one view or snapshot at a time, never two (tokio's `RwLock` is write-preferring, so a second read guard taken behind a queued writer waits for that writer, which may be a pass waiting for the first guard; FR8).
 
 - [ ] **Step 1: Write the failing unit tests in `za_search.rs`'s `mod tests`**
 
@@ -2700,7 +2708,36 @@ Expected: compile errors naming `za_search`, `za_resolve_residual`, `za_content_
 
 - [ ] **Step 3: Implement `za_search.rs` and the five `query.rs` insertions**
 
-In `email_query` (`query.rs:105-246`): `let za = za_content_query(self, access_token, account_id, &request.filter, request.sort.as_deref().unwrap_or_default()).await?;` in place of `za_refuse_content_query` (`:112-124`), then the cache read (`:124-128`) becomes `let cache = match &za { Some(view) => view.cache.clone(), None => <upstream's read> };`, so the state the response returns (`query_state = cache.get_state(false)`, `:156`) is the state the content was checked against (PL3); pass `za.as_ref().map(ZaView::content)` into `QueryFilter::parse` (`:148-154`) and `sort_comparators` (`:155`); `windowed = None` when `za.is_some()` (`:165-179`: the PostgreSQL walk never runs for a key account, `window.rs:242-354`); replace the `filter_account` block (`:181-196`) with `let residual = match &za { Some(za) => SearchQuery::new(SearchIndex::Email).with_filters(za_resolve_residual(residual_filters, za.content()).map_err(|r| za_unavailable(&"residual", false, &r))?).with_mask(filter.readable(&cache)).filter().into_bitmap(), None => <upstream's call> };`. In `QueryFilter::parse` (`filter.rs:212-291`): the fork arm before `row.absorb(condition)` and before the non-top-level `push_condition`: `if let Some(content) = za && za_content_condition(&condition) { residual.push(SearchFilter::is_in_set(za_resolve_condition(&condition, content, cache).unwrap())); continue; }` (a condition that is not top level goes to `residual` as upstream puts it, so the operator structure is kept). In `sort_comparators` (`:631-688`): for a key account, `From`, `To`, `Subject`, `SentAt` and the three keyword sorts on an attachment keyword go through `za_sort_comparator` with `documents = filter.readable(&cache)`; the `threadId` sort stays `unsupportedSort` (`:681-685`). `query_changes` (`changes/query.rs:74-82`) calls `za_content_query` and drops the view at once, before it calls `email_query` (which acquires its own; no guard is held across the two): the early refusal, keyless or unavailable, keeps its reason.
+In the public Email/query wrapper (query.rs:105–124), acquire with
+za_content_query as described above, then invoke an internal query
+evaluator that accepts the already acquired optional view by reference
+and receives the selected Map or Content mode separately. The evaluator
+borrows the view through filtering, sorting and rendering. It performs
+no view acquisition. The cache read (:124–128) uses the borrowed view's
+cache when present, else upstream's read. The standalone query takes its
+item state from that cache (`query_state = cache.get_state(false)`, `:156`).
+Derive an optional `ContentPart` only for selected Content and pass it to
+`QueryFilter::parse` (`:148-154`), `sort_comparators` (`:155`) and residual
+resolution. Choose the mode from the request, independent of optional
+content residency in the guard. The keyed evaluator disables the
+PostgreSQL windowed walk (`:165-179`, `window.rs:242-354`). In the residual
+block (`:181-196`), resolve content leaves with `za_resolve_residual` in
+Content mode, preserving its unavailable mapping. Map uses the borrowed
+cache and identity projection and supplies its already-resolved
+`DocumentSet` and operator residuals to the same in-memory evaluator
+without calling `view.content()`. For either keyed mode, evaluate with
+`SearchQuery::new(SearchIndex::Email).with_filters(residual).with_mask(filter.readable(&cache)).filter().into_bitmap()`.
+Ordinary `None` retains the upstream search-store path.
+
+In `QueryFilter::parse` (`filter.rs:212-291`): the fork arm before `row.absorb(condition)` and before the non-top-level `push_condition`: `if let Some(content) = za && za_content_condition(&condition) { residual.push(SearchFilter::is_in_set(za_resolve_condition(&condition, content, cache).unwrap())); continue; }` (a condition that is not top level goes to `residual` as upstream puts it, so the operator structure is kept). In `sort_comparators` (`:631-688`): for a key account, `From`, `To`, `Subject`, `SentAt` and the three keyword sorts on an attachment keyword go through `za_sort_comparator` with `documents = filter.readable(&cache)`; the `threadId` sort stays `unsupportedSort` (`:681-685`).
+
+At this stage, queryChanges still reads the upstream changes page, then
+checks content availability even when it will return early. Keep the
+resulting Content view through any query evaluation by calling the
+internal evaluator with that borrow. Leave the raw page and intermediate
+grouping in place until their owning tasks. Task 11 adds the equivalent
+Map acquisition for the keyed metadata-only path, and Task 13 moves
+the selected acquisition before keyed page rendering.
 
 - [ ] **Step 4: Write the IMAP unit test and the insertions**
 
@@ -2772,7 +2809,10 @@ that keeps singleton ids off every keyed response.
 
 **Files:**
 - Create: `crates/email/src/message/za/search/snapshot.rs` (`ZaSnapshot`, the procedure, the id helpers)
-- Modify: `crates/email/src/message/za/search/view.rs` (optional acknowledged-write floor in the existing validation loop; unchanged default entry points)
+- Modify: crates/email/src/message/za/search/view.rs (optional caller minimum
+  cache counter in the existing validation loop, used here by write responses)
+  and crates/jmap/src/changes/query.rs (borrow the same Map view for keyed
+  metadata-only queries).
 - Modify: `crates/jmap/src/email/get.rs:174-199` (the cache and the ids), `:210` (keys, already read), `:229-236`, `:257-262`, `:272-277` (`email_by_jmap_id` on supplied ids), `:415-425` (`Id`, `ThreadId`)
 - Modify: `crates/jmap/src/email/query.rs:484-492` (`Page::emit`), `:600-603` (`Page::top`), `:456-461` (`count_matches`, Task 12 completes it): the prefix passed to `builder.add` is the map's
 - Modify: `crates/jmap/src/email/set.rs:1172-1174` (update's prefix filter), `:1620-1623` (destroy's lookup), `:1758` (create's response)
@@ -2794,7 +2834,20 @@ that keeps singleton ids off every keyed response.
 - Produces, in `email::message::za::search::snapshot`:
   - `pub type ZaSnapshot = ZaView;` (Task 10's view; this task adds the map methods to it in `snapshot.rs`).
   - `Server::za_snapshot(&self, account_id: u32, keys: &SessionKeys) -> Result<ZaSnapshot, NoMapReason>`: `za_view(self, account_id, keys, ViewNeed::Map)`, `ViewError::NoMap(r)` → `r` (a `Map` acquisition never answers `Unavailable`).
-  - `Server::za_response_snapshot(&self, account_id: u32, keys: &SessionKeys, write_floor: Option<u64>) -> Result<ZaSnapshot, NoMapReason>`: the same Map acquisition with an optional minimum cache counter. Factor Task 10's existing loop into an internal entry point accepting the floor; existing `za_view`/`za_snapshot` callers pass `None` and keep their interfaces. In that loop, alongside newest-row and epoch checks, require `cache.last_change_id >= write_floor` when present. A miss drops the view/guard, marks the Email group stale and retries within the same three-round bound, then uses the existing no-map validation error. Do not add an outer retry loop, return `max(floor, state)`, or patch a cache counter.
+  - Generalize Task 10's loop through za_view_with_minimum(server, account_id,
+    keys, need, minimum_cache_counter: Option<u64>). The normal za_view and
+    za_snapshot wrappers pass None. In step 6 add cache.last_change_id <
+    minimum_cache_counter as a stale-cache condition when a minimum is
+    supplied. Drop the guard, mark the Email group stale, and use the same
+    validation-round budget. Exhaustion returns `NoMap(Transient(Validation))`
+    for Map and `Unavailable(Transient(Validation))` for Content. Route Map
+    through `za_no_map_error` and Content through the existing named-property
+    unavailable adapter. Content deadline expiry remains
+    `Unavailable(NotCurrent)`, using the original deadline. The Content cap,
+    checkpoint and currency checks still apply. Use the real cache state.
+  - Server::za_response_snapshot(account_id, keys, write_floor: Option<u64>)
+    keeps its Map-only interface and delegates to that minimum-aware entry
+    with the acknowledged-write floor. Task 13 also supplies a read floor.
   - `impl ZaView` (in `snapshot.rs`): `pub fn map_id(&self, document_id: u32) -> Id` (`Id::from_parts(self.thread_of(document_id), document_id)`); `pub fn thread_of(&self, document_id: u32) -> u32` (`self.index.thread.current_thread(document_id)`: the singleton when the index holds no record); `pub fn check_id(&self, id: Id) -> Option<u32>` (`Some(id.document_id())` when `self.cache.email_by_id(&id.document_id())` is present and `self.thread_of(id.document_id()) == id.prefix_id()`, else `None`); `pub fn thread_members(&self, thread_id: u32) -> Vec<u32>` (`self.index.thread.members(thread_id)`, every record present or tombstoned, filtered by `self.cache.email_by_id(..).is_some()`, plus `thread_id` itself when the cache holds it and its record is absent: a never-indexed message is its own singleton. FR7: the cache decides existence, the record only the thread, so a message the cache holds and the index has tombstoned is listed, as `Email/get` lists it under the same state); `pub fn state(&self) -> u64` (`self.cache.last_change_id`: the Email group's counter the cache was built at, which `za_view`'s step 6 proved at or past the newest row and the epoch; the Thread collection shares that group, `crates/types/src/collection.rs:228-231`, so it is the Thread state the view returns. FR3, plan call D13: never a store read after the cache. A delivery between the cache read and such a read would give an `E` above the cache, and Task 13's stream, which takes existence at `E` from the cache, would call the new message absent and emit nothing for it; the client would never learn of that thread).
   - `pub fn za_no_map_error(reason: NoMapReason) -> trc::Error`: `trc::StoreEvent::UnexpectedError.into_err().details(ZA_SEARCH_UNAVAILABLE).ctx(trc::Key::Reason, reason.as_str())` (a store event maps to `serverUnavailable` on JMAP; the IMAP call sites add `.code(ResponseCode::Unavailable)`), traced once at the site with the account id.
   - `pub fn za_submission_prefix(document_id: u32) -> u32` = `document_id` (the singleton the submission record stores, 6.2).
@@ -2837,12 +2890,31 @@ Expected: compile errors naming `ZaSnapshot`, `za_snapshot`.
 
 - [ ] **Step 3: Implement `snapshot.rs` and the two hooks**
 
-`za_snapshot` is Task 10's `za_view` with `ViewNeed::Map`; this step adds the type alias, the map methods and the hooks `SEARCH_CACHE_HOLD` and `SEARCH_MANIFEST_FAIL_ONCE`. Add `za_response_snapshot` and its optional floor to that same validation loop, preserving normal callers and the shared retry bound. Add a predicate/bounded-acquisition regression for a cache at the manifest publication but below an acknowledged write; Task 11's real write fixture below must also exercise it.
+`za_snapshot` is Task 10's `za_view` with `ViewNeed::Map`; this step adds the type alias, the map methods and the hooks `SEARCH_CACHE_HOLD` and `SEARCH_MANIFEST_FAIL_ONCE`. Add the optional caller minimum to that same validation loop, preserving
+normal callers and the shared retry bound. Retain the predicate and
+bounded-acquisition regression below an acknowledged write and above the
+publication and epoch. Exercise None and equality as positive controls,
+one refresh to the floor, and repeated stale returns that exhaust the
+existing bound with the selected mode's validation error. For Content
+with a caller minimum, prove a no-minimum acquisition serves the same
+cache and content, then supply a minimum it misses and assert
+`Unavailable(Transient(Validation))` through the existing named-property
+adapter. Map exhaustion answers `NoMap(Transient(Validation))` through
+`za_no_map_error`. A separate Content deadline control asserts
+`Unavailable(NotCurrent)` at the original deadline across retries.
+Task 11's real write fixture below still exercises the write floor.
 
 - [ ] **Step 4: Map on the way out, check on the way in, at every site**
 
 - `Email/get` (`get.rs:174-199`): with keys (`:210` already reads them; move that read above `:174`), `snapshot = za_snapshot(..)` and `cache = snapshot.cache.clone()`; the `all_ids` closure maps `Id::from_parts(snapshot.thread_of(item.document_id()), item.document_id())`; each supplied id goes through `snapshot.check_id(id)` and a `None` is `push_not_found(id)` (`:229-236`, `:257-262`, `:272-277` use `email_by_id(&document_id)` after the check instead of `email_by_jmap_id`); `EmailProperty::Id` and `ThreadId` (`:415-425`) use the mapped id; `state` (`:198`) stays `cache.get_state(false)` of the snapshot's cache.
 - `Email/query` (`query.rs`): `Page::emit` (`:484-492`), `Page::count` (`:499-505`: the `collapseThreads` total counted after the limit, through `count_rest` `:522-530` and the tail loop `:618-620`), `Page::top` (`:600-603`) and `count_matches` (`:456-461`) take the thread id from `snapshot.thread_of(document_id)` when a snapshot is present (a `Option<&ZaSnapshot>` threaded through `Page`; every place `Page` reads `message.thread_id()` takes it, PL9); the `anchor` then matches as a whole u64 (`api/query.rs:45, 98`: a stale prefix is `anchorNotFound`, upstream's own outcome). When Task 10's `za_content_query` returned a view, that view is the snapshot; otherwise `za_snapshot` is taken once, in place of the cache read at `:124-128` (PL3: never both).
+- Keyed Email/queryChanges at this stage borrows the Content view obtained
+  in Task 10 or one Map view when the query needs only metadata. The public
+  Email/query acquires its own view and uses the same evaluator. For the
+  keyed composite path the upstream page remains in use until Task 13.
+  Pass the selected mode to the evaluator so it reads content only for
+  Content, even when a Map guard happens to hold a content part. Keep the
+  acquisition and evaluator split for Task 13.
 - `Email/set` (`set.rs`, P1-STATE): retain the original pre-ingest `ifInState`/`oldState`. After create flush, `recheck.finish` and Task 9's selected post-write hook, acquire an **input view** before updates. Both prefix and existence lookups use that view's cache: replace update's stored-prefix check (`:1172-1174`) and destroy's `email_by_jmap_id` (`:1620-1623`) with `input.check_id(id)` for keyed calls; preserve the approved keyless document-only lookup. Acknowledgement keys in `updated`, `destroyed`, `notUpdated` and `notDestroyed` echo the supplied IDs, as upstream does. Keep same-call creation-reference objects available during ingestion, but finalize their externally advertised `id` and `threadId` only at the response seam.
   After all acknowledged update/destroy commits, drop the input view before acquiring the **final response view** through `za_response_snapshot(.., last_change_id)`. Normal commits already mark the local mail cache stale synchronously; the explicit floor additionally refuses a view below this call's acknowledged writes even when the manifest is unchanged. Map each created object's document ID through this final view and choose keyed `newState` from its `cache.get_state(false)`; do not append a later store/viewer state or use the Thread counter as the Email item state. A view with no later writes may be reused only if it meets the same floor. Do not replay mutations, rerun preconditions or add a search pass. At most one live guard; drop it before any reacquisition/reload (FR8). Ordinary-account metadata/state behavior stays unchanged.
 - `Email/import` (`import.rs:277-304,347`): after final flush/recheck and the selected hook, acquire its single final response view with `za_response_snapshot(.., last_change_id)`. Render created objects and keyed `newState` from that view, including a selected call with only `notCreated` when the hook published an earlier call's pending successful inserts. Preserve original precondition state, result references and ordinary-account behavior.
@@ -2974,7 +3046,11 @@ Expected: compile errors naming `za_mailbox_counters`.
 
 - [ ] **Step 3: Implement the helpers and the eight substitutions**
 
-`Thread/get` (`thread/get.rs:46-70`): with a snapshot, supplied ids → `thread_map[id.document_id()] = snapshot.thread_members(id.document_id())` filtered by `access`; no ids → `za_group_by_thread(&snapshot, cache.emails.iter().filter(access))`; an unknown thread id is `notFound` (`:104-106`, upstream). `Mailbox/get` (`mailbox/get.rs:117-135`): `za_mailbox_counters` when a snapshot is present (the method is keyed from Task 11, so a key account always has one). `restrict_thread_keywords` (`query.rs:319-335`): for a key account the replacement runs whatever `filter.visible(cache)` answers (PL9: owner access answers `None`, `filter.rs:410-417`, and upstream's guard `:325-332` would then leave the cache comparator, which groups by the stored singleton), as `*comparator = MessageComparator::Search(SearchComparator::set(za_thread_keywords(&snapshot, keyword, match_all, None, filter.visible(cache)), ascending))`; the filter arms (`filter.rs:621-648`) call `za_thread_keywords` likewise; for an attachment keyword both use the content's attachment bit in place of the keyword bit (Task 10's forms, now grouped by the map). `InThread`: `QueryFilter::parse` gains `snapshot: Option<&ZaSnapshot>` (Task 11's, present on every keyed request), and the fork arm before `row.absorb` (Task 10's) takes `EmailFilter::InThread(id)` at the top level too when a snapshot is present, pushing `SearchFilter::is_in_set(snapshot.thread_members(id.document_id()))` into `residual` (PL9: otherwise `RowFilter::absorb` narrows `thread_id`, `filter.rs:126-128`, and `RowFilter::matches` compares the stored singleton, `:84-86`); the nested arm (`:692-696`) → the same set; `count_matches` (`query.rs:456-461`) → `snapshot.thread_of`. `Email/queryChanges` (`changes/query.rs:129, 133`): `snapshot.thread_of(message.document_id())` in place of `message.thread_id()` (the page's prefixes are mapped by Task 13; until then the touched set is upstream's raw ids, an interim the variants do not run against). `EmailSubmission/query`: the `ThreadIds` filter keeps a submission when `ids.contains(&snapshot.thread_of(s.email_id))` (`:155-164`); the `ThreadId` sort keys by `snapshot.thread_of(s.email_id)` (`:247-252`). IMAP `THREAD` (`thread.rs:98-104`): `threads.entry(snapshot.thread_of(document_id))`.
+`Thread/get` (`thread/get.rs:46-70`): with a snapshot, supplied ids → `thread_map[id.document_id()] = snapshot.thread_members(id.document_id())` filtered by `access`; no ids → `za_group_by_thread(&snapshot, cache.emails.iter().filter(access))`; an unknown thread id is `notFound` (`:104-106`, upstream). `Mailbox/get` (`mailbox/get.rs:117-135`): `za_mailbox_counters` when a snapshot is present (the method is keyed from Task 11, so a key account always has one). `restrict_thread_keywords` (`query.rs:319-335`): for a key account the replacement runs whatever `filter.visible(cache)` answers (PL9: owner access answers `None`, `filter.rs:410-417`, and upstream's guard `:325-332` would then leave the cache comparator, which groups by the stored singleton), as `*comparator = MessageComparator::Search(SearchComparator::set(za_thread_keywords(&snapshot, keyword, match_all, None, filter.visible(cache)), ascending))`; the filter arms (`filter.rs:621-648`) call `za_thread_keywords` likewise; for an attachment keyword both use the content's attachment bit in place of the keyword bit (Task 10's forms, now grouped by the map). `InThread`: `QueryFilter::parse` gains `snapshot: Option<&ZaSnapshot>` (Task 11's, present on every keyed request), and the fork arm before `row.absorb` (Task 10's) takes `EmailFilter::InThread(id)` at the top level too when a snapshot is present, pushing `SearchFilter::is_in_set(snapshot.thread_members(id.document_id()))` into `residual` (PL9: otherwise `RowFilter::absorb` narrows `thread_id`, `filter.rs:126-128`, and `RowFilter::matches` compares the stored singleton, `:84-86`); the nested arm (`:692-696`) → the same set; `count_matches` (`query.rs:456-461`) → `snapshot.thread_of`. For Email/queryChanges, keep the staged borrowed query evaluator and raw
+page/re-emission until Task 13. That task supplies the explicit historical
+endpoint and end-presence projection to the query's mapped grouping, filter,
+sort and re-emission seams. Task 12's standalone current-thread behavior
+continues through the same evaluator. `EmailSubmission/query`: the `ThreadIds` filter keeps a submission when `ids.contains(&snapshot.thread_of(s.email_id))` (`:155-164`); the `ThreadId` sort keys by `snapshot.thread_of(s.email_id)` (`:247-252`). IMAP `THREAD` (`thread.rs:98-104`): `threads.entry(snapshot.thread_of(document_id))`.
 
 - [ ] **Step 4: Write the failing `mail::threads` cases**
 
@@ -3033,14 +3109,29 @@ a pinned range, with existence decided from raw records first.
 **Files:**
 - Create: `crates/email/src/message/za/search/changes.rs` (the stream, pure over records and a present set; the epoch rule; the retained bound)
 - Create: `crates/jmap/src/changes/za.rs` (the key account's page inside `ChangesLookup::changes`; `pub mod za;` in `crates/jmap/src/changes/mod.rs`)
-- Modify: `crates/jmap/src/changes/get.rs:217-229` (after the key gate: `if let Some(keys) = .. && matches!(object, Email | Thread) { return za_changes_page(..).await; }`), `crates/jmap/src/changes/query.rs:65-74` (the page consumed is the fork's for a key account, unchanged call), `:105-137` (the `collapseThreads` block reads the page's mapped prefixes; Task 12 switched the re-emission to the map)
+- Modify: crates/jmap/src/changes/get.rs (keyed page entry after authorization
+  and maxChanges validation) and crates/jmap/src/changes/query.rs (keyed
+  composition with one borrowed view, preserving the ordinary call path).
+- Modify: crates/jmap/src/email/{query.rs,query/filter.rs,za_search.rs} (borrowed
+  evaluator's endpoint projection and minimum-aware Map/Content selection).
+  Extend the Task 12 thread-query helpers only as needed to accept that
+  projection.
 - Modify: `tests/src/za/mail/threads.rs` (the cases below)
 - Test: `cargo test -p email --lib --features test_mode za::search::changes`, the za suite's `mail::threads`
 
 **Interfaces:**
-- Consumes (Task 7): `Store::za_changes_records(&self, account_id, collection: SyncCollection, from: Option<Checkpoint>, max_records: usize) -> trc::Result<ZaChangeRecords { records: Vec<(u64, Vec<Change>)>, truncated: bool, resumed_record_lost: bool, first_retained: Option<u64> }>` (`from = Some(Checkpoint { change_id: S, position: 0, complete: true })` reads exclusively from `S`; `None` reads from 0; `truncated` is the marker `truncate_change_log` leaves at the oldest surviving key, `crates/common/src/storage/transaction.rs:228-244`, met inside the read; `first_retained` is that marker's change id when the log holds one, else `None`) and `Store::za_log_first_retained(&self, account_id, collection) -> trc::Result<Option<u64>>` (the same marker, read alone).
+- Consumes: Store::za_changes_records_range(account_id, collection,
+  from_exclusive, to_inclusive) -> trc::Result<ZaChangeRecords> and
+  Store::za_log_first_retained(account_id, collection)
+  (crates/store/src/query/log.rs:210–310). Range applies both endpoints in
+  the store iterator. Its truncated flag records an encountered marker.
+  The first-retained read supplies the actual marker independently of the
+  bounded range. The unbounded record reader still serves existing callers.
 - Consumes (Task 3): `ThreadPart::{revision_at, thread_of(document_id, change_id), members_of(thread_id, change_id), exists_at(document_id, change_id) -> Option<bool>, records() -> impl Iterator<Item = &ThreadRecord>}` (`records()` iterates present and tombstoned records; plan call D10).
-- Consumes (Task 11): `ZaSnapshot { index, cache, epoch, .. }`, `ZaSnapshot::{thread_of, state, map_id}`, `za_no_map_error`.
+- Consumes (Tasks 10–12): the borrowed Email/query evaluator, existing
+  Map/Content classification and error adapters, za_view_with_minimum,
+  ZaSnapshot { index, cache, epoch, .. }, ZaSnapshot::state and
+  za_no_map_error. Use ThreadPart::thread_of(d,E) for historical lookup.
 - Consumes (upstream): `Change::{InsertItem, UpdateItem, UpdateItemMetadata, DeleteItem, InsertContainer, UpdateContainer, UpdateContainerPartial, DeleteContainer}` (`crates/store/src/query/log.rs:25-34`; an item id is `thread << 32 | document`, so the document id is `id as u32`), `State::{Initial, Exact, Intermediate(JMAPIntermediateState { from_id, to_id, items_sent })}` and `State::new_intermediate`, `new_exact` (`crates/jmap-proto/src/types/state.rs:18-30, 83-93`), `ChangesResponse<NullObject>` and `IntermediateChangesResponse` (`changes/get.rs:69-73`), `max_changes` (`:230-238`), `JmapCacheState::get_state(false)` = `cache.emails.change_id` (`changes/state.rs:132-139`), the kind filter (`page.rs:173`: item changes for Email, container changes for Thread), `fill_page`'s classification (`page.rs:365-410`), `Email/queryChanges`'s diff (`changes/query.rs:348-378`).
 - Produces, in `email::message::za::search::changes`:
   - `pub enum StreamKind { Created, Updated, Destroyed }`; `pub struct StreamItem { pub document_id: u32, pub kind: StreamKind, pub old: Option<Id>, pub new: Option<Id>, pub order: (u64, u32) }` (`Destroyed` carries `old`, `Created` carries `new`, a reassignment is two items, `Destroyed` then `Created`, with the same `order`).
@@ -3051,7 +3142,12 @@ a pinned range, with existence decided from raw records first.
   - `pub fn za_initial_stream(thread: &ThreadPart, present_at_end: impl Iterator<Item = u32>, end: u64) -> Vec<StreamItem>` (the `S = 0` form: every document in the corrected set as `Created(thread_of(d, end)|d)`, document-id order; the historical end is explicit).
   - `pub fn za_epoch_refuses(records_of_kind: &ZaChangeRecords, is_container: bool, since: u64, epoch: u64) -> bool`: `since > 0 && since < epoch && records_of_kind.records.iter().any(|(id, changes)| *id <= epoch && changes.iter().any(|c| is_kind(c, is_container)))` (the closed interval `(S, epoch]`, R27, H1).
   - `Server::za_retained_bound(&self, account_id) -> trc::Result<u64>`: `max(first_retained(Email), first_retained(Thread))`, `0` when neither log holds a marker (G4: the shorter log's bound).
-- Produces, in `jmap::changes::za`: `pub async fn za_changes_page(server: &Server, request: ChangesRequest, object: MethodObject, keys: &SessionKeys, max_changes: usize) -> trc::Result<IntermediateChangesResponse>`.
+- Produces, in jmap::changes::za: a parsed since-state with its caller
+  minimum, and an internal za_changes_page that borrows the admitted
+  view. Its result carries IntermediateChangesResponse plus the effective
+  since, end and corrected end-presence context. Current presence can
+  refer to the admitted cache; a historical end can hold the reconstructed
+  bitmap. The public wrapper returns only IntermediateChangesResponse.
 
 **The stream of `(S, E]`, as a decision table** (6.3). Inputs: `records` (unfolded, `(S, E]`), `later` (unfolded, after `E`; empty for a current `E`), `present(d)` (the snapshot's cache), the thread part. `R(X) = revision_at(X)`.
 
@@ -3065,17 +3161,84 @@ a pinned range, with existence decided from raw records first.
 
 **`Thread/changes`** (F14, R25): over the same candidates, `members_of(T, S)` and `members_of(T, E)` for every `T` in `{T0, T1}` of every candidate (members intersected with existence at that end by rules 2 and 3; a candidate `d` the index holds no record for is its own thread at both ends, its only member `d` where it exists): no member at `S`, some at `E` → `Created(T)`; some at `S`, none at `E` → `Destroyed(T)`; some at both and the two member sets differ → `Updated(T)`; some at both and the sets equal → nothing (FS8: a flag-only `UpdateItem` makes `d` a candidate but changes no membership, and upstream's Thread log carries no flag changes, so its `Thread/changes` reports nothing for one; the Email stream keeps its `Updated(T|d)`); ordered as the Email stream, by the earliest change id, then thread id. For `S = 0`: every thread with a member at `E` (a present document without a record is its own thread), `Created`, ordered by its lowest member's document id.
 
-**The page** (`za_changes_page`), for `object` Email (`is_container = false`, the Email log) or Thread (`true`, the Thread log):
+**The page** (Email item or Thread container).
 
-1. `snapshot = za_snapshot(..)` (fails as `za_no_map_error`). `E_email = snapshot.cache.emails.change_id` (`get_state(false)`, the item state); for Thread `E = snapshot.state()` (the group counter the same cache was built at; D13, FR3), for Email `E = E_email`. Both come from the view's cache, so existence at `E` (rules 2 and 3, from that cache) and the records of `(S, E]` describe one moment.
-2. `S` from `request.since_state`: `Initial` → 0; `Exact(s)` → `s`; `Intermediate { from, to, items_sent }` → `S = from`, `E = to` (pinned), `skip = items_sent`.
-3. For `S > 0`, the existing refusals are: `S < za_retained_bound(account_id)` → `cannotCalculateChanges` ("Change log is truncated", the text of `changes/get.rs:424-427`); the read of step 5 reports `truncated` → the same; `za_epoch_refuses(kind_records, is_container, S, snapshot.epoch)` where `kind_records` = `za_changes_records(method's collection, from S exclusive)` cut at `epoch` → `cannotCalculateChanges` ("Since state is invalid" is not reused: the detail is `"State predates the index's epoch"`). Fresh `Initial`/`Exact(0)` is never refused because zero is below retention or the epoch (R28, R31). For `Intermediate { from: 0, to: E, .. }`, require `E >= max(za_retained_bound(account_id), snapshot.epoch)` before rendering or skipping; otherwise return `cannotCalculateChanges` (retention: "Change log is truncated"; epoch: "State predates the index's epoch"). Never silently restart or advance E. A content-only rebuild or reconciliation adds no epoch refusal (P1-PAGING).
-4. If `S == E` and the state is `Exact`: the empty response with `new_state = Exact(E)` (upstream's equality return, `:363-369`).
-5. `records = za_changes_records(Email, from S exclusive, cut at E)`; `later = za_changes_records(Email, from E exclusive, cut at snapshot.cache.last_change_id)` when `E` is pinned, else empty. After all required raw reads, read `B_after = za_retained_bound(account_id)`. For `S > 0`, refuse if `S < B_after` or either required raw read is truncated. For `Intermediate { from: 0, to: E, .. }`, refuse if `E < B_after` or the post-E suffix is truncated. These checks precede rendering, skipping `sent`, and the exhausted-stream fallback; the recheck catches a racing marker beyond the bounded reads. Fresh `Initial`/`Exact(0)` remains exempt: truncation of its unused `(0,E]` records alone does not refuse it. For an initial continuation, history at/below E may disappear without refusal. For Thread the Thread log supplies only the bound and epoch check, not member candidates (H18, P1-PAGING).
-6. `items = za_email_stream(..)` or `za_thread_stream(..)` (or the `S = 0` forms); `page = items.into_iter().skip(skip).take(max_changes)`; `created`, `updated`, `destroyed` filled from the items' ids (`new`/`old`); `has_more_changes = items.len() > skip + max_changes`.
-7. `new_state`: exhausted → `Exact(E)`; more → `Intermediate { from: S, to: E, items_sent: skip + max_changes }` (`State::new_intermediate`). An `Intermediate` request whose stream is exhausted at `skip` continues as `Exact(to)` (step 2 with `S = to`, `E` current), as upstream continues with `Since(to)` (`:393-419`).
-8. `updated_properties`: `None` (a key account's metadata is refused, `:260-268`).
-`Email/queryChanges` (`changes/query.rs:65-74`) receives this page through `self.changes(..)` unchanged; its `collapseThreads` block (`:105-137`) takes `id.prefix_id()` from the page's mapped ids and Task 12's `thread_of` re-emission; the diff (`:348-378`) is upstream's over mapped ids on both sides.
+1. Parse the state before acquiring a view. Initial and Exact(0) set S=0
+   without a minimum. Exact(s>0) sets S and the minimum to s. Intermediate
+   sets S=from, pins E=to, sets skip=items_sent, and sets the minimum to
+   to. Keep the actual request state for oldState.
+2. Standalone changes acquires Map once with that minimum; keyed
+   queryChanges acquires its selected Map or Content view once. A caller
+   minimum uses the selected mode's existing validation-round budget and
+   error routing from Task 11. Derive current E from cache.emails.change_id for Email and
+   cache.last_change_id for Thread, after acquisition. Write C for this
+   cache's last_change_id. A pinned E comes from the token and must satisfy
+   E<=C before any reconstruction or fallback. It stays pinned while
+   rendering that range. Keep ordinary invalid-state behavior unchanged.
+3. For S>0, refuse with cannotCalculateChanges ("Change log is truncated")
+   if S is below the shorter-log bound. Check the method's kind in
+   (S,epoch] with its bounded log read, and refuse with "State predates the
+   index's epoch" if it has a relevant record. An initial Intermediate
+   requires E at or above both the shorter-log bound and the validated
+   epoch; use the corresponding retention or epoch refusal. Fresh Initial
+   and Exact(0) are exempt from these old-history checks. Content-only
+   rebuild and reconciliation keep the existing identity epoch.
+4. If S==E for Exact, mark the stream empty and prepare its effective
+   endpoint and presence context. Before returning Exact(E), complete
+   the required method-kind epoch read and the shared final retained-bound
+   and truncation checks in step 5. Skip the item and suffix reads for this
+   empty current range. Fresh Exact(0) retains its exemption. Only then
+   return the empty response or evaluate calculateTotal from that context.
+5. Physically read the Email records in (S,E] using
+   za_changes_records_range. For a pinned E, read its Email lifecycle
+   suffix (E,C] with the same API. After all required reads, including the
+   method-kind epoch read, recheck the shorter retained bound. For S>0
+   refuse if S<B_after or any required read reports truncation. For an
+   initial Intermediate refuse if E<B_after or the suffix is truncated.
+   Do this before rendering, skipping, or falling through. A marker
+   beyond C may be invisible to both range reads. Fresh Initial and
+   Exact(0) still ignore truncation of their unused early history. Equal
+   endpoints at the bound and at the identity epoch remain admissible. Thread's log supplies its
+   marker and epoch check; Email's log supplies member candidates.
+6. Derive present-at-E from the admitted cache for a current end or by
+   restoring suffix deletes and subtracting suffix inserts for a pinned
+   end. Reuse that exact set for the stream and the page context. Render
+   the appropriate stream, skip the sent count, and take maxChanges;
+   expose the mapped IDs in their created, updated or destroyed lists.
+7. Return Exact(E) when the returned page exhausts the stream or
+   Intermediate(S,E,skip+maxChanges) with hasMoreChanges when it does
+   not. If an Intermediate already exhausts the stream at its input
+   skip, after its admission and final bound checks continue once as
+   Exact(to) with current E from the same view, as upstream continues
+   with Since(to). Reapply the range and retention checks to that
+   effective range. Return its actual endpoints and presence context,
+   preserving the input oldState and using no second acquisition.
+8. Keep updated_properties None for the keyed page.
+
+**The keyed queryChanges composition.** Preserve account authorization
+and maxChanges checks, and select Map or Content with Task 10's
+classification before acquiring one view using the token minimum. Route
+Map exhaustion through `za_no_map_error` and Content exhaustion or
+deadline expiry through the existing named-property unavailable adapter.
+Content availability remains an early check even when the page is
+unchanged; ordinary queries keep their existing availability behavior.
+The borrowed page and evaluator run only after ensure, pass, reload and
+content loading have finished. The page's effective end and presence
+context control the identity projection through both query and
+re-emission. The query evaluates the existing masks, filters and sort
+keys on current readable rows intersected with present-at-E. Apply the E
+projection before any thread filter or comparator, count, collapse or
+representative selection, and emit those projected IDs. Use the full
+projected ID for upToId in the existing cutoff branch. Thread-dependent
+query operations group these eligible current rows at E. Nonidentity
+filter values and sort keys use the current rows and the same view's
+content when required. A document deleted after E can supply its
+historical ID and membership for re-emission. It has no query row.
+Take touched prefixes from the page's mapped IDs and re-emit other
+present-at-E members with their thread at E. Exclude the page's existing
+created/updated IDs. Keep the upstream diff over the projected results
+and the page's state, and leave the standalone current Email/query and
+ordinary queryChanges paths as before.
 
 - [ ] **Step 1: Write the failing unit tests in `changes.rs`'s `mod tests`** (a fixture builder: `history()` with records, aliases and revision rows; `records_of(&[(change_id, Change)])`; `present(&[u32])`)
 
@@ -3128,7 +3291,12 @@ Expected: compile errors naming `za_email_stream`.
 
 - [ ] **Step 3: Implement `changes.rs`, `za.rs` and the branch in `ChangesLookup::changes`**
 
-The branch sits right after the key gate Task 11 placed at `changes/get.rs:217-229`: `if matches!(object, MethodObject::Email | MethodObject::Thread) && let Some(keys) = self.za_mail_keys(access_token, account_id).await? { return za_changes_page(self, request, object, &keys, max_changes).await; }` (`max_changes` computed as `:230-238` computes it, moved above the branch). `Mailbox/changes` and `EmailSubmission/changes` keep upstream's path.
+Standalone Email/changes and Thread/changes branch after the existing key,
+route and maxChanges checks. Parse, acquire once, and return the public
+part of the borrowed page result. Keyed Email/queryChanges calls the
+same page helper after its own one acquisition, then borrows that view
+for its query evaluator. Keep the ordinary self.changes and email_query
+calls and all other /changes methods on their existing path.
 
 - [ ] **Step 4: Write the failing `mail::threads` cases**
 
@@ -3189,6 +3357,62 @@ async fn case_g3_empty_account(..) { /* a fresh key account: Mailbox/set create 
 async fn case_g7_r6_f15_pinned(..) { .. }
 ```
 
+**Required composition and minimum regressions.** Use the actual JMAP
+methods, real persisted changes, and the retained paging inputs; keep
+the preceding parity, deletion, and retention tests.
+
+- **Fresh view and pinned history.** Start with independent same-subject
+  roots A and D, with descending receivedAt putting D first. Insert C
+  referencing A in the same thread T, with receivedAt between A and D.
+  Call that published end E. Add bridge B referencing A and D after E,
+  with receivedAt below all three. Its publication F merges D's thread
+  into T. Require real raw records and published prefixes. For the
+  fresh form, park a keyed queryChanges after the one view is validated,
+  publish F on another entry or park it after durable commit and before
+  swap, then resume. Check the diff's exact IDs, representative and
+  state: C represents T at E, and D retains its old identity. For the
+  pinned form, put an unrelated raw update before C and take a real
+  maxChanges=1 first page so the continuation's next item is C. Publish
+  F before making that call, establish E<C_cache, and assert the same E
+  identity result. Apply each diff and call again from E to prove the
+  F identity of D is added once and was absent from the previous page.
+  The pinned fixture must fail if collapse selects the representative
+  with current grouping before any prefix rewrite.
+- **Token minimum and exhausted fallback.** Warm a separate node's cache
+  before a real nonpublishing delete, with newest publication and epoch
+  below that warm cache counter. Issue an actual initial Intermediate
+  token with maxChanges=1 on the refreshed node after the delete and
+  before the other node refreshes. Require C_cache<to and unchanged
+  publication/epoch, with retained suffix and bounds. Continue on the
+  stale node. Require refresh to at least to or bounded no-map refusal
+  with no data. Holding the old cache through the retries isolates the
+  refusal; after release the same actual token must return the survivor
+  and preserve to. Include a refreshed cache with C_cache==to. For the
+  exhausted branch use that issued from/to
+  with a controlled sent count equal to the verified stream length.
+  Assert the floor is applied before fallback. With a later durable
+  insert, verify the refreshed fallback returns the new effective end
+  and current presence from the same view, including that insert.
+  A naturally emitted token has remaining items; the exhausted control
+  changes only the count. Also exercise the positive Exact since-floor
+  and the fresh Initial/Exact(0) absence of a floor.
+- **Current-row compatibility.** With an actual pinned E, insert a new
+  high-ranked candidate after E and delete a historical member of a
+  touched thread after E. Verify the insert is excluded before ranking
+  and collapse. The deleted member's old E ID may be re-emitted for
+  removal, and its absent current row contributes neither an addition
+  nor a total. A still-present row changed after E uses its current
+  nonidentity filter/sort values while retaining its E thread identity.
+  Exercise a supported thread-keyword filter or sort and the existing
+  immutable upToId cutoff with IDs whose prefix changes at F. Also hold
+  the page unchanged in a Content-mode case and assert its unavailable
+  refusal still occurs before the early return.
+- **Isolated mutations.** Independently bypass the caller-minimum check;
+  reacquire the query view after page selection; and use current
+  grouping before historical prefix emission. The corresponding tests
+  above distinguish each failure while keeping retention, cap and
+  deadline checks active. Preserve the separate P1-PAGING mutations.
+
 - [ ] **Step 5: Run, implement, run**
 
 Run: the za suite.
@@ -3199,7 +3423,7 @@ Expected: `mail::threads` passes; `mail::search`'s `query_changes_collapse_threa
 Run: `cargo test -p email --lib --features test_mode za::search::changes`; the per-task compile check; `cargo check -p tests --tests`; `jmap::jmap_tests` plain and with `ZA_KEY_ACCOUNTS=1` (`changes/get.rs` and `changes/query.rs` are shared paths); the za suite with `BLOB_STORE=FileSystem` (the end of phase E); formatting.
 
 ```bash
-git add crates/email/src/message/za/search/changes.rs crates/email/src/message/za/search/mod.rs crates/jmap/src/changes/za.rs crates/jmap/src/changes/mod.rs crates/jmap/src/changes/get.rs crates/jmap/src/changes/query.rs tests/src/za/mail/threads.rs tests/src/utils/za.rs
+git add crates/email/src/message/za/search/changes.rs crates/email/src/message/za/search/mod.rs crates/jmap/src/changes/za.rs crates/jmap/src/changes/mod.rs crates/jmap/src/changes/get.rs crates/jmap/src/changes/query.rs crates/jmap/src/email/query.rs crates/jmap/src/email/query/filter.rs crates/jmap/src/email/za_search.rs tests/src/za/mail/threads.rs tests/src/utils/za.rs
 git commit -m "Release 7: Email/changes and Thread/changes rendered from the sealed thread history"
 ```
 

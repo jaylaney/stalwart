@@ -1,6 +1,11 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 27 (2026-11-08), execution correction.
+Date: 2026-11-04. Status: revision 28 (2026-11-08), execution correction.
+Revision 28 pairs keyed changes and query evaluation with one validated view.
+A supplied since-state sets a minimum cache counter. Query evaluation keeps
+upstream current-row filter values and sort keys and applies the effective page
+endpoint to identities and membership before grouping. The change needs no new
+stored history or wire token.
 Revision 27 closes the Content-view deletion race (P2-CONTENT-FLOOR).
 A Content view also validates its cache counter against the applied indexing
 checkpoint, using the existing stale-mark and bounded retry. A deletion-only
@@ -1952,6 +1957,26 @@ thread map as loaded (5.2) and validated (below):
   remain available during ingestion, and each method's final created IDs are
   registered for later calls only after that method completes. Ordinary
   accounts keep upstream's state and metadata behavior.
+- **Keyed sync admission.** Before acquiring a view for Email/changes,
+  Thread/changes or Email/queryChanges, derive the minimum Email group
+  counter from the supplied state. Intermediate uses its pinned to; a
+  positive Exact uses its since value; Initial and Exact(0) have no
+  minimum. A caller-supplied minimum joins the existing bounded view
+  validation. If the cache counter is below it, drop the guard, mark the
+  Email group stale and retry within the existing validation-round budget.
+  Exhaustion returns `NoMap(Transient(Validation))` for Map and
+  `Unavailable(Transient(Validation))` for Content. Route Map through
+  `za_no_map_error` and Content through the existing named-property
+  unavailable adapter. Content deadline expiry remains
+  `Unavailable(NotCurrent)` and uses the original deadline. Content mode
+  still enforces the cap and checkpoint floor.
+  This minimum covers a real token from another node after a deletion-only
+  commit, when the local cache may be warm but behind the token even
+  though the newest identity publication and epoch have not moved.
+  Keep the pinned end and the cache's own counters. The same admission
+  applies before an exhausted Intermediate can fall through to Exact(to).
+  The ordinary account's state handling and the keyed write floor stay
+  as described above.
 - Every Email id a client supplies to a keyed method is translated
   before upstream's lookup: 1.0.3 resolves a supplied id with
   `cache.email_by_jmap_id(id)` (`crates/email/src/cache/email.rs:620-624`,
@@ -2132,8 +2157,10 @@ when the message cache's present set holds it; when `E` is a pinned
 past state, reconstruct its present set by undoing the complete lifecycle
 suffix after `E`: `(present_now ∪ later_deletes) \ later_inserts` (document
 ids have one lifecycle and are never reused). A later insert excludes `D`
-even if a later delete also names it (P1-PAGING). The suffix is limited to
-the validated cache's group counter. After all required raw reads, check
+even if a later delete also names it (P1-PAGING). The pinned end is at or
+below the admitted cache's group counter C. Use the store's physically
+bounded unfolded reads for (S,E] and the suffix (E,C]. After all required
+raw reads, check
 retention again: use `S` when `S > 0`, and pinned `E` for an initial
 continuation. Refuse if that endpoint is below the new bound, before
 rendering, skipping or the exhausted-stream fallback. A truncated required
@@ -2254,12 +2281,34 @@ entries, so the fork renders a key account's `Email/changes` and
   property change advances too (revision 20, 6.2); a flag-only record
   lies inside `(S, E]` for the Thread stream, and renders nothing there,
   since it changes no thread's member set;
-- `Email/queryChanges` consumes the same page through its `changes` call
-  (`changes/query.rs:65-74`) and diffs it against the mapped query as
-  upstream does (`:348-378`); its `collapseThreads` handling
-  (`:105-137`) takes the prefixes of the page's created, updated and
-  destroyed ids, mapped, and selects the messages it re-emits as updated
-  by the map's thread id as of `E` instead of the cache's (`:129, :133`).
+- Keyed Email/queryChanges chooses Map or Content for its query before
+  acquiring one validated view and before choosing a fresh page end.
+  Content availability is still checked before an unchanged-state return.
+  The page and query borrow the same cache and guard. The page gives the
+  caller its effective since, end and end-presence set, including the
+  endpoint selected by an exhausted continuation's fallback. The public
+  response and diff keep their existing shapes and operations
+  (changes/query.rs:348–378). The standalone query and changes methods
+  acquire their own view. The composed caller holds its guard only after
+  ensure, pass, reload and content load have finished.
+- For a keyed queryChanges page, E pins the change stream and identities.
+  At E, the query projects each document through thread_of(d,E) before
+  applying thread predicates, thread-dependent sorts, collapse, and ID
+  emission. Compare upToId against the complete projected ID wherever
+  upstream applies that cutoff. Query candidates are the current readable
+  cache rows whose documents were present at E. Their filter values and
+  nonidentity sort keys come from the current rows and, when needed, the
+  same view's current content. That evaluation follows upstream's
+  current-row behavior. E supplies historical identity and existence,
+  without reconstructing old flags, mailbox values, content rows or exact
+  historical ranks. An insert after E cannot supply a query row even when
+  it would otherwise win the sort. A document deleted after E can supply
+  its retained historical ID for touched-thread re-emission, but cannot
+  supply a query row. Re-emission takes touched prefixes from the page's
+  mapped IDs and selects members from the same corrected present-at-E
+  set with thread_of(d,E), excluding IDs already created or updated by
+  the page. The public standalone Email/query keeps its current-result
+  contract. Ordinary accounts keep the upstream composition.
 
 **Pruning.** An alias, a deleted message's record and a revision-table
 row are kept until their change id is older than the oldest retained
@@ -2378,10 +2427,16 @@ for a content request only, when:
   manifest is of a newer format (F7);
 - the index is not current after `ZA_SEARCH_WAIT_SECS` of passes (a
   rebuild or a reconciliation in progress, or a very long absence),
-  where **current** means, against the same `E` the response returns
-  (6.2): `indexed_to.change_id <= E <= scanned_to`, a complete
-  `indexed_to`, no insert or delete record in `(indexed_to, scanned_to]`,
-  and `content_to` at `indexed_to` (G14, P2-CONTENT-FLOOR);
+  where **current** is checked against `C = cache.last_change_id`, the
+  admitted view's Email group counter (6.2). Require
+  `indexed_to.change_id <= C <= scanned_to`, a complete `indexed_to`,
+  no insert or delete record in `(indexed_to, scanned_to]`, and
+  `content_to` at `indexed_to` (G14, P2-CONTENT-FLOOR). C is distinct
+  from a historical page endpoint E and from `cache.emails.change_id`,
+  the Email item state returned by ordinary keyed Email read responses.
+  For keyed queryChanges, E may be older than C. E controls historical
+  identity and end-presence. Current rows and content come from the
+  admitted view. Keep the page's E-based state and each counter's own value;
 - a leaf cannot be resolved (a defect, traced as such).
 
 A content request is never answered from an index that is behind the
@@ -2639,7 +2694,14 @@ and `fence.rs` and `index_task.rs` reach `keymail45` and `plainmail49`):
   `SEARCH_CACHE_HOLD`), and the response either re-reads the cache or
   fails, never returning a mapped id under the stale state, with
   `Email/queryChanges` never emitting an `added` for an id the client
-  holds; a deleted merged message, a thread compaction and a reload,
+  holds; a fresh queryChanges view held across a competing publication
+  and a retained continuation with that publication above E both exclude
+  its new representative and add it only when its own range is read.
+  A real cross-node continuation after a nonpublishing deletion refreshes
+  a cache below the pinned end or refuses after bounded validation. A
+  historical query projection excludes post-end insert rows and can
+  re-emit the old ID of a post-end deletion without a query row.
+  A deleted merged message, a thread compaction and a reload,
   then changes from a retained pre-delete state rendering the destroyed
   mapped id (R3); the publishing pass's keyless writes are exactly one
   item update of the lowest indexed id, one Thread property change and
