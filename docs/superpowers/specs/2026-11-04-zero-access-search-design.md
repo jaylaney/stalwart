@@ -1,6 +1,15 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 20 (2026-11-08), approved.
+Date: 2026-11-04. Status: revision 21 (2026-11-08), approved.
+Revision 21 records Jay's Task 1 benchmark ruling: the provisional account
+content cap is 512 MiB and the process content budget is 1536 MiB. The
+15,000-message format benchmark measured 214.40 MiB of Term-compressed
+payloads with positions, projecting to 428.79 MiB at 30,000 messages before
+record fields and postings. Positions and the Term dictionary stay; Task 19
+must confirm these limits against the completed model's loaded size. The
+one-third boot refusal and the shared account-cap requirement are unchanged.
+The outcome note records the measured build, corpus and qualifications.
+
 Revision 20 is wording only, one correction plan 16 asked for (its call
 D13) and Jay ruled on 2026-11-08: a Thread method's state (`Thread/get`'s
 `state`, `E` for `Thread/changes`) is the validated view's cache
@@ -293,6 +302,14 @@ only those sessions hold.
   few milliseconds (more with attachment text). These are estimates; the
   plan's first task is the benchmark of 9.6, whose figures decide the
   blob format's details and confirm or adjust the limits of 4.4.
+  Task 1's 2026-11-08 measurements supersede those estimates for its
+  15,000-message, 1.22 GB synthetic corpus: Term frames with positions
+  total 214.40 MiB, before record fields and postings. The measured
+  open-and-index rates (27.879 messages/s with attachment text, 56.793
+  without) use an unoptimized test-mode build and include two raw
+  encodings per message; they are not production throughput. Actual
+  loaded memory and end-to-end performance remain Task 19 measurements.
+  See `../plans/2026-11-07-zero-access-plan16-outcome.md`.
 
 ## 2. Threat model delta
 
@@ -853,7 +870,7 @@ structure with its own rules:
   needs a load the first is making waits for it rather than paying a
   second transient.
 - **Evict** after `ZA_SEARCH_IDLE_SECS` (default 900) without use, when
-  the process budget `ZA_SEARCH_MEM_MB` (default 512) needs room (least
+  the process budget `ZA_SEARCH_MEM_MB` (default 1536) needs room (least
   recently used first, content parts before thread parts), and on every
   invalidation that drops the account's keys
   (`CacheInvalidation::Account` and `AccessToken`,
@@ -886,7 +903,7 @@ structure with its own rules:
   (`crates/common/src/cache/swap/evict.rs:20-26`); `Caches::za_search`
   never implements it, and invariant 49 says so.
 - **Account cap.** An account whose content part would exceed
-  `ZA_SEARCH_ACCOUNT_MAX_MB` (default 128, at most a third of the
+  `ZA_SEARCH_ACCOUNT_MAX_MB` (default 512, at most a third of the
   content budget so that a load's transient fits, G6), read from the
   manifest's chain size without a walk (4.2), loads its thread part
   only; its
@@ -912,9 +929,9 @@ after eviction is the load cost of 4.3. The knobs:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ZA_SEARCH_MEM_MB` | 512 | process budget for loaded content parts, transients included |
+| `ZA_SEARCH_MEM_MB` | 1536 | process budget for loaded content parts, transients included |
 | `ZA_SEARCH_THREAD_MEM_MB` | 256 | process budget for loaded thread parts, transients included (G6) |
-| `ZA_SEARCH_ACCOUNT_MAX_MB` | 128 | largest content part a node loads or extends; at most a third of `ZA_SEARCH_MEM_MB`, for the load's transient (G6) |
+| `ZA_SEARCH_ACCOUNT_MAX_MB` | 512 | largest content part a node loads or extends; at most a third of `ZA_SEARCH_MEM_MB`, for the load's transient (G6) |
 | `ZA_SEARCH_IDLE_SECS` | 900 | eviction after disuse |
 | `ZA_SEARCH_PASS_CAP` | 48 | admitted items after which a pass stops at the next insert boundary (`C`); at most `H / (R + (K − 1) · a)`, so that it binds (H7) |
 | `ZA_SEARCH_PASS_MB` | 32 | opened message bytes after which a pass stops at the next insert boundary |
