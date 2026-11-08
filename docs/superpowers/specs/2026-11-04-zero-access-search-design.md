@@ -1,6 +1,12 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 22 (2026-11-08), approved.
+Date: 2026-11-04. Status: revision 23 (2026-11-08), approved.
+Revision 23 makes the keyed write-response view explicit (execution finding
+P1-STATE). A mixed Email/set validates input prefixes before mutations, then
+uses a final validated view after its later writes for created IDs and newState.
+That view's cache counter must cover the call's acknowledged writes, within the
+existing bounded validation loop. It adds no pass or simultaneous read guard;
+oldState and supplied-ID acknowledgement echoes keep their original meaning.
 Revision 22 corrects the publishing target for every accepted padding minimum
 (execution review P1-PAD). A publishing hidden section pads directly to M and
 refuses a framed payload above M. Rounding an actual payload can exceed a valid
@@ -1833,6 +1839,24 @@ thread map as loaded (5.2) and validated (below):
   pass. The pass's own reload at step 0 is not enough on its own: the
   message cache can refresh between the pass and the handler's state
   read.
+- **Keyed write responses** (P1-STATE). `Email/set` keeps its pre-ingest
+  precondition and `oldState`. After create ingestion and its selected
+  post-write pass, it takes an input view for update/destroy prefix and
+  existence checks. If later mutations commit, it drops that view before
+  acquiring a final response view; newly advertised created IDs and `newState`
+  come from that final view together. Its cache counter must also be at or
+  past this call's latest acknowledged Email change id, even when the manifest
+  is unchanged. A miss uses the existing stale mark and bounded validation
+  retry, then fails as no map; it never synthesizes a later state over an older
+  cache. A view with no later writes may be reused if it meets this floor.
+  `Email/import` takes its final view after its selected hook, with the same
+  write floor. The Email state is the final cache's Email item state, not the
+  Thread counter or a later store read. No additional pass, mutation replay
+  or simultaneous read guard is introduced. Supplied IDs echoed in mutation
+  acknowledgements retain their input meaning; same-call creation references
+  remain available during ingestion, and each method's final created IDs are
+  registered for later calls only after that method completes. Ordinary
+  accounts keep upstream's state and metadata behavior.
 - Every Email id a client supplies to a keyed method is translated
   before upstream's lookup: 1.0.3 resolves a supplied id with
   `cache.email_by_jmap_id(id)` (`crates/email/src/cache/email.rs:620-624`,
