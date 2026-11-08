@@ -38,6 +38,7 @@ pub mod pinning;
 pub mod raw_input;
 pub mod registry;
 pub mod reply;
+pub mod search_bench;
 pub mod setup;
 pub mod sharing;
 pub mod sharing_move_atomic;

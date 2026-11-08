@@ -102,6 +102,11 @@ impl Writer {
         plain
     }
 
+    #[cfg(feature = "test_mode")]
+    pub(crate) fn into_raw_bytes(self) -> Vec<u8> {
+        self.buf
+    }
+
     pub fn push_leb128<T: Leb128>(&mut self, value: T) {
         self.buf.push_leb128(value);
     }
