@@ -130,9 +130,14 @@
 //!   the calendars and before any item is read, keyed by the requesting
 //!   principal (`dav::common::propfind::za`).
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+use super::search::ZaSearchConfig;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 pub use store::za_test::{
     FORCE_COMMIT_SPLIT, Pause, set_index_chunk_pause, set_second_chunk_fail_once,
@@ -847,4 +852,251 @@ pub fn set_propfind_admitted_pause(pause: Option<Arc<Pause>>) {
 }
 pub async fn propfind_admitted_pause_point(reader: u32) {
     wait(take_for(&PROPFIND_ADMITTED_PAUSE, reader)).await;
+}
+
+// Zero-access search hooks. The consuming tasks place the pause points and flags.
+pub static SEARCH_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_SWAP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_SNAPSHOT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_VIEW_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_SWEEP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_PASS_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_DESTROY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_HOLD_EXPIRE: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_CACHE_HOLD: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_SWAP_SKIP: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_OPEN_FAIL_ALL: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_BLOB_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_OPEN_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_MANIFEST_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_DESTROY_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_BLOB_SLOW: Mutex<Option<(u32, u64)>> = Mutex::new(None);
+pub static SEARCH_CONFIG_OVERRIDE: Mutex<Option<ZaSearchConfig>> = Mutex::new(None);
+static ZA_SEARCH_COUNTERS: std::sync::LazyLock<Mutex<HashMap<u32, (u64, u64, usize)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn set_search_commit_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_COMMIT_PAUSE, pause);
+}
+
+pub async fn search_commit_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_COMMIT_PAUSE, account_id)).await;
+}
+
+pub fn set_search_swap_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_SWAP_PAUSE, pause);
+}
+
+pub async fn search_swap_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_SWAP_PAUSE, account_id)).await;
+}
+
+pub fn set_search_snapshot_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_SNAPSHOT_PAUSE, pause);
+}
+
+pub async fn search_snapshot_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_SNAPSHOT_PAUSE, account_id)).await;
+}
+
+pub fn set_search_view_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_VIEW_PAUSE, pause);
+}
+
+pub async fn search_view_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_VIEW_PAUSE, account_id)).await;
+}
+
+pub fn set_search_sweep_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_SWEEP_PAUSE, pause);
+}
+
+pub async fn search_sweep_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_SWEEP_PAUSE, account_id)).await;
+}
+
+pub fn set_search_pass_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_PASS_PAUSE, pause);
+}
+
+pub async fn search_pass_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_PASS_PAUSE, account_id)).await;
+}
+
+pub fn set_search_destroy_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_DESTROY_PAUSE, pause);
+}
+
+pub async fn search_destroy_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_DESTROY_PAUSE, account_id)).await;
+}
+
+pub fn set_search_hold_expire(account_id: Option<u32>) {
+    *SEARCH_HOLD_EXPIRE.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn search_hold_expire(account_id: u32) -> bool {
+    *SEARCH_HOLD_EXPIRE.lock().unwrap_or_else(|e| e.into_inner()) == Some(account_id)
+}
+
+pub fn set_search_cache_hold(account_id: Option<u32>) {
+    *SEARCH_CACHE_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn search_cache_hold(account_id: u32) -> bool {
+    *SEARCH_CACHE_HOLD.lock().unwrap_or_else(|e| e.into_inner()) == Some(account_id)
+}
+
+pub fn set_search_swap_skip(account_id: Option<u32>) {
+    *SEARCH_SWAP_SKIP.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn search_swap_skip(account_id: u32) -> bool {
+    *SEARCH_SWAP_SKIP.lock().unwrap_or_else(|e| e.into_inner()) == Some(account_id)
+}
+
+pub fn set_search_open_fail_all(account_id: Option<u32>) {
+    *SEARCH_OPEN_FAIL_ALL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn search_open_fail_all(account_id: u32) -> bool {
+    *SEARCH_OPEN_FAIL_ALL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        == Some(account_id)
+}
+
+pub fn set_search_blob_fail_once(account_id: Option<u32>) {
+    *SEARCH_BLOB_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn take_search_blob_fail(account_id: u32) -> bool {
+    take_flag(&SEARCH_BLOB_FAIL_ONCE, account_id)
+}
+
+pub fn set_search_open_fail_once(account_id: Option<u32>) {
+    *SEARCH_OPEN_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn take_search_open_fail(account_id: u32) -> bool {
+    take_flag(&SEARCH_OPEN_FAIL_ONCE, account_id)
+}
+
+pub fn set_search_manifest_fail_once(account_id: Option<u32>) {
+    *SEARCH_MANIFEST_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn take_search_manifest_fail(account_id: u32) -> bool {
+    take_flag(&SEARCH_MANIFEST_FAIL_ONCE, account_id)
+}
+
+pub fn set_search_destroy_fail_once(account_id: Option<u32>) {
+    *SEARCH_DESTROY_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn take_search_destroy_fail(account_id: u32) -> bool {
+    take_flag(&SEARCH_DESTROY_FAIL_ONCE, account_id)
+}
+
+pub fn set_search_blob_slow(delay: Option<(u32, u64)>) {
+    *SEARCH_BLOB_SLOW.lock().unwrap_or_else(|e| e.into_inner()) = delay;
+}
+
+pub fn search_blob_slow(account_id: u32) -> Option<Duration> {
+    SEARCH_BLOB_SLOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|(id, _)| *id == account_id)
+        .map(|(_, millis)| Duration::from_millis(millis))
+}
+
+pub fn set_search_config_override(config: Option<ZaSearchConfig>) {
+    *SEARCH_CONFIG_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = config;
+}
+
+pub(super) fn search_config_override() -> Option<ZaSearchConfig> {
+    SEARCH_CONFIG_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub fn count_za_search_blob_read(account_id: u32) {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(account_id)
+        .or_default()
+        .0 += 1;
+}
+
+pub fn count_za_search_message_open(account_id: u32) {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(account_id)
+        .or_default()
+        .1 += 1;
+}
+
+pub fn note_za_search_item_aliases(account_id: u32, n: usize) {
+    let mut counters = ZA_SEARCH_COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+    let max_aliases = &mut counters.entry(account_id).or_default().2;
+    *max_aliases = (*max_aliases).max(n);
+}
+
+pub fn za_search_blob_reads(account_id: u32) -> u64 {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&account_id)
+        .map_or(0, |counters| counters.0)
+}
+
+pub fn za_search_message_opens(account_id: u32) -> u64 {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&account_id)
+        .map_or(0, |counters| counters.1)
+}
+
+pub fn za_search_max_item_aliases(account_id: u32) -> usize {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&account_id)
+        .map_or(0, |counters| counters.2)
+}
+
+pub fn reset_za_search_counters(account_id: u32) {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&account_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_blob_failure_is_taken_once_by_its_account() {
+        set_search_blob_fail_once(Some(5));
+        assert!(!take_search_blob_fail(6));
+        assert!(take_search_blob_fail(5));
+        assert!(!take_search_blob_fail(5));
+    }
 }

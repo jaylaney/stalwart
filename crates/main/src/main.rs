@@ -71,6 +71,16 @@ async fn async_main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if let Some(reason) = init.inner.cache.za_search.refusal() {
+        eprintln!("{reason}");
+        trc::event!(
+            Server(trc::ServerEvent::StartupError),
+            Details = "Zero-access search configuration refused, aborting startup.",
+            Reason = reason.to_string(),
+        );
+        return ExitCode::FAILURE;
+    }
+
     // Init services
     init.start_services().await;
     init.start_queue_manager();

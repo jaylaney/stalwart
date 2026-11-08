@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::keys::{KeyError, Secret, derive_event_key, derive_mail_key};
+use crate::keys::{KeyError, Secret, derive_event_key, derive_mail_key, derive_search_key};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
@@ -37,6 +37,7 @@ pub struct SessionKeys {
     ewk: Secret,
     /// Mail spec 3.1: the mail wrapping key, derived from MK next to the EWK.
     mwk: Secret,
+    swk: Secret,
     /// Invitations spec 3.2: the X25519 private key, unwrapped from the
     /// vault record on first use. Holds the outcome, so a wrap that does not
     /// open is traced once per session.
@@ -167,6 +168,7 @@ impl SessionKeys {
     pub fn new(account_id: u32, generation: u64, mk: Secret) -> Self {
         let ewk = derive_event_key(&mk);
         let mwk = derive_mail_key(&mk);
+        let swk = derive_search_key(&mk);
         #[cfg(feature = "test_mode")]
         live::created(account_id);
         SessionKeys {
@@ -175,6 +177,7 @@ impl SessionKeys {
             mk,
             ewk,
             mwk,
+            swk,
             private_key: OnceLock::new(),
             drain: ZaDrainState::new(),
             collection_keys: Mutex::new(HashMap::new()),
@@ -191,6 +194,10 @@ impl SessionKeys {
 
     pub fn mwk(&self) -> &Secret {
         &self.mwk
+    }
+
+    pub fn swk(&self) -> &Secret {
+        &self.swk
     }
 
     /// `None` until the first unwrap was attempted.
@@ -347,7 +354,7 @@ impl std::fmt::Debug for SessionKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::{KeyError, Secret, derive_event_key, derive_mail_key};
+    use crate::keys::{KeyError, Secret, derive_event_key, derive_mail_key, derive_search_key};
 
     #[test]
     fn collection_cache_separates_reconversions() {
@@ -602,6 +609,22 @@ mod tests {
         let mk = Secret::random();
         let keys = SessionKeys::new(7, 3, mk.clone());
         assert_eq!(keys.mwk().as_bytes(), derive_mail_key(&mk).as_bytes());
+        assert_eq!(format!("{keys:?}"), "SessionKeys(account 7, generation 3)");
+    }
+
+    #[test]
+    fn session_keys_carry_the_search_key_and_it_survives_a_rewrap() {
+        let mk = Secret::random();
+        let keys = SessionKeys::new(7, 3, mk.clone());
+        assert_eq!(keys.swk().as_bytes(), derive_search_key(&mk).as_bytes());
+        // A password change, a recovery or an app password rewraps mk under a
+        // new generation; the derived key does not move (spec 3.1).
+        let rewrapped = SessionKeys::new(7, 4, mk.clone());
+        assert_eq!(rewrapped.swk().as_bytes(), keys.swk().as_bytes());
+        assert_ne!(keys.swk().as_bytes(), keys.mwk().as_bytes());
+        assert_ne!(keys.swk().as_bytes(), keys.ewk().as_bytes());
+        let other = SessionKeys::new(7, 3, Secret::random());
+        assert_ne!(other.swk().as_bytes(), keys.swk().as_bytes());
         assert_eq!(format!("{keys:?}"), "SessionKeys(account 7, generation 3)");
     }
 

@@ -13,6 +13,7 @@ pub mod query;
 pub mod registry;
 pub mod search;
 pub mod write;
+pub mod za_search;
 #[cfg(feature = "test_mode")]
 pub mod za_test;
 

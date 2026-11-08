@@ -8,6 +8,7 @@ use ::registry::{
     schema::prelude::{OBJ_SINGLETON, ObjectType},
     types::EnumImpl,
 };
+use std::collections::HashSet;
 use store::{
     ValueKey,
     write::{
@@ -46,9 +47,9 @@ enum Rule {
     /// registry id counters kept (as at 0.16), and any other counter that the
     /// store purge did not remove (it removes zero counters) is a leftover.
     Counters,
-    /// Properties: a zero-access vault or pin record is reported to the
-    /// caller, which checks that its account still exists; the rest are
-    /// leftovers.
+    /// Properties: zero-access vault, pin and search-manifest records are
+    /// reported to the caller, which checks that their accounts still exist.
+    /// The rest are leftovers.
     Properties,
     /// The schema version and the node-id claims are kept; the rest are
     /// leftovers.
@@ -255,7 +256,7 @@ pub async fn store_assert_is_empty(store: &Store, blob_store: BlobStore, include
         store_assert_is_empty_except_account_state(store, blob_store, include_registry).await;
     assert!(
         account_state.vault_accounts.is_empty(),
-        "Found zero-access vault records of accounts {:?}",
+        "Found zero-access vault, pin or search state of accounts {:?}",
         account_state.vault_accounts
     );
     assert!(
@@ -270,15 +271,14 @@ pub async fn store_assert_is_empty(store: &Store, blob_store: BlobStore, include
 /// exists.
 #[derive(Debug, Default)]
 pub struct AccountState {
-    /// Accounts holding a zero-access vault or pin record (kept).
+    /// Accounts holding zero-access vault, pin or search state (kept).
     pub vault_accounts: Vec<u32>,
     /// Accounts that held share notifications (deleted with the logs).
     pub share_notification_accounts: Vec<u32>,
 }
 
-/// Like `store_assert_is_empty`, but returns the accounts holding a
-/// zero-access vault record or a share notification instead of reporting
-/// them. The caller must check that each account still exists.
+/// Like `store_assert_is_empty`, but returns the accounts holding zero-access
+/// state or share notifications instead of reporting them. The caller must check that each account still exists.
 #[allow(unused_variables)]
 #[must_use]
 pub async fn store_assert_is_empty_except_account_state(
@@ -290,6 +290,15 @@ pub async fn store_assert_is_empty_except_account_state(
     // (`store_lookup_expire_all`). 1.0 keeps no in-memory values in the data
     // store: `InMemoryStore` has no data-store variant, so that step has no
     // subject.
+    let internal_blob_key_len = match &blob_store {
+        BlobStore::Store(blob) if blob.is_same(store) => Some(if blob.is_foundationdb() {
+            // FoundationDB appends a u16 chunk number to each blob key.
+            BLOB_HASH_LEN + U16_LEN
+        } else {
+            BLOB_HASH_LEN
+        }),
+        _ => None,
+    };
     store_blob_expire_all(store).await;
     store.purge_blobs_all_shards(blob_store).await.unwrap();
     store.purge_store().await.unwrap();
@@ -299,6 +308,24 @@ pub async fn store_assert_is_empty_except_account_state(
     let mut delete_batch = BatchBuilder::new();
     let mut vault_accounts = Vec::new();
     let mut share_notification_accounts = Vec::new();
+    let mut search_blob_hashes = HashSet::<[u8; BLOB_HASH_LEN]>::new();
+
+    // A commit marker sorts before its document links. Collect eligible links
+    // before classifying commits and payloads, regardless of iteration order.
+    let (from_key, to_key) = subspace_range(Subspace::BlobLink);
+    store
+        .iterate(
+            IterateParams::new(from_key, to_key).set_values(false),
+            |key, _| {
+                if let Some(account_id) = search_blob_account(key) {
+                    search_blob_hashes.insert(key[..BLOB_HASH_LEN].try_into().unwrap());
+                    vault_accounts.push(account_id);
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
 
     for subspace in Subspace::ALL.iter().copied() {
         let rule = subspace_rule(subspace);
@@ -411,11 +438,12 @@ pub async fn store_assert_is_empty_except_account_state(
                                 && key[U32_LEN] == Collection::Principal as u8
                                 && (key[U32_LEN + 1] == PrincipalField::ZeroAccessVault as u8
                                     || key[U32_LEN + 1]
-                                        == PrincipalField::ZeroAccessPins as u8) =>
+                                        == PrincipalField::ZeroAccessPins as u8
+                                    || key[U32_LEN + 1]
+                                        == PrincipalField::ZeroAccessSearch as u8) =>
                         {
-                            // Zero-access vault and pin records persist for the life
-                            // of the account; the caller checks that the account
-                            // exists.
+                            // Vault, pin and search-manifest records persist for the life
+                            // of the account. The caller checks that the account exists.
                             vault_accounts.push(key.deserialize_be_u32(0).unwrap());
                             return Ok(true);
                         }
@@ -425,6 +453,21 @@ pub async fn store_assert_is_empty_except_account_state(
                                     && key[0] == SystemKind::NodeId as u8) =>
                         {
                             // The schema version and the node-id claims
+                            return Ok(true);
+                        }
+                        Rule::Leftover { with_values: true }
+                            if subspace == Subspace::BlobLink
+                                && (search_blob_account(key).is_some()
+                                    || (key.len() == BLOB_HASH_LEN
+                                        && search_blob_hashes.contains(key))) =>
+                        {
+                            return Ok(true);
+                        }
+                        Rule::Leftover { with_values: true }
+                            if subspace == Subspace::Blobs
+                                && Some(key.len()) == internal_blob_key_len
+                                && search_blob_hashes.contains(&key[..BLOB_HASH_LEN]) =>
+                        {
                             return Ok(true);
                         }
                         Rule::Leftover { with_values: false } if subspace == Subspace::Indexes => {
@@ -482,6 +525,17 @@ pub async fn store_assert_is_empty_except_account_state(
     }
 }
 
+fn search_blob_account(key: &[u8]) -> Option<u32> {
+    if key.len() == BLOB_HASH_LEN + U32_LEN + 1 + U32_LEN
+        && key[BLOB_HASH_LEN + U32_LEN] == Collection::Principal as u8
+        && key.ends_with(&0u32.to_be_bytes())
+    {
+        Some(key.deserialize_be_u32(BLOB_HASH_LEN).unwrap())
+    } else {
+        None
+    }
+}
+
 fn is_allowed_registry_type(object_type: ObjectType) -> bool {
     (object_type.flags() & OBJ_SINGLETON) != 0
         || matches!(
@@ -499,4 +553,180 @@ fn is_allowed_registry_type(object_type: ObjectType) -> bool {
                 | ObjectType::Tracer
                 | ObjectType::Domain
         )
+}
+
+#[cfg(all(test, feature = "rocks"))]
+mod tests {
+    use super::*;
+    use crate::utils::{registry::UnwrapRegistryId, server::TestServerBuilder};
+    use ::registry::{
+        schema::structs::{Account, SystemSettings, UserAccount},
+        types::id::ObjectId,
+    };
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+    use store::{
+        registry::write::RegistryWrite,
+        write::blob_codec::{BlobKeyring, BlobOpts},
+    };
+    use types::id::Id;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cleanup_retains_only_search_blobs_of_live_accounts() {
+        // This fixture needs to see the internal payload row in the data store.
+        if std::env::var("STORE").as_deref() != Ok("RocksDb")
+            || std::env::var_os("BLOB_STORE").is_some()
+        {
+            return;
+        }
+
+        let test = TestServerBuilder::new("cleanup-search-blobs")
+            .await
+            .disable_services()
+            .build()
+            .await;
+        let registry = test.server.registry();
+        let domain_id = registry
+            .object::<SystemSettings>(Id::singleton())
+            .await
+            .unwrap()
+            .unwrap()
+            .default_domain_id;
+        let id = registry
+            .write(RegistryWrite::insert(
+                &Account::User(UserAccount {
+                    name: "cleanup-search-blobs".into(),
+                    domain_id,
+                    ..Default::default()
+                })
+                .into(),
+            ))
+            .await
+            .unwrap()
+            .unwrap_id(trc::location!());
+        let account_id = id.document_id();
+
+        let store = test.server.store();
+        let blob_store = &test.server.core.storage.blob;
+        assert!(
+            matches!((store, blob_store), (Store::RocksDb(_), BlobStore::Store(blob)) if blob.is_same(store))
+        );
+        let payload = b"sealed search blob fixture";
+        let hash = BlobHash::generate(payload.as_slice());
+        let link = BlobOp::Link {
+            hash: hash.clone(),
+            to: BlobLink::Document,
+        };
+        blob_store
+            .put_blob(hash.as_ref(), payload, &BlobOpts::PLAIN)
+            .await
+            .unwrap();
+        store
+            .write_batch(
+                BatchBuilder::new()
+                    .with_account_id(account_id)
+                    .with_collection(Collection::Principal)
+                    .with_document(0)
+                    .set(BlobOp::Commit { hash: hash.clone() }, Vec::new())
+                    .set(link.clone(), Vec::new()),
+            )
+            .await
+            .unwrap();
+
+        let state =
+            store_assert_is_empty_except_account_state(store, blob_store.clone(), true).await;
+        assert_eq!(state.vault_accounts, [account_id]);
+        test.assert_is_empty().await;
+        assert!(store.blob_exists(&hash).await.unwrap());
+        assert_eq!(
+            blob_store
+                .get_blob(hash.as_ref(), 0..usize::MAX, &BlobKeyring::default())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(payload.as_slice())
+        );
+
+        // A tolerated hash never excuses a different document link.
+        for (collection, document) in [(Collection::Email, 0), (Collection::Principal, 1)] {
+            let mut batch = BatchBuilder::new();
+            batch
+                .with_account_id(account_id)
+                .with_collection(collection)
+                .with_document(document)
+                .set(link.clone(), Vec::new());
+            store.write_batch(&mut batch).await.unwrap();
+            assert_cleanup_panics(&test, "Store is not empty.").await;
+            store
+                .write_batch(
+                    BatchBuilder::new()
+                        .with_account_id(account_id)
+                        .with_collection(collection)
+                        .with_document(document)
+                        .clear(link.clone()),
+                )
+                .await
+                .unwrap();
+        }
+
+        // A payload with no matching search link remains a leftover.
+        let unrelated = b"unrelated blob fixture";
+        let unrelated_hash = BlobHash::generate(unrelated.as_slice());
+        blob_store
+            .put_blob(unrelated_hash.as_ref(), unrelated, &BlobOpts::PLAIN)
+            .await
+            .unwrap();
+        assert_cleanup_panics(&test, "Store is not empty.").await;
+        assert!(
+            blob_store
+                .delete_blob(unrelated_hash.as_ref())
+                .await
+                .unwrap()
+        );
+
+        // Remove just the registry object to simulate a destroyed account
+        // whose principal link leaked. The caller must reject the account ID.
+        registry
+            .write(RegistryWrite::delete(ObjectId::new(
+                ObjectType::Account,
+                id,
+            )))
+            .await
+            .unwrap()
+            .unwrap_id(trc::location!());
+        assert_cleanup_panics(&test, &format!("of destroyed account {account_id}")).await;
+
+        store
+            .write_batch(
+                BatchBuilder::new()
+                    .with_account_id(account_id)
+                    .with_collection(Collection::Principal)
+                    .with_document(0)
+                    .clear(link),
+            )
+            .await
+            .unwrap();
+        test.assert_is_empty().await;
+        assert!(!store.blob_exists(&hash).await.unwrap());
+        assert!(
+            blob_store
+                .get_blob(hash.as_ref(), 0..usize::MAX, &BlobKeyring::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    async fn assert_cleanup_panics(test: &crate::utils::server::TestServer, expected: &str) {
+        let panic = AssertUnwindSafe(test.assert_is_empty())
+            .catch_unwind()
+            .await
+            .expect_err("cleanup must reject this fixture");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("cleanup panic must have a message");
+        assert!(message.contains(expected), "unexpected panic: {message}");
+    }
 }

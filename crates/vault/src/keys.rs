@@ -27,6 +27,7 @@ const LABEL_AKEK_PREFIX: &[u8] = b"za/v1/akek/";
 const LABEL_EVENTS: &[u8] = b"za/v1/events";
 const LABEL_PK: &[u8] = b"za/v1/pk";
 const LABEL_MAIL: &[u8] = b"za/v1/mail";
+const LABEL_SEARCH: &[u8] = b"za/v1/search";
 const AAD_PREFIX: &[u8] = b"za/v1|";
 
 /// A 32-byte secret that is zeroed on drop and never printed.
@@ -154,6 +155,12 @@ pub fn derive_event_key(mk: &Secret) -> Secret {
 /// message written during a session.
 pub fn derive_mail_key(mk: &Secret) -> Secret {
     hkdf_expand(mk.as_bytes(), LABEL_MAIL)
+}
+
+/// The search key (search spec 3.1): seals the index's blobs and keys the
+/// manifest's tag. Derived from mk, so a rewrap does not move it.
+pub fn derive_search_key(mk: &Secret) -> Secret {
+    hkdf_expand(mk.as_bytes(), LABEL_SEARCH)
 }
 
 /// AAD purpose of the primary-password wrap of MK.
