@@ -1650,6 +1650,14 @@ impl AssignedIds {
         self.current_change_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_current_change_id(current_change_id: u64) -> Self {
+        Self {
+            current_change_id,
+            ..Self::default()
+        }
+    }
+
     #[inline(always)]
     pub fn try_current_change_id(&self) -> Option<u64> {
         Some(self.current_change_id).filter(|change_id| *change_id != 0)

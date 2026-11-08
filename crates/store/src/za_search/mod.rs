@@ -6,8 +6,151 @@
 
 //! Zero-access search format version 1 (search spec 4.2).
 
+pub mod blob;
 pub mod content;
+pub mod manifest;
 pub mod thread;
+
+#[cfg(test)]
+mod blob_tests;
+#[cfg(test)]
+mod manifest_tests;
+
+use types::blob_hash::BlobHash;
+use zeroize::Zeroizing;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SegmentId(pub [u8; 16]);
+
+impl SegmentId {
+    pub fn random() -> Self {
+        Self(rand::random())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BlobKind {
+    Thread = 1,
+    Content = 2,
+}
+
+impl TryFrom<u8> for BlobKind {
+    type Error = FormatError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Thread),
+            2 => Ok(Self::Content),
+            value => Err(FormatError::Kind(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SectionKind {
+    Hidden = 1,
+    Public = 2,
+    Content = 3,
+}
+
+impl TryFrom<u8> for SectionKind {
+    type Error = FormatError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Hidden),
+            2 => Ok(Self::Public),
+            3 => Ok(Self::Content),
+            value => Err(FormatError::Kind(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobHeader {
+    pub kind: BlobKind,
+    pub tier: u8,
+    pub segment: SegmentId,
+    pub predecessor: Option<(BlobHash, SegmentId)>,
+}
+
+impl BlobHeader {
+    pub const LEN: usize = 1 + 1 + 1 + 16 + 32 + 16;
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut bytes = [0; Self::LEN];
+        bytes[..3].copy_from_slice(&[SEARCH_FORMAT_V1, self.kind as u8, self.tier]);
+        bytes[3..19].copy_from_slice(&self.segment.0);
+        if let Some((hash, segment)) = &self.predecessor {
+            bytes[19..51].copy_from_slice(hash.as_slice());
+            bytes[51..].copy_from_slice(&segment.0);
+        }
+        bytes
+    }
+
+    pub fn decode(mut bytes: &[u8]) -> Result<(Self, &[u8]), FormatError> {
+        let [version] = read_array(&mut bytes)?;
+        if version != SEARCH_FORMAT_V1 {
+            return Err(FormatError::Version(version));
+        }
+        let [kind] = read_array(&mut bytes)?;
+        let kind = BlobKind::try_from(kind)?;
+        let [tier] = read_array(&mut bytes)?;
+        let segment = SegmentId(read_array(&mut bytes)?);
+        let predecessor_hash = BlobHash(read_array(&mut bytes)?);
+        let predecessor_segment = SegmentId(read_array(&mut bytes)?);
+        let predecessor = (!predecessor_hash.is_empty() || predecessor_segment.0 != [0; 16])
+            .then_some((predecessor_hash, predecessor_segment));
+        Ok((
+            Self {
+                kind,
+                tier,
+                segment,
+                predecessor,
+            },
+            bytes,
+        ))
+    }
+}
+
+#[derive(Clone)]
+pub struct ZaSearchKey(Zeroizing<[u8; 32]>);
+
+impl ZaSearchKey {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ZaSearchKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ZaSearchKey(..)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadTarget {
+    Publishing,
+    Compaction { n_records: usize },
+}
+
+fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Result<&'a [u8], FormatError> {
+    let (prefix, rest) = bytes.split_at_checked(len).ok_or(FormatError::Truncated)?;
+    *bytes = rest;
+    Ok(prefix)
+}
+
+fn read_array<const N: usize>(bytes: &mut &[u8]) -> Result<[u8; N], FormatError> {
+    let (array, rest) = bytes.split_first_chunk().ok_or(FormatError::Truncated)?;
+    *bytes = rest;
+    Ok(*array)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Checkpoint {
@@ -32,7 +175,7 @@ pub struct ThreadFieldsK {
     pub sent_at: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum FormatError {
     Version(u8),
     Kind(u8),
@@ -74,12 +217,27 @@ pub const fn reservation() -> usize {
 
 /// Round the framed length up to a power of two, with a minimum class (spec 4.2).
 pub fn padded_len(framed_len: usize, min_class: usize) -> usize {
-    framed_len.max(1).next_power_of_two().max(min_class)
+    checked_padded_len(framed_len, min_class).expect("search padding class fits usize")
+}
+
+fn checked_padded_len(framed_len: usize, min_class: usize) -> Option<usize> {
+    Some(
+        framed_len
+            .max(1)
+            .checked_next_power_of_two()?
+            .max(min_class),
+    )
 }
 
 /// The framed length a compacted hidden section pads to (spec 4.2, 5.5).
 pub fn compaction_allowance(n_records: usize) -> usize {
-    n_records * (RECORD_MAX + ALIAS_LEN) + 4
+    checked_compaction_allowance(n_records).expect("search compaction allowance fits usize")
+}
+
+fn checked_compaction_allowance(n_records: usize) -> Option<usize> {
+    n_records
+        .checked_mul(RECORD_MAX + ALIAS_LEN)?
+        .checked_add(4)
 }
 
 #[cfg(test)]

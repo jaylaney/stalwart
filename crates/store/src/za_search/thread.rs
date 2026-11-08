@@ -26,7 +26,7 @@ pub struct Alias {
     pub revision: u32,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[derive(Clone, Copy, Default, Eq, PartialEq, Debug)]
 pub struct RevisionRow {
     pub revision: u32,
     pub change_id: u64,

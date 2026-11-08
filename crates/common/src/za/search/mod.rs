@@ -6,6 +6,8 @@
 
 pub mod cache;
 pub mod config;
+pub mod error;
+pub mod seal;
 pub mod trace;
 
 pub use cache::ZaSearchCache;
