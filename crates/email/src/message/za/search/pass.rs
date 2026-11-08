@@ -11,7 +11,11 @@ use super::{
 };
 use crate::{
     cache::MessageCacheFetch,
-    message::{messagedata::MessageData, sortkeys::MessageSortKeys, za::view::za_has_attachment},
+    message::{
+        messagedata::{EmailMessageData, MessageData},
+        sortkeys::MessageSortKeys,
+        za::view::za_has_attachment,
+    },
 };
 use common::{
     Server,
@@ -578,6 +582,19 @@ pub(crate) fn za_effective_sent_at(date: Option<i64>, received_at: u64) -> i64 {
     received_at as i64 + i64::from(MessageData::sent_at_offset(date, received_at))
 }
 
+/// Read the Email state without initializing the account's normal mailbox cache.
+pub(super) async fn read_change_id(server: &Server, account_id: u32) -> trc::Result<u64> {
+    if let Some(cache) = server.fresh_messages(account_id) {
+        Ok(cache.last_change_id)
+    } else {
+        server
+            .store()
+            .get_last_change_id(account_id, SyncCollection::Email.into())
+            .await
+            .map(Option::unwrap_or_default)
+    }
+}
+
 pub trait ZaSearchPass: Sync + Send {
     fn za_search_pass(
         &self,
@@ -593,14 +610,16 @@ impl ZaSearchPass for Server {
         keys: &SessionKeys,
     ) -> trc::Result<PassOutcome> {
         let config = self.za_search_config();
-        let entry = match self.za_search_entry(account_id, keys).await {
-            Ok(entry) => entry,
-            Err(failure) => return Ok(failure.into()),
-        };
+        let entry = self.inner.cache.za_search.entry(account_id);
+        // A running pass can hold the index write guard during a reload.
+        // Check the pass slot before awaiting any loaded state or load flight.
         let Ok(_pass) = entry.pass_lock.try_lock() else {
             return Ok(PassOutcome::Running);
         };
-        let cache = self.get_cached_messages(account_id).await?;
+        if let Err(failure) = self.za_search_load_entry(&entry, keys).await {
+            return Ok(failure.into());
+        }
+        let state = read_change_id(self, account_id).await?;
         let loaded_hash = {
             let Some(index) = entry.read_loaded().await else {
                 return Ok(PassOutcome::Lost);
@@ -610,7 +629,7 @@ impl ZaSearchPass for Server {
                 && manifest.reconciliation.is_none()
                 && manifest.content_to.cursor.is_none()
                 && manifest.indexed_to.complete
-                && cache.last_change_id <= index.scanned_to
+                && state <= index.scanned_to
             {
                 return Ok(PassOutcome::Current);
             }
@@ -668,19 +687,22 @@ impl ZaSearchPass for Server {
                 thread_charge,
             }
         };
-        let cursor = base
-            .manifest
-            .cursor
-            .as_ref()
-            .map_or_else(Vec::new, |cursor| {
-                let mut ids = cache
-                    .emails
-                    .document_ids()
-                    .filter(|d| cursor.next <= *d && *d <= cursor.end)
-                    .collect::<Vec<_>>();
-                ids.sort_unstable();
-                ids
-            });
+        let mut cursor = Vec::new();
+        if let Some(bounds) = &base.manifest.cursor {
+            let in_bounds = |id: &u32| bounds.next <= *id && *id <= bounds.end;
+            if let Some(cache) = self.fresh_messages(account_id) {
+                cursor.extend(cache.emails.document_ids().filter(in_bounds));
+            } else {
+                self.message_datas(account_id, &(), |document_id, _| {
+                    if in_bounds(&document_id) {
+                        cursor.push(document_id);
+                    }
+                    Ok(true)
+                })
+                .await?;
+            }
+            cursor.sort_unstable();
+        }
         let records = if cursor.is_empty() {
             let checkpoint = if base.scanned_to > base.manifest.indexed_to.change_id {
                 complete_checkpoint(base.scanned_to)

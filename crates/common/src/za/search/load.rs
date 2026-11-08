@@ -719,16 +719,26 @@ impl Server {
         keys: &SessionKeys,
     ) -> Result<Arc<IndexEntry>, LoadFailure> {
         let entry = self.inner.cache.za_search.entry(account_id);
+        self.za_search_load_entry(&entry, keys).await?;
+        Ok(entry)
+    }
+
+    /// Load the chosen entry without switching to another cache entry after
+    /// the caller has acquired this entry's pass lock.
+    pub async fn za_search_load_entry(
+        &self,
+        entry: &IndexEntry,
+        keys: &SessionKeys,
+    ) -> Result<(), LoadFailure> {
         let key = keys.swk();
         load_entry(
             self,
-            &entry,
+            entry,
             key,
             &self.za_search_config(),
-            self.read_search_index_manifest(account_id, key),
+            self.read_search_index_manifest(entry.account_id, key),
         )
-        .await?;
-        Ok(entry)
+        .await
     }
 
     pub async fn za_search_reload_if_moved(

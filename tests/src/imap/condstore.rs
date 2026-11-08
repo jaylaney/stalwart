@@ -6,9 +6,12 @@
 
 use imap_proto::ResponseType;
 
-use crate::imap::{
-    AssertResult,
-    append::{assert_append_message, build_messages},
+use crate::{
+    imap::{
+        AssertResult,
+        append::{assert_append_message, build_messages},
+    },
+    utils::za::key_accounts_mode,
 };
 
 use super::{ImapConnection, Type};
@@ -92,6 +95,22 @@ pub async fn test(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
             .await
             .into_highest_modseq(),
     );
+
+    // The publish witness advances mailbox state without changing UID 3.
+    imap.send("UID FETCH 3 (MODSEQ)").await;
+    let uid3_modseq = imap
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("(UID 3 MODSEQ")
+        .into_modseq()
+        .parse::<u64>()
+        .unwrap();
+    let mailbox_modseq = modseqs[4].parse::<u64>().unwrap();
+    if key_accounts_mode() {
+        assert!(mailbox_modseq > uid3_modseq);
+    } else {
+        assert_eq!(mailbox_modseq, uid3_modseq);
+    }
 
     // SEQ 5: Insert message
     assert_append_message(imap, "Pecorino", &messages.pop().unwrap(), ResponseType::Ok).await;
@@ -231,16 +250,24 @@ pub async fn test(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
         .assert_contains("3 EXISTS");
+    // SEARCH MODSEQ is inclusive (RFC 7162 3.1.5), so UID 3 matches
+    // at its own modseq even after search publication advances the mailbox.
     imap_check
-        .send(&format!("SEARCH MODSEQ {}", modseqs[4]))
+        .send(&format!("SEARCH MODSEQ {uid3_modseq}"))
         .await;
-    // 1.0's MODSEQ criterion is inclusive (RFC 7162 3.1.5: equal to or greater
-    // than), so UID 3, last changed at that modseq, matches; 0.16 read the
-    // change log after it.
     imap_check
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
         .assert_contains("SEARCH 1 2 3 (MODSEQ");
+    if key_accounts_mode() {
+        imap_check
+            .send(&format!("SEARCH MODSEQ {mailbox_modseq}"))
+            .await;
+        imap_check
+            .assert_read(Type::Tagged, ResponseType::Ok)
+            .await
+            .assert_contains("SEARCH 2 3 (MODSEQ");
+    }
 
     // Store unchanged since
     imap.send(&format!(

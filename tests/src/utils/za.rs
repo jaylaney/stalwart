@@ -23,7 +23,7 @@ use common::{
     },
     za::{
         lease::lease_key_range,
-        search::cache::EvictReason,
+        search::{ZaSearchConfig, cache::EvictReason},
         test_hooks::{self, Pause as HookPause},
     },
 };
@@ -1649,6 +1649,37 @@ impl<T> Drop for HookParked<T> {
         self.pause.release.notify_one();
     }
 }
+
+/// Temporarily override the search limits and restore the exact previous
+/// override on drop. Test suites run these cases serially.
+#[must_use = "dropping the guard restores the search configuration"]
+pub struct SearchConfigGuard(Option<ZaSearchConfig>);
+
+impl SearchConfigGuard {
+    pub fn new(config: ZaSearchConfig) -> Self {
+        let prior = test_hooks::SEARCH_CONFIG_OVERRIDE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(config);
+        Self(prior)
+    }
+}
+
+impl Drop for SearchConfigGuard {
+    fn drop(&mut self) {
+        test_hooks::set_search_config_override(self.0.take());
+    }
+}
+
+macro_rules! search_config_guard {
+    ($test:expr, $($field:ident: $value:expr),+ $(,)?) => {
+        $crate::utils::za::SearchConfigGuard::new(common::za::search::ZaSearchConfig {
+            $($field: $value,)+
+            ..$test.server.za_search_config()
+        })
+    };
+}
+pub(crate) use search_config_guard;
 
 /// Upgrade ruling 156: one of `common::za::test_hooks`' pause slots, as the
 /// test found it, restored when the guard drops (also when the test panics),

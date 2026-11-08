@@ -5,7 +5,10 @@
  */
 
 use crate::{
-    api::metadata::{MetadataType, ObjectMetadata},
+    api::{
+        metadata::{MetadataType, ObjectMetadata},
+        request::PostWriteCall,
+    },
     blob::download::BlobDownload,
     changes::state::JmapCacheState,
     email::{
@@ -48,6 +51,7 @@ pub trait EmailImport: Sync + Send {
         access_token: &AccessToken,
         session: &HttpSessionData,
         using: CapabilityIds,
+        post_write: Option<&mut PostWriteCall<'_>>,
     ) -> impl Future<Output = trc::Result<ImportEmailResponse>> + Send;
 }
 
@@ -58,6 +62,7 @@ impl EmailImport for Server {
         access_token: &AccessToken,
         session: &HttpSessionData,
         using: CapabilityIds,
+        mut post_write: Option<&mut PostWriteCall<'_>>,
     ) -> trc::Result<ImportEmailResponse> {
         // Validate state
         let account_id = request.account_id.document_id();
@@ -238,6 +243,7 @@ impl EmailImport for Server {
                     &mut last_change_id,
                     &mut delivered,
                     account_id,
+                    post_write.as_deref_mut(),
                 )
                 .await
             {
@@ -268,6 +274,7 @@ impl EmailImport for Server {
                 &mut last_change_id,
                 &mut delivered,
                 account_id,
+                post_write.as_deref_mut(),
             ) {
                 recheck.finish(self, session.session_id).await;
                 return Err(err);
@@ -282,10 +289,14 @@ impl EmailImport for Server {
             &mut last_change_id,
             &mut delivered,
             account_id,
+            post_write.as_deref_mut(),
         )
         .await;
         recheck.finish(self, session.session_id).await;
         flushed?;
+        if let Some(post_write) = post_write {
+            post_write.attempt(self).await;
+        }
 
         // Update state
         if let Some(change_id) = last_change_id {
@@ -308,6 +319,7 @@ impl EmailImport for Server {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush(
     server: &Server,
     grouped: &mut GroupedIngest<'_, FetchedBlob>,
@@ -316,6 +328,7 @@ async fn flush(
     last_change_id: &mut Option<u64>,
     delivered: &mut Vec<u32>,
     account_id: u32,
+    post_write: Option<&mut PostWriteCall<'_>>,
 ) -> trc::Result<()> {
     grouped.flush(server).await?;
     record(
@@ -325,6 +338,7 @@ async fn flush(
         last_change_id,
         delivered,
         account_id,
+        post_write,
     )
 }
 
@@ -335,7 +349,11 @@ fn record(
     last_change_id: &mut Option<u64>,
     delivered: &mut Vec<u32>,
     account_id: u32,
+    post_write: Option<&mut PostWriteCall<'_>>,
 ) -> trc::Result<()> {
+    if let Some(post_write) = post_write {
+        post_write.acknowledge(&grouped.results);
+    }
     for (id, result) in grouped.results.drain(..) {
         match result {
             Ok(mut email) => {

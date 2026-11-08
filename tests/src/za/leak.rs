@@ -2191,7 +2191,26 @@ pub async fn test_codec(test: &mut TestServer) {
             .violations
             .contains(&format!("email {planted}: plaintext message blob"))
     );
-    hashes.push(planted_hash);
+    hashes.push(planted_hash.clone());
+
+    // APPEND's request hooks also publish committed Principal-linked blobs.
+    // Their encrypted outer codec must be rewritten before key retirement.
+    let search_links = crate::utils::za::principal_blob_links(test, id).await;
+    assert!(
+        !search_links.is_empty(),
+        "APPEND should publish search blobs"
+    );
+    for (hash, _) in search_links {
+        let encoded = test
+            .server
+            .blob_store()
+            .get_raw_blob(hash.as_slice())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(BlobFormat::of(&encoded).unwrap().key_id, Some(codec_key));
+        hashes.push(hash);
+    }
 
     // The whole-store recode must leave this temporary-only blob for purge.
     let (temporary, _) = test
@@ -2220,7 +2239,11 @@ pub async fn test_codec(test: &mut TestServer) {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(BlobFormat::of(&encoded).unwrap().key_id, None);
+        assert_eq!(
+            BlobFormat::of(&encoded).unwrap().key_id,
+            None,
+            "committed blob {hash:?} was not recoded",
+        );
     }
     let encoded = test
         .server
@@ -2231,12 +2254,9 @@ pub async fn test_codec(test: &mut TestServer) {
         .unwrap();
     assert_eq!(BlobFormat::of(&encoded).unwrap().key_id, Some(codec_key));
 
-    test.destroy_all_mailboxes(&key).await;
-    for account_id in [id, plain_id] {
-        wait_for_index_queue(test, account_id, Duration::from_secs(10)).await;
-        assert!(message_ids(test, account_id).await.is_empty());
-    }
-    test.wait_for_tasks().await;
+    // Retire the old codec while the recoded links are still live. The
+    // keyed mailbox cleanup can publish search deltas, so run it only
+    // after the original write settings are active again.
     retire_blob_codec_key(test, &admin, key_id, Some(original)).await;
     assert!(
         test.server
@@ -2245,9 +2265,26 @@ pub async fn test_codec(test: &mut TestServer) {
             .unwrap()
             .is_none()
     );
+    test.destroy_all_mailboxes(&key).await;
+    for account_id in [id, plain_id] {
+        wait_for_index_queue(test, account_id, Duration::from_secs(10)).await;
+        assert!(message_ids(test, account_id).await.is_empty());
+    }
+    test.wait_for_tasks().await;
     admin.destroy_account(key).await;
     admin.destroy_account(plain).await;
     test.wait_for_tasks().await;
+    // This fixture's plaintext positive control was unlinked after key
+    // retirement. Purge it before the next whole-store leak scan.
+    purge_blobs(test).await;
+    assert!(
+        test.server
+            .get_blob(planted_hash.as_slice(), 0..usize::MAX)
+            .await
+            .unwrap()
+            .is_none(),
+        "planted plaintext control still exists after codec fixture teardown",
+    );
 }
 
 /// Mail spec 11, the leak test's mail extension: a key account receives a

@@ -37,7 +37,7 @@ use store::{
 use types::{
     blob_hash::BlobHash,
     collection::{Collection, SyncCollection},
-    field::PrincipalField,
+    field::{Field, PrincipalField},
 };
 use vault::{Zeroizing, keys::Secret, session::SessionKeys};
 
@@ -403,8 +403,34 @@ async fn commit_and_swap(
     staging: Staging,
 ) -> trc::Result<PassOutcome> {
     let publishing = matches!(staging.decision, PassDecision::Publishing);
-    let cache = server.get_cached_messages(account_id).await?;
     let witness = publishing.then(|| staging.witness.expect("publishing indexed a message"));
+    let mut mailboxes = Vec::new();
+    if publishing {
+        // Witness only existing mailboxes. Loading the ordinary message
+        // cache on a cold account can provision default mailboxes.
+        if let Some(cache) = server.fresh_messages(account_id) {
+            mailboxes.extend(
+                cache
+                    .mailboxes
+                    .items
+                    .iter()
+                    .map(|mailbox| mailbox.document_id),
+            );
+        } else {
+            server
+                .archives(
+                    account_id,
+                    Collection::Mailbox,
+                    Field::ARCHIVE,
+                    &(),
+                    |id, _| {
+                        mailboxes.push(id);
+                        Ok(true)
+                    },
+                )
+                .await?;
+        }
+    }
     let expires_by = blobs.iter().map(|blob| blob.expires_by).min();
     let key = za_search_key(keys.swk());
     let batch = build_batch(
@@ -414,7 +440,7 @@ async fn commit_and_swap(
         &key,
         blobs,
         witness,
-        cache.mailboxes.items.iter().map(|m| m.document_id),
+        mailboxes,
     );
 
     #[cfg(feature = "test_mode")]

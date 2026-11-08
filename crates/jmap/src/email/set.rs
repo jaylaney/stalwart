@@ -10,7 +10,7 @@ use crate::{
             MetadataAccess, MetadataPatches, MetadataTarget, MetadataType, MetadataWriter,
             NewMetadata, ObjectMetadata,
         },
-        request::za_assert_mail_keys,
+        request::{PostWriteCall, za_assert_mail_keys},
     },
     blob::download::{BlobAccess, BlobDownload},
     changes::state::JmapCacheState,
@@ -84,6 +84,7 @@ pub trait EmailSet: Sync + Send {
         access_token: &AccessToken,
         session: &HttpSessionData,
         using: CapabilityIds,
+        post_write: Option<&mut PostWriteCall<'_>>,
     ) -> impl Future<Output = trc::Result<SetResponse<Email>>> + Send;
 }
 
@@ -94,6 +95,7 @@ impl EmailSet for Server {
         access_token: &AccessToken,
         session: &HttpSessionData,
         using: CapabilityIds,
+        mut post_write: Option<&mut PostWriteCall<'_>>,
     ) -> trc::Result<SetResponse<Email>> {
         // Prepare response
         let account_id = request.account_id.document_id();
@@ -261,6 +263,7 @@ impl EmailSet for Server {
                         &mut recheck,
                         &mut last_change_id,
                         account_id,
+                        post_write.as_deref_mut(),
                     )
                     .await
                     {
@@ -1046,6 +1049,7 @@ impl EmailSet for Server {
                         &mut recheck,
                         &mut last_change_id,
                         account_id,
+                        post_write.as_deref_mut(),
                     )
                     .await
                 {
@@ -1079,6 +1083,7 @@ impl EmailSet for Server {
                     &mut recheck,
                     &mut last_change_id,
                     account_id,
+                    post_write.as_deref_mut(),
                 )
                 .await
                 {
@@ -1109,6 +1114,7 @@ impl EmailSet for Server {
                 &mut recheck,
                 &mut last_change_id,
                 account_id,
+                post_write.as_deref_mut(),
             ) {
                 recheck.finish(self, session.session_id).await;
                 return Err(err);
@@ -1121,6 +1127,7 @@ impl EmailSet for Server {
             &mut recheck,
             &mut last_change_id,
             account_id,
+            post_write.as_deref_mut(),
         )
         .await
         {
@@ -1128,6 +1135,9 @@ impl EmailSet for Server {
             return Err(err);
         }
         recheck.finish(self, session.session_id).await;
+        if let Some(post_write) = post_write {
+            post_write.attempt(self).await;
+        }
 
         // Process updates
         let mut batch = BatchBuilder::new();
@@ -1736,9 +1746,17 @@ async fn flush(
     recheck: &mut ThreadRecheck,
     last_change_id: &mut Option<u64>,
     account_id: u32,
+    post_write: Option<&mut PostWriteCall<'_>>,
 ) -> trc::Result<()> {
     grouped.flush(server).await?;
-    record(grouped, response, recheck, last_change_id, account_id)
+    record(
+        grouped,
+        response,
+        recheck,
+        last_change_id,
+        account_id,
+        post_write,
+    )
 }
 
 fn record(
@@ -1747,7 +1765,11 @@ fn record(
     recheck: &mut ThreadRecheck,
     last_change_id: &mut Option<u64>,
     account_id: u32,
+    post_write: Option<&mut PostWriteCall<'_>>,
 ) -> trc::Result<()> {
+    if let Some(post_write) = post_write {
+        post_write.acknowledge(&grouped.results);
+    }
     for (id, result) in grouped.results.drain(..) {
         match result {
             Ok(mut message) => {

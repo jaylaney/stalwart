@@ -24,7 +24,10 @@ use crate::{
         push::{PUSH_ORIGIN, spawn_mock_push_server},
         server::TestServer,
         smtp::SmtpConnection,
-        za::{plant_plain_message, wait_for_delivery, za_bearer_token},
+        za::{
+            log_records_since, plant_plain_message, read_manifest, wait_for_delivery,
+            za_bearer_token,
+        },
     },
     za::{STRONG, user_permissions},
 };
@@ -47,18 +50,24 @@ use email::{
 };
 use groupware::calendar::seal::{WRAP_MK, WRAP_PK};
 use imap_proto::{ResponseType, protocol::SerializeResponse as ImapResponse};
-use jmap_proto::object::push_subscription::EmailPushProperty;
+use jmap_proto::{object::push_subscription::EmailPushProperty, types::state::State};
 use pop3::protocol::response::SerializeResponse as Pop3Response;
 use registry::schema::prelude::ObjectType;
 use serde_json::{Value, json};
 use services::state_manager::email_push::build_email_push_object;
 use std::time::{Duration, Instant};
+use store::{query::log::Change, za_search::manifest::ManifestValue};
 use tokio::sync::mpsc;
 use trc::{
     Collector, EventType, Key, StoreEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
-use types::{blob::BlobClass, collection::Collection, id::Id, type_state::StateChange};
+use types::{
+    blob::BlobClass,
+    collection::{Collection, SyncCollection},
+    id::Id,
+    type_state::StateChange,
+};
 
 const KEY: &str = "keymail5@example.com";
 const PLAIN: &str = "plainmail3@example.com";
@@ -1450,6 +1459,16 @@ async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
             let subject = "append push canary";
             imap.append("INBOX", &message_with(subject, "append push body canary"))
                 .await;
+            let append_publication = if is_key {
+                let Some(ManifestValue::Index(manifest)) =
+                    read_manifest(test, account.id().document_id()).await
+                else {
+                    panic!("the keyed APPEND should publish an index manifest");
+                };
+                Some(manifest.newest_row.change_id)
+            } else {
+                None
+            };
             imap.send_ok("LOGOUT").await;
             let after_append = account
                 .jmap_get("Email", ["id", "subject"], [] as [&str; 0])
@@ -1460,13 +1479,26 @@ async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
                 .iter()
                 .find(|email| email["subject"] == subject)
                 .expect("the appended message");
+            // Search spec 6.3: this subscriber requests no ordinary state
+            // types. Its keyed EmailPush fallback carries the exact insert
+            // state, while a later Get also sees the search publication.
+            let append_push_state = if let Some(publication) = append_publication {
+                let inserted =
+                    message_insert_change(test, account, &appended["id"], before_append.state())
+                        .await;
+                assert!(publication > inserted);
+                assert!(exact_change(after_append.state()) >= publication);
+                Some(State::Exact(inserted).to_string())
+            } else {
+                None
+            };
             assert_message_push(
                 &mut rx,
                 account,
                 is_key,
                 &appended["id"],
                 subject,
-                after_append.state(),
+                append_push_state.as_deref().unwrap_or(after_append.state()),
             )
             .await;
 
@@ -1499,7 +1531,23 @@ async fn push_is_state_only(test: &TestServer, key: &Account, plain: &Account) {
                 .expect("the imported message");
             let import_state = imported.new_state();
             assert_ne!(import_state, after_append.state(), "import state");
-            assert_message_push(&mut rx, account, is_key, imported_id, subject, import_state).await;
+            let import_push_state = if is_key {
+                let inserted =
+                    message_insert_change(test, account, imported_id, after_append.state()).await;
+                assert!(exact_change(import_state) >= inserted);
+                Some(State::Exact(inserted).to_string())
+            } else {
+                None
+            };
+            assert_message_push(
+                &mut rx,
+                account,
+                is_key,
+                imported_id,
+                subject,
+                import_push_state.as_deref().unwrap_or(import_state),
+            )
+            .await;
         }
 
         let destroyed = account
@@ -1562,6 +1610,36 @@ fn assert_state_only(pushes: &[Value], account: &Account, types: &[&str]) {
         }),
         "no {types:?} state change: {pushes:?}"
     );
+}
+
+fn exact_change(state: &str) -> u64 {
+    let Some(State::Exact(change)) = State::parse(state) else {
+        panic!("expected an exact JMAP state: {state}");
+    };
+    change
+}
+
+async fn message_insert_change(
+    test: &TestServer,
+    account: &Account,
+    email_id: &Value,
+    previous_state: &str,
+) -> u64 {
+    let document = email_id
+        .as_str()
+        .unwrap()
+        .parse::<Id>()
+        .unwrap()
+        .document_id();
+    log_records_since(test, account.id().document_id(), SyncCollection::Email, exact_change(previous_state))
+        .await
+        .into_iter()
+        .find_map(|(change_id, changes)| {
+            changes.into_iter().any(|change| {
+                matches!(change, Change::InsertItem(item) if Id::from(item).document_id() == document)
+            }).then_some(change_id)
+        })
+        .expect("the message has an acknowledged insert record")
 }
 
 async fn assert_message_push(

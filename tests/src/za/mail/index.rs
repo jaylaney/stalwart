@@ -14,14 +14,19 @@ use crate::{
     utils::{
         account::Account,
         imap::{ImapConnection, Type},
+        pop3::{Pop3Connection, ResponseType as Pop3Reply},
         server::TestServer,
         za::{
             HookParked, expire_and_purge_blobs, index_holds, log_records_since, manifest_bytes,
-            principal_blob_links, read_manifest, run_search_pass, simulate_restart,
-            temporary_blob_hashes, write_manifest_bytes, za_setup_token, za_unlock,
+            principal_blob_links, read_manifest, run_search_pass, search_config_guard,
+            simulate_restart, temporary_blob_hashes, wait_for_delivery, write_manifest_bytes,
+            za_setup_token, za_unlock,
         },
     },
-    za::user_permissions,
+    za::{
+        tracing::{ws_call, ws_close, ws_connect},
+        user_permissions,
+    },
 };
 use common::auth::vault::ZaVaultExtra;
 use common::za::{
@@ -32,7 +37,7 @@ use common::za::{
         load::entry_outcome,
         seal::za_search_key,
         setup::za_setup_manifest,
-        trace::{ZA_SEARCH_EVENT_TYPE, ZA_SEARCH_LOST, ZA_SEARCH_SKIPPED},
+        trace::{ZA_SEARCH_EVENT_TYPE, ZA_SEARCH_LOST, ZA_SEARCH_PASS, ZA_SEARCH_SKIPPED},
     },
     test_hooks::{
         reset_za_search_counters, set_search_blob_fail_once, set_search_blob_slow,
@@ -43,12 +48,20 @@ use common::za::{
 };
 use email::{
     cache::MessageCacheFetch,
-    message::za::search::pass::{PassOutcome, ZaSearchPass},
+    mailbox::{DRAFTS_ID, INBOX_ID},
+    message::za::search::{
+        ensure::{Unavailable, ZaSearchEnsure, is_current},
+        pass::{PassOutcome, ZaSearchPass},
+    },
 };
 use imap_proto::ResponseType;
+use jmap_proto::types::state::State;
 use registry::{schema::prelude::ObjectType, types::EnumImpl};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{
+    str::FromStr,
+    time::{Duration, Instant},
+};
 use store::{
     ValueKey,
     query::log::{Change, PartialChange},
@@ -65,7 +78,7 @@ use trc::{EventType, Key, StoreEvent, Value as TraceValue};
 use types::{
     blob_hash::BlobHash,
     collection::{Collection, SyncCollection},
-    field::PrincipalField,
+    field::{Field, PrincipalField},
     id::Id,
 };
 
@@ -85,6 +98,62 @@ pub async fn test(test: &mut TestServer) {
             user_permissions(),
         )
         .await;
+
+    let triggers = key_mail_account(test, "keymail48@example.com", "Keymail-48!").await;
+    let waits = key_mail_account(test, "keymail49@example.com", "Keymail-49!").await;
+    let plain_triggers = admin
+        .create_user_account(
+            "plainmail51@example.com",
+            "Plainmail-51!",
+            "Search trigger control",
+            &[],
+            user_permissions(),
+        )
+        .await;
+
+    case_blob_hook_does_not_create_mailboxes(test, &triggers, true).await;
+    case_triggers(test, &triggers).await;
+    clean_messages(test, &triggers).await;
+    case_pipelined_imap_commands(test, &triggers, &plain_triggers).await;
+    clean_messages(test, &triggers).await;
+    case_busy_pass_does_not_wait_for_reload(test, &waits).await;
+    clean_messages(test, &waits).await;
+    case_reads_do_not_wait_for_a_pass(test, &waits).await;
+    clean_messages(test, &waits).await;
+    case_content_wait_budget(test, &waits).await;
+    clean_messages(test, &waits).await;
+    case_content_wait_uses_deadline_during_reload(test, &waits).await;
+    clean_messages(test, &waits).await;
+    case_content_loader_uses_original_deadline(test, &waits).await;
+    clean_messages(test, &waits).await;
+    case_time_cap_bounds_the_command(test, &waits).await;
+    clean_messages(test, &waits).await;
+    case_plain_control_unaffected(test, &plain_triggers).await;
+    for import_first in [false, true] {
+        case_r8_two_adding_calls(test, &triggers, import_first, true).await;
+        clean_messages(test, &triggers).await;
+        case_r8_two_adding_calls(test, &plain_triggers, import_first, false).await;
+        clean_plain_messages(test, &plain_triggers).await;
+    }
+    for failure in [
+        CandidateFailure::Reference,
+        CandidateFailure::State,
+        CandidateFailure::NotCreated,
+    ] {
+        case_r8_failed_candidate(test, &triggers, failure, true, true).await;
+        clean_messages(test, &triggers).await;
+        case_r8_failed_candidate(test, &plain_triggers, failure, false, true).await;
+        clean_plain_messages(test, &plain_triggers).await;
+        case_r8_failed_candidate(test, &triggers, failure, true, false).await;
+    }
+    case_r8_non_candidates(test, &triggers).await;
+    clean_messages(test, &triggers).await;
+    case_r8_generated_call(test, &triggers, &plain_triggers).await;
+    clean_messages(test, &triggers).await;
+    case_r8_foreign_plain_writer(test, &triggers, &plain_triggers).await;
+    clean_messages(test, &triggers).await;
+    case_r8_same_call_reference(test, &triggers).await;
+    clean_messages(test, &triggers).await;
 
     case_setup_manifest(test, &key).await;
     case_persistence_and_thread_only_load(test, &key).await;
@@ -126,9 +195,10 @@ pub async fn test(test: &mut TestServer) {
     case_repeated_delta_changes_nothing(test, &key).await;
     clean_messages(test, &key).await;
 
-    for account in [&key, &split, &plain] {
+    for account in [&key, &split, &plain, &triggers, &waits, &plain_triggers] {
         test.destroy_all_mailboxes(account).await;
     }
+    case_blob_hook_does_not_create_mailboxes(test, &triggers, false).await;
     test.wait_for_tasks().await;
     destroy_cases(test, &admin).await;
     println!("Zero-access mail index pass tests finished");
@@ -265,6 +335,986 @@ async fn assert_manifest_links(test: &TestServer, id: u32, manifest: &Manifest) 
     for (hash, size) in expected {
         assert_eq!(stored_blob(test, &hash).await.len(), size);
     }
+}
+
+async fn mailbox_get(account: &Account) {
+    let reply = account
+        .jmap_method_call("Mailbox/get", json!({ "accountId": account.id_string() }))
+        .await;
+    assert_eq!(
+        reply.0["methodResponses"][0][0], "Mailbox/get",
+        "{:?}",
+        reply.0
+    );
+}
+
+async fn append_one(imap: &mut ImapConnection, subject: &str) {
+    let message = message_with(subject, "Request trigger fixture");
+    imap.send(&format!("APPEND INBOX {{{}}}", message.len()))
+        .await;
+    imap.assert_read(Type::Continuation, ResponseType::Ok).await;
+    imap.send_untagged(&message).await;
+    let reply = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert!(reply.last().unwrap().contains("[APPENDUID "), "{reply:?}");
+}
+
+async fn upload_message(account: &Account, message: &str) -> String {
+    account
+        .jmap_client()
+        .await
+        .upload(None, message.as_bytes().to_vec(), None)
+        .await
+        .unwrap()
+        .take_blob_id()
+}
+
+fn create_request(account: &Account, creation_id: &str, subject: &str) -> Value {
+    let inbox = Id::from(INBOX_ID).to_string();
+    json!({
+        "accountId": account.id_string(),
+        "create": { (creation_id): {
+            "mailboxIds": { inbox: true },
+            "from": [{ "email": account.name() }],
+            "to": [{ "email": SENDER }],
+            "subject": subject,
+            "textBody": [{ "partId": "t", "type": "text/plain" }],
+            "bodyValues": { "t": { "value": "Request trigger fixture" } },
+        }},
+    })
+}
+
+fn import_request(account: &Account, creation_id: &str, blob_id: &str) -> Value {
+    let inbox = Id::from(INBOX_ID).to_string();
+    json!({
+        "accountId": account.id_string(),
+        "emails": { (creation_id): { "blobId": blob_id, "mailboxIds": { inbox: true } } },
+    })
+}
+
+fn created_id<'a>(body: &'a Value, creation_id: &str) -> &'a str {
+    body["created"][creation_id]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing created ID for {creation_id}: {body:?}"))
+}
+
+async fn assert_indexed(test: &TestServer, id: u32, document: u32, since: u64) {
+    let record = log_records_since(test, id, SyncCollection::Email, since)
+        .await
+        .into_iter()
+        .find_map(|(change_id, changes)| {
+            changes.into_iter().any(|change| {
+                matches!(change, Change::InsertItem(item) if Id::from(item).document_id() == document)
+            }).then_some(change_id)
+        })
+        .expect("message has an acknowledged insert record");
+    assert!(index(test, id).await.indexed_to.change_id >= record);
+    assert!(index_holds(test, id, document).await, "document {document}");
+}
+
+async fn case_blob_hook_does_not_create_mailboxes(test: &TestServer, key: &Account, fresh: bool) {
+    let phase = if fresh {
+        "fresh"
+    } else {
+        "after mailbox deletion"
+    };
+    println!("case_blob_hook_does_not_create_mailboxes: {phase}");
+    let id = account_id(key);
+    let mailbox_ids = async || {
+        let mut ids = Vec::new();
+        test.server
+            .archives(id, Collection::Mailbox, Field::ARCHIVE, &(), |id, _| {
+                ids.push(id);
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        ids
+    };
+    assert!(
+        mailbox_ids().await.is_empty(),
+        "{phase}: setup has mailbox rows"
+    );
+    let reply = key.jmap_method_call("Blob/upload", json!({
+        "accountId": key.id_string(),
+        "create": { "vcard": { "data": [{ "data:asText": "BEGIN:VCARD\r\nEND:VCARD\r\n" }] }},
+    })).await;
+    assert!(
+        reply.0["methodResponses"][0][1]["created"]["vcard"]["id"].is_string(),
+        "{:?}",
+        reply.0
+    );
+    assert!(
+        mailbox_ids().await.is_empty(),
+        "{phase}: the Blob hook created mailboxes"
+    );
+    if fresh {
+        // A real mailbox request still uses normal lazy provisioning.
+        mailbox_get(key).await;
+        assert!(!mailbox_ids().await.is_empty());
+    }
+}
+
+async fn case_triggers(test: &TestServer, key: &Account) {
+    println!("case_triggers");
+    let id = account_id(key);
+    let since = change_id(test, id).await;
+    let document = deliver_one(test, key, "JMAP trigger backlog").await;
+    assert!(index(test, id).await.indexed_to.change_id < change_id(test, id).await);
+    mailbox_get(key).await;
+    assert_indexed(test, id, document, since).await;
+
+    let mut imap = ImapConnection::connect(b"_trigger ").await;
+    imap.authenticate(key.name(), key.secret()).await;
+    let since = change_id(test, id).await;
+    let document = deliver_one(test, key, "IMAP trigger backlog").await;
+    let before = index(test, id).await.indexed_to;
+    imap.send_ok("NOOP").await;
+    assert_eq!(index(test, id).await.indexed_to, before);
+    imap.send_ok("SELECT INBOX").await;
+    assert_indexed(test, id, document, since).await;
+
+    let waiting = deliver_one(test, key, "POP3 and keyless JMAP backlog").await;
+    let before = index(test, id).await.indexed_to;
+    let mut pop3 = Pop3Connection::connect().await;
+    pop3.authenticate(key.name(), key.secret()).await;
+    pop3.send("STAT").await;
+    pop3.assert_read(Pop3Reply::Ok).await;
+    pop3.send("QUIT").await;
+    pop3.assert_read(Pop3Reply::Ok).await;
+    assert_eq!(index(test, id).await.indexed_to, before);
+
+    let waiting_id = email_id(waiting);
+    let mut socket = ws_connect(key.name(), key.secret()).await;
+    let request = json!({
+        "@type": "Request",
+        "id": "1",
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [["Email/set", {
+            "accountId": key.id_string(),
+            "update": { &waiting_id: { "keywords/$flagged": true } },
+        }, "flag"]],
+    });
+    let reply: Value =
+        serde_json::from_str(&ws_call(&mut socket, &request.to_string()).await).unwrap();
+    assert!(
+        reply["methodResponses"][0][1]["updated"]
+            .as_object()
+            .unwrap()
+            .contains_key(&waiting_id),
+        "{reply}"
+    );
+    ws_close(socket).await;
+    assert_eq!(index(test, id).await.indexed_to, before);
+
+    let since = change_id(test, id).await;
+    let before = message_ids(test, id).await;
+    append_one(&mut imap, "APPEND post-write trigger").await;
+    let appended = super::new_message(test, id, &before).await;
+    assert_indexed(test, id, appended, since).await;
+
+    let blob = upload_message(key, &message_with("Import trigger", "Imported")).await;
+    let since = change_id(test, id).await;
+    let reply = key
+        .jmap_method_call("Email/import", import_request(key, "imported", &blob))
+        .await;
+    let imported = Id::from_str(created_id(&reply.0["methodResponses"][0][1], "imported"))
+        .unwrap()
+        .document_id();
+    assert_indexed(test, id, imported, since).await;
+
+    let since = change_id(test, id).await;
+    let reply = key
+        .jmap_method_call(
+            "Email/set",
+            create_request(key, "made", "Set post-write trigger"),
+        )
+        .await;
+    let created = Id::from_str(created_id(&reply.0["methodResponses"][0][1], "made"))
+        .unwrap()
+        .document_id();
+    assert_indexed(test, id, created, since).await;
+}
+
+async fn case_pipelined_imap_commands(test: &TestServer, key: &Account, plain: &Account) {
+    println!("case_pipelined_imap_commands");
+    let _config = search_config_guard!(test, pass_cap: 1);
+    for account in [key, plain] {
+        let id = account_id(account);
+        let since = change_id(test, id).await;
+        let first = deliver_one(test, account, "First pending pipelined command").await;
+        let second = deliver_one(test, account, "Second pending pipelined command").await;
+        let mut imap = ImapConnection::connect(b"_pipe ").await;
+        imap.authenticate(account.name(), account.secret()).await;
+
+        let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+        // Write both same-kind commands together with distinct tags. The
+        // CREATE handler sends each tagged response in order.
+        imap.send_raw("_pipe1 CREATE PipelineOne\r\n_pipe CREATE PipelineTwo\r\n")
+            .await;
+        let responses = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+        assert!(
+            responses.iter().any(|line| line.starts_with("_pipe1 OK")),
+            "{responses:?}"
+        );
+
+        if id == account_id(key) {
+            assert_indexed(test, id, first, since).await;
+            assert_indexed(test, id, second, since).await;
+            assert_eq!(search_pass_sizes(traces, id).await, [1, 1]);
+        } else {
+            assert!(search_pass_sizes(traces, id).await.is_empty());
+            assert_plain_no_index(test, id).await;
+            clean_plain_messages(test, plain).await;
+        }
+        imap.send_ok("DELETE PipelineOne").await;
+        imap.send_ok("DELETE PipelineTwo").await;
+    }
+}
+
+async fn case_busy_pass_does_not_wait_for_reload(test: &TestServer, key: &Account) {
+    println!("case_busy_pass_does_not_wait_for_reload");
+    let id = account_id(key);
+    let document = deliver_one(test, key, "Busy reload backlog").await;
+    let keys = za_unlock(test, id, key.secret()).await;
+    let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+    {
+        // A pass can hold these together while reloading a moved manifest.
+        let _pass = entry.pass_lock.lock().await;
+        let _reload = entry.index.write().await;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            test.server.za_search_pass(id, &keys),
+        )
+        .await
+        .expect("busy pass attempted to read the index before checking its pass lock")
+        .unwrap();
+        assert_eq!(outcome, PassOutcome::Running);
+    }
+    advanced(test, key, true).await;
+    assert!(index_holds(test, id, document).await);
+}
+
+async fn case_reads_do_not_wait_for_a_pass(test: &TestServer, key: &Account) {
+    println!("case_reads_do_not_wait_for_a_pass");
+    let id = account_id(key);
+    let _config = search_config_guard!(test, pass_cap: 1);
+    let document = deliver_one(test, key, "Parked request first").await;
+    deliver_one(test, key, "Parked request second").await;
+    let reader = key.clone();
+    let parked = HookParked::start(id, set_search_pass_pause, async move {
+        reader.jmap_method_call("Email/get", json!({
+            "accountId": reader.id_string(), "ids": [email_id(document)], "properties": ["id"],
+        })).await
+    })
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(2), set_flag(key, document, true))
+        .await
+        .expect("keyword update waited for a publishing pass");
+    tokio::time::timeout(Duration::from_secs(2), mailbox_get(key))
+        .await
+        .expect("Mailbox/get waited for a publishing pass");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), pass(test, key))
+            .await
+            .expect("a separate pass waited for a publishing pass"),
+        PassOutcome::Running,
+    );
+    let response = parked.finish().await;
+    assert_eq!(
+        response.0["methodResponses"][0][1]["list"][0]["id"],
+        email_id(document)
+    );
+    advanced(test, key, true).await;
+}
+
+async fn case_content_wait_budget(test: &TestServer, key: &Account) {
+    println!("case_content_wait_budget");
+    let id = account_id(key);
+    let _config = search_config_guard!(test, wait_secs: 1, pass_cap: 1);
+    let mut documents = Vec::new();
+    for n in 0..6 {
+        documents.push(deliver_one(test, key, &format!("Content wait backlog {n}")).await);
+    }
+    let checkpoint = index(test, id).await.indexed_to;
+    let parked = park(test, key, set_search_pass_pause).await;
+    let keys = za_unlock(test, id, key.secret()).await;
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        test.server
+            .za_search_ensure_current(id, &keys, start + Duration::from_secs(1)),
+    )
+    .await
+    .expect("content waiter exceeded its deadline");
+    assert!(matches!(result, Err(Unavailable::NotCurrent)));
+    assert!(
+        start.elapsed() >= Duration::from_millis(900),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(index(test, id).await.indexed_to, checkpoint);
+    assert!(matches!(
+        parked.finish().await,
+        PassOutcome::Advanced {
+            published: true,
+            ..
+        }
+    ));
+    assert!(index(test, id).await.indexed_to.change_id > checkpoint.change_id);
+    assert_held(test, id, &documents, 1).await;
+
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let entry = test
+        .server
+        .za_search_ensure_current(id, &keys, Instant::now() + Duration::from_secs(30))
+        .await
+        .unwrap_or_else(|error| panic!("index did not catch up: {error:?}"));
+    let state = change_id(test, id).await;
+    let loaded = entry
+        .read_loaded()
+        .await
+        .expect("current index remains loaded");
+    assert!(is_current(&loaded, state));
+    assert!(loaded.content.is_some());
+    drop(loaded);
+    let committed = traces
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_PASS)
+        .count();
+    assert_eq!(committed, documents.len() - 1);
+    assert_held(test, id, &documents, documents.len()).await;
+}
+
+async fn case_content_wait_uses_deadline_during_reload(test: &TestServer, key: &Account) {
+    println!("case_content_wait_uses_deadline_during_reload");
+    let id = account_id(key);
+    let document = deliver_one(test, key, "Content waiter while a pass reloads").await;
+    let keys = za_unlock(test, id, key.secret()).await;
+    let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+    let checkpoint = index(test, id).await.indexed_to;
+
+    {
+        // Reproduce the running pass's reload lock order. The content waiter
+        // must find the pass slot without first reading or loading the index.
+        let _pass = entry.pass_lock.lock().await;
+        let _reload = entry.index.write().await;
+        let start = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            test.server
+                .za_search_ensure_current(id, &keys, start + Duration::from_millis(200)),
+        )
+        .await
+        .expect("content waiter blocked on the reload guard beyond its original deadline");
+        assert!(matches!(result, Err(Unavailable::NotCurrent)));
+        assert!(
+            start.elapsed() >= Duration::from_millis(190),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(index(test, id).await.indexed_to, checkpoint);
+    }
+
+    let current = test
+        .server
+        .za_search_ensure_current(id, &keys, Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap_or_else(|error| panic!("content wait did not recover after reload: {error:?}"));
+    let state = change_id(test, id).await;
+    let loaded = current.read_loaded().await.unwrap();
+    assert!(is_current(&loaded, state));
+    assert!(loaded.content.is_some());
+    drop(loaded);
+    assert!(index_holds(test, id, document).await);
+}
+
+async fn case_content_loader_uses_original_deadline(test: &TestServer, key: &Account) {
+    println!("case_content_loader_uses_original_deadline");
+    let id = account_id(key);
+    let _config = search_config_guard!(test, wait_secs: 30);
+    deliver_one(
+        test,
+        key,
+        "Current thread part with an unloaded content head",
+    )
+    .await;
+    advanced(test, key, true).await;
+    simulate_restart(test, id).await;
+    assert_eq!(pass(test, key).await, PassOutcome::Current);
+
+    let keys = za_unlock(test, id, key.secret()).await;
+    let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+    {
+        let state = change_id(test, id).await;
+        let loaded = entry.read_loaded().await.unwrap();
+        assert!(is_current(&loaded, state));
+        assert!(loaded.manifest.content.is_some() && loaded.content.is_none());
+    }
+
+    // The thread entry is resident and current, so the pass needs no load
+    // flight. Only the actual content load waits on this lock.
+    let load_flight = entry.load_flight.lock().await;
+    let budget = test.server.inner.cache.za_search.content_used();
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        test.server
+            .za_search_ensure_current(id, &keys, start + Duration::from_millis(200)),
+    )
+    .await
+    .expect("content load ignored the caller's shorter absolute deadline");
+    assert!(matches!(result, Err(Unavailable::NotCurrent)));
+    assert!(
+        start.elapsed() >= Duration::from_millis(190),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(test.server.inner.cache.za_search.content_used(), budget);
+    assert!(entry.read_loaded().await.unwrap().content.is_none());
+    drop(load_flight);
+
+    let current = test
+        .server
+        .za_search_ensure_current(id, &keys, Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap_or_else(|error| panic!("content loader did not recover after timeout: {error:?}"));
+    assert!(current.read_loaded().await.unwrap().content.is_some());
+}
+
+async fn case_time_cap_bounds_the_command(test: &TestServer, key: &Account) {
+    println!("case_time_cap_bounds_the_command");
+    let id = account_id(key);
+    let _config = search_config_guard!(test, pass_ms: 1);
+    let before = index(test, id).await.indexed_to;
+    let attachment =
+        "Attachment content for the command time-cap regression test.\r\n".repeat(5120);
+    for n in 0..12 {
+        let fixture = format!(
+            concat!(
+                "From: {}\r\nTo: {}\r\nSubject: Time-cap fixture {}\r\n",
+                "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=cap\r\n\r\n",
+                "--cap\r\nContent-Type: text/plain\r\n\r\nMessage text\r\n",
+                "--cap\r\nContent-Type: text/plain; charset=utf-8\r\n",
+                "Content-Disposition: attachment; filename=attachment.txt\r\n\r\n{}--cap--\r\n",
+            ),
+            SENDER,
+            key.name(),
+            n,
+            attachment
+        );
+        deliver(test, SENDER, key.name(), &fixture).await;
+    }
+    let latest = change_id(test, id).await;
+    let docs = message_ids(test, id).await;
+    assert_eq!(docs.len(), 12);
+    let mut imap = ImapConnection::connect(b"_cap ").await;
+    imap.authenticate(key.name(), key.secret()).await;
+    tokio::time::timeout(Duration::from_secs(5), imap.send_ok("SELECT INBOX"))
+        .await
+        .expect("one SELECT exceeded the command budget");
+    let first = index(test, id).await.indexed_to;
+    assert!(
+        first.change_id > before.change_id && first.change_id < latest,
+        "{first:?}"
+    );
+
+    for _ in 1..docs.len() {
+        if index(test, id).await.indexed_to.change_id >= latest {
+            break;
+        }
+        imap.send_ok("SELECT INBOX").await;
+    }
+    assert!(index(test, id).await.indexed_to.change_id >= latest);
+    assert_held(test, id, &docs, docs.len()).await;
+}
+
+async fn case_plain_control_unaffected(test: &TestServer, plain: &Account) {
+    println!("case_plain_control_unaffected");
+    let id = account_id(plain);
+    deliver_one(test, plain, "Ordinary trigger control").await;
+    mailbox_get(plain).await;
+    let mut imap = ImapConnection::connect(b"_plain ").await;
+    imap.authenticate(plain.name(), plain.secret()).await;
+    imap.send_ok("NOOP").await;
+    imap.send_ok("SELECT INBOX").await;
+    imap.send_ok("LOGOUT").await;
+    assert!(manifest_bytes(test, id).await.is_none());
+    assert!(principal_blob_links(test, id).await.is_empty());
+
+    clean_plain_messages(test, plain).await;
+}
+
+async fn clean_plain_messages(test: &TestServer, plain: &Account) {
+    let cache = test
+        .server
+        .get_cached_messages(account_id(plain))
+        .await
+        .unwrap();
+    let ids = cache
+        .emails
+        .iter()
+        .map(|email| Id::from_parts(email.thread_id(), email.document_id()).to_string())
+        .collect::<Vec<_>>();
+    destroy(plain, &ids).await;
+    test.wait_for_tasks().await;
+}
+
+async fn search_pass_sizes(traces: Traced, id: u32) -> Vec<u64> {
+    traces
+        .finish()
+        .await
+        .into_iter()
+        .filter_map(|event| {
+            if event.account_id != Some(u64::from(id)) || event.details != ZA_SEARCH_PASS {
+                return None;
+            }
+            Some(
+                event
+                    .keys
+                    .iter()
+                    .find_map(|(key, value)| match (key, value) {
+                        (Key::Total, TraceValue::UInt(count)) => Some(*count),
+                        _ => None,
+                    })
+                    .expect("a committed pass has an insert count"),
+            )
+        })
+        .collect()
+}
+
+fn get_created(account: &Account, create_id: &str) -> Value {
+    json!(["Email/get", {
+        "accountId": account.id_string(),
+        "ids": [format!("#{create_id}")],
+        "properties": ["id"],
+    }, "get-created"])
+}
+
+fn get_imported(account: &Account, call_id: &str, create_id: &str) -> Value {
+    json!(["Email/get", {
+        "accountId": account.id_string(),
+        "#ids": { "resultOf": call_id, "name": "Email/import", "path": format!("/created/{create_id}/id") },
+        "properties": ["id"],
+    }, "get-imported"])
+}
+
+fn assert_get_created(body: &Value, expected_id: &str) -> u64 {
+    assert_eq!(body[0], "Email/get", "{body}");
+    assert_eq!(body[1]["list"][0]["id"], expected_id, "{body}");
+    let Some(State::Exact(state)) = body[1]["state"].as_str().and_then(State::parse) else {
+        panic!("missing exact Email/get state: {body}");
+    };
+    state
+}
+
+async fn assert_plain_no_index(test: &TestServer, id: u32) {
+    assert!(manifest_bytes(test, id).await.is_none());
+    assert!(principal_blob_links(test, id).await.is_empty());
+}
+
+async fn case_r8_two_adding_calls(
+    test: &TestServer,
+    account: &Account,
+    import_first: bool,
+    keyed: bool,
+) {
+    println!("case_r8_two_adding_calls: import_first={import_first}, keyed={keyed}");
+    let id = account_id(account);
+    let root = message_with("R8 root", "pre-request backlog");
+    let parent = root
+        .lines()
+        .find_map(|line| line.strip_prefix("Message-ID: "))
+        .unwrap();
+    let parent_id = parent.trim_matches(['<', '>']);
+    let imported = message_with("Re: R8 root", "import reply").replacen(
+        "\r\n\r\n",
+        &format!("\r\nIn-Reply-To: {parent}\r\n\r\n"),
+        1,
+    );
+    let blob = upload_message(account, &imported).await;
+    let since = change_id(test, id).await;
+    deliver(test, SENDER, account.name(), &root).await;
+
+    let mut create = create_request(account, "create", "Re: R8 root");
+    create["create"]["create"]["inReplyTo"] = json!([parent_id]);
+    let create = json!(["Email/set", create, "create-call"]);
+    let import = json!([
+        "Email/import",
+        import_request(account, "import", &blob),
+        "import-call"
+    ]);
+    let read_create = get_created(account, "create");
+    let read_import = get_imported(account, "import-call", "import");
+    let (calls, creations) = if import_first {
+        (
+            [import, read_import, create, read_create],
+            ["import", "create"],
+        )
+    } else {
+        (
+            [create, read_create, import, read_import],
+            ["create", "import"],
+        )
+    };
+
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let reply = account.jmap_method_calls(json!(calls)).await;
+    let responses = reply.0["methodResponses"].as_array().unwrap();
+    assert_eq!(responses.len(), 4, "{:?}", reply.0);
+    for n in 0..4 {
+        assert_eq!(responses[n][0], calls[n][0], "{:?}", reply.0);
+        assert_eq!(responses[n][2], calls[n][2], "{:?}", reply.0);
+    }
+    let first = created_id(&responses[0][1], creations[0]);
+    let last = created_id(&responses[2][1], creations[1]);
+    let earlier_view = assert_get_created(&responses[1], first);
+    let later_view = assert_get_created(&responses[3], last);
+    if keyed {
+        let manifest = index(test, id).await;
+        assert!(earlier_view < manifest.newest_row.change_id);
+        assert!(later_view >= manifest.newest_row.change_id);
+        assert_eq!(search_pass_sizes(traces, id).await, [1, 2]);
+        for email_id in [first, last] {
+            let document = Id::from_str(email_id).unwrap().document_id();
+            assert_indexed(test, id, document, since).await;
+        }
+    } else {
+        assert!(search_pass_sizes(traces, id).await.is_empty());
+        assert_plain_no_index(test, id).await;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CandidateFailure {
+    Reference,
+    State,
+    NotCreated,
+}
+
+async fn case_r8_failed_candidate(
+    test: &TestServer,
+    account: &Account,
+    failure: CandidateFailure,
+    keyed: bool,
+    earlier_write: bool,
+) {
+    println!("case_r8_failed_candidate: {failure:?}, keyed={keyed}, earlier_write={earlier_write}");
+    let id = account_id(account);
+    let since = change_id(test, id).await;
+    let before = manifest_bytes(test, id).await;
+    let mut calls = Vec::new();
+    if earlier_write {
+        calls.push(json!([
+            "Email/set",
+            create_request(account, "earlier", "Before a failed candidate"),
+            "create",
+        ]));
+    }
+    let failed = match failure {
+        CandidateFailure::Reference => json!([
+            "Email/import",
+            import_request(account, "failed", "#missing-upload"),
+            "selected",
+        ]),
+        CandidateFailure::State => {
+            let mut request = create_request(account, "failed", "State mismatch");
+            // A well-formed but different state, even on an empty account.
+            request["ifInState"] = json!(State::Exact(u64::MAX - 1));
+            json!(["Email/set", request, "selected"])
+        }
+        CandidateFailure::NotCreated => {
+            let blob = upload_message(account, &message_with("No mailbox", "Not created")).await;
+            let mut request = import_request(account, "failed", &blob);
+            request["emails"]["failed"]["mailboxIds"] = json!({});
+            json!(["Email/import", request, "selected"])
+        }
+    };
+    calls.push(failed);
+    if earlier_write {
+        calls.push(get_created(account, "earlier"));
+    }
+
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let reply = account.jmap_method_calls(json!(calls)).await;
+    let failed = &reply.0["methodResponses"][usize::from(earlier_write)];
+    assert_eq!(failed[2], "selected");
+    match failure {
+        CandidateFailure::Reference => {
+            assert_eq!(failed[0], "error", "{:?}", reply.0);
+            assert_eq!(failed[1]["type"], "invalidResultReference", "{:?}", reply.0);
+        }
+        CandidateFailure::State => {
+            assert_eq!(failed[0], "error", "{:?}", reply.0);
+            assert_eq!(failed[1]["type"], "stateMismatch", "{:?}", reply.0);
+        }
+        CandidateFailure::NotCreated => {
+            assert_eq!(failed[0], "Email/import", "{:?}", reply.0);
+            assert_eq!(
+                failed[1]["notCreated"]["failed"]["type"], "invalidProperties",
+                "{:?}",
+                reply.0
+            );
+            assert!(failed[1].get("created").is_none(), "{:?}", reply.0);
+        }
+    }
+    if earlier_write {
+        let first = created_id(&reply.0["methodResponses"][0][1], "earlier");
+        let following_view = assert_get_created(&reply.0["methodResponses"][2], first);
+        if keyed {
+            assert!(following_view >= index(test, id).await.newest_row.change_id);
+            let document = Id::from_str(first).unwrap().document_id();
+            assert_indexed(test, id, document, since).await;
+        }
+    }
+    assert_eq!(
+        search_pass_sizes(traces, id).await,
+        if earlier_write && keyed {
+            vec![1]
+        } else {
+            vec![]
+        },
+    );
+    if !earlier_write {
+        assert_eq!(manifest_bytes(test, id).await, before);
+        assert!(message_ids(test, id).await.is_empty());
+    }
+    if !keyed {
+        assert_plain_no_index(test, id).await;
+    }
+}
+
+async fn case_r8_non_candidates(test: &TestServer, key: &Account) {
+    println!("case_r8_non_candidates");
+    let id = account_id(key);
+    let prior = deliver_one(test, key, "Existing message to update").await;
+    advanced(test, key, true).await;
+    let prior_id = email_id(prior);
+    let since = change_id(test, id).await;
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let reply = key
+        .jmap_method_calls(json!([
+            ["Email/set", create_request(key, "writer", "Last actual writer"), "shared-call-id"],
+            get_created(key, "writer"),
+            ["Email/set", {
+                "accountId": key.id_string(),
+                "update": { &prior_id: { "keywords/$flagged": true } },
+            }, "shared-call-id"],
+            ["Email/import", { "accountId": key.id_string(), "emails": {} }, "shared-call-id"],
+        ]))
+        .await;
+    let responses = reply.0["methodResponses"].as_array().unwrap();
+    assert_eq!(responses.len(), 4, "{:?}", reply.0);
+    let created = created_id(&responses[0][1], "writer");
+    let view = assert_get_created(&responses[1], created);
+    assert_eq!(responses[2][0], "Email/set", "{:?}", reply.0);
+    assert!(
+        responses[2][1]["updated"].get(&prior_id).is_some(),
+        "{:?}",
+        reply.0
+    );
+    assert_eq!(responses[3][0], "Email/import", "{:?}", reply.0);
+    assert!(responses[3][1].get("created").is_none(), "{:?}", reply.0);
+    assert!(view >= index(test, id).await.newest_row.change_id);
+    assert_eq!(search_pass_sizes(traces, id).await, [1]);
+    assert_indexed(
+        test,
+        id,
+        Id::from_str(created).unwrap().document_id(),
+        since,
+    )
+    .await;
+}
+
+async fn case_r8_generated_call(test: &TestServer, key: &Account, plain: &Account) {
+    println!("case_r8_generated_call");
+    let id = account_id(key);
+    let identity = key
+        .jmap_create(
+            "Identity",
+            [json!({ "name": "Generated call", "email": key.name() })],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .created_id(0)
+        .to_string();
+    let mut draft = create_request(key, "draft", "Local generated-call fixture");
+    let email = &mut draft["create"]["draft"];
+    let drafts = Id::from(DRAFTS_ID).to_string();
+    email["mailboxIds"] = json!({ drafts: true });
+    email["to"] = json!([{ "email": plain.name() }]);
+    email["keywords"] = json!({ "$draft": true });
+    let draft = key.jmap_method_call("Email/set", draft).await;
+    let draft_id = created_id(&draft.0["methodResponses"][0][1], "draft");
+    let blob = upload_message(key, &message_with("After generated call", "Import fixture")).await;
+    let since = change_id(test, id).await;
+    deliver_one(test, key, "Before generated call").await;
+
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let reply = key
+        .jmap_method_calls(json!([
+            ["Email/set", create_request(key, "first", "Before submission"), "create"],
+            ["EmailSubmission/set", {
+                "accountId": key.id_string(),
+                "create": { "sub": { "identityId": &identity, "emailId": draft_id } },
+                "onSuccessUpdateEmail": { "#sub": { "keywords/$flagged": true } },
+            }, "shared-call-id"],
+            get_created(key, "first"),
+            ["Email/import", import_request(key, "last", &blob), "shared-call-id"],
+            get_created(key, "last"),
+        ]))
+        .await;
+    let responses = reply.0["methodResponses"].as_array().unwrap();
+    assert_eq!(responses.len(), 6, "{:?}", reply.0);
+    let first = created_id(&responses[0][1], "first");
+    assert_eq!(responses[1][0], "EmailSubmission/set", "{:?}", reply.0);
+    let submission = created_id(&responses[1][1], "sub");
+    assert_eq!(responses[2][0], "Email/set", "{:?}", reply.0);
+    assert_eq!(responses[2][2], "shared-call-id");
+    assert!(
+        responses[2][1]["updated"].get(draft_id).is_some(),
+        "{:?}",
+        reply.0
+    );
+    let after_generated = assert_get_created(&responses[3], first);
+    let last = created_id(&responses[4][1], "last");
+    let after_selected = assert_get_created(&responses[5], last);
+    let publication = index(test, id).await.newest_row.change_id;
+    assert!(after_generated < publication && after_selected >= publication);
+    assert_eq!(search_pass_sizes(traces, id).await, [1, 2]);
+    for created in [first, last] {
+        let document = Id::from_str(created).unwrap().document_id();
+        assert_indexed(test, id, document, since).await;
+    }
+
+    wait_for_delivery(test).await;
+    assert_eq!(message_ids(test, account_id(plain)).await.len(), 1);
+    assert_plain_no_index(test, account_id(plain)).await;
+    clean_plain_messages(test, plain).await;
+    key.jmap_destroy("EmailSubmission", [submission], Vec::<(&str, &str)>::new())
+        .await;
+    key.jmap_destroy("Identity", [&identity], Vec::<(&str, &str)>::new())
+        .await;
+}
+
+async fn case_r8_foreign_plain_writer(test: &TestServer, key: &Account, plain: &Account) {
+    println!("case_r8_foreign_plain_writer");
+    let inbox = Id::from(INBOX_ID).to_string();
+    mailbox_get(plain).await;
+    let share = plain
+        .jmap_method_call(
+            "Mailbox/set",
+            json!({
+                "accountId": plain.id_string(),
+                "update": { &inbox: { "shareWith": {
+                    key.id_string(): { "mayReadItems": true, "mayAddItems": true },
+                } } },
+            }),
+        )
+        .await;
+    assert!(
+        share.0["methodResponses"][0][1]["updated"]
+            .get(&inbox)
+            .is_some(),
+        "{:?}",
+        share.0
+    );
+
+    let id = account_id(key);
+    let since = change_id(test, id).await;
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let reply = key
+        .jmap_method_calls(json!([
+            [
+                "Email/set",
+                create_request(key, "owner", "Owner's last writer"),
+                "owner"
+            ],
+            get_created(key, "owner"),
+            [
+                "Email/set",
+                create_request(plain, "foreign", "Foreign ordinary writer"),
+                "foreign"
+            ],
+        ]))
+        .await;
+    let responses = reply.0["methodResponses"].as_array().unwrap();
+    assert_eq!(responses.len(), 3, "{:?}", reply.0);
+    let owner_email = created_id(&responses[0][1], "owner");
+    let owner_view = assert_get_created(&responses[1], owner_email);
+    let foreign = created_id(&responses[2][1], "foreign");
+    let foreign_doc = Id::from_str(foreign).unwrap().document_id();
+    assert!(
+        message_ids(test, account_id(plain))
+            .await
+            .contains(&foreign_doc)
+    );
+    assert!(owner_view >= index(test, id).await.newest_row.change_id);
+    assert_eq!(search_pass_sizes(traces, id).await, [1]);
+    assert_indexed(
+        test,
+        id,
+        Id::from_str(owner_email).unwrap().document_id(),
+        since,
+    )
+    .await;
+    assert_plain_no_index(test, account_id(plain)).await;
+    clean_plain_messages(test, plain).await;
+
+    let unshare = plain
+        .jmap_method_call(
+            "Mailbox/set",
+            json!({
+                "accountId": plain.id_string(),
+                "update": { &inbox: { (format!("shareWith/{}", key.id_string())): null } },
+            }),
+        )
+        .await;
+    assert!(
+        unshare.0["methodResponses"][0][1]["updated"]
+            .get(&inbox)
+            .is_some(),
+        "{:?}",
+        unshare.0
+    );
+}
+
+async fn case_r8_same_call_reference(test: &TestServer, key: &Account) {
+    println!("case_r8_same_call_reference");
+    let id = account_id(key);
+    let since = change_id(test, id).await;
+    let mut request = create_request(key, "first", "Referenced grouped create");
+    let mut dependent = create_request(key, "dependent", "Same-call reference fixture");
+    // A creation ID resolves to an Email id. The id is server-set, so the
+    // dependent create must reach property validation rather than notFound.
+    dependent["create"]["dependent"]["id"] = json!("#first");
+    request["create"]["dependent"] = dependent["create"]["dependent"].take();
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let reply = key
+        .jmap_method_calls(json!([
+            ["Email/set", request, "writer"],
+            get_created(key, "first"),
+        ]))
+        .await;
+    let responses = reply.0["methodResponses"].as_array().unwrap();
+    let created = created_id(&responses[0][1], "first");
+    assert_eq!(
+        responses[0][1]["notCreated"]["dependent"]["type"], "invalidProperties",
+        "{:?}",
+        reply.0
+    );
+    let view = assert_get_created(&responses[1], created);
+    assert!(view >= index(test, id).await.newest_row.change_id);
+    assert_eq!(search_pass_sizes(traces, id).await, [1]);
+    assert_indexed(
+        test,
+        id,
+        Id::from_str(created).unwrap().document_id(),
+        since,
+    )
+    .await;
 }
 
 async fn case_setup_manifest(test: &TestServer, key: &Account) {
@@ -409,6 +1459,10 @@ async fn multiappend(test: &TestServer, key: &Account, count: usize) -> (u64, Ve
     let id = account_id(key);
     assert!(message_ids(test, id).await.is_empty());
     let before = change_id(test, id).await;
+    // Seed one grouped insert for the explicit checkpoint pass below. Task 9's
+    // command and APPEND hooks see the real busy slot during this fixture.
+    let entry = test.server.inner.cache.za_search.entry(id);
+    let seed_guard = entry.pass_lock.lock().await;
     let mut imap = ImapConnection::connect(b"_index ").await;
     imap.authenticate(key.name(), key.secret()).await;
     imap.send_ok("SELECT INBOX").await;
@@ -429,6 +1483,7 @@ async fn multiappend(test: &TestServer, key: &Account, count: usize) -> (u64, Ve
         }
     }
     drop(imap);
+    drop(seed_guard);
     test.wait_for_tasks().await;
     let docs = message_ids(test, id).await;
     let groups = log_records_since(test, id, SyncCollection::Email, before)

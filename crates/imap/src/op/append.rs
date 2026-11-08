@@ -12,10 +12,13 @@ use common::{
     ipc::{EmailPush, PushNotification},
     network::SessionStream,
 };
-use email::message::ingest::{
-    IngestEmail, IngestSource, IngestedEmail,
-    group::{IngestGroup, ThreadKey},
-    recheck::ThreadRecheck,
+use email::message::{
+    ingest::{
+        IngestEmail, IngestSource, IngestedEmail,
+        group::{IngestGroup, ThreadKey},
+        recheck::ThreadRecheck,
+    },
+    za::search::ensure::ZaSearchEnsure,
 };
 use imap_proto::{
     Command, ResponseCode, StatusResponse,
@@ -183,78 +186,90 @@ impl<T: SessionStream> SessionData<T> {
         let mut last_change_id = None;
         let limits = &self.server.core.email.limits;
         let grouping = arguments.messages.len() > 1;
-        let mut group = IngestGroup::with_max_emails(arguments.messages.len());
-        for message in arguments.messages {
-            let parsed = MessageParser::new().parse(&message.message);
-            if let Some(parsed) = &parsed
-                && let Err(err) = limits.validate_header_section(parsed)
-            {
-                return Err(err.into_imap_error().id(arguments.tag));
-            }
-            let keywords = message
-                .flags
-                .into_iter()
-                .map(Keyword::from)
-                .collect::<Vec<_>>();
-            if let Err(err) = limits.validate_email(1, &keywords) {
-                return Err(err.into_imap_error().id(arguments.tag));
-            }
+        let ingest = async {
+            let mut group = IngestGroup::with_max_emails(arguments.messages.len());
+            for message in arguments.messages {
+                let parsed = MessageParser::new().parse(&message.message);
+                if let Some(parsed) = &parsed
+                    && let Err(err) = limits.validate_header_section(parsed)
+                {
+                    return Err(err.into_imap_error());
+                }
+                let keywords = message
+                    .flags
+                    .into_iter()
+                    .map(Keyword::from)
+                    .collect::<Vec<_>>();
+                if let Err(err) = limits.validate_email(1, &keywords) {
+                    return Err(err.into_imap_error());
+                }
 
-            let received_at = message
-                .received_at
-                .map(|received_at| received_at.clamp(0, MAX_RECEIVED_AT as i64) as u64);
+                let received_at = message
+                    .received_at
+                    .map(|received_at| received_at.clamp(0, MAX_RECEIVED_AT as i64) as u64);
 
-            let key = match &parsed {
-                Some(parsed) if grouping => ThreadKey::new(parsed),
-                _ => ThreadKey::default(),
-            };
-            if group.must_flush_before(message.message.len()) {
-                match group.flush(&self.server).await {
-                    Ok(emails) => appended(
-                        emails,
-                        account_id,
-                        recheck,
-                        &mut created,
-                        &mut last_change_id,
-                    ),
-                    Err(err) => return Err(append_error(err).id(arguments.tag)),
+                let key = match &parsed {
+                    Some(parsed) if grouping => ThreadKey::new(parsed),
+                    _ => ThreadKey::default(),
+                };
+                if group.must_flush_before(message.message.len()) {
+                    match group.flush(&self.server).await {
+                        Ok(emails) => appended(
+                            emails,
+                            account_id,
+                            recheck,
+                            &mut created,
+                            &mut last_change_id,
+                        ),
+                        Err(err) => return Err(append_error(err)),
+                    }
+                }
+
+                if let Err(err) = group
+                    .ingest(
+                        &self.server,
+                        IngestEmail {
+                            raw_message: &message.message,
+                            message: parsed.as_ref(),
+                            blob_hash: None,
+                            access_token: &access_token,
+                            mailbox_ids: vec![mailbox_id],
+                            keywords,
+                            received_at,
+                            source: IngestSource::Imap {
+                                train_classifier: true,
+                            },
+                            metadata: None,
+                            session_id: self.session_id,
+                        },
+                        key,
+                    )
+                    .await
+                {
+                    return Err(append_error(err));
                 }
             }
-
-            if let Err(err) = group
-                .ingest(
-                    &self.server,
-                    IngestEmail {
-                        raw_message: &message.message,
-                        message: parsed.as_ref(),
-                        blob_hash: None,
-                        access_token: &access_token,
-                        mailbox_ids: vec![mailbox_id],
-                        keywords,
-                        received_at,
-                        source: IngestSource::Imap {
-                            train_classifier: true,
-                        },
-                        metadata: None,
-                        session_id: self.session_id,
-                    },
-                    key,
-                )
-                .await
-            {
-                return Err(append_error(err).id(arguments.tag));
+            match group.flush(&self.server).await {
+                Ok(emails) => appended(
+                    emails,
+                    account_id,
+                    recheck,
+                    &mut created,
+                    &mut last_change_id,
+                ),
+                Err(err) => return Err(append_error(err)),
             }
+            Ok::<_, trc::Error>(())
         }
-        match group.flush(&self.server).await {
-            Ok(emails) => appended(
-                emails,
-                account_id,
-                recheck,
-                &mut created,
-                &mut last_change_id,
-            ),
-            Err(err) => return Err(append_error(err).id(arguments.tag)),
+        .await;
+        // Earlier groups can have committed even if a later group failed.
+        // Acknowledge that durable work before sending either result.
+        if last_change_id.is_some_and(|id| id != u64::MAX)
+            && let Some(keys) = self.access_token.za_keys_for(account_id)
+        {
+            self.server.za_search_pass_hook(account_id, keys).await;
         }
+        ingest.map_err(|err| err.id(arguments.tag.clone()))?;
 
         // Broadcast changes
         if let Some(change_id) = last_change_id {

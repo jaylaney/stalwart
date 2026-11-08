@@ -55,7 +55,11 @@ use types::{
 use za::ZaFetchedBlob;
 
 impl<T: SessionStream> Session<T> {
-    pub async fn handle_fetch(&mut self, requests: Vec<Request<Command>>) -> trc::Result<()> {
+    pub async fn handle_fetch(
+        &mut self,
+        requests: Vec<Request<Command>>,
+        finish_before_next: bool,
+    ) -> trc::Result<()> {
         // Validate access
         self.assert_has_permission(Permission::ImapFetch)?;
 
@@ -104,9 +108,13 @@ impl<T: SessionStream> Session<T> {
             op.as_ref()
                 .is_ok_and(|(_, _, arguments)| arguments.sets_seen())
         });
-        let _write_permit;
+        let _inline_permit;
         let permit = if sets_seen {
-            _write_permit = self.acquire_write_permit().await;
+            _inline_permit = self.acquire_write_permit().await;
+            None
+        } else if finish_before_next {
+            // Preserve adjacent FETCH response order across separate keyed hooks.
+            _inline_permit = self.acquire_read_permit().await;
             None
         } else {
             self.acquire_read_permit().await

@@ -354,7 +354,10 @@ impl Store {
                     DOC_LINK => key.get(COLLECTION_OFFSET).is_some_and(|collection| {
                         matches!(
                             Collection::from(*collection),
-                            Collection::Email | Collection::SieveScript | Collection::FileNode
+                            Collection::Email
+                                | Collection::SieveScript
+                                | Collection::FileNode
+                                | Collection::Principal
                         )
                     }),
                     ID_LINK => true,
@@ -496,6 +499,51 @@ mod tests;
 mod za_tests {
     use super::*;
     use crate::backend::ephemeral::EphemeralStore;
+
+    #[tokio::test]
+    async fn za_search_recode_selects_committed_principal_and_email_document_links() {
+        let store = EphemeralStore::open();
+        let account_id = 42;
+        let shard = 7;
+        let hash = |tag: u8| {
+            let mut bytes = [tag; BLOB_HASH_LEN];
+            bytes[0] = shard;
+            BlobHash(bytes)
+        };
+        let principal = hash(1);
+        let email = hash(2);
+        let temporary = hash(3);
+        let mut batch = BatchBuilder::new();
+        batch.with_account_id(account_id);
+        for hash in [&principal, &email, &temporary] {
+            batch.set(BlobOp::Commit { hash: hash.clone() }, Vec::new());
+        }
+        for (collection, hash) in [
+            (Collection::Principal, principal.clone()),
+            (Collection::Email, email.clone()),
+        ] {
+            batch.with_collection(collection).with_document(0).set(
+                BlobOp::Link {
+                    hash,
+                    to: BlobLink::Document,
+                },
+                BlobLinkValue::new(10u64),
+            );
+        }
+        batch.set(
+            BlobOp::Link {
+                hash: temporary,
+                to: BlobLink::Temporary { until: u64::MAX },
+            },
+            BlobLinkValue::new(10u64),
+        );
+        store.write_batch(&mut batch).await.unwrap();
+
+        assert_eq!(
+            store.user_blob_hashes(shard).await.unwrap(),
+            [principal, email]
+        );
+    }
 
     #[tokio::test]
     async fn za_search_scan_matches_only_exact_principal_document_zero_links() {

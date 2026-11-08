@@ -32,6 +32,7 @@ impl<T: SessionStream> Session<T> {
         &mut self,
         requests: Vec<Request<Command>>,
         permit: Option<OwnedSemaphorePermit>,
+        finish_before_next: bool,
     ) -> trc::Result<()> {
         // Validate access
         self.assert_has_permission(Permission::ImapStatus)?;
@@ -61,6 +62,12 @@ impl<T: SessionStream> Session<T> {
             data.use_messages_of(&arguments.mailbox_name);
         }
 
+        // Preserve adjacent STATUS response order across separate keyed hooks.
+        let (permit, _inline_permit) = if finish_before_next {
+            (None, permit)
+        } else {
+            (permit, None)
+        };
         spawn_op!(permit, data, {
             let mut caches = None;
 

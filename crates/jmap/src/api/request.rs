@@ -47,7 +47,10 @@ use crate::{
 };
 use common::{Server, auth::AccessToken, network::memory::MemoryReservation};
 use compact_str::format_compact;
-use email::message::za::view::ZaMailView;
+use email::message::{
+    ingest::IngestedEmail,
+    za::{search::ensure::ZaSearchEnsure, view::ZaMailView},
+};
 use http_proto::HttpSessionData;
 use jmap_proto::{
     request::{
@@ -62,6 +65,66 @@ use std::future::Future;
 use std::time::Instant;
 use trc::JmapEvent;
 use types::{collection::Collection, id::Id};
+use vault::session::SessionKeys;
+
+pub struct PostWriteCall<'a> {
+    keys: &'a SessionKeys,
+    pending: &'a mut bool,
+    selected: bool,
+}
+
+impl<'a> PostWriteCall<'a> {
+    pub(crate) fn acknowledge(&mut self, results: &[(String, trc::Result<IngestedEmail>)]) {
+        // A quota fallback can commit one item after a fatal result. Count
+        // all acknowledgments before recording can return at that error.
+        *self.pending |= results.iter().any(|(_, result)| {
+            result
+                .as_ref()
+                .is_ok_and(|email| email.change_id != u64::MAX)
+        });
+    }
+
+    fn take_attempt(&mut self) -> Option<&'a SessionKeys> {
+        if self.selected && std::mem::take(self.pending) {
+            // Consume before awaiting the hook, including busy/failed passes.
+            self.selected = false;
+            Some(self.keys)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) async fn attempt(&mut self, server: &Server) {
+        if let Some(keys) = self.take_attempt() {
+            server.za_search_pass_hook(keys.account_id, keys).await;
+        }
+    }
+}
+
+pub(crate) fn is_mail_method(obj: MethodObject) -> bool {
+    matches!(
+        obj,
+        MethodObject::Email
+            | MethodObject::Thread
+            | MethodObject::Mailbox
+            | MethodObject::SearchSnippet
+            | MethodObject::EmailSubmission
+            | MethodObject::Blob
+    )
+}
+
+fn last_adding_call(calls: &[Call<RequestMethod<'_>>], owner: u32) -> Option<usize> {
+    calls.iter().rposition(|call| {
+        let target = match &call.method {
+            RequestMethod::Set(SetRequestMethod::Email(request)) if request.has_creates() => {
+                request.account_id
+            }
+            RequestMethod::ImportEmail(request) if !request.emails.is_empty() => request.account_id,
+            _ => return false,
+        };
+        target.id() < INVALID_ACCOUNT_ID && target.document_id() == owner
+    })
+}
 
 pub trait RequestHandler: Sync + Send {
     fn handle_jmap_request<'x>(
@@ -82,6 +145,7 @@ pub trait RequestHandler: Sync + Send {
         session: &HttpSessionData,
         using: CapabilityIds,
         reservation: &mut MemoryReservation,
+        post_write: Option<&mut PostWriteCall<'_>>,
     ) -> impl Future<Output = trc::Result<ResponseMethod<'x>>> + Send;
 }
 
@@ -101,9 +165,33 @@ impl RequestHandler for Server {
             request.method_calls.len(),
         );
 
-        for mut call in request.method_calls {
+        let owner = access_token.account_id();
+        let keys = access_token.za_keys_for(owner).map(|keys| keys.as_ref());
+        let last_adding = if let Some(keys) = keys {
+            if request
+                .method_calls
+                .iter()
+                .any(|call| is_mail_method(call.name.obj))
+            {
+                self.za_search_pass_hook(owner, keys).await;
+            }
+            last_adding_call(&request.method_calls, owner)
+        } else {
+            None
+        };
+        let mut pending = false;
+
+        for (ordinal, mut call) in request.method_calls.into_iter().enumerate() {
+            let mut post_write = last_adding.zip(keys).map(|(selected, keys)| PostWriteCall {
+                keys,
+                pending: &mut pending,
+                selected: ordinal == selected,
+            });
             // Resolve result and id references
             if let Err(error) = response.resolve_references(&mut call.method) {
+                if let Some(post_write) = &mut post_write {
+                    post_write.attempt(self).await;
+                }
                 let method_error = error.clone();
                 let error = za_method_error_for_trace(self, access_token, error).await;
 
@@ -116,6 +204,9 @@ impl RequestHandler for Server {
             if !matches!(call.method, RequestMethod::Error(_)) {
                 let capability = call.name.capability();
                 if capability != Capability::Stalwart && !using.contains(capability) {
+                    if let Some(post_write) = &mut post_write {
+                        post_write.attempt(self).await;
+                    }
                     response.push_response(
                         call.id,
                         MethodName::error(),
@@ -130,6 +221,9 @@ impl RequestHandler for Server {
             }
 
             loop {
+                // Follow-up calls can reuse the outer call's id, but never
+                // inherit its post-write context.
+                let mut post_write = post_write.take();
                 let mut next_call = None;
 
                 // Add response
@@ -143,6 +237,7 @@ impl RequestHandler for Server {
                         session,
                         using,
                         reservation,
+                        post_write.as_mut(),
                     )
                     .await
                 {
@@ -231,6 +326,9 @@ impl RequestHandler for Server {
                         response.push_response(call.id, call.name, method_response);
                     }
                     Err(error) => {
+                        if let Some(post_write) = &mut post_write {
+                            post_write.attempt(self).await;
+                        }
                         let method_error = error.clone();
                         let error = za_method_error_for_trace(self, access_token, error).await;
 
@@ -272,6 +370,7 @@ impl RequestHandler for Server {
         session: &HttpSessionData,
         using: CapabilityIds,
         reservation: &mut MemoryReservation,
+        post_write: Option<&mut PostWriteCall<'_>>,
     ) -> trc::Result<ResponseMethod<'x>> {
         let op_start = Instant::now();
 
@@ -546,7 +645,9 @@ impl RequestHandler for Server {
                     self.za_assert_mail_route(access_token, req.account_id.document_id())
                         .await?;
 
-                    self.email_set(*req, access_token, session, using)
+                    let post_write = post_write
+                        .filter(|context| context.keys.account_id == req.account_id.document_id());
+                    self.email_set(*req, access_token, session, using, post_write)
                         .await?
                         .into()
                 }
@@ -768,7 +869,9 @@ impl RequestHandler for Server {
                 access_token.assert_has_access(req.account_id, Collection::Email)?;
                 za_assert_mail_keys(self, access_token, req.account_id).await?;
 
-                self.email_import(*req, access_token, session, using)
+                let post_write = post_write
+                    .filter(|context| context.keys.account_id == req.account_id.document_id());
+                self.email_import(*req, access_token, session, using, post_write)
                     .await?
                     .into()
             }
@@ -943,5 +1046,90 @@ pub(crate) fn resolve_account_id(
         Err(trc::JmapEvent::InvalidArguments
             .into_err()
             .details("The \"accountId\" property is required."))
+    }
+}
+
+#[cfg(test)]
+mod za_post_write_tests {
+    use super::*;
+    use vault::keys::Secret;
+
+    #[test]
+    fn failed_or_busy_attempt_does_not_reopen_selected_slot() {
+        let keys = SessionKeys::new(7, 0, Secret::random());
+        let mut pending = false;
+        let mut selected = PostWriteCall {
+            keys: &keys,
+            pending: &mut pending,
+            selected: true,
+        };
+        assert!(selected.take_attempt().is_none());
+        selected.acknowledge(&[(
+            "created".into(),
+            Ok(IngestedEmail {
+                change_id: 42,
+                ..IngestedEmail::default()
+            }),
+        )]);
+
+        // The hook returns no success flag. Even if it was busy or failed,
+        // the dispatcher fallback has no second attempt to make.
+        assert_eq!(selected.take_attempt().map(|keys| keys.account_id), Some(7));
+        assert!(selected.take_attempt().is_none());
+        assert!(!pending);
+    }
+
+    #[test]
+    fn acknowledgment_scans_after_fatal_results_and_survives_later_errors() {
+        let keys = SessionKeys::new(7, 0, Secret::random());
+        let mut pending = false;
+        let mut earlier = PostWriteCall {
+            keys: &keys,
+            pending: &mut pending,
+            selected: false,
+        };
+        earlier.acknowledge(&[
+            (
+                "fatal".into(),
+                Err(trc::StoreEvent::AssertValueFailed.into_err()),
+            ),
+            (
+                "duplicate".into(),
+                Ok(IngestedEmail {
+                    change_id: u64::MAX,
+                    ..IngestedEmail::default()
+                }),
+            ),
+        ]);
+        assert!(!*earlier.pending);
+
+        earlier.acknowledge(&[
+            (
+                "fatal".into(),
+                Err(trc::StoreEvent::AssertValueFailed.into_err()),
+            ),
+            (
+                "committed".into(),
+                Ok(IngestedEmail {
+                    change_id: 42,
+                    ..IngestedEmail::default()
+                }),
+            ),
+        ]);
+        assert!(earlier.take_attempt().is_none());
+        earlier.acknowledge(&[(
+            "later error".into(),
+            Err(trc::StoreEvent::AssertValueFailed.into_err()),
+        )]);
+        assert!(pending);
+
+        let mut selected = PostWriteCall {
+            keys: &keys,
+            pending: &mut pending,
+            selected: true,
+        };
+        selected.acknowledge(&[]);
+        assert!(selected.take_attempt().is_some());
+        assert!(selected.take_attempt().is_none());
     }
 }
