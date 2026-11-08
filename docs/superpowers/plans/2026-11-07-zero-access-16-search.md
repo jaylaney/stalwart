@@ -2,6 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Plan revision 15** (2026-11-08) closes the execution review's P1-PAD finding:
+a valid non-power-of-two `ZA_SEARCH_PAD_MIN` could make rounding the actual
+publishing payload reveal its alias count. Task 5 now pads Publishing directly to
+`M`, refusing a framed payload above `M`; only Compaction rounds its public-count
+allowance. This preserves the approved fixed-size guarantee, accepted configuration
+bounds and default wire behavior, with no format change (spec revision 22).
+Task 5 adds the equal-record-width alias-count fixture and publishing-boundary
+refusal, extends the sealed-blob check, and Task 19 adds mutation M53. The obsolete
+grouped-record overshoot example is corrected to one message.
+
 **Plan revision 14** (2026-11-08) records Jay's Task 1 benchmark ruling:
 `ZA_SEARCH_ACCOUNT_MAX_MB = 512` MiB and `ZA_SEARCH_MEM_MB = 1536` MiB are the
 provisional defaults (spec revision 21). The full 15,000-message benchmark measured
@@ -118,7 +128,7 @@ The fork diff stays narrow: new modules (`crates/store/src/za_search/`, `crates/
 
 **Tech Stack:** Rust 2024 on upstream Stalwart v1.0.3 (fork `0.4.0-beta.1`; internal crates `1.0.3`, `vault` `0.16.25`); upstream's `index_document`, `SearchQuery`/`Leaf` planner and forward-index codec (`crates/store/src/search/`), `MessageSortKeys`, `ThreadFields`, `commit_batch`, `hold_blob`/`BlobHold`, the blob codec; `vault::keys::{aad, seal, open}` (XChaCha20-Poly1305), HKDF sub-keys; `blake3` 1.8 (keyed tag, manifest hash; already a `store` dependency); `zstd` 0.14 through `store::write::compress::compress`; `roaring` bitmaps; tokio `RwLock`/`Mutex`; the `tests` crate harness (`TestServer`, `TestServerBuilder`, `SmtpConnection` on LMTP 11200, `za_unlock`, the JMAP and IMAP clients, `assert_is_empty`).
 
-**Spec:** `docs/superpowers/specs/2026-11-04-zero-access-search-design.md`, revision 21 (2026-11-08): revision 18 (`9d3457e4d`), approved by Jay on 2026-11-07 after Codex approved it under the stopping rule (`24fbd54d8`, the Codex review file beside the spec; the Fable review file `2026-11-04-zero-access-search-design-fable-review.md` holds the four Fable rounds), with the wording corrections of plan calls B1 and E1 (revision 19, ruled 2026-11-07) and D13 (revision 20, ruled 2026-11-08), and the provisional benchmark memory defaults (revision 21, ruled 2026-11-08). Cited by section number; where this plan and the spec disagree, the spec wins. The release 1, mail (release 3), invitations, key pinning, sharing and iMIP specs bind where it cites them. Project rules: `CLAUDE.md`, `docs/README-dev.md`, the plan 3 outcome note (gate inventory), the 1.0 upgrade outcome note (hook inventory, conflict ledger), the plan 13 outcome note (the mail rulings R0–R63).
+**Spec:** `docs/superpowers/specs/2026-11-04-zero-access-search-design.md`, revision 22 (2026-11-08): revision 18 (`9d3457e4d`), approved by Jay on 2026-11-07 after Codex approved it under the stopping rule (`24fbd54d8`, the Codex review file beside the spec; the Fable review file `2026-11-04-zero-access-search-design-fable-review.md` holds the four Fable rounds), with the wording corrections of plan calls B1 and E1 (revision 19, ruled 2026-11-07) and D13 (revision 20, ruled 2026-11-08), the provisional benchmark memory defaults (revision 21, ruled 2026-11-08), and the fixed publishing target for every accepted padding minimum (revision 22). Cited by section number; where this plan and the spec disagree, the spec wins. The release 1, mail (release 3), invitations, key pinning, sharing and iMIP specs bind where it cites them. Project rules: `CLAUDE.md`, `docs/README-dev.md`, the plan 3 outcome note (gate inventory), the 1.0 upgrade outcome note (hook inventory, conflict ledger), the plan 13 outcome note (the mail rulings R0–R63).
 
 ## Spec questions / plan calls
 
@@ -226,7 +236,7 @@ Each is the plan's choice; none changes a decision of the spec. B1 and E1, marke
 ## Execution
 
 Subagent-driven development on a new branch `release7-search` cut from `za-search-design`
-(the spec at revision 21 and this plan committed there). Start execution with an Astra
+(the spec at revision 22 and this plan committed there). Start execution with an Astra
 primary (`gpt-6-astra`, `high` reasoning), which orchestrates, adjudicates, integrates and
 performs final verification. The primary dispatches both implementers and reviewers as
 siblings; Sol implementers do not dispatch Astra reviewers. This keeps both routes within
@@ -281,7 +291,7 @@ Commands:
 Spec values, verbatim (4.2, 4.4, 7.4, 8, 6.2):
 - `K = 16`, a constant of format version 1 (`SEARCH_FORMAT_V1 = 1`), not a knob; a change of `K` is a format bump and a rebuild (H22).
 - `R = RECORD_MAX = 304` bytes (the encoded maximum of a thread record at `K = 16`, framing included), `a = ALIAS_LEN = 15`, `t = TOMBSTONE_LEN = 12`, `REVISION_ROW_LEN = 12`; `reservation() = R + (K − 1) · a = 304 + 225 = 529`.
-- The hidden section of a publishing pass is never more than `H + R + (K − 1) · a` bytes and always pads to `M`; `padded_len(framed, M) = max(M, 2^ceil(log2 framed))` where `framed = p + 4`; a compacted hidden section pads to `compaction_allowance(N_records) = N_records · (R + a) + 4` framed, then the same rounding (decision 2 (c), R35).
+- The hidden section of a publishing pass is never more than `H + R + (K − 1) · a` bytes and always pads directly to `M`, rejecting a framed payload above `M` (P1-PAD); the class helper `padded_len(framed, M) = max(M, 2^ceil(log2 framed))` is used for the public compaction allowance, never the actual publishing payload; a compacted hidden section pads to `compaction_allowance(N_records) = N_records · (R + a) + 4` framed, then the same rounding (decision 2 (c), R35).
 - The knobs (4.4), each read once at boot by the parse-and-fall-back convention (`KeyCacheConfig::from_env`, `crates/vault/src/cache.rs:41-53`) and logged beside the key cache's (`crates/common/src/manager/boot.rs:199-210`):
 
   | Variable | Default | Meaning |
@@ -299,7 +309,7 @@ Spec values, verbatim (4.2, 4.4, 7.4, 8, 6.2):
   | `ZA_SEARCH_CHECKPOINT` | 1000 | update-only records after which a pass writes a manifest-only checkpoint (G19) |
   | `ZA_SEARCH_SKIP_AFTER` | 8 | aborted passes on one document after which it is skipped as loss (H5) |
   | `ZA_SEARCH_ABSENT_RETRY_SECS` | 10 | how long a blob a committed manifest names may be reported absent before that is loss (H6) |
-  | `ZA_SEARCH_PAD_MIN` | 65536 | the smallest hidden-section class in bytes (`M`) |
+  | `ZA_SEARCH_PAD_MIN` | 65536 | exact publishing target and minimum compaction class in bytes (`M`) |
 
 - The boot refusals, with `H = ZA_SEARCH_PASS_HIDDEN_KB · 1024`: `ZA_SEARCH_PAD_MIN < H + R + (K − 1) · a + 4` (at the defaults the bound is `32768 + 529 + 4 = 33301`); `ZA_SEARCH_PASS_CAP > floor(H / (R + (K − 1) · a))` (at the defaults `floor(32768 / 529) = 61`); `ZA_SEARCH_ACCOUNT_MAX_MB > floor(ZA_SEARCH_MEM_MB / 3)` (at the defaults `512`); `ZA_SEARCH_SEGMENTS` outside `2..=255` (plan revision 2, PL12: the manifest's thread count is one byte). `R` and `a` are the constants, never measured (R20).
 - Refusal texts: `ZA_MAIL_SEARCH_UNAVAILABLE = "Search for this account is not available right now; try again shortly."` (7.4, a content request only, in the three cases of 7.4), beside the unchanged keyless text `ZA_MAIL_SEARCH_REFUSED` (`crates/common/src/za/mod.rs:31`). On IMAP both are `NO [CANNOT]`; on JMAP `unsupportedFilter` / `unsupportedSort`. The no-map failure of 6.2 is `serverUnavailable` on JMAP and `NO [UNAVAILABLE]` on IMAP.
@@ -379,9 +389,10 @@ Every test case the spec names (9.1 unit, 9.2 suite, 9.3 variants, 9.4 leak, 9.5
 | Resolution is exhaustive: an unresolvable leaf refuses, never widens (7.1, invariant 51) | 4 (the error), 10 (the refusal) | `s71_integer_leaf_is_unresolvable`, `s71_resolve_keeps_operators_and_replaces_leaves` |
 | Sort ranks as upstream's rule: pad to 40, sort, dense rank (7.1) | 4 | `s71_ranks_mirror_message_sort_ranks` |
 | The padding formula just below, at and above each class boundary, `M − 5`, `M − 4`, `2M` (F1, R15) | 5 | `r15_padded_len_at_class_boundaries` |
-| The maximal pass (`H` plus one grouped record with `K − 1` aliases each) stays under `M`; any tombstones, aliases or merges pad to `M` exactly (R20, R21, G1) | 5 | `r20_g1_maximal_pass_stays_under_m_and_every_pass_pads_to_m`, `r20_record_max_and_alias_len_are_the_encoded_maxima` |
+| The maximal pass (`H` plus one message with `K − 1` aliases) stays under `M`; any tombstones, aliases or merges pad to `M` exactly (R20, R21, G1) | 5 | `r20_g1_maximal_pass_stays_under_m_and_every_pass_pads_to_m`, `r20_record_max_and_alias_len_are_the_encoded_maxima` |
 | A compaction over equal record and tombstone counts pads to the same class whatever merged (decision 2 (c), I2) | 5 (formula), 15 (the rule) | `i2_compaction_allowance_is_a_function_of_counts` |
 | The allowance carries the framing before rounding; a content over the allowance is a defect (R35) | 5 | `r35_allowance_exceeded_is_an_error` |
+| P1-PAD: non-power-of-two publishing minimum hides aliases; over-minimum payloads refuse; sealed lengths agree | 5 | `publishing_non_power_of_two_minimum_hides_alias_count`, publishing boundary and sealed-blob cases |
 | A blob sealed for one account, segment id, kind or predecessor does not open under another (3.1, 9.1) | 5 | `s31_a_section_opens_only_under_its_account_header_and_kind`, `s42_thread_blob_rejects_another_position` |
 | The thread blob's length is the class plus a known multiple of the tombstone count (4.2) | 5 | `r9_h13_thread_blob_parses_with_and_without_a_hidden_section`, `s42_public_section_is_fixed_width` |
 | A deletion-only pass's blob has no hidden section (H13) | 5 | `r9_h13_thread_blob_parses_with_and_without_a_hidden_section` |
@@ -542,7 +553,7 @@ Every test case the spec names (9.1 unit, 9.2 suite, 9.3 variants, 9.4 leak, 9.5
 | 9.6: the first-search latency after an absence of one day's volume | 19 | `search_bench::system`, row 6 |
 | 9.6: a design-size rebuild end to end: about 625 passes, the compactions, the rewritten bytes against `⌈log_S n⌉`, the refusals before the first success, the wall time (H7, R32) | 19 | `search_bench::system`, row 7 |
 | 9.6: the figures confirm or adjust 4.4's defaults, `M` against `C · R` among them | 1, 19 | `search_bench::format` (Task 1) and the **Defaults** section of the outcome note |
-| 9.7: every listed site | 19 | Step 2's table M1–M52, one row per site, each naming the mutant and the catcher |
+| 9.7: every listed site | 19 | Step 2's table M1–M53, one row per site, each naming the mutant and the catcher |
 | Review Focus 1: a message with no `Date`, an unparsable or an out-of-range one sorts and filters as the control's (PL10) | 8, 18 | `effective_sent_at_is_upstreams`; `mail::differential::test` (the no-`Date`, `Date: yesterday` and year-9999 messages) |
 | Review Focus 2: a term set above `MAX_DOCUMENT_SIZE` is truncated as upstream's and indexed without an abort | 4, 18 | `s42_document_cap_is_upstreams`; `mail::differential::test` (the 1.2 MiB body) |
 | Review Focus 3: `SEARCH CHARSET ISO-8859-1` and `SORT (REVERSE SUBJECT DATE)` equal the control's | 18 | `mail::differential::test` (the two IMAP forms) |
@@ -687,7 +698,7 @@ Procedure, printing each figure as it is measured and keeping it for the table: 
 - [ ] **Step 7: Run the benchmark and record the table**
 
 Run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::search_bench::format -- --exact --ignored --nocapture` (budget an hour; set `SEARCH_BENCH_MESSAGES=2000` for a smoke run first).
-Expected: the test passes and prints the table. Create `docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md` with the header line (`# Zero-access search and threads: plan 16 outcome`, the date, the plan and spec paths, spec revision 21) and `## Format benchmark (Task 1)` holding the machine (CPU, memory, store), the corpus (count, raw bytes, ingest seconds), and this table with the measured values:
+Expected: the test passes and prints the table. Create `docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md` with the header line (`# Zero-access search and threads: plan 16 outcome`, the date, the plan and spec paths, spec revision 22) and `## Format benchmark (Task 1)` holding the machine (CPU, memory, store), the corpus (count, raw bytes, ingest seconds), and this table with the measured values:
 
 | Figure | With positions | Without positions |
 |---|---|---|
@@ -1489,10 +1500,13 @@ git commit -m "Search plan 16 Task 2: search key, field 152, configuration, form
     alias body `u32 source | u32 target | u32 revision`; all little-endian; records first)
   - `pub fn decode_hidden(bytes: &[u8]) -> Result<HiddenSection, FormatError>`
   - `pub fn frame_and_pad(hidden: &[u8], target: PadTarget, min_class: usize) -> Result<Vec<u8>, FormatError>`
-    (`u32 LE hidden.len() | hidden | zeros` to `padded_len(hidden.len() + 4, min_class)` for
-    `Publishing`, to `padded_len(compaction_allowance(n_records), min_class)` for
-    `Compaction`; `Err(AllowanceExceeded)` when `hidden.len() + 4 > compaction_allowance
-    (n_records)`, a defect that aborts the pass rather than writing a content-dependent size)
+    (`u32 LE hidden.len() | hidden | zeros` to exactly `min_class` for `Publishing`,
+    after rejecting `hidden.len() + 4 > min_class` with `Err(AllowanceExceeded)`;
+    for `Compaction`, reject a framed payload above `compaction_allowance(n_records)`
+    and pad to `padded_len(compaction_allowance(n_records), min_class)`. Preserve checked
+    length arithmetic/conversions. A publishing overflow aborts; never retry at a larger
+    content-dependent class. Compaction callers follow E5's refusal policy. P1-PAD: do
+    not call the class helper on the actual publishing payload, even when it fits `M`.)
   - `pub fn unframe(padded: &[u8]) -> Result<&[u8], FormatError>` (`Truncated` when the
     prefix exceeds what follows)
   - `pub fn encode_public(section: &PublicSection) -> Vec<u8>` (`u32 LE n | n × (u32
@@ -1571,22 +1585,34 @@ git commit -m "Search plan 16 Task 2: search key, field 152, configuration, form
   - `r15_padded_len_at_class_boundaries`: with `M = 65536`: `padded_len(100, M) == M`,
     `padded_len(M - 1, M) == M`, `padded_len(M, M) == M`, `padded_len(M + 1, M) == 2 * M`,
     `padded_len(2 * M, M) == 2 * M`, `padded_len(2 * M + 1, M) == 4 * M`; payloads: a hidden
-    section of `M - 5` bytes frames to `M - 1` and pads to `M`; `M - 4` to `M`; `M - 3` to
-    `2 * M`; `2 * M` to `4 * M`.
+    section of `M - 5` bytes frames to `M - 1` and Publishing pads to `M`; `M - 4`
+    succeeds at `M`; `M - 3` and `2 * M` return `AllowanceExceeded` for Publishing.
+    Keep arbitrary class-boundary assertions on the helper; they are not valid reasons
+    to grow a publishing blob. Successful frames unframe to the complete input.
   - `r20_g1_maximal_pass_stays_under_m_and_every_pass_pads_to_m`: with `H = 32768` and
     `M = 65536`: `H + reservation() + 4 <= M`; fixtures (a) one record with 0 hashes, no
     alias; (b) one record, 15 aliases; (c) 61 records with `K` hashes and `61 * 15` aliases
-    (every reservation of a full pass spent, `61 * 529 = 32269 <= H`) plus one grouped record
-    of 8 messages each with `K - 1` aliases (the overshoot of one grouped record, R20): each
+    (`61 * 529 = 32269 <= H`) plus one message with `K - 1` aliases as the conservative
+    one-message overshoot bound (the pass may split a grouped record, R20): each
     `frame_and_pad(encode_hidden(..), PadTarget::Publishing, M)` has length exactly `M`;
-    `encode_hidden` of (c) is at most `H + reservation() * 8`, and (c)'s framed length is
-    under `M`.
+    `encode_hidden` of (c) is at most `H + reservation()`, and its framed length is under `M`.
+  - `publishing_non_power_of_two_minimum_hides_alias_count` (P1-PAD): valid configuration
+    `H = 120 * 1024`, `C = 232`, `M = 123413` satisfies both boot bounds. Two publishing
+    sections each hold 200 maximal records with 16 hashes: one has no alias, the other
+    has 400 aliases (two losing threads per new message, from disjoint prior cohorts).
+    Reservations are `200 * 529 = 105800 < H` and 200 is below C. Assert encoded lengths
+    60800 and 66800, framed lengths 60804 and 66804, and that both Publishing outputs
+    have length exactly 123413 and round-trip through `unframe` and `decode_hidden`.
+    The old actual-payload rounding produces 123413 versus 131072 and must fail this test.
+    With the same non-power-of-two M, a hidden payload of M-4 succeeds and M-3 is refused.
   - `i2_compaction_allowance_is_a_function_of_counts`: two `HiddenSection`s with 1,000
     records each (500 present with `K` hashes, 500 tombstoned), one with no alias and one
     with 999 aliases: `frame_and_pad(.., PadTarget::Compaction { n_records: 1000 }, M)`
     lengths are equal; `compaction_allowance(30_000) == 30_000 * 319 + 4` and `padded_len
     (compaction_allowance(30_000), M) == 16 * 1024 * 1024` (the 16 MiB class of 1.3 and
-    13); `padded_len(compaction_allowance(0), M) == M`.
+    13); `padded_len(compaction_allowance(0), M) == M`. Repeat the two 1,000-record
+    sections with `M = 123413`: each must use `padded_len(compaction_allowance(1000), M)`,
+    not the exact Publishing target; retain the allowance-exceeded refusal.
   - `r35_allowance_exceeded_is_an_error`: 10 records and 11 aliases with `n_records: 10`
     whose encoding exceeds `compaction_allowance(10)` (add a 12th alias if needed) →
     `Err(FormatError::AllowanceExceeded)`.
@@ -1637,7 +1663,10 @@ git commit -m "Search plan 16 Task 2: search key, field 152, configuration, form
     `Some((&hidden, PadTarget::Publishing))` and with `None`; `parse_thread_blob` returns
     `(Some(hidden), public)` and `(None, public)`; the blob with a hidden section has length
     `BlobHeader::LEN + 4 + (M + SEAL_OVERHEAD) + (public_len(t, m) + SEAL_OVERHEAD)` exactly
-    (the length formula of 4.2).
+    (the length formula of 4.2). Repeat with `M = 123413` and the P1-PAD twins above:
+    equal public sections give equal final blob lengths, and each blob parses back to
+    its own hidden/public contents. Parsing remains independent of the current config;
+    do not require a historical blob's padding to equal the node's current M.
   - `s42_thread_blob_rejects_another_position`: `parse_thread_blob` with an `expected` header
     of another segment → `Err(LossClass::Parse)`.
   - `r11_content_blob_names_its_predecessor`: build node 1 (no predecessor) and node 2
@@ -3439,6 +3468,7 @@ Procedure, plan 15's (its outcome note, "Mutation runs (plan 15)"): against the 
 | M50 | the bridge rule (Task 15) | prune a deleted record when its deletion alone is below the bound | unit: the chain fixture's resolution fails (R35) |
 | M51 | the dead-alias rule (Task 15) | keep every alias above the bound | unit: R35's 128-family fit fails the class |
 | M52 | one-hop folding (Task 15) | fold to the end of the chain | unit: the pre-merge rendering fails (R35) |
+| M53 | the Publishing padding target (Task 5) | use `padded_len(actual_framed, M)` in place of exact M | unit: `publishing_non_power_of_two_minimum_hides_alias_count` produces unequal lengths (P1-PAD) |
 
 Expected: every row killed, or recorded as a finding with the test that should have caught it; an equivalent mutant is argued in the note as plan 13's row 3 was.
 
@@ -3446,7 +3476,7 @@ Expected: every row killed, or recorded as a finding with the test that should h
 
 Text to add, in the file's voice (edit the sentences the executing session finds changed by Tasks 2 to 18; the controller adds the merge status at merge time):
 
-- In "## Zero-access fork", "Where the code lives", after the release 5 bullet: "New at release 7 (search and threads, issue #23; spec `docs/superpowers/specs/2026-11-04-zero-access-search-design.md`, revision 21; plan `docs/superpowers/plans/2026-11-07-zero-access-16-search.md`; outcome note `docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md`): the index model in `crates/store/src/za_search/` (`ThreadPart`, `ContentPart`, `BlobHeader`, `Manifest`, `ManifestWrite`, the padding formula `padded_len` and `compaction_allowance`, `SEARCH_FORMAT_V1`, `K = 16`), the record reader `Store::za_changes_records` beside `changes` in `crates/store/src/query/log.rs`; the sealed sections, the cache `Caches::za_search` (`ZaSearchCache`, `IndexEntry`, `LoadedIndex`), the loader, `ZaSearchConfig::from_env` and the `ZA_SEARCH_*` trace constants in `crates/common/src/za/search/`; the pass (`Server::za_search_pass`), the openers, the `K` capture `za_thread_fields_k`, the validated snapshot `ZaSnapshot`, the changes stream, the rebuild, the reconciliation, the compactions and the content wait `za_search_ensure_current` in `crates/email/src/message/za/search/`; the query resolution in `crates/jmap/src/email/za_search.rs` and `crates/imap/src/op/za_search.rs`, the changes page in `crates/jmap/src/changes/za.rs`; the search key `SessionKeys::swk()` (`crates/vault/src/session.rs`, HKDF label `za/v1/search`); the manifest field `PrincipalField::ZeroAccessSearch = 152`."
+- In "## Zero-access fork", "Where the code lives", after the release 5 bullet: "New at release 7 (search and threads, issue #23; spec `docs/superpowers/specs/2026-11-04-zero-access-search-design.md`, revision 22; plan `docs/superpowers/plans/2026-11-07-zero-access-16-search.md`; outcome note `docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md`): the index model in `crates/store/src/za_search/` (`ThreadPart`, `ContentPart`, `BlobHeader`, `Manifest`, `ManifestWrite`, the padding formula `padded_len` and `compaction_allowance`, `SEARCH_FORMAT_V1`, `K = 16`), the record reader `Store::za_changes_records` beside `changes` in `crates/store/src/query/log.rs`; the sealed sections, the cache `Caches::za_search` (`ZaSearchCache`, `IndexEntry`, `LoadedIndex`), the loader, `ZaSearchConfig::from_env` and the `ZA_SEARCH_*` trace constants in `crates/common/src/za/search/`; the pass (`Server::za_search_pass`), the openers, the `K` capture `za_thread_fields_k`, the validated snapshot `ZaSnapshot`, the changes stream, the rebuild, the reconciliation, the compactions and the content wait `za_search_ensure_current` in `crates/email/src/message/za/search/`; the query resolution in `crates/jmap/src/email/za_search.rs` and `crates/imap/src/op/za_search.rs`, the changes page in `crates/jmap/src/changes/za.rs`; the search key `SessionKeys::swk()` (`crates/vault/src/session.rs`, HKDF label `za/v1/search`); the manifest field `PrincipalField::ZeroAccessSearch = 152`."
 - Invariants, one bullet after the release 5 one: "Search and threads (release 7 spec section 10, 48-56): a key account's terms, positions, sort keys, threading fields, thread ids and thread history exist outside process memory only in blobs sealed under the search key, bound to the account, segment id, kind and predecessor; the manifest (field 152, in the clear, keyed-tagged) holds versions, change ids, segment ids, hashes, sizes and counts only; the stored thread id, the `Thread` container and every change-log entry stay the message's own document id; a publishing pass's thread blob pads its hidden section to the smallest class (`ZA_SEARCH_PAD_MIN`, 64 KiB) and a compacted one to a function of the public record count (decision 2 (c)), the public section being a multiple of the tombstone count; the one residual is the time cap (48); the index is loaded, built and written only inside a request holding the account's keys, on that request's task, dropped on every invalidation and never swapped (49); the pass is a deterministic function of the mail and the log in chronological order, advancing only in one batch that asserted the previous manifest (50); every content leaf is resolved from a current content part or the query is refused with `ZA_MAIL_SEARCH_UNAVAILABLE` (51); a thread id leaves the server only mapped from a map validated after the response's state was read, and a request with no loadable or validated map fails rather than emit a singleton (52); the pass's keyless writes are the manifest, the links and, for a publishing pass, one Email item update and one Thread property change of the lowest indexed id and a container property change of every mailbox (53); traces carry ids, counts and reason classes (54); destroy fences with the marker and unlinks before the range delete (55); identities are retained until their change id leaves the shorter log, and a rebuild's epoch refuses every earlier state whose method log holds a record in `(S, epoch]`, never `Initial` (56). The method table of release 7 spec 6.2 amends mail spec 3.3: for a key account `Email/get|query|changes|queryChanges|import|parse|copy`, `Email/set` create, `Thread/*`, `Mailbox/get`, `EmailSubmission/get|query|changes` and `Blob/lookup` require keys; a keyless session keeps `Mailbox/query|changes|set`, `Email/set` update and destroy (prefix unchecked), identities, vacation, Sieve, push and `Core/echo`."
 - The Registry paragraph's environment list gains `ZA_SEARCH_MEM_MB`, `ZA_SEARCH_THREAD_MEM_MB`, `ZA_SEARCH_ACCOUNT_MAX_MB`, `ZA_SEARCH_IDLE_SECS`, `ZA_SEARCH_PASS_CAP`, `ZA_SEARCH_PASS_MB`, `ZA_SEARCH_PASS_HIDDEN_KB`, `ZA_SEARCH_PASS_MS`, `ZA_SEARCH_WAIT_SECS`, `ZA_SEARCH_SEGMENTS`, `ZA_SEARCH_CHECKPOINT`, `ZA_SEARCH_SKIP_AFTER`, `ZA_SEARCH_ABSENT_RETRY_SECS`, `ZA_SEARCH_PAD_MIN` (defaults as spec 4.4; the four boot refusals, the fourth the segments range of plan call A7; a cluster shares `ZA_SEARCH_ACCOUNT_MAX_MB`, FX5).
 - The test-harness paragraph: the pauses `SEARCH_COMMIT_PAUSE`, `SEARCH_SWAP_PAUSE`, `SEARCH_SNAPSHOT_PAUSE`, `SEARCH_VIEW_PAUSE`, `SEARCH_SWEEP_PAUSE`, `SEARCH_PASS_PAUSE`, `SEARCH_DESTROY_PAUSE`, the flags `SEARCH_CACHE_HOLD`, `SEARCH_SWAP_SKIP`, `SEARCH_OPEN_FAIL_ALL`, `SEARCH_HOLD_EXPIRE`, the one-shots `SEARCH_BLOB_FAIL_ONCE`, `SEARCH_OPEN_FAIL_ONCE`, `SEARCH_MANIFEST_FAIL_ONCE`, `SEARCH_DESTROY_FAIL_ONCE`, the delay `SEARCH_BLOB_SLOW` (`common::za::test_hooks`, each with its setter), the counters `za_search_blob_reads` and `za_search_message_opens`, the configuration override `set_search_config_override` read by `Server::za_search_config()`; the helpers `run_search_pass`, `read_manifest`, `manifest_bytes`, `principal_blob_links`, `index_holds`, `simulate_restart`, `search_config_guard`, `lower_changes_history`, `purge_account`, `za_index_current`, `imap_index_current`, `za_search_thread_part`, `log_records_since`, `compaction_class` in `tests/src/utils/za.rs`.

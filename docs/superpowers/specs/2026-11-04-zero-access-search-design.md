@@ -1,6 +1,13 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 21 (2026-11-08), approved.
+Date: 2026-11-04. Status: revision 22 (2026-11-08), approved.
+Revision 22 corrects the publishing target for every accepted padding minimum
+(execution review P1-PAD). A publishing hidden section pads directly to M and
+refuses a framed payload above M. Rounding an actual payload can exceed a valid
+non-power-of-two M and reveal merge aliases. Compaction alone uses the rounded
+public-count allowance. No format, accepted configuration boundary, default wire
+size or privacy guarantee changes; this makes the construction meet that guarantee.
+
 Revision 21 records Jay's Task 1 benchmark ruling: the provisional account
 content cap is 512 MiB and the process content budget is 1536 MiB. The
 15,000-message format benchmark measured 214.40 MiB of Term-compressed
@@ -358,7 +365,7 @@ below (4.2; decision 2 in section 13).
   holds one record per message the pass indexed and one alias per
   thread a merge retired, nothing per member of a merged thread (R21);
   the pass stops staging at a byte budget `H` with an overshoot of at
-  most one grouped record; and `M` is chosen above that total, an
+  most one message; and `M` is chosen above that total, an
   inequality the configuration enforces (4.2, R20). So an operator who
   delivers the mail chooses what a pass indexes but cannot push the
   hidden section past `M`, whatever the pass found, whether a message
@@ -660,18 +667,22 @@ one other cutoff, and it is the processing-cost residual of section 2
 (R30). The hidden section is padded before sealing, in the
 stub's framing (`seal_padded`'s form: a u32 length prefix, zero padding,
 then the seal; `crates/groupware/src/calendar/seal/tree.rs:272-282`,
-whose own 256-byte rounding is not this policy): with `p` its length
-and `p + 4` the framed length, the padded length `B` is
-`max(M, 2^ceil(log2(p + 4)))` with `M = ZA_SEARCH_PAD_MIN`, 64 KiB at
-4.4's defaults, chosen so that `H + R + (K − 1) · a + 4 <= M`, an
-inequality the configuration refuses to violate (9.1). A publishing
-pass's hidden section therefore always pads to `M`: its sealed size is
-the same whatever the pass found, and the per-pass size channel carries
-nothing. The public section is unpadded, `t` bytes per tombstone plus
-the revision row. A compacted thread blob (5.5) pads its hidden section
-not by its length but to `N_records · (R + a)` framed, then rounded by
-the same class formula, where `N_records` is the count of retained
-records, present and tombstoned, a public count (decision 2 (c), I2):
+whose own 256-byte rounding is not this policy). With `p` the hidden
+payload's length, `p + 4` is its framed length. A publishing section pads
+**directly to exactly M**, after rejecting `p + 4 > M` as a construction
+defect; it never grows to a larger class based on its contents. Here
+`M = ZA_SEARCH_PAD_MIN`, 64 KiB at 4.4's defaults, and the configuration
+requires `H + R + (K − 1) · a + 4 <= M` (9.1), proving every valid
+publishing payload fits. M need not be a power of two: applying a
+power-of-two ceiling to an actual payload that fits M can still exceed M
+and reveal aliases (P1-PAD). Every publishing section therefore has the
+same sealed size whatever the pass found, and the per-pass size channel
+carries nothing. The public section is unpadded, `t` bytes per tombstone
+plus the revision row. A compacted thread blob (5.5) instead uses the
+public framed allowance `A = N_records · (R + a) + 4` and padded length
+`max(M, 2^ceil(log2 A))`, rejecting a framed payload above A. Here
+`N_records` is the count of retained records, present and tombstoned,
+a public count (decision 2 (c), I2):
 the content always fits, since every record is at most `R` and the
 retained aliases never exceed the retained records (5.5), so the class
 is a function of public counts and says nothing of how many merges the
@@ -942,7 +953,7 @@ after eviction is the load cost of 4.3. The knobs:
 | `ZA_SEARCH_CHECKPOINT` | 1000 | update-only records after which a pass writes a manifest-only checkpoint (G19) |
 | `ZA_SEARCH_SKIP_AFTER` | 8 | aborted passes on one document after which it is skipped as loss (H5) |
 | `ZA_SEARCH_ABSENT_RETRY_SECS` | 10 | how long a blob a committed manifest names may be reported absent before that is loss (H6) |
-| `ZA_SEARCH_PAD_MIN` | 65536 | the smallest hidden-section class in bytes (`M`) |
+| `ZA_SEARCH_PAD_MIN` | 65536 | exact publishing target and minimum compaction class in bytes (`M`) |
 
 `K = 16` is a constant of the format, not a knob (4.2, H22). The
 configuration refuses `M < H + R + (K − 1) · a + 4`,
@@ -2397,9 +2408,10 @@ check of the validated snapshot rejects a counter below the newest
 revision row, and passes an empty account whose item state never moved
 (F2, G3); the padding formula is checked at framed lengths just below,
 at and above each class boundary, payloads of `M − 5` and `M − 4`
-bytes and `2M` included, the hidden section of a maximal pass (`H`
-plus one grouped record of `G` messages each with `K − 1` aliases)
-stays under `M`, and a pass with any number of tombstones, aliases or
+bytes and `2M` included; publishing refuses a framed payload over `M`,
+while compaction rounds its public-count allowance. The hidden section
+of a maximal pass (`H` plus one message with `K − 1` aliases) stays
+under `M`, and a pass with any number of tombstones, aliases or
 merges of any size pads its hidden section to `M` exactly (F1, R15,
 R20, R21, G1); a compaction over fixtures of equal record and tombstone
 counts with no merge, with every message in one thread, with a chain of
