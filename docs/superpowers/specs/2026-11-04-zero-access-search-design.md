@@ -1,6 +1,17 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 24 (2026-11-08), execution correction.
+Date: 2026-11-04. Status: revision 25 (2026-11-08), execution correction.
+Revision 25 closes the reset/destroy overlap found during implementation
+(P1-RESET), without a marker-format change. Every reset mutation batch asserts
+the live Account registry Item, including the initial marker write and final
+clear. The final clear also asserts the marker hash. Every unlink
+chunk also asserts the marker, so a stale reset cannot unlink a rebuilt index
+after its fence moved. A resumed empty inventory scans, since the existing
+marker cannot distinguish a truly empty index from missing/garbage input.
+Section 5.7, invariant 55 and the lifecycle mutation controls record these
+requirements. The destroy primitive is implemented before the broad request
+hooks; the remaining operator integrations keep their planned dependencies.
+
 Revision 24 corrects initial-sync paging (execution finding P1-PAGING).
 At a pinned end E, the initial set is the current present set plus later
 deletions, minus later insertions. A fresh Initial/Exact(0) remains admissible.
@@ -1127,8 +1138,8 @@ a rebuild, which only loss triggers. The remedy is upstream's
 per-account reindex maintenance task
 (`TaskAccountMaintenanceType::Reindex`,
 `crates/services/src/task_manager/tasks/maintenance.rs:433`): for a key
-account it also writes the index's destroying marker (5.7) without
-touching the account, so the next keyed request after the repair
+account it also performs the marker, unlink and guarded clear of 5.7
+without touching the account, so the next keyed request after the repair
 rebuilds; a one-line hook at that site, and the operator's step after
 repairing the store.
 
@@ -1643,7 +1654,8 @@ does not already prevent, and a lease would add a sweep.
   inventory, every thread blob and every content blob the chain from
   its head reaches, so a destroy that dies after the marker retries from
   the marker with nothing lost. If the manifest was missing or did not
-  parse, or the chain cannot be traversed to its end (R7), the step
+  parse, a resumed marker has an empty inventory, or the chain cannot
+  be traversed to its end (R7), the step
   instead scans the blob-link subspace for this account's `Document`
   links on `Collection::Principal` document 0 and clears each in chunks
   (F23: a walk of the link keys with the account, collection and
@@ -1651,7 +1663,12 @@ does not already prevent, and a lease would add a sweep.
   `crates/store/src/write/blob.rs:159-287`, and not `user_blob_hashes`,
   which returns hashes without their links; the keys are hash-first, so
   the walk reads every link of every account once, a cost stated here
-  and paid only on this path). The range delete then removes the marker.
+  and paid only on this path). An empty resumed inventory takes this scan
+  because the marker has no bit distinguishing a truly empty index from a
+  missing or unreadable manifest. Every unlink chunk asserts the same marker
+  bytes captured by this attempt before clearing links; a stale attempt whose
+  marker has moved cannot remove links found by a delayed scan. An assertion
+  failure stops the attempt; it does not refresh the marker for the old scan. The range delete then removes the marker.
   A batch that *creates* a manifest where none exists (a rebuild's first
   batch, `AssertValue::None`) also asserts the vault record's presence
   (field 150, `AssertValue::Hash`), since the range delete takes marker
@@ -1665,6 +1682,25 @@ does not already prevent, and a lease would add a sweep.
   `assert_is_empty` exempts field 152 and the index's blobs while their
   account exists, as it exempts fields 150 and 151, and the suite's
   destroy-then-purge-then-assert order verifies that nothing remains.
+- **Reindex reset** (P1-RESET). For a key account the operator's reindex
+  performs the same marker and unlink steps, then clears field 152 so the next
+  keyed request rebuilds. Every reset mutation batch asserts the live Account
+  registry Item's presence (`RegistryClass::Item` with
+  `ObjectType::Account.to_id()` and this account id, `AssertValue::Some`), and
+  the final clear also asserts the marker bytes. This includes the initial
+  marker write: a reset admitted before deletion may resume only after destroy
+  finished, and must not recreate an orphan marker then. The
+  registry deletion commits removal of that Item before the destroy task is
+  scheduled; destroy proceeds only while it is absent. Thus reset can clear
+  before deletion, or fail and leave the marker for destroy, but cannot remove
+  destroy's fence after its inventory was captured. A cached key-account check
+  or field-150 presence is insufficient: an admitted reset can outlive deletion,
+  and the vault remains until the Property range delete. Keep the per-chunk
+  marker assertions as well; a stale worker that continues after lease loss
+  must not unlink a new index before its final clear assertion fails. No new
+  operation identity or marker field is introduced. Permanent destruction
+  retains authority to mutate after the Account Item is absent; the live-Item
+  assertion applies only to reset.
 - **Provisioning fence.** No ordinary writer touches the index, so no
   fence is added; `za_assert_no_data` need not check field 152 (an
   unprovisioned account cannot have one).
@@ -2888,7 +2924,13 @@ log's bound (pruning by the Email log alone must fail G4's case), the
 counter comparison (comparing the item state must fail G3's empty
 account), the vault assertion on creation (a creating batch without it
 must recreate the manifest in R19's second case), the skip of an
-already-held insert, and the destroy step's chain walk and scan.
+already-held insert, and the destroy step's chain walk and scan. The lifecycle
+controls also remove, one at a time, reset's initial live Account assertion
+(no marker may be created after completed destroy), its final assertion (the
+post-deletion marker must remain), an unlink chunk's marker assertion (a stale
+scan must leave the new links), and the scan for an empty resumed marker (a
+retry from garbage input must remove the orphan links). Each has a live or
+unchanged-marker control, so unconditional refusal cannot pass.
 
 ## 10. Invariants for implementers
 
@@ -3007,7 +3049,9 @@ Added:
     every principal-linked blob of the account when the manifest cannot
     be read or the chain cannot be walked to its end, before the
     Property range is removed; a batch that creates a manifest asserts
-    the vault record's presence; and the blob purge then holds nothing
+    the vault record's presence; every unlink chunk asserts the marker;
+    every reset mutation batch asserts the live Account registry Item;
+    an empty resumed inventory scans; and the blob purge then holds nothing
     of the index.
 56. A deleted message's identity is retained, sealed, with its deletion
     change id, and an alias with its revision, until that change id
