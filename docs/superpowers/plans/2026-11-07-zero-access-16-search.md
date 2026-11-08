@@ -2,6 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Plan revision 20** (2026-11-08) incorporates the bounded Content-view
+corrections (spec revision 27). Task 10 refreshes a cache below the applied
+indexing checkpoint after a deletion-only pass (P2-CONTENT-FLOOR), checks the
+cap under its final guard, and preserves the original deadline across its
+read/load waits. Map/FR7 and owned-pass transaction completion are unchanged.
+Real deletion and lock fixtures plus a final-cap fixture distinguish each
+check. These use the existing acquisition loop, with no storage or wire change.
+
 **Plan revision 19** (2026-11-08) closes P2-DUPLICATE (spec revision 26).
 Task 16a does not create a marker when both fields 150 and 152 are absent;
 it still scans exact orphan links with both absence assertions in every
@@ -2593,15 +2601,26 @@ snapshot reuses (PL3); the rest is integration into upstream's query engine.
 
 **The validated view, as a procedure** (PL3; spec 6.2 and 7.4). One loop takes the cache, the read guard and, for a content request, the current content, and validates exactly the guard and the cache it returns. It holds no guard while anything that takes `index.write()` runs (a pass, a reload, a content load), so it cannot deadlock against itself, and a swap or a publication between two of its reads only sends it round again. A `LoadFailure` maps to `ViewError::NoMap` for `Map` (`Loss` → trace `ZA_SEARCH_REBUILD` and `NoMap(Transient(Store))` until Task 14 replaces the arm with `za_search_rebuild_start` and one retry; `Transient(t)` → `NoMap(Transient(t))`; `NoMap(r)` → `NoMap(r)`) and through Task 9's `map_load` to `ViewError::Unavailable` for `Content`.
 
-0. `rounds = 0`; `entry = za_search_entry(account_id, keys)`.
+0. `rounds = 0`; `Map` only: `entry = za_search_entry(account_id, keys)`. `Content` has no preliminary entry load and enters through step 1.
 1. `Content` only: `entry = za_search_ensure_current(account_id, keys, deadline)?` (Task 9: the passes, the wait on a running pass, the content load; `Err(u)` → `Err(Unavailable(u))`). Nothing is held here.
 2. `cache = get_cached_messages(account_id)`; then `search_snapshot_pause_point(account_id).await` (`SEARCH_SNAPSHOT_PAUSE`, plan call D4: between the state read and the manifest read).
 3. `(bytes, value) = za_search_read_manifest(account_id, &za_search_key(keys.swk()))` (one point read): `None` → step 0's loss arm; `Destroying` → `NoMap(Destroying)`; an error → its class.
-4. `guard = entry.read_loaded().await`; `None` (evicted since step 0) → `entry = za_search_entry(..)`, `rounds += 1`, back to step 1.
+4. `guard = entry.read_loaded().await`; `None` → `rounds += 1`; `Map` reloads its entry through `za_search_entry(..)`, while `Content` re-enters through step 1 without a separate entry load.
 5. `manifest_hash(&bytes) != guard.manifest_bytes_hash` → `drop(guard)`, `za_search_reload_if_moved(&entry, keys)` (its error → its class), `rounds += 1`, back to step 1.
-6. `!counter_at_or_past(cache.last_change_id, &guard.manifest)` → `drop(guard)`, mark the account's Email group stale (the call `commit_batch` makes; name it in a comment), `rounds += 1`, back to step 1.
-7. `Content` only: `guard.content.is_none() || !is_current(&guard, cache.last_change_id)` → `drop(guard)`; `Instant::now() >= deadline` → `Err(Unavailable(NotCurrent))`; else back to step 1 (not a round; the deadline bounds it).
+6. `!counter_at_or_past(cache.last_change_id, &guard.manifest)`, or for `Content` only `cache.last_change_id < guard.manifest.indexed_to.change_id` → `drop(guard)`, mark the account's Email group stale (the call `commit_batch` makes; name it in a comment), `rounds += 1`, back to step 1. The additional floor compares the group counter, whose empty value is zero; Map/FR7 is unchanged. Do not require equality or use `scanned_to` as the floor.
+7. `Content` only: call Task 9's `check_content_cap(&guard, account_max_mb << 20)` under this guard; refusal maps to `Unavailable(OverCap)`. Then `guard.content.is_none() || !is_current(&guard, cache.last_change_id)` → `drop(guard)`; `Instant::now() >= deadline` → `Err(Unavailable(NotCurrent))`; else back to step 1 (not a round; the deadline bounds it).
 8. `search_view_pause_point(account_id).await` (`SEARCH_VIEW_PAUSE`, test mode: a view acquired and held, before any rendering; Codex rev-6 PL3's regression parks here, since a pause inside the loop, at `SEARCH_SNAPSHOT_PAUSE`, would be answered by the loop's own reload), then `Ok(ZaView { entry, epoch: guard.manifest.epoch, index: guard, cache })`.
+
+For `Content`, convert the original deadline to Tokio time once and apply
+`timeout_at` to the cache read, authenticated manifest read, loaded-guard read,
+and standalone reload after dropping the guard. Timeout is
+`Unavailable(NotCurrent)`; no retry receives a fresh deadline. Check expiry
+after ensure-current and before returning a Content view. Do not wrap the
+whole ensure-current future: its owned pass must finish its transaction.
+Map retains its direct waits and existing validation-round limit. A cancelled
+read-side reload may discard optional content, but leaves the old committed
+manifest/thread coherent for a later load. Test-only pauses retain their
+existing placement.
 
 `rounds > 3` → `NoMap(Transient(Validation))` for `Map`, `Unavailable(Transient(Validation))` for `Content`. The handler then reads its content from `view.content()`, its map from `view.index` (Task 11) and every read-response state and every "is present" from `view.cache`; write responses use Task 11's final view for `newState`, preserving pre-mutation `oldState`; for a content request the content was checked current against that same cache, so the results and the state the response reports describe one moment. A view lives for one method call or one IMAP command and is dropped before the call returns; no path that runs a pass, a reload or a content load (Task 9's triggers, the post-commit pass of `Email/set` create, `Email/import` and APPEND) is reached while one is held, since each takes `index.write()`; and a request task holds one view or snapshot at a time, never two (tokio's `RwLock` is write-preferring, so a second read guard taken behind a queued writer waits for that writer, which may be a pass waiting for the first guard; FR8).
 
@@ -2704,6 +2723,34 @@ Remove the call at `snippet.rs:61` and its import `:7`; delete `za_refuse_snippe
 - [ ] **Step 6: Turn `tests/src/za/mail/search.rs` around**
 
 `imap_refused_keys` becomes `imap_served_content_keys`: every command of `refused_commands()` (`:413-446`) is sent to both fixtures and the key fixture's result line equals the plain fixture's (`served`, `:296`), the `THREAD REFERENCES UTF-8 FROM x` line included (singletons until Task 12 groups them, so compare the sorted UID set, not the grouping); the `Traced` assertion stays: no `SecurityEvent::Unauthorized`, and `TERM` (`:456`) appears in no event. `jmap_refused_filters_and_sorts` becomes `jmap_served_content_filters_and_sorts`: each filter of `:847-880` and each content sort runs on both fixtures and the key account's subject list equals the plain account's (the seeds' headers at `:42-90` decide the expected sets: `text`/`subject`/`body` on a word of one seed, `from`/`to`/`cc`/`bcc` on the seeds' addresses, `header` on a header only `fifth()` carries, `hasAttachment` true and false, `sentBefore`/`sentAfter` on the seeds' `Date` headers, the attachment keywords in `hasKeyword`/`notKeyword` and the three thread forms; and the sorts `hasKeyword`, `allInThreadHaveKeyword` and `someInThreadHaveKeyword` on `$hasattachment`, each ascending and descending, PL9); the `metadataExists` filter stays refused (ruling 57, unchanged). New cases: `keyless_search_refused` (a Bearer token on `Email/query` with `{"text": "x"}` answers `unsupportedFilter` with `ZA_MAIL_SEARCH_REFUSED`; the token is obtained as `gates.rs:84-213` obtains its `Keyless::Bearer`); `unavailable_refusal` (`search_config_guard!(wait_secs: 1)`; deliver one message; park a first keyed IMAP session's pass on `SEARCH_PASS_PAUSE` (`HookParked`); on a second keyed IMAP session of the account, whose pre-command pass finds `Running` and waits on the budget, `SEARCH SUBJECT alpha` answers `NO [CANNOT] <ZA_MAIL_SEARCH_UNAVAILABLE>` within 2 s; JMAP `Email/query` `{"text": "alpha"}` answers `unsupportedFilter` with the same text; `SEARCH OR SUBJECT alpha SEEN` is refused whole; release the pause and clear the override; both are served). Three acquisition cases (PL3), each on the module's key fixture, each request wrapped in `tokio::time::timeout(Duration::from_secs(20))` so a deadlock fails the case instead of hanging the suite: `view_publication_while_parked` (park a keyed `Email/query` `{"text": "alpha"}` at `SEARCH_SNAPSHOT_PAUSE`, after its cache read; deliver a message whose body holds `alpha` and, on a second keyed connection with `set_search_swap_skip(Some(id))`, run one keyed request so its pass commits without swapping, as another node's would; clear the flag; release: the parked query completes, its `ids` hold the new message and its `queryState` is the post-delivery state; a fresh `Email/query` returns the same `ids` and state); `view_local_swap_while_acquiring` (park a pass at `SEARCH_SWAP_PAUSE` after its commit, the delivery's message not yet swapped in; on a second keyed connection `Email/get` of every id and `Thread/get` of their threads complete while the pass is still parked (map acquisitions: a content request would wait on the parked pass's lock, Task 9's rule, which `unavailable_refusal` covers); release; a fresh `Email/get` and `Thread/get` then return the same ids, threads and states as the two answered while parked); `view_delivery_between_reads_keeps_results_and_state_paired` (park a keyed `Email/query` `{"text": "alpha"}` at `SEARCH_SNAPSHOT_PAUSE`; deliver a matching message with no keyed request, so no pass runs; release: the answer omits the new message and its `queryState` is the pre-delivery state, never the new state without the message; the next `Email/query` holds the message under the new state). `visible_field_document` (`:1143`) stays: `key.terms == 0` and `documents_are_ids_only()` (invariant 27).
+
+Additional acquisition cases:
+
+- `content_view_resamples_after_nonpublishing_deletion` (P2-CONTENT-FLOOR):
+  index readable D/subject-alpha and S/subject-beta; positively establish D's
+  posting and the NOT-alpha result `{S}`. Park a second NOT-alpha query after
+  cache sampling. Actually delete D and run a deletion-only nonpublishing pass.
+  Require changed manifest hash, complete/equal advanced checkpoints, unchanged
+  newest row/epoch/content head, and D removed from resident content. Resume:
+  the answer must be `{S}` under the refreshed post-deletion state. Removing
+  only the Content checkpoint floor must return D and fail. Zero counters and
+  `indexed_to < E <= scanned_to` remain valid; partial, pending, or suspended
+  content remains unavailable under existing conditions. Map's floor is unchanged.
+- Final-guard cap: after ensure-current, use the existing snapshot pause to
+  change only an authenticated durable/resident descriptor's size while its
+  counter and content stay aligned. Re-encode and authenticate the durable
+  manifest, set the resident manifest to that descriptor, and set its
+  `manifest_bytes_hash` to `manifest_hash(encoded_bytes)` before releasing the
+  snapshot pause; the final hash comparison must succeed without reload or
+  retry. Exact cap serves; one byte over refuses the whole query; Map remains
+  available. Restore the original durable bytes, resident manifest and resident
+  hash. This is synthetic descriptor coverage, not a physical crossing-pass
+  test. Removing only the final-view cap check must fail the case.
+- Original read deadline: hold the actual pass mutex and index write guard
+  before Content acquisition, then separately hold a writer after the snapshot
+  pause. Require `NotCurrent` under the original deadline in both schedules,
+  and successful unchanged queries after releasing the locks. No unbounded
+  preliminary entry load or refreshed wait window may mask the original limit.
 
 - [ ] **Step 7: Run the tests and checks** (including `imap::imap_tests` and `jmap::jmap_tests` plain and with `ZA_KEY_ACCOUNTS=1`: ordinary accounts share `email_query`, the filter parser and IMAP's `query`)
 

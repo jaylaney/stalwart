@@ -1,6 +1,13 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 26 (2026-11-08), execution correction.
+Date: 2026-11-04. Status: revision 27 (2026-11-08), execution correction.
+Revision 27 closes the Content-view deletion race (P2-CONTENT-FLOOR).
+A Content view also validates its cache counter against the applied indexing
+checkpoint, using the existing stale-mark and bounded retry. A deletion-only
+pass can remove postings without moving the publication row. Map views keep
+FR7. The final Content guard also enforces the account cap, and its read-side
+waits share the original content deadline. No storage or wire change.
+
 Revision 26 closes the stale permanent-destroy marker gap (P2-DUPLICATE).
 When both the manifest and vault are absent, destroy scans and unlinks under
 atomic absence assertions without recreating a marker. When only the manifest
@@ -1914,6 +1921,19 @@ thread map as loaded (5.2) and validated (below):
   pass. The pass's own reload at step 0 is not enough on its own: the
   message cache can refresh between the pass and the handler's state
   read.
+- **Content views** (P2-CONTENT-FLOOR). In that same validation loop, a
+  content request additionally requires the cache's Email group counter to be
+  at or past `manifest.indexed_to.change_id`. On a miss it drops the guard,
+  marks the group stale and retries within the existing bound. A deletion-only
+  pass advances this checkpoint and removes content without moving the newest
+  publication row; otherwise a NOT filter could complement a missing posting
+  against a cache that still contains the deleted message. This floor is not
+  equality with the checkpoint and is not a floor at `scanned_to`. Zero is the
+  absent group counter. All existing currency conditions still apply. Map
+  views retain FR7's cache-based existence, including retained tombstones.
+  The account-cap check applies to the exact final Content guard, and the
+  acquisition's read/load waits use the original content deadline; an owned
+  pass still finishes its transaction before its deadline is checked again.
 - **Keyed write responses** (P1-STATE). `Email/set` keeps its pre-ingest
   precondition and `oldState`. After create ingestion and its selected
   post-write pass, it takes an input view for update/destroy prefix and
@@ -2359,8 +2379,9 @@ for a content request only, when:
 - the index is not current after `ZA_SEARCH_WAIT_SECS` of passes (a
   rebuild or a reconciliation in progress, or a very long absence),
   where **current** means, against the same `E` the response returns
-  (6.2): `scanned_to >= E` with no insert or delete record in
-  `(indexed_to, scanned_to]`, and `content_to` at `indexed_to` (G14);
+  (6.2): `indexed_to.change_id <= E <= scanned_to`, a complete
+  `indexed_to`, no insert or delete record in `(indexed_to, scanned_to]`,
+  and `content_to` at `indexed_to` (G14, P2-CONTENT-FLOOR);
 - a leaf cannot be resolved (a defect, traced as such).
 
 A content request is never answered from an index that is behind the
