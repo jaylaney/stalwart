@@ -6,6 +6,52 @@
 
 //! Zero-access search format version 1 (search spec 4.2).
 
+pub mod thread;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub change_id: u64,
+    pub position: u32,
+    pub complete: bool,
+}
+
+impl Default for Checkpoint {
+    fn default() -> Self {
+        Self {
+            change_id: 0,
+            position: 0,
+            complete: true,
+        }
+    }
+}
+
+pub struct ThreadFieldsK {
+    pub hashes: Vec<u128>,
+    pub subject_hash: u128,
+    pub sent_at: Option<i64>,
+}
+
+#[derive(Debug)]
+pub enum FormatError {
+    Version(u8),
+    Kind(u8),
+    Truncated,
+    Count,
+    AllowanceExceeded,
+}
+
+impl std::fmt::Display for FormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Version(version) => write!(f, "unsupported search format version {version}"),
+            Self::Kind(kind) => write!(f, "unknown search format kind {kind}"),
+            Self::Truncated => f.write_str("truncated search format"),
+            Self::Count => f.write_str("invalid search format count"),
+            Self::AllowanceExceeded => f.write_str("search format allowance exceeded"),
+        }
+    }
+}
+
 // Encoded layouts, including each length prefix:
 // thread record = u16 len | u8 flags | u32 document_id | u32 thread_id | u32 revision
 //               | u64 created | u64 deleted (0 = none) | u128 subject_hash
