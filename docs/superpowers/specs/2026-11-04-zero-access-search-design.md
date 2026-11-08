@@ -1,6 +1,17 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 23 (2026-11-08), approved.
+Date: 2026-11-04. Status: revision 24 (2026-11-08), execution correction.
+Revision 24 corrects initial-sync paging (execution finding P1-PAGING).
+At a pinned end E, the initial set is the current present set plus later
+deletions, minus later insertions. A fresh Initial/Exact(0) remains admissible.
+An initial continuation requires E at or above both the retained bound and the
+validated map's epoch; a truncated suffix read, or a bound that passes E during
+that read, refuses it. Earlier history may disappear without affecting the page.
+Unconditional continuation after evidence loss was not constructible: a removed
+member shifts the count-based offset, and a folded alias loses an old prefix.
+An expired continuation now answers cannotCalculateChanges and must restart.
+No state shape, retained snapshot, storage format or ordinary-account path changes.
+
 Revision 23 makes the keyed write-response view explicit (execution finding
 P1-STATE). A mixed Email/set validates input prefixes before mutations, then
 uses a final validated view after its later writes for created IDs and newState.
@@ -103,7 +114,8 @@ review file), and adds no mechanism: the epoch interval is closed,
 `(S, epoch]`, so the boundary's own entries fence the latest pre-loss
 state (5.4, 6.3, R27, H1); a partial record is resumed inclusively and
 the checkpoint says whether it is complete (5.1, R29); `Initial` is
-`Exact(0)` with an always-admissible continuation (6.3, R28); the time
+`Exact(0)` with an always-admissible continuation (6.3, R28; the
+unconditional continuation was corrected by revision 24); the time
 cap's processing-cost channel is recorded as a residual and invariants
 48 and 50 narrowed to the byte and count charges (2, 10, R30, H4);
 existence at a range's end comes from the message cache or the log
@@ -1422,10 +1434,13 @@ was lost for that client and the call is served (R27: an account whose
 messages were all deleted before the loss writes no Email or Thread
 entry at its boundary, so its clients' states stay usable). `Mailbox/*`
 is outside the rule (H12): nothing of the mailbox history is lost at a
-loss, and a keyless session has no map to carry an epoch. `Initial`,
-and its continuation (6.3), are never refused, since a client at
-`Initial` holds nothing. Clients refused resync as JMAP clients do on
-that error (a full query and get).
+loss, and a keyless session has no map to carry an epoch. A fresh `Initial`
+or `Exact(0)` is never refused by this rule: it holds no prior page. An
+`Intermediate{from: 0, to: E, sent}` continuation does hold earlier pages;
+it is refused when `E < epoch`, since the lost map cannot reproduce their
+historical prefixes (P1-PAGING, 6.3). Content-only rebuilds and reconciliation
+do not move that identity epoch. Clients refused resync as JMAP clients do
+on that error (a full query and get).
 From the epoch on, every assignment the rebuild makes is an ordinary
 transition from the singleton with a published revision, rendered by 6.3
 for clients that synced after the epoch. IMAP keeps no object-id sync
@@ -1685,8 +1700,8 @@ of 4.2, as one model rather than one patch each:
 | The stopping point moving with a probe's actual aliases (R21) | every admitted item charged the same reservation | `indexed_to` is a function of the admitted count |
 | A permanently skipped insert never checkpointed, holding search back (R26) | a consumed insert or delete record checkpoints even when nothing was staged | only update-only work is a no-op |
 | An empty account's post-rebuild states refused for ever (R27) | the epoch refuses a state only when the method's log holds a record of the method's kind in `(S, epoch]`; `Initial` never | nothing was lost for a client whose delta has no such record; mailbox entries in the Email log do not count |
-| An `Initial` page continued as `Exact` with another classification, or refused below the retained bound or the epoch (R28, both forms) | `Initial` is `Exact(0)`; `from = 0` is never refused | a client there holds nothing, and 0 is below every record |
-| An `Initial` continuation after a truncation skipping a survivor (R31) | the `S = 0` stream is every document present at `E`, in document-id order | no retained record decides it, so the pages are the same before and after the truncation |
+| An `Initial` page continued with another classification (R28) | `Initial` is `Exact(0)` and all initial pages render created IDs | fresh initial requests remain admissible; a continuation must retain evidence at its pinned end (P1-PAGING) |
+| An `Initial` continuation after a truncation skipping a survivor (R31, P1-PAGING) | reconstruct the set at `E` from the present set and the complete lifecycle suffix; refuse when `E` is below retention or the identity epoch | history below `E` may disappear; evidence needed at or after `E` may not |
 | The latest pre-loss state admitted by an open interval (R27, H1) | the interval is `(S, epoch]` | the boundary's own Email and Thread entries sit at the epoch |
 | A split record's suffix skipped by an exclusive resume (R29) | the checkpoint carries `complete`; a partial record is resumed inclusively; its marker is loss | the reader skips the from-key only for a complete record |
 | The time cap making the checkpoint a function of processing cost (R30, H4) | recorded as the one remaining channel; invariants 48 and 50 narrowed to the byte and count charges | duration is observable anyway |
@@ -2034,8 +2049,15 @@ consulted (H2: a deletion committed between a pass's log read and its
 commit leaves a present record for a message a client may already have
 seen deleted): when `E` is the current state, `D` exists at `E` exactly
 when the message cache's present set holds it; when `E` is a pinned
-past state, `D` exists at `E` when the cache holds it or the unfolded
-log shows a delete of `D` after `E`; and in either case a `D` the cache
+past state, reconstruct its present set by undoing the complete lifecycle
+suffix after `E`: `(present_now ∪ later_deletes) \ later_inserts` (document
+ids have one lifecycle and are never reused). A later insert excludes `D`
+even if a later delete also names it (P1-PAGING). The suffix is limited to
+the validated cache's group counter. After all required raw reads, check
+retention again: use `S` when `S > 0`, and pinned `E` for an initial
+continuation. Refuse if that endpoint is below the new bound, before
+rendering, skipping or the exhausted-stream fallback. A truncated required
+read also refuses; a fresh `Initial`/`Exact(0)` is exempt. In either case a `D` the cache
 lacks with no delete record anywhere in `(S, now]` was deleted at or
 before `S`, absent at both ends (I3: with `E` current, a deletion
 logged at or before `S` and not yet consumed by a pass leaves a record
@@ -2062,20 +2084,17 @@ when there are several), then by document id, and so is deterministic
 for a fixed `(S, E]` as long as the history is retained, which 5.5
 guarantees for every state the log retains and the refusals below
 enforce for every `S > 0`. For `S = 0`, `Initial` and its
-continuations, the rule reduces to a stream that needs no retained
-record (R31): no document existed at 0, so every document present at
-`E` is a candidate, rendered created `T1|D`, and nothing else is (a
-deleted message is absent at both ends); the candidates are the cache's
-present set corrected by the raw records after `E`, as the existence
-rule says, and the order is by document id alone, since no entry's
-change id is needed. A truncation between two pages of an `Initial`
-stream therefore renders the same remaining pages, where the general
-rule would have dropped a singleton whose only evidence was a raw
-record the truncation removed (its thread is the same id at both ends,
-so no transition names it) and let the page skip a survivor instead
-(R31). This is what an ordinary account's folded log would show,
-except that upstream's `Initial` after a truncation omits the messages
-whose inserts it lost (7.5).
+continuations render every document present at `E` as created `T1|D`, in
+document-id order, and nothing else (R31). No record at or below `E` is
+needed to choose that set: for a fresh initial request use the validated
+cache's present set; for a pinned continuation undo the complete raw
+lifecycle suffix after `E` as above, then map every id at `E`. This same
+set supplies initial `Thread/changes` membership. Truncating history below
+`E` leaves the stream unchanged. A bound above `E`, or a new identity epoch
+above `E`, can erase a candidate or its old mapped prefix; that continuation
+is refused rather than recomputed from incomplete evidence (P1-PAGING).
+This differs from upstream's `Initial` after a truncation, which omits the
+messages whose inserts it lost (7.5).
 
 **Thread membership for `Thread/changes`** (F14, R25): a thread's
 members at `S` and at `E` are "the members of `T` as of `X`" above,
@@ -2100,26 +2119,24 @@ entries, so the fork renders a key account's `Email/changes` and
 (`changes/get.rs:148-608`), keeping upstream's state shapes:
 
 - for `Initial` (G13, R28, R31): the stream of `(0, E]`, `Exact(0)`,
-  with the continuation `Intermediate{from: 0, to: E, sent}`; no
-  message existed at change id 0, so a client at `Initial` or at
-  `Exact(0)` holds nothing, and every document present at `E` renders
-  as created, in document-id order, from the cache and the records
-  after `E` alone (the `S = 0` form of the stream rule above). The lower
-  bound 0 is never refused by the truncation check (upstream reads
-  `Query::All` from 0 without it, `changes/get.rs:314-335`) or by the
-  epoch (5.4), so a continuation is always admissible and needs no mode
-  of its own: the first page and every later one render the same stream
-  by the same rule, whatever the log lost in between (R28's two forms: a
-  shared `Intermediate` shape and a continuation that fell below the
-  retained bound or the epoch; R31: a client on a continuation holds the
-  earlier pages, so the stream it continues must not depend on what
-  retention removes; upstream's own `Initial` continuation, whose `from`
-  is the first retained id, `changes/get.rs:593-597`, refuses after a
-  truncation instead). Upstream's `Query::All` preserves each record's
-  kind, so a pre-existing message with a retained update renders there
-  as updated and here as created (7.5, H19), and it omits a message
-  whose insert the log lost, which renders here (7.5); to a client that
-  holds nothing these are the same instruction;
+  with continuation `Intermediate{from: 0, to: E, sent}`. No message
+  existed at 0, so every document present at `E` renders created, in
+  document-id order. A fresh `Initial` or `Exact(0)` is never refused
+  because zero is below retention or the epoch. A continuation requires
+  `E >= max(retained_bound, snapshot.epoch)` (P1-PAGING): unlike a fresh
+  request, it already holds earlier pages. Its present set is the cache's
+  set with later deletes restored and later inserts removed, mapped at
+  `E`, never at the current revision. Read the suffix through the validated
+  cache's group counter; a truncated suffix read or a retained bound above
+  `E` on the post-read check returns `cannotCalculateChanges` before
+  skipping `sent`. Do not silently start over or advance the pinned end.
+  Equality at the bound and epoch is admissible. Retention below `E` does
+  not affect these pages; retention past `E` or loss of their identity era
+  requires resync. Content-only rebuilds add no epoch refusal. Upstream's
+  `Query::All` preserves record kinds, so a retained update renders there
+  as updated and here as created; it also omits messages whose inserts
+  were lost, which render here (7.5, H19). To a fresh client holding
+  nothing, these are the same instruction;
 - for `Exact(S)`: `E` is the validated current state (6.2); if `S == E`
   the response is empty, as upstream's equality return; otherwise the
   stream of `(S, E]` is computed, the first `maxChanges` items are
@@ -2140,13 +2157,10 @@ entries, so the fork renders a key account's `Email/changes` and
   the Email log's records, so a truncation of either refuses; the
   unfolded reader reports the marker as upstream's does,
   `query/log.rs:149-151`), as upstream answers for a truncated log
-  (`changes/get.rs:424-433`); never for `from = 0`, which is `Initial`
-  and its continuations (R28, R31: a client at `Initial` holds nothing
-  and a client on its continuation holds pages of a stream that no
-  retained record decides, so neither refusal protects anything, and a
-  continuation that could be refused would loop the client between a
-  first page that succeeds and a second
-  that fails);
+  (`changes/get.rs:424-433`). The lower bound zero alone never refuses a
+  fresh initial request or its continuation. Initial continuations instead
+  require the pinned-end evidence check above (P1-PAGING); a failed check
+  returns the same `cannotCalculateChanges` error;
 - `Thread/changes` renders the threads touched, from the same union and
   the membership rule above: a thread that had no member as of `S` is
   created, one that has none as of `E` is destroyed, else updated,
@@ -2472,8 +2486,10 @@ record and the last document id (R20, R1); `Initial` paged with
 `maxChanges = 1` over pre-existing updated messages equals its unpaged
 result (R28); the epoch rule serves a state below the epoch when the
 method's log holds no record in `(S, epoch]` and refuses one when it
-does, the boundary's own entries included, and never refuses
-`from = 0` (R27, H1); a partial record resumed inclusively indexes its
+does, the boundary's own entries included, and never refuses a fresh
+`Initial` or `Exact(0)` (R27, H1); an initial continuation below its pinned-end
+retention or identity-epoch boundary is refused (P1-PAGING); a partial
+record resumed inclusively indexes its
 suffix and applies its deletions, and a marker in its place is loss
 (R29); a deletion committed between a pass's log read and its commit
 renders nothing for the deleted message at a state that already saw
@@ -2588,9 +2604,14 @@ and `fence.rs` and `index_task.rs` reach `keymail45` and `plainmail49`):
   are refused; `Initial` and `Exact(0)` paged with a tiny
   `maxChanges` over pre-existing updated messages, each equal to its own
   unpaged result, after a reload between pages too (R28), and after a
-  truncation between pages (the log's history limit lowered under the
-  page, or a direct `delete_changes`) the remaining pages are the same
-  and no message is skipped, where the control refuses (R31); the
+  truncation below the pinned end the remaining pages are the same and no
+  message is skipped, where the control refuses (R31). Also test later
+  inserts and deletes with their suffix retained; retention past a later
+  deletion, a post-end alias folded at compaction, and a new identity epoch
+  without log loss must each refuse the old continuation. A content-only
+  rebuild or reconciliation alone adds no epoch refusal. A truncation
+  racing the suffix read is detected before skipping the sent count
+  (P1-PAGING). The
   residual pinned beside them: `N` and `D` both arriving and `D` deleted
   before any keyed request, where `N` stays a singleton and the control
   does not (5.8); the stale-snapshot case (R17): `D`'s deletion
@@ -2845,8 +2866,10 @@ checkpoint (a whole-record-only stop must fail the MULTIAPPEND case),
 the skipped checkpoint (treating a skipped-only pass as a no-op must
 fail R26's case), the epoch rule (refusing without the `(S, epoch]`
 check must fail R27's empty rebuild, and an open interval must admit the latest
-pre-loss state in H1's case), the `Initial` rule (a continuation that
-the retained bound or the epoch can refuse must loop R28's client), the
+pre-loss state in H1's case), the `Initial` rule (applying retention to
+zero itself must fail R28/R31 while `E` remains retained), the pinned-end
+rules (omitting later-insert removal, the retained-end refusal, the epoch-end
+refusal or the post-read bound check must each fail its P1-PAGING case), the
 inclusive resume (an exclusive resume of a partial record must lose its
 suffix in R29's case), the existence rule's cache step (a record
 consulted first must emit H2's phantom `created`), the reconciliation
@@ -2992,9 +3015,11 @@ Added:
     loses identities allocates a fresh change id for its epoch, with or
     without a message to witness it, and refuses every sync state below
     it whose method's log holds a record in `(S, epoch]`, the boundary's
-    own entries and the latest issued state included, and never
-    `Initial` or its continuations; a newer manifest format is never
-    loss, and loss of a content blob alone never moves the epoch.
+    own entries and the latest issued state included. Fresh `Initial` and
+    `Exact(0)` remain admissible; their continuations require a pinned end
+    at or above retention and the validated map's epoch (P1-PAGING, 6.3).
+    A newer manifest format is never loss, and loss of a content blob alone
+    never moves the epoch.
 
 ## 11. Merge hotspots and silent dependencies
 
@@ -3285,7 +3310,8 @@ on `sync_view` and `View::sync` (`imap/src/core/view.rs:813-838, 645-647`).
 - **An all-created `Initial`** (revision 13). Rejected by R28: a
   continuation page cannot tell it from `Exact(m − 1)`, which preserves
   kinds. Revision 14 made `Initial` `Exact(m − 1)`; revision 15 made it
-  `Exact(0)` (the bullet below), whose continuation nothing can refuse.
+  `Exact(0)` (the bullet below). Revision 24 corrects the unconditional
+  continuation promise: the pinned end must retain its evidence.
 - **Refusing every state below the epoch** (revisions 6 to 13).
   Rejected by R27: an empty account's Email and Thread states never pass
   a boundary that touched only the mailbox log, so its clients were
@@ -3305,7 +3331,8 @@ on `sync_view` and `View::sync` (`imap/src/core/view.rs:813-838, 645-647`).
   continuation carried a `from` below the retained bound, which the
   truncation check and the epoch refused, looping the client between a
   first page that succeeded and a second that failed. `Initial` is
-  `Exact(0)`, and `from = 0` is never refused.
+  `Exact(0)`, so zero alone does not refuse it. Revision 24 adds the
+  pinned-end retention and epoch checks to continuations (P1-PAGING).
 - **No time cap, so that the checkpoint depends on counts alone.**
   Rejected: a pass of attachment-heavy mail would stall the triggering
   command without bound, and the duration channel exists whatever the
@@ -3544,11 +3571,12 @@ the thread records on every pass, which section 12 rejects on cost.
     boundary (G3); the retention bound is the shorter of the Email and
     Thread logs (G4); a reconciliation attributes by the retained log
     before stamping (R24, G2).
-25. The epoch refuses a state only when the method's log holds a record
-    in `(S, epoch]`, closed at the epoch, and never `from = 0` (R27, H1);
-    `Initial` is `Exact(0)`, every present message created, its
-    continuation always admissible (R28, H19); `Mailbox/*` is outside the
-    rule (H12).
+25. For `S > 0`, the epoch refuses a state only when the method's log holds
+    a record in `(S, epoch]`, closed at the epoch (R27, H1). Fresh `Initial`
+    and `Exact(0)` remain admissible; every message present at the end is
+    created. Their continuations require the pinned end at or above the
+    retained bound and identity epoch (P1-PAGING, R28, H19). `Mailbox/*`
+    remains outside this identity rule (H12).
 27. The checkpoint carries whether its record is complete and a partial
     record is resumed inclusively (R29); the manifest carries a keyed
     tag (H9); the merge survivor is the thread with the most matching
