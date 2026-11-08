@@ -1,6 +1,92 @@
 # Zero-access plan 16: Codex review
 
-## Current review — plan revision 6, 2026-11-08
+## Current review — plan revision 7, 2026-11-08
+
+**Verdict: APPROVE under the stopping rule. No P1 construction defect remains in scope.**
+
+Re-reviewed the [plan](2026-11-07-zero-access-16-search.md) at `aa594dc09`, checking the
+three revision 6 follow-ups, their direct interactions, and the D13 changes in
+[spec revision 20](../specs/2026-11-04-zero-access-search-design.md). This is a scoped
+re-review; earlier accepted decisions and model-tier assignments remain outside its scope.
+
+- HEAD: `aa594dc098519b6068230298770a6cb6f72b9484`, branch `za-search-design`.
+- Worktree: `/Users/jay/Development/stalwart/.worktrees/za-search-design`.
+- Plan SHA-256: `7463124e004fb587597b350f737f26bb8609ecd7f487573dedcbd032416caac4`.
+- Spec revision 20 SHA-256:
+  `6f2d9a2e3b9f5b28687c1e9ccbe94b41dd9fc3b7fbcd8b009e7aa6aae4dad0d4`.
+
+### Disposition of the revision 6 follow-ups
+
+| Finding | Revision 7 disposition |
+|---|---|
+| PL11 | Sequential growth and size estimate fixed; two admission details remain below. |
+| PL3 | Closed: the regression pauses after validation while retaining the view's guard. |
+| PL19 | Closed: Task 1's Files list and staging command both include `codec.rs`. |
+| D13 | Spec alignment closed: Thread state is the validated cache's group counter. |
+
+PL11's swap now uses `ContentPart::loaded_bytes()` and drops resident content if growth
+cannot be admitted, without losing committed progress (2219). The estimate is explicitly
+shared by loads, reloads and swaps (1649), including postings (1239–1240). The new test
+covers sequential cross-account pressure, refusal with other parts held, and checkpoint
+preservation (1772). These answer the previous sequential counterexample.
+
+PL3's `SEARCH_VIEW_PAUSE` is after all validation, with the returned cache and read guard
+still held (2377). The revised regression (2875–2885) can now publish a merge while the old
+view remains pinned: the competing pass pauses or skips before taking the swap's write
+lock. Both same-node and remote forms retain the old grouping and its old state.
+Spec 6.2 and 6.3 now agree with the plan's `ZaView::state()` (2520), `Thread/get` (2570)
+and `Thread/changes` (2779). Task 1 includes its raw-buffer helper in both lists (511, 618).
+
+Two P2 corrections remain within PL11: one construction issue and one wording issue.
+Neither changes the verdict under **approve unless a P1 construction defect remains**.
+
+### PL11 — P2 — Construction: Reserve admitted growth before another account can claim it
+
+**Plan:** 2219; admission and charge interfaces at 1635–1648.
+
+The new swap checks `make_room(Content, delta, account_id)` and only afterward calls
+`content.charge.resize(grown)`. `make_room` returns a Boolean; its contract checks the
+counter but reserves no bytes. The surrounding index write lock belongs to one account,
+so it cannot serialize admission and charging across two accounts.
+
+With a 1 MiB budget and 800 KiB already charged, let two accounts each grow by 150 KiB.
+Both swaps can observe 800 KiB and admit their growth before either resizes its charge.
+Both then retain their content, leaving 1,100 KiB charged. No eviction is triggered,
+because each separate check saw room. This is the concurrent form of the budget failure;
+the new sequential test does not exercise it.
+
+**Correction:** admission must atomically reserve the delta, or a shared admission lock
+must cover the check through the charge adjustment. Ensure load and swap admissions
+participate in the same reservation protocol, without double charging. Existing source
+shows an atomic reservation and rollback pattern in
+[memory.rs](../../../crates/common/src/network/memory.rs), 88–104. Add a two-account test
+that synchronizes the competing growth attempts and verifies that only admitted content
+remains resident, with committed progress retained on refusal.
+
+### PL11 — P2 — Wording: Call admission on the search cache
+
+**Plan:** 2192, 2219.
+
+`write_pass` binds `cache` to `server.get_cached_messages(account_id)`, an
+`Arc<MessageStoreCache>` ([cache/mod.rs](../../../crates/email/src/cache/mod.rs), 59).
+The new `cache.make_room(...)` call therefore names the wrong receiver: that method
+belongs to `ZaSearchCache`. Qualify it as `server.inner.cache.za_search.make_room(...)`,
+or bind a distinctly named search-cache reference, adapting the call to the atomic
+admission correction above. The literal sketch otherwise cannot compile.
+
+### Review method and limits
+
+Three read-only scopes checked memory admission, view timing/spec alignment, and Task 1's
+commit instructions. The primary inspected the changed passages and supporting source,
+then adjudicated the findings. Existing parent-model routes were inherited because the
+originating capability ceiling remained unresolved; the plan's Claude tiers were ignored.
+
+No builds, tests, benchmarks, runtime probes or network checks ran. This is approval of
+the scoped plan under the stated stopping rule, not implementation or runtime validation.
+Only this review was edited. The plan, spec and Fable report were preserved, and earlier
+reviews follow unchanged except for renaming the previous current heading to historical.
+
+## Historical review — plan revision 6, 2026-11-08
 
 **Verdict: APPROVE under the stopping rule. No P1 construction defect remains in scope.**
 
