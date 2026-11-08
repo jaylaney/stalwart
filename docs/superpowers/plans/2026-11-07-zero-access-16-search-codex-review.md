@@ -1,6 +1,111 @@
 # Zero-access plan 16: Codex review
 
-## Current review — plan revision 2, 2026-11-07
+## Current review — plan revision 6, 2026-11-08
+
+**Verdict: APPROVE under the stopping rule. No P1 construction defect remains in scope.**
+
+Re-reviewed the [plan](2026-11-07-zero-access-16-search.md) at `32c05fb78`, checking the
+five outstanding items from the revision 2 re-review and their directly changed consumers.
+The intervening revisions 3–5 supply part of those fixes. This is a scoped re-review,
+not a fresh audit of every task. Model-tier assignments remain out of scope.
+
+- HEAD: `32c05fb78c6c5afc860e27489d12d9badbccc0f7`, branch `za-search-design`.
+- Worktree: `/Users/jay/Development/stalwart/.worktrees/za-search-design`.
+- Plan SHA-256: `ea1559e07deb879e4828d9c7fa043bc832a40276f0fa783d57abc0d6f2995ed2`.
+- Spec revision 19 SHA-256:
+  `3d90536da3396c1af2d8c306dba9c7bac4fc575f2c3804eb5859b144e7a994db`.
+
+### Disposition of the revision 2 re-review
+
+| Finding | Revision 6 disposition |
+|---|---|
+| PL3 | P1 closed: Thread state comes from the validated view. Regression timing follow-up below. |
+| PL11 | Lifetime test and resize calls fixed; content admission/accounting follow-up below. |
+| PL19 | Raw-byte accessor fixed; Task 1's commit list needs the new codec file below. |
+| PL1 | Closed: stale-hash corruption expects Hash; header mismatch uses its actual hash. |
+| PL16 | Closed: the wait test uses currency and progress, without persisted-state equality. |
+
+`ZaSnapshot::state()` now returns `cache.last_change_id` (2517). `Thread/get` (2567)
+and `Thread/changes` (2776) use that value from the same view whose map and cache were
+validated together (2368–2374). A later store publication cannot independently advance
+the response's Thread state. This closes the remaining lost-sync construction.
+
+Source supports that pairing: the cache retains its corresponding counter in
+[cache/mod.rs](../../../crates/email/src/cache/mod.rs), 449–483, and Thread shares the
+Email counter group in [collection.rs](../../../crates/types/src/collection.rs), 228–231.
+D13 explicitly identifies the corresponding spec wording amendments; that synchronization
+remains recorded in the plan rather than applied to the spec in this review.
+
+Three P2 follow-ups remain: one construction/integration defect and two wording defects.
+None changes the approval verdict under **approve unless a P1 construction defect remains**.
+
+### PL11 — P2 — Construction: Admit resident content growth against the process budget
+
+**Plan:** 2216; budget interfaces at 1632–1636; content size estimate at 1236–1237.
+
+The swap now resizes both charges, and the two-generation test at 1769 releases all owners
+correctly. However, the swap still retains content growth unconditionally. Resizing records
+the usage; it does not check whether that usage fits or evict another content part.
+
+For example, eight resident content parts can grow from 40 MiB each to 80 MiB each through
+local passes. Every account stays below the default 128 MiB account cap, but their retained
+total reaches 640 MiB against the 512 MiB process budget. Task 8's limits (2185) check the
+account cap, and its blob-writing step (2191) does not perform process-budget admission.
+The load/reload checks at 1699–1701 and 1807–1809 do not cover these resident local swaps.
+Spec 4.3's soft-budget exception at 864–868 applies to thread parts.
+
+**Correction:** apply the existing budget admission/eviction mechanism to retained content
+growth. If room cannot be made, drop the resident content part while preserving the
+committed index progress. Use the existing `ContentPart::loaded_bytes()` estimate, which
+includes postings and bitmaps: the new `content.bytes += c.encoded_len()` only counts
+encoded records and omits that growth. Keep the estimate consistent across loads and swaps.
+
+Extend the growth test to cross the process budget with several accounts while remaining
+below each account's cap, and include records that create new posting keys. The existing
+mechanisms suffice; the remaining defect is their application in the swap.
+
+### PL3 — P2 — Wording: Pause the regression after the view has been acquired
+
+**Plan:** 2875–2880; the hook's actual placement is 2368–2369.
+
+The new regression parks `Thread/get` at `SEARCH_SNAPSHOT_PAUSE`, after the cache read but
+before the manifest read. It then commits a merge and requires the parked request to return
+the old grouping and a state below that merge. Correct acquisition instead reads the new
+manifest, detects the old loaded hash, reloads, and refreshes the cache through steps 5–6.
+It returns the new grouping/state, or a bounded refusal, rather than the prescribed old pair.
+
+Place this regression's pause after `za_view` successfully returns, retaining its read guard
+before Thread rendering. Then commit the competing merge and resume the old view. Its
+returned state must stay below the merge, and the next `Thread/changes` must include it.
+Keep both the same-node commit waiting to swap and the remote-publication forms. This
+corrects the test interleaving; the production state-pairing fix stands.
+
+### PL19 — P2 — Wording: Include the raw-byte helper in Task 1's commit
+
+**Plan:** 505–510, 562, 615.
+
+The accessor now correctly obtains the writer's raw buffer through a test-only
+`Writer::into_raw_bytes()` in `crates/store/src/search/codec.rs`. Task 1's Files list and
+explicit `git add` command omit that file. Following the prescribed command leaves the
+required helper uncommitted, so a fresh checkout cannot compile its `test_mode` caller.
+
+Add `crates/store/src/search/codec.rs` to both lists. The underlying benchmark correction
+is closed: it no longer feeds `into_document()`'s compressed, marked output into the
+compression comparison.
+
+### Review method and limits
+
+Three read-only scopes checked state pairing, memory accounting, and the benchmark/test
+corrections. The primary inspected the cited plan and source passages and adjudicated the
+findings. Existing parent-model routes were inherited because the originating capability
+ceiling was unresolved; the plan's Claude execution tiers were not evaluated.
+
+No builds, tests, benchmarks, runtime probes or network checks ran. This approves the plan
+under the stated scoped stopping rule, not an implementation or runtime result. Only this
+review was edited; the plan, spec and Fable report were preserved. Earlier reviews follow
+unchanged apart from changing the previous current heading to historical.
+
+## Historical review — plan revision 2, 2026-11-07
 
 **Verdict: REQUEST CHANGES. One P1 construction issue remains in PL3's Thread consumer.**
 
