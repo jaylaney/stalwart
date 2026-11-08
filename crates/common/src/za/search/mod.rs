@@ -7,6 +7,7 @@
 pub mod cache;
 pub mod config;
 pub mod error;
+pub mod load;
 pub mod seal;
 pub mod trace;
 
