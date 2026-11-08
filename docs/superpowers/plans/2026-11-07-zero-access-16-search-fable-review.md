@@ -1360,3 +1360,328 @@ allowed` suspension rule at 2249 and the `Behind` rule at 2985 as written; FV2's
 judged from the step-1 read on every reconciliation pass, as 2990 says, and on the arm order at
 2248. The closures of FS1 to FS10, FR1 to FR14, FT1 to FT9 and the Codex findings were not
 re-verified beyond what these traces exercised.
+
+## Scoped re-review of plan revisions 9 and 10 (5a24dcbac), Opus
+
+Date: 2026-11-08. Plan commit: `5a24dcbac` (branch `za-search-design`), revisions 9 and 10.
+Spec: revision 20. Scope: the text `git diff 1e0b8b8c9 5a24dcbac` adds or changes in the plan
+(every hunk), the closure of FV1 to FV13, revision 10's E10 backfill traced end to end, the names
+the two revisions introduced or changed and their consumers, and collateral damage in text the
+diff did not mean to change. The Codex rounds and the five earlier sections stand and were not
+reopened.
+
+**Verdict: REQUEST CHANGES.** Two P1s, both in revision 10's new step: the content load that
+Task 8 step 5's sub-step 1 performs before the content block. First, the load's `OverCap` and
+`Budget` failures abort the whole pass, so on any account whose content cursor is pending while
+this node cannot load the chain (a backfill that met the raised cap, then a restart or an idle
+sweep; a lower-cap node beside a higher-cap one, the 9.2 case; a budget refusal) no log record
+is ever consumed: new mail stays unthreaded, `suspended` may never be written, and a text
+search waits the full budget and answers `Transient(Budget)` instead of FV12's `OverCap` (FW1).
+Second, the load runs in the pre-method pass of every keyed request, outside the pass's caps, so
+a `Mailbox/get` or an IMAP `SELECT` waits for a whole content-part load while a backfill is
+pending, against spec 7.4 ("mailbox listing ... never wait for the content part") and G18 (FW2).
+Both have one correction: the pass never loads the content part; it runs the backfill's block
+only when the part is resident and current, and otherwise skips that block for the pass without
+aborting, while the content wait, which may wait, does the load. FV1 to FV13 are otherwise
+closed: the guarded `Behind`, the `(Some(b), Some(m))` arm, the transition-only
+`suspend_content` and the moved carry rule hold on every trace the brief named. Six P2s (a stale
+or dropped content part read as an empty chain; FV12's condition losing revision 8's `size >
+cap` refusal; `s3` unproducible by `plan_pass`; the skipped content block gating the gap
+blocks; step 0 and step 1 disagreeing on where the items are computed; `case_f6_r23`'s new
+assertions) and six P3s.
+
+Counts: 2 P1, 6 P2, 6 P3 (14 findings).
+
+### Assessment of the revision 9 and 10 changes
+
+| Change | Assessment | Findings |
+|---|---|---|
+| FV1, Task 14 (`Behind` needs `!suspended` and `size < cap`; plan 3012, 3022; `case_f6_r23`'s suspended-phase assertions, 3035; FU1's sentence, 2269; case map 514) | Closed. The just-crossed account: the crossing pass (base `size < cap`) writes content, `checkpoint == indexed_to`, not suspended; the next `Publishing` pass sets `suspended` with the checkpoint behind; `CapRaised` fails `size < cap`, `Behind` fails `!suspended` → `None`, the shortcut answers on an idle account, no start, no chain drop. The just-crossed idle account (no further mail): `checkpoint == indexed_to`, `Behind` fails its last term. The raised cap: `suspended`, `size < cap` → `CapRaised` only. The ordinary idle account: `None`. The two new rule rows are right, and the suspended-phase assertions would show a spurious start. | — |
+| FV2, Task 8 (the bound arm, 2275; rule 4's sentence, 3017; `s3`, `a_finishing_bound_move_writes_no_bound`, 2238-2247) | The arm is closed: with `Finished` the marker is cleared and the bound dropped, no panic; with `GapNext` both are applied; a `BoundMoved` pass that does not finish writes the bound; `Restart` never reaches `write_pass`. But `s3` cannot be produced by `plan_pass`, which has no input for `marker_bound` or rule 5's counter, and Task 8 implements neither; the write-side test names a helper no task produces. | FW5, FW9 |
+| FV3, Task 8 (`suspend_content = !base.suspended`, 2261; `s_over_again`, 2227-2228) | Closed as written for a node that already holds the content part: the first skip writes `suspended`, later passes stage nothing and decide `Nothing`, a text search meets FV12's check at once. On a node without the part revision 10's load aborts the pass before `plan_pass`, so the unit test passes while that node never reaches the rule; and the skipped block still gates the gap blocks. | FW1, FW6 |
+| FV4, Task 8 (the carry beside the arms, 2275) | Closed. Deletion-only and update-only passes carry `content_to` when it was at `indexed_to`; a publishing pass over the cap leaves it behind and suspends; a content-only pass leaves it (it is behind while a cursor runs), and the `Exhausted` arm, applied earlier in the same paragraph, is not overwritten, since the carry only ever assigns when its condition holds. | — |
+| FV5 to FV11, Tasks 6, 8, 14 (the shortcut's owner, 2269; the fixtures, 2218-2236; the barrier test, 1817; the loader's refused shrink and the `Whole` reload, 1740-1748; `admit_content_growth` on `None` and the trace owner, 1666-1675; the `Abort` carriers, 2261; `Restart`, 3017; the `Lost` trace, 2997; counts and Consumes, 2074, 2266, 1873) | Closed. Nineteen load tests and fifteen pass tests counted. Revision 10 repeats FV5's pattern in step 5's sub-step 1. | FW12 |
+| FV12, Task 9 (the `OverCap` check before `is_current`, 2382; case map 517) | Closed for a suspended account whose pass returns `Current`, `Advanced` or `Lost`. It removed revision 8's `size > cap` refusal, so a current, not-yet-suspended account over the cap now reaches the loader's `OverCap`, which `map_load` does not map; and the stuck state of FW1 never reaches the check. The case map's "within 2 s" is not in the case. | FW1, FW4, FW10 |
+| FV13 / E10, revision 10 (header 67, 179; Task 14's start by reason, 2997, 3012; step 5's load, 2269-2270; `case_f6_r23`, 3035; case map 518) | The start by reason is right and now agrees with spec 5.4 (1361-1370) and 9.2 (2627-2631): `ContentLoss` drops the chain and resets `content_to` (1306); `CapRaised` and `Behind` keep the chain and the checkpoint and restart the cursor at `u32::MAX`, and a `CapRaised` start over a stuck `ContentLoss` cursor completes it correctly. `content_cursor_items` is fed the loaded index, not `base`. But where and when the part is loaded is the two P1s; the "content `None` means list everything" contract is keyed on the wrong `None`; `case_f6_r23`'s new counts are fragile. | FW1, FW2, FW3, FW7, FW8, FW11, FW13 |
+
+### New findings
+
+#### FW1 — P1 — The step-1 content load aborts the whole pass, so an account whose cursor is pending on a node that cannot load the chain stops indexing (Tasks 8 and 14, E10)
+
+Confidence: high on the text, medium-high on the runtime trace. Plan lines 2270 ("when
+`base.manifest.content_to.cursor.is_some()` and the rebuild cursor is `None`, and
+`base.manifest.content.is_some()` with the content part not loaded,
+`self.za_search_load_content(&entry, keys).await` first (`Err(Transient(Budget))` or
+`Err(OverCap)` → `Ok(Aborted(TransientClass::Budget))`, traced: this node cannot run the
+backfill"), 1744 (`Err(OverCap)` when `size > account_max_mb << 20`), 2261 (FU6/FV3: over the
+cap the content block does not run and `suspend_content` is set on the transition), 3012 ("a
+node that cannot, `Err(Transient(Budget))`, answers `Aborted(Budget)` and the cursor waits for
+another node or a later request"), header 179 (E10), 2382 (the `Aborted` arm of the content
+wait). Spec 4.3 (888-897: over the cap "content indexing is suspended (4.2), and everything else
+is served"), 9.2 (2627-2631: "a raised cap, or a second node with a higher cap, takes a
+content-only rebuild"), 7.4 (2247-2253: the thread-valued reads answer from the map, which "in
+normal use is current").
+
+The load is attempted whenever a content cursor is pending and the part is not resident, whatever
+`limits.content_allowed` is (the limits are computed after it), and a failed load returns before
+`plan_pass`: no rebuild cursor item, no gap item and no log record is consumed, and FU6's
+transition never runs.
+
+Counterexample (single node). `account_max_mb` is 1 for a while and the account suspends with
+the chain at about 1.1 MiB; the operator raises the cap to 2; `CapRaised` starts the backfill
+(chain kept); the suspended period held more than 0.9 MiB of content, so the backfill's passes
+take the chain to 2.05 MiB; the next pass on this node has the part resident, `content_allowed
+== false`, and FU6 writes `suspended = true` with the cursor pending (`needs` is `None` from
+here: `CapRaised` needs `size < cap`, `Behind` needs no content cursor). The idle sweep, an
+eviction or a restart drops the entry. From then on every keyed request's pass reloads the thread
+part, finds the cursor pending and the part not loaded, calls the loader, gets `OverCap` (2.05
+> 2), and returns `Aborted(Budget)`. Mail delivered afterwards is never consumed: `indexed_to`
+never moves, every new message renders as a singleton thread and is absent from the index's
+thread map until the cap is raised again (spec 4.3's "everything else is served" fails), a
+`ZA_SEARCH_ABORTED` is traced per request, and a text search loops the `Aborted` arm for the
+whole `ZA_SEARCH_WAIT_SECS` and answers `Transient(Budget)`, never FV12's `OverCap` (case map
+row 517). The same happens at once, with no restart, on any node that never held the part: a
+second node with the old lower cap while a higher-cap node backfills (spec 9.2's case; there
+`suspended` is never written at all, since FU6's transition is never reached), and a node whose
+budget refuses the 3× admission (transient, but each refusal costs the whole pass). A
+`ContentLoss` rebuild that meets the cap ends in the same state after its first blob, since
+from then on `content.is_some()`.
+
+Correction. Compute `limits` first and never abort the pass for the backfill: when the content
+block cannot run on this node (`!content_allowed`, or the part not resident, or any load
+failure), run the pass with `sources.content` empty and a `content_block_runnable: false` flag,
+so FU6's transition still happens when `!content_allowed`, and the gap blocks and the records
+run (FW6). Where the load belongs is FW2. Add a `plan_pass` row: `s_over_again` with one insert
+record → the record is admitted (`Publishing`, no content). Add a case to `case_f6_r23` or a
+sibling: raise the cap to a value the backfill exceeds, let it suspend, `simulate_restart`,
+deliver one message, one keyed `Mailbox/get` → `index_holds(new)` and `indexed_to` moved; a text
+search answers `OverCap` within 2 s.
+
+#### FW2 — P1 — The step-1 load makes non-content requests wait for a whole content-part load (Tasks 8 and 9, E10)
+
+Confidence: high on the text; medium on how long a load takes at the design size. Plan lines
+2270 (the load in `za_search_pass`), 2385-2388 (the pass runs before the methods of every keyed
+mail request and after keyed writes), 2365 ("only a content request waits"), 2371
+(`case_time_cap_bounds_the_command`, G18: a keyed `SELECT` returns within 5 s), 1744
+(`admit(Content, 3 × size)`, then the whole chain walked from the head). Spec 7.4 (2253-2255:
+"`Email/get`'s content, flag updates, mailbox listing, FETCH of content and every keyed write
+never wait for the content part"), 5.1's pass bounds.
+
+The pass's work is bounded by `pass_cap`, `pass_mb` and `pass_ms` (G18), and none of them bounds
+the load, which comes before `limits` and before the first item. While a `CapRaised` or `Behind`
+cursor is pending and the part is not resident (after every restart, idle sweep or eviction), the
+first keyed request of any kind on the node, a `Mailbox/get`, an IMAP `SELECT`, a keyword
+update's pass, an `APPEND`'s post-commit pass, fetches and opens the whole chain (up to
+`account_max_mb`, 128 MiB at the default), admitting three times its size and evicting other
+accounts' content parts to make room. Revision 8 had named exactly this as what dropping the
+chain spared ("spares the pass a loaded content part to consult", the old E10); the ruling
+changed what the rebuild keeps, not where loading is allowed.
+
+Correction. The pass never calls `za_search_load_content`. The backfill's block runs only when
+the content part is resident and its head segment equals the manifest's (FW3); otherwise the
+pass skips the block as FW1 says. `za_search_ensure_current`, which is a content request and may
+wait, loads the part before its pass loop when a content cursor is pending,
+`manifest.content.is_some()` and the account is under the cap (an `OverCap` there answers
+`OverCap` at once, a `Budget` answers `Budget`), so the passes it runs find the part resident and
+work the cursor. Until a content request arrives the backfill does not progress on that node,
+which no client can see, since only content requests need it. Say so in E10; spec 5.4's "a node
+finds `content_to` behind ... with the chain loadable" is still met.
+
+#### FW3 — P2 — `content_cursor_items` lists everything when the *loaded part* is `None`, not when the *chain* is empty (Tasks 6 and 14, E10)
+
+Confidence: medium (one path depends on how `apply_reload` treats a manifest with `content:
+None`, which Task 6 does not say). Plan lines 2997 ("with `content: None` every present document
+is listed, the `ContentLoss` case"), 2270 (the items computed from `entry.read_loaded()`),
+1700-1703 and 1720-1722 (`plan_reload`: `Append { content_head_moved }`, and the walk's "replace
+the loaded content whole" only when a head exists), 1740-1741 (the `Whole` reload drops the old
+part before the new `admit`, which can refuse).
+
+Two counterexamples. (a) A hole. Node A holds account X's content part. Node B's content request
+finds a chain node absent and starts a `ContentLoss` rebuild: `content = None`, cursor at
+`u32::MAX`. A's next pass reloads: the thread segments are unchanged, so `plan_reload` answers
+`Append { thread: [], content_head_moved: true }` against a manifest with no head; nothing in
+Task 6 drops the resident part, so it stays. A's step 1 (`content.is_some()` is false, so no
+load) computes the items from the stale part, which holds a record for every pre-loss message:
+the cursor lists only messages that never had content, runs off its list, and the `Exhausted`
+arm sets `content_to.checkpoint = indexed_to`. The chain now holds almost nothing while
+`content_to` promises content for every indexed message (I7); A serves from its stale part until
+it is evicted, and every node that loads the chain afterwards answers text searches without
+those messages, with no recovery path. (b) Duplicates. During a `CapRaised` backfill, after step
+1 has loaded the part, a view's concurrent `Whole` reload (another node compacted) drops it and
+its `admit` refuses; step 1's `read_loaded()` then sees `content: None` and lists every present
+message, so the pass re-indexes the kept chain's messages and appends their content again,
+growing the chain toward the cap.
+
+Correction. Key the contract on the manifest, not the loaded index:
+`content_cursor_items(cursor, index)` lists every present document below `next_below` when
+`index.manifest.content.is_none()` and ignores any resident part; when the manifest names a head,
+it requires `index.content` with `segments.first() == Some(&head.segment)`, and otherwise the
+block does not run this pass (FW1's skip). Say in Task 6's `apply_reload` that a manifest with
+`content: None` drops the resident content part with its charge. Add unit rows: manifest `None`
+with a resident part holding `{2}` → `[3, 2, 1]`; a manifest head with no resident part → the
+block skipped.
+
+#### FW4 — P2 — FV12's condition drops revision 8's `size > cap` refusal, and `map_load` has no `OverCap` arm (Task 9)
+
+Confidence: high. Plan line 2382 (`if g.manifest.content_to.suspended && size >= cap { return
+Err(Unavailable::OverCap) }` before `is_current`; then `za_search_load_content` with `Err(e) =>
+return Err(map_load(e))`; `map_load` maps `Loss`, `Transient(Budget)`, `Transient(t)`,
+`NoMap(NewerFormat)` and other `NoMap`, not `OverCap`). Revision 8 refused `size > cap` inside
+`if current`; FV12 had asked for `content_to.suspended || size > cap`.
+
+Counterexample. The pass that crosses the cap starts with `size < cap`, writes its content and
+leaves `size` above the cap with `suspended == false` and `content_to.checkpoint == indexed_to`
+(the carry). With no further mail nothing ever sets `suspended` (only a `Publishing` pass without
+content, or FU6 under a pending cursor, does). A text search: the pass answers `Current`, the
+FV12 check is false (`!suspended`), `is_current` is true, the loader answers `Err(OverCap)`, and
+`map_load` has no arm for it: a non-exhaustive match the implementer closes by guess (a wildcard
+into `Transient(Store)` answers a transient refusal where 7.4 lists the over-cap one).
+
+Correction. `size > cap || (suspended && size >= cap)` → `OverCap` (`suspended` with `size < cap`
+is a pending `CapRaised` and stays out), and `OverCap → OverCap` in `map_load`. Add the
+not-yet-suspended form to `case_f6_r23`: right after the crossing delivery and its keyed
+request, before the next delivery, a text search answers `OverCap` at once.
+
+#### FW5 — P2 — `s3` cannot come out of `plan_pass`, which has no input for the bound or the finish (Tasks 8 and 14)
+
+Confidence: high. Plan lines 2086-2087 (`PassSources { cursor, content, gap_inserts,
+gap_deletes, gap_stamp }`; `plan_pass(base, sources, records, limits, started, opener)`),
+2238-2239 (`s3`: "a BoundMoved pass that also finishes ... carries both steps", `marker_bound ==
+Some(43) && marker == Finished`), 2261 ("Task 14's step 5 sets `marker = Finished`, and a
+`BoundMoved` pass sets `marker_bound = Some(bound_now)`"; the `ManifestOnly` disjunction reads
+`marker_bound.is_some()` and `bookkeeping` reads `Finished`), 3017-3018 (rule 4's bound from
+`za_retained_bound`, rule 5's test against `cache.last_change_id`), 2266 ("15 passed").
+
+`plan_pass` cannot know `bound_now` or `cache.last_change_id`, so it can set neither step, and
+Task 8 implements neither rule (both are Task 14's): `s3` fails at Task 8 step 4 on correct code,
+and a test that set the two fields by hand would assert nothing. The gap reaches production: if
+Task 14 sets the two fields on the returned `Staging`, the decision `plan_pass` already computed
+does not see them, so a pass whose only work is a bound move or the marker's completion decides
+`Nothing`, writes nothing, and the marker never clears on an idle account (rule 5's
+"`bookkeeping`, so the manifest is written even when nothing else was staged" fails).
+
+Correction. Add `marker_bound: Option<u64>` and `finish_at: Option<u64>` (the cache counter read
+at step 0, `Some` only while a marker is set) to `PassSources`; `plan_pass` copies the bound into
+`Staging.marker_bound` and applies rule 5 (`gap lists empty && checkpoint.change_id >=
+finish_at` → `Finished`) before deciding; Task 14 fills both. Move `s3` to Task 14's step 1, or
+keep it in Task 8 with these inputs.
+
+#### FW6 — P2 — A content block skipped over the cap still gates the gap blocks (Task 8)
+
+Confidence: medium-high (the source-order sentence read literally). Plan lines 2261 ("each later
+block running only when every earlier one is not pending, is empty, or ran off its list this
+pass"; FU6/FV3: "if `!limits.content_allowed` the block does not run") and 3018 (rule 5 needs the
+gap lists empty). On a suspended account with a pending content cursor and a non-empty item list
+(FV3's and FW1's steady state) the content block is pending, not empty and did not run off its
+list, so the gap blocks never run. With a reconciliation marker set (a purge while the account
+sits over the cap), gap inserts are never indexed, gap deletes never applied, rule 5 never
+finishes, and the shortcut stays disabled until the cap is raised. Correction: a content block
+that does not run this pass (over the cap, or not runnable on this node, FW1) counts as not
+pending for the later blocks; give `s_over_again` a gap fixture whose gap insert is admitted.
+
+#### FW7 — P2 — Step 0 and step 1 disagree on where the content items are computed (Task 8 step 5)
+
+Confidence: high on the contradiction; the deadlock depends on the reading. Plan line 2269 ("a
+pending content cursor's items are computed from the guard itself, before `base` is built, since
+they need the loaded content part") against 2270 (the load first, which takes `index.write()`,
+then `content_cursor_items(&cursor, &*entry.read_loaded().await..)` under a new guard, its
+condition reading `base.manifest`). Read as step 0 says, the items come from the base snapshot's
+read guard: either computed before the load, when the part is absent, so every present message
+is listed (FW3's duplicates, on every backfill after a restart), or with that guard still held
+across `za_search_load_content`, whose `index.write()` then waits on the task's own read guard
+forever while it holds `pass_lock`, so every later pass of the account answers `Running` and
+every content wait times out. Correction: strike step 0's clause and say in step 1 that the base
+guard is dropped before the load (after FW2 the load leaves the pass, and the items are computed
+under the guard that builds `base`, which is then right).
+
+#### FW8 — P2 — `case_f6_r23`'s new E10 assertions fail on correct code (Task 14)
+
+Confidence: medium-high. Plan line 3035. (a) "`za_search_message_opens(id)` ... equals the count
+of messages delivered while suspended": the message delivered just before `suspended` is first
+read is indexed without content by the very pass that writes `suspended` (the loop is "deliver,
+keyed request, read `suspended`"), so the backfill opens one more than the deliveries made while
+the flag reads true. (b) "`content.length` grew by the backfill's blobs only": the case keeps the
+default `ZA_SEARCH_SEGMENTS` of 16, and content compaction (Task 15, plan 3070) merges every run
+of 16 tier-0 blobs; reaching a 1 MiB cap one node per delivery lays down many nodes, so a backfill
+pass can trigger a merge that shortens the chain and unlinks pre-suspension blobs. (c) "one keyed
+request starts the content-only rebuild ... `content.length` ... unchanged by the start" holds
+only for a non-content request; a text search runs the backfill in the same request. Correction:
+`search_config_guard!(account_max_mb: 1, segments: 255)`; count "the messages indexed without
+content, from the pass that set `suspended` on"; name the starting request (`Mailbox/get`).
+
+#### FW9 — P3 — `apply_marker_arms` and `manifest_with_marker` are produced by no task (Task 8)
+
+Plan lines 2241-2247 and 2275. Step 6 writes the arms inline in `write_pass`; no Produces names
+`apply_marker_arms(Manifest, MarkerStep, Option<u64>) -> Manifest` or the fixture
+`manifest_with_marker`, and the test sits in step 1's `pass.rs` block while its comment says
+`write.rs` (where step 4's filter `za::search::pass` would not run it, making "15 passed" 14).
+Name the helper in Produces (`write.rs`, `pub(crate)`), say step 6 factors the arms into it, and
+put the test where the count expects it.
+
+#### FW10 — P3 — Case-map rows claim assertions their cases do not make
+
+Plan lines 517 ("the text search answers within 2 s while suspended": `case_f6_r23`, 3035, has no
+timing) and 518 ("`case_h23_content_loss_is_content_only` (the chain dropped)": the case, 3033,
+asserts identities, the epoch, the wait and `content_to.cursor == None`, not that the old chain's
+links are gone). Add both assertions to the cases (a `tokio::time::timeout` of 2 s around the
+suspended-phase search; the old head's hash absent from `principal_blob_links` after the start).
+
+#### FW11 — P3 — The step-1 load's error mapping is incomplete, and it introduces the first pass-level `Aborted(Budget)` (Tasks 8 and 9)
+
+Plan lines 2270 and 2382. Only `Transient(Budget)`, `OverCap` and `Loss` are mapped; other
+`Transient(t)` (`BlobStore`, `AbsentWithinWindow`, `CodecKey`) and `NoMap` are not, nor are the
+`ContentLoss` start's own errors (FU12's convention: an assertion failure is `Lost`, traced, with
+a reload). The new `Aborted(Budget)` reaches the content wait's `Aborted` arm, which answers
+`Unavailable::Transient(Budget)` while `map_load` answers `Unavailable::Budget` for the same
+class. Moot if FW1 and FW2 take the load out of the pass; otherwise map each and route `Budget`
+to `Unavailable::Budget`.
+
+#### FW12 — P3 — Ownership and step names of the new load (Tasks 8 and 14)
+
+Plan lines 2270 ("Task 14 fills them"), 3012 and header 179 ("Task 8 step 1 loads it"; it is
+step 5's sub-step 1), 3025 (Task 14 step 4 wires `content_cursor_items` without the load), 2074
+(Task 8's Consumes lacks `za_search_load_content`). FV5's pattern again: Task 8 cannot call
+`content_cursor_items` or `ContentRebuildReason`; say Task 14 step 4 adds the load (or, after
+FW2, the resident-part check) and correct the step references.
+
+#### FW13 — P3 — `content_cursor_items`' unit test does not pin the `None` contract (Task 14)
+
+Plan line 3022 and case map 518. `content_cursor_items_run_newest_first_and_skip_content_present`
+covers the skip only; the E10 row cites it for the whole contract. Add FW3's rows.
+
+#### FW14 — P3 — Wording and types
+
+Plan line 3012: "After a `ContentLoss` start the chain is empty and the cursor runs on any node"
+holds for its first pass only; after one blob the chain is non-empty and the same residency rule
+applies. Plan line 2382: `g.manifest` on `entry.index.read().await` is a guard over
+`Option<LoadedIndex>` (as the neighbouring `is_current(&*entry.index.read().await, ..)` already
+was); write `entry.read_loaded()` or `.as_ref().expect(..)`. Plan line 2261: in FW1's stuck state
+a node that holds the part still runs a full pass per keyed request (manifest read, thread clone,
+item list) to decide `Nothing`, since the pending cursor disables the shortcut; harmless, worth a
+sentence beside FV3's.
+
+### Method and limits
+
+A reading review of `git diff 1e0b8b8c9 5a24dcbac` on the plan (every hunk), of the fifth Fable
+section (FV1 to FV13), and of the plan passages the hunks depend on: the header's plan calls and
+case map, Task 6's cache and loader (1640-1875), Task 8 in full (2061-2336), Task 9's rules and
+`ensure.rs` (2338-2390), Task 14's Produces, rules and steps 1 and 4 (2994-3040), and Task 15's
+content compaction rule (3070). The traces the brief named were walked by hand: FV1's `Behind`
+on the just-crossed, the just-crossed idle, the raised-cap and the ordinary idle account; FV2's
+arm on a finishing and a non-finishing `BoundMoved` pass, then `s3` against `plan_pass`'s inputs
+(FW5); FV3 across several requests and a text search's wait, on a node with and without the part
+(FW1); FV4's carry on deletion-only, update-only, over-cap publishing and content-only passes, and
+its order against the `Exhausted` arm; FV12 on a suspended account and on a current,
+not-yet-suspended one over the cap (FW4); E10 through `case_f6_r23` (the suspended phase, the
+raised cap, the start by reason, the load, the items, `Advanced` and `Exhausted`, the carry, the
+counts; FW8), through `case_h23`, on a lower-cap node, and through a backfill that meets the new
+cap (FW1, FW6); the `None` contract against a stale and a dropped part (FW3); the locks in step 1
+(FW7). Spec passages read: 4.3 (880-897), 5.4 (1298-1370), 7.4 (2236-2256), 9.2 (2620-2635).
+
+Not done: no build, test or runtime probe; no subagents; this section is the only edit. The
+source tree was not consulted: revisions 9 and 10 cite no new upstream or fork code, and the
+earlier rounds' source checks stand. FW3's hole rests on Task 6 not saying what a reload does
+with a manifest whose `content` is `None`; FW6 on the source-order sentence read literally; FW2's
+cost on a whole-chain load taking seconds at the default cap, not measured. The closures of FU1
+to FU13, FS1 to FS10, FR1 to FR14, FT1 to FT9 and the Codex findings were not re-verified beyond
+what these traces exercised.
