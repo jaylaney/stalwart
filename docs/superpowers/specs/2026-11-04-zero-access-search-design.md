@@ -1,6 +1,17 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 18 (2026-11-07), for re-approval.
+Date: 2026-11-04. Status: revision 19 (2026-11-07), approved.
+Revision 19 is wording only, two corrections plan 16 asked for and Jay
+ruled on 2026-11-07 (its calls B1 and E1). The record and alias maxima
+are the encoded sizes, `R = 304` and `a = 15` bytes, not the earlier
+estimates of 296 and about 24: the subject bucket is upstream's 128-bit
+hash and an alias three u32s with its framing; the inequality, the
+reservation and the 16 MiB class at 30,000 messages all still hold
+(4.2). Thread compaction keeps the newest revision-table row below the
+bound as a floor row, so `R(X)` is defined at every servable state
+after the older rows are pruned; the row count is public already (5.5).
+Revision 18 was approved by Jay on 2026-11-07 after Codex approved it
+under the stopping rule.
 Revision 18 answers Codex R35, the one P1 construction finding of the
 pass scoped to revision 17's compaction change: the alias bound's proof
 was wrong. A catch-up pass that merges threads whose roots were deleted
@@ -598,8 +609,10 @@ Resent-Message-ID, taken in that order before `ThreadFields::scan`'s
 sort and dedup (`crates/email/src/message/thread.rs:33, 61-62`) by a
 fork wrapper that captures header order (G10). A record is written once
 and holds no history (4.1), so its size has a derived maximum `R`: the
-ids and the subject hash, about 40 bytes, plus `16 · K` bytes of hashes,
-296 bytes at `K = 16`; an alias is `a` bytes, about 24. The hidden
+ids, the change ids, the 128-bit subject hash and the entry's framing,
+48 bytes encoded, plus `16 · K` bytes of hashes, `R = 304` bytes at
+`K = 16`; an alias is `a = 15` bytes encoded (its source, target and
+revision, three u32s, and the framing). The hidden
 section of a pass's thread blob is bounded by construction (R20, R21):
 an item's record is at most `R` and, under 5.1's chronological order,
 its aliases at most `K − 1`, so one admitted item contributes at most
@@ -608,7 +621,7 @@ admitted item exactly that reservation, whatever it comes to, and stops
 at the next insert boundary once the reservations reach
 `H = ZA_SEARCH_PASS_HIDDEN_KB` (5.1), so the overshoot is one
 reservation and the hidden section is never more than
-`H + R + (K − 1) · a` bytes, 32 KiB + 296 + 360 at the defaults. The
+`H + R + (K − 1) · a` bytes, 32 KiB + 304 + 225 at the defaults. The
 byte and count cutoff therefore depends only on how many items the pass
 admitted, a public count, never on what their records or aliases
 actually came to (R21), and no record of any writer, a MULTIAPPEND
@@ -1432,7 +1445,10 @@ own batch (new links, old unlinks, the manifest, atomically):
   `crates/common/src/storage/transaction.rs:116-139`, and the Thread
   log, which carries no flag changes, keeps older change ids than the
   Email log): a deleted message's record whose deletion change id is
-  older than that bound; a revision-table row older than it; and an
+  older than that bound; a revision-table row older than it, except the
+  newest such row, kept as the **floor row** so that `R(X)` is defined
+  at every servable state between the bound and the next retained row
+  (plan 16 call E1; the row count is public already); and an
   alias older than it, which
   is first **folded** into the records it governs (every record whose
   assignment is the alias's source takes the alias's target as its
