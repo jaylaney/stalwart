@@ -1,5 +1,154 @@
 # Zero-access plan 16: Codex review
 
+## Current review — plan revision 2, 2026-11-07
+
+**Verdict: REQUEST CHANGES. One P1 construction issue remains in PL3's Thread consumer.**
+
+Re-reviewed the [plan](2026-11-07-zero-access-16-search.md) at the requested commit,
+checking PL1–PL19 and interactions introduced by their corrections. Model tiers remain
+out of scope. The stopping rule is **approve unless a P1 construction defect remains**.
+There are four P2 wording/integration follow-ups in addition to the P1 below.
+
+- HEAD: `584096fe562958a9a22439e9c2a7a4df4211deca`, branch `za-search-design`.
+- Worktree: `/Users/jay/Development/stalwart/.worktrees/za-search-design`.
+- Plan SHA-256: `51c083f68d64b2ecb7131ba2618cb8aa60c86d0bab53533f734ba7f93f4e4f44`.
+- Spec revision 19 SHA-256:
+  `3d90536da3396c1af2d8c306dba9c7bac4fc575f2c3804eb5859b144e7a994db`.
+
+### Disposition of the first review
+
+| Finding | Revision 2 disposition |
+|---|---|
+| PL1 | Production fix closed: descriptor hashes verified before parsing. Test follow-up below. |
+| PL2 | Closed: staging resolves current assignments without published-row filtering. |
+| PL3 | Original three cases closed by `za_view`; Thread's state still escapes it below. |
+| PL4 | Closed: partial-safe `scanned_to`, complete checkpoint and all pending cursors checked. |
+| PL5 | Closed: content cleanup excludes retained thread hashes; purge/restart case added. |
+| PL6 | Closed: durable `gap_next` advances on skips; retained records resume from checkpoint. |
+| PL7 | Closed: whole expired prefixes are walked before deletion, including same-revision edges. |
+| PL8 | Closed: per-item alias counts are test-only; production traces explicitly omit them. |
+| PL9 | Closed: row absorption, page counting and owner/attachment sorts are covered. |
+| PL10 | Closed: production records carry upstream's effective sent time. |
+| PL11 | Lifetime fixed; mutation accounting and test ownership need updates below. |
+| PL12 | Closed: boot range and final publication guard cover the one-byte manifest count. |
+| PL13 | Closed: positions remain mandatory; the size figure is reported for a decision. |
+| PL14 | Closed: Move is an explicit no-op; Task 13 retains real merge-rendering coverage. |
+| PL15 | Closed: the four measurements subtract each neighbor's standalone contribution. |
+| PL16 | Benchmark loop fixed; one old currency assertion remains below. |
+| PL17 | Closed: the control disables Attachment indexing and checks the resulting terms. |
+| PL18 | Closed: the conditional preserves a failed build's nonzero status. |
+| PL19 | Tokenizer call and R threshold fixed; the raw-byte accessor needs correction below. |
+
+The chosen alternatives are sound for their stated purpose: a gap cursor records skipped
+work, per-record prefix walks need no same-revision tie-break, and the segments ceiling
+matches the codec's count width. The spec's B1/E1 amendments supply the derived byte
+maxima and a revision floor row; neither reopens R35's alias-count proof.
+
+### PL3 — P1 — Construction: Pin Thread's state inside the validated view
+
+**Plan:** 2448, 2494, 2703–2706; `za_view` at 2297–2305.
+
+The new acquisition closes the three reported Email/content interleavings. However,
+`thread_state` still reads the live store counter after the view has frozen its map and
+cache, checking only that the counter is not below the map's publication. `Thread/get`
+and `Thread/changes` call that helper outside the acquisition loop.
+
+A concrete lost-sync sequence:
+
+1. `za_view` returns the map/cache at publication P1, holding its read guard.
+2. A pass commits a merge at P2. A local swap may wait for that guard; another node also
+   can commit without acquiring the reader's local lock.
+3. `thread_state` reads P2. Its lower-bound check succeeds against the P1 map.
+4. `Thread/get` returns the old grouping with state P2.
+5. The client's next `Thread/changes` from P2 returns empty under the equality rule, so
+   the client never receives that merge.
+
+[get_state](../../../crates/jmap/src/changes/state.rs), lines 58–65, really reads the
+current store counter; it is not a state attached to the view. Holding a read lock through
+the response prevents a local swap, not the store commit preceding it.
+
+**Correction:** make the Thread state part of the view's retry/validation procedure and
+return that pinned value. It must correspond to the returned cache and map, not merely be
+at least as new as the map. Capture and validate it with those inputs, or use a corresponding
+snapshot counter where the method contract permits. Update the inherited I5 instruction
+in spec 6.2 as well: its after-manifest read and lower-bound check alone are insufficient.
+This is an overlooked consumer of PL3, not a failure of the new three regression cases.
+
+**Regression:** pause after successful view acquisition, commit a merge, resume
+`Thread/get`, then apply `Thread/changes` from the returned state. The resulting grouping
+must agree with a fresh read. Cover a same-node commit waiting to swap as well as a remote
+publication, and the corresponding current-end acquisition in `Thread/changes`.
+
+### PL11 — P2 — Wording/integration: Apply charges to growth and release all test owners
+
+**Plan:** 1585, 1706, 2147, 2896.
+
+`BudgetCharge` fixes the original lifetime defect. The local pass swap still appends
+thread/content records and updates only `thread_bytes`, without resizing either charge
+or updating `content.bytes`. Compaction's replacement likewise needs explicit charge
+adjustment. A small loaded account can therefore grow through local passes while remaining
+charged at its old size.
+
+Wire the already-defined byte estimates, budget admission and `BudgetCharge::resize` into
+every local mutation/replacement, just as the plan does for incremental reload. Add a
+loaded-small, grow-through-passes, then budget-pressure case. This uses the existing
+mechanism; it does not require another cache design.
+
+The new lifetime test also needs its owners released correctly: dropping the first reader
+does not free its generation while the local `entry` Arc still owns it, and dropping the
+replacement's local Arc does not free it while the map still owns it. Drop the old entry
+handle before the last reader, and remove the replacement from the map before expecting
+zero usage. Otherwise the corrected implementation fails the prescribed test.
+
+### PL19 — P2 — Wording: Obtain raw encoder bytes before benchmarking compression
+
+**Plan:** 510, 541.
+
+The tokenizer call is now correct, but the accessor is still told to use
+`Writer::into_document()` while promising raw, uncompressed output.
+[codec.rs](../../../crates/store/src/search/codec.rs), lines 89–102, compresses eligible
+documents under the Term dictionary and always appends a storage marker. Task 1 would
+then recompress those stored bytes, invalidating its raw-size and dictionary comparisons.
+
+Return the actual writer buffer through a test-only accessor, or decode the storage
+wrapper before measuring. Check an above-watermark fixture so an already-compressed
+result cannot accidentally satisfy the accessor test.
+
+### PL1 — P2 — Wording: Expect hash failure before the old parse failure
+
+**Plan:** 1660–1662, versus the new verifier at 1602–1606.
+
+The existing chain test replaces node 1's bytes under its original hash and still expects
+`Loss(Parse)`. Mandatory descriptor-hash verification now returns `Loss(Hash)` first.
+Update that expectation; test header/descriptor mismatch separately using the replacement
+bytes' actual hash. The production integrity correction itself is closed.
+
+### PL16 — P2 — Wording: Remove the same invalid equality from the wait test
+
+**Plan:** 2216; the corrected benchmark is at 3117.
+
+`case_content_wait_budget` still expects persisted `indexed_to.change_id` to equal the
+cache's latest change ID after `ensure_current` succeeds. The final publication's own
+update lies above that checkpoint, and a short update-only tail advances `scanned_to`
+without another manifest write. This is the same distinction the revised benchmark now
+handles correctly.
+
+Use `is_current` and the existing progress assertions here too. A successful wait must
+not fail a test solely because its harmless update-only tail stayed in memory.
+
+### Review method and limits
+
+Three read-only scopes rechecked the assigned fixes and their consumers; the primary
+verified the findings and the benchmark, trace and compile-gate corrections against the
+current plan/source. Existing parent-model routes were inherited; the plan's execution
+tiers were not assessed. Task 14's abbreviated shortcut reminder is read together with
+Task 8's explicit complete predicate, not treated as a separate construction defect.
+
+No builds, tests, benchmarks, runtime probes or network checks ran. Only this review was
+edited. The plan and spec remain unchanged, and the first review below is preserved.
+
+## Historical review — plan revision 1, 2026-11-07
+
 Date: 2026-11-07. **Verdict: REQUEST CHANGES before execution.**
 
 Reviewed the [plan](2026-11-07-zero-access-16-search.md) against the approved
