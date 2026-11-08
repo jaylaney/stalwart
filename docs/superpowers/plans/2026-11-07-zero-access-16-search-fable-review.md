@@ -1058,3 +1058,305 @@ Codex findings were not re-verified beyond what these traces exercised; tasks th
 touch were not re-read beyond the lines the findings cite. FU1's reachability rests on the
 `NonPublishing` write rule at 2219 and the shortcut at 2187 as written; a `NonPublishing` pass
 that also wrote a log entry would change the trace, and the plan says it writes none (R13).
+
+## Scoped re-review of plan revision 8 (1e0b8b8c9)
+
+Date: 2026-11-08. Plan commit: `1e0b8b8c9` (branch `za-search-design`), revision 8. Spec:
+revision 20. Scope: the text `git diff aa594dc09 1e0b8b8c9` adds or changes in the plan (every
+hunk), the closure of FU1 to FU13 and of Codex's two rev-7 PL11 items, the names revision 8
+introduced or changed and every consumer of each, and the traces the brief named. Revision 4's
+approval, the Codex rounds and the four earlier Fable sections stand and were not reopened.
+
+**Verdict: REQUEST CHANGES.** Two P1s, both on the content and reconciliation rules revision 8
+wired into the pass, and neither one the earlier sections traced. First, FU1's shortcut term now
+evaluates `za_search_content_needs_rebuild` on every idle account, and that rule's `Behind` arm
+has no "chain loadable" guard: an account that has just crossed the cap (`suspended`, its
+`content_to.checkpoint` behind `indexed_to` because its last records were indexed without
+content) answers `Some(Behind)`, so the very next keyed request starts a content-only rebuild
+that, by plan call E10, drops the whole chain and re-indexes the account's content newest first
+until it meets the cap again, where FU6's step suspends it with the content cursor left pending
+for good; spec 4.2, 4.3 and decision 20 say the chain is not extended above the cap, and 5.4
+restricts `Behind` to "with the chain loadable" (FV1). `case_f6_r23` passes as written while
+this happens. Second, FU3's bound carrier is applied by an arm that `expect`s a marker after the
+`Finished` arm has cleared it: a lossless bound move and the marker's completion fall in one
+pass whenever a maintenance purge runs during a multi-pass reconciliation, the pass panics
+before writing, the manifest is unchanged, and every later keyed request of the account panics
+at the same point (FV2). Both fixes are one clause each. The other closures hold: the atomic
+admission is sound (nothing awaits or blocks under the admission lock, a refused growth drops
+the part with its old charge, thread parts are always admitted, the barrier test proves the
+exclusion); the gap deletes wait for the last gap insert and still run on a delete-only
+difference; `s_empty` is right; the `<` complement and the `Lost` convention are right; the
+bookkeeping items are closed. Two P2s (FU6's suspension step turns every pass of a suspended
+account with a pending content cursor into a manifest write, and the `content_to` carry rule
+sits inside the content-blob clause now that `Behind` gates the shortcut) and nine P3s.
+
+Counts: 2 P1, 2 P2, 9 P3 (13 findings).
+
+### Assessment of the revision 8 changes
+
+| Change | Assessment | Findings |
+|---|---|---|
+| FU1 (Tasks 8 and 14, the shortcut's `needs` term; plan lines 2242, 2998, 2970; `case_f6_r23`'s variant, 3008; case-map row 506) | Closed as stated. Traced the ordinary idle account: a publishing pass with content sets `content_to.checkpoint = indexed_to` (2249), the witness record above `indexed_to` is consumed in memory (`Nothing`, `scanned_to` moved), after a restart the first pass reads that one update-only record and answers `Nothing` again; `suspended` false, no cursor → `needs == None` and the shortcut answers `Current` from the second request on. Traced the deletion-ending variant: the suspended phase's `Publishing` passes leave `content_to.checkpoint` behind; the destroy's pre-method pass consumes the witness (`Nothing`), the next pass consumes the delete record (`NonPublishing`, `indexed_to = complete(d)`, no entry, the carry vacuous but the checkpoint "already behind"); after the restart `scanned_to == d == cache.last_change_id`, every other term holds, `needs == Some(CapRaised)` under the default cap → refused → manifest read → start → `Advanced`; the next pass finds the reloaded manifest's content cursor and runs it. But the same rule, evaluated under the *low* cap on the account that has just suspended, answers `Some(Behind)` and starts a chain-dropping rebuild (FV1); the carry rule's placement (FV4); the term's owner between Tasks 8 and 14 (FV5). | FV1, FV4, FV5 |
+| Codex rev-7 PL11, FU4, FU7 (Task 6's `admit`, `grow`, `admit_content_growth`, the private `make_room`, no `charge`/`resize`; 1646-1666, 1675, 1718-1734, 1796-1807, 1827-1830, 1836-1846; Task 8's swap, 2243, 2274; Task 15 step 9, 3041; case-map row 507) | The construction holds. `admission` is a `std::sync::Mutex` held across eviction, check and add; `admit`, `grow` and `admit_content_growth` are synchronous, so nothing awaits under it; `make_room` reads entries with `try_read` and must evict with a non-blocking `try_write` (the only lock take a synchronous `fn` can make), so a swap holding `index.write()` and another account's `admit` cannot wait on each other, and the own entry reads as in use (`keep`, and its lock held). A refused growth leaves the charge as it was, then `index.content = None` drops `LoadedContent` and its charge at the old size; the counter stays consistent, the manifest, `scanned_to`, `thread_segments` and `thread_bytes` are still set, the `segments` insert is skipped by its `if let`. Thread parts: `admit(Thread, ..)` always `Some`, `grow` on a thread charge always `true`, the clone charge of step 5 `expect`s it rightly. The two growth tests now drive Task 6's helper on a `LoadedIndex` the test holds; the barrier test's arithmetic is right (one of two admitted per round, `content_used()` never above the budget) and the lock makes it deterministic. Loose ends: the barrier test's fixture, the 3× shrink claim in the loader, `admit_content_growth` on `content: None`, the trace duty at the clone charge, and bookkeeping. | FV7, FV8, FV9, FV11 |
+| FU2, FU5, FU6 (Task 8's gap-delete gate and `suspend_content`, 2234; the two `plan_pass` tests, 2202-2220; `s_empty`, 2195-2197; the arm, 2248; Task 14 rule 3, 2989; case-map row 505) | FU2 closed: the deletes run only in the pass whose insert loop ran off its list; a delete-only difference (no gap inserts) has an empty insert loop, which ran off trivially, so its deletes run; a cap-stopped loop defers them and the recomputed difference keeps them; H3 holds across the cap (the test's two passes trace: `(2, 39)`, `GapNext(3)`, no tombstone; then 5 threads with 8, `Tombstone { 8, 39 }`, `GapNext(6)`), at the cost of one more pass before `Finished` (rule 5 sees the deletes non-empty in the applying pass). FU5 closed (`s_empty` on empty records). FU6 closed as stated, but the step is set on every pass while the cursor is pending and the account suspended, not only on the transition, which makes every such pass a `ManifestOnly` write (FV3). The new tests' fixtures name an undefined helper and need details the step-1 fixture contradicts (FV6). | FV3, FV6 |
+| FU3, FU13 (`Staging.marker_bound`, the arm, the `ManifestOnly` disjunction, `gap_stamp = bound_now − 1`, the gap blocks' gate; 2070, 2234, 2248, 2990, 2998) | Closed as stated: the carrier exists, the arm writes it, a `BoundMoved` pass with nothing else staged is `ManifestOnly`, the stamps come from `bound_now`, and step 4 names the three outcomes. Attribution is unaffected (`inserted_in_log`/`deleted_in_log` read the log as it is now; the records the move dropped were consumed, so their items are not in the difference), and stamps at `old − 1` and `new − 1` are both below every servable state (`/changes` refuses states below the current bound). The gap blocks' gate and the `expect` inside it are right. But the bound arm runs after the `Finished` arm and `expect`s the marker (FV2). | FV2 |
+| FU8 to FU12 (`case_d13`'s `Email/import`, 2935-2936; "seven" pause statics, 918; `clone_for_test` in Files and Produces, 522, 528; `encoded_len`'s purpose, 1226; D13 "Ruled", 151; "revision 20" at 189 and 3337; the cross-account test's fresh cache, 1802; E10, 171 and 2985; `<`, 2985; `Lost`, 2970) | Closed. `Email/import` is a keyed write with a post-commit pass (Task 9 step 4). The `<` complement is right: at `size == cap` neither `content_allowed` nor `CapRaised` holds. The `Lost` arm reloads and answers `Lost`, which Task 9 handles like `Current`; it does not trace `ZA_SEARCH_LOST` as `write_pass` does (FV10). E10 is named as a plan call and is observably equivalent to the spec's backfill in identities, refusal window and final coverage; its cost is the whole chain (FV13). | FV10, FV13 |
+| Codex rev-7 PL11 wording (the receiver; 2274) | Closed: `server.inner.cache.za_search.admit_content_growth(index, account_id)` after the `if let` borrow ends. | — |
+| Task 8 step 4 "14 passed" (2239), Task 1 step 7's header (612), Execution (189) | Right: fourteen tests in step 1's block; the outcome header names spec revision 20 and no SHA; the branch cut names revision 20. | FV11 (Task 6's count, untouched by the diff, is stale) |
+
+### New findings
+
+#### FV1 — P1 — `Behind` fires on every account that has just crossed the cap, and FU1's gate now reaches it on an idle account (Tasks 8 and 14)
+
+Confidence: high on the text, medium-high on the runtime trace. Plan lines 2985 (the rule:
+"`Some(Behind)` when `content_to.cursor.is_none()` and `content_to.checkpoint.change_id <
+indexed_to.change_id` and the manifest is not mid-rebuild (`cursor.is_none()`)"; the start:
+"drops the whole chain for every reason"), 2242 and 2998 (FU1: `needs.is_none()` in the
+shortcut, the start "after the manifest read and the reload-if-moved"), 2243 (`content_allowed =
+!suspended && size < cap`), 2249 ("it stays behind only when a record was indexed without
+content (over the cap)"; "When `Publishing` and `!limits.content_allowed`: `new.content_to.
+suspended = true`"), 2234 (FU6: over the cap the content block does not run and
+`suspend_content = true`), 2995 (`content_needs_rebuild_rules` has no over-the-cap case), 3008
+(`case_f6_r23`). Spec 4.2 (684-687: "Above the account cap the chain is not extended: content
+indexing is suspended"), 4.3 (888-897: over the cap the account "loads its thread part only ...
+content indexing is suspended (4.2), and everything else is served ... raising it takes a
+content-only rebuild"), 5.4 (1361-1363: a content-only rebuild is taken "when the account cap is
+raised over a suspended chain (4.3) or when a node finds `content_to` behind `indexed_to` **with
+the chain loadable**"), decision 20 (3543-3544), 9.2 (2627-2631: "stops extending the chain").
+
+Counterexample. The account reaches the cap: the pass that finds `size >= cap` has
+`content_allowed == false`, indexes its records without content, publishes, and writes
+`suspended = true` with `content_to.checkpoint` left behind `indexed_to` (2249). The manifest is
+now `suspended`, `content_to.cursor == None`, `checkpoint < indexed_to`, `cursor == None`, `size
+>= cap`. The next keyed request's pass: the shortcut computes `needs`: `CapRaised` needs `size <
+cap`, false; `Behind` holds on every term → `Some(Behind)` → the shortcut is refused (and would
+be refused on an idle account from now on, FU1), the manifest is read, nothing moved, and
+`za_search_content_rebuild_start(Behind)` runs: `content = None`, every content blob unlinked,
+`content_to = { 0, suspended: false, cursor: Some(u32::MAX) }`; the pass answers `Advanced`.
+The next pass: `content_allowed = !false && 0 < cap`, true; the content cursor re-opens and
+re-seals the account's content newest first, 48 documents per keyed request, until the new
+chain's `size >= cap`, where FU6 sets `suspended = true` and leaves the cursor pending; `needs`
+is then `None` (`CapRaised` needs `size < cap`; `Behind` needs no content cursor), `is_current`
+is false for good (cursor pending, `suspended`, `checkpoint == 0`), and every pass writes a
+manifest (FV3). Net: on every account that crosses the cap, the pre-suspension content is
+unlinked and purged, a full content pass re-reads and re-seals up to `account_max_mb` of
+content (at the default 128 MiB and the design size, hundreds of keyed requests), and which
+messages hold content flips from the oldest to the newest; the chain was extended above the cap
+against 4.2 and 9.2, and `Behind` fired without the chain being loadable, against 5.4.
+`case_f6_r23` does not show it: "`content.length` stops growing across two more deliveries" is
+compared after the text search's wait, by when the re-indexing cursor has usually met the cap
+and suspended again, so the two values are equal; "one keyed request starts the content-only
+rebuild (`content_to.cursor.is_some()`)" is true vacuously, the cursor being pending already;
+and the raised cap then takes `CapRaised` and the case finishes as written.
+
+Correction. `Some(Behind)` only when `!manifest.content_to.suspended` as well (and, since the
+rule runs on this node, `manifest.content.size < cap`: the spec's "chain loadable"); with that
+guard `Behind` is the safety net it was meant to be (after a cap crossing the manifest is
+`suspended`, and after a content cursor's `Exhausted` arm the checkpoint equals `indexed_to`, so
+no ordinary path reaches it). Add to `content_needs_rebuild_rules`: suspended, size at or over
+the cap, checkpoint behind `indexed_to`, no cursors → `None`. Make `case_f6_r23` assert, during
+the suspended phase and before the cap is cleared, that `read_manifest(..).content_to.cursor.
+is_none()`, that `content.length` and `principal_blob_links` are unchanged by the `Thread/get`
+and the text search, and that no `ZA_SEARCH_REBUILD` trace was emitted, so a spurious start
+shows. Say in FU1's sentence (2998) that the `needs` term is what makes this guard
+load-bearing: without it the gate itself would start the rebuild on every idle over-cap account.
+
+#### FV2 — P1 — The bound arm `expect`s a marker the `Finished` arm has just cleared (Tasks 8 and 14)
+
+Confidence: medium-high (reachability argued from rules 4 and 5 as written; the panic from the
+literal arm order and `expect`). Plan lines 2248 (the arms, in this order: "`match
+staging.marker { .. MarkerStep::Finished => new.reconciliation = None }`; `if let Some(b) =
+staging.marker_bound { new.reconciliation.as_mut().expect("a marker is set").bound = b }`"),
+2990 (rule 4: a `BoundMoved` pass "sets `Staging.marker_bound = Some(bound_now)` ... and consumes
+on"; the step-1 read of every retained record "meets the log's truncation marker by design, so
+`truncated` is then expected", so `second_truncation` is judged on every reconciliation pass),
+2991 (rule 5: `Finished` when the difference is empty and `staging.checkpoint.change_id >=
+cache.last_change_id`), 2998 (step 4's wiring).
+
+Counterexample. A reconciliation with marker `{ bound: 40, gap_next: g }` whose gap items are
+done and whose retained records are consumed to `indexed_to = (44, 0, true)`, the cap having
+stopped the previous pass with inserts in records 45..60 unconsumed; the cache counter is 60.
+The maintenance purge runs and the Email log now retains from 43 (records 40..42 dropped, all
+consumed). The next keyed request's pass: step 1's read reports `truncated`, `bound_now = 43 >
+40`, `second_truncation(40, 43, &(44, 0, true)) == BoundMoved` (no unconsumed record lost) →
+`marker_bound = Some(43)`, `gap_stamp = 42`; the difference is empty; step 4 consumes 45..60
+within the cap → `checkpoint = (60, 0, true) >= 60` → rule 5: `marker = Finished`. In
+`write_pass`, the marker arm sets `new.reconciliation = None`, then the bound arm's
+`expect("a marker is set")` panics. Nothing was written (the panic precedes the batch), so the
+manifest still says `{ bound: 40 }`, the log still retains from 43, and the next keyed request
+of that account takes the same path to the same panic: the account's pre-method pass panics on
+every keyed JMAP request and IMAP command until the state changes by other means, and the
+reconciliation never finishes. A purge during a multi-pass reconciliation is an ordinary event
+(the reconciliation itself started from one).
+
+Correction. Apply the bound only to a marker that survives the pass: `if let (Some(b),
+Some(m)) = (staging.marker_bound, new.reconciliation.as_mut()) { m.bound = b }`, or order the
+bound arm before the marker arm; say in rule 4 that a `BoundMoved` pass that also finishes
+writes no bound. Add to `gap_deletes_wait_for_the_last_gap_insert` or a sibling a `plan_pass`
+case with `marker_bound = Some(..)` and `marker == Finished`, and a `write.rs` unit assertion
+that the new manifest has `reconciliation == None` without panicking.
+
+#### FV3 — P2 — FU6's step makes every pass of a suspended account with a pending content cursor a manifest write (Task 8)
+
+Confidence: high. Plan lines 2234 ("if `!limits.content_allowed` the block does not run and
+`suspend_content = true`"; the decision: "`ManifestOnly` if `.. || suspend_content || ..`"),
+2243 (`content_allowed = !base.manifest.content_to.suspended && size < cap`), 2248 (the arm:
+"`new.content_to.suspended = true`; trace once per transition"), 2274 (a `ManifestOnly` write
+asserts and sets the manifest), 2355 (`za_search_ensure_current` loops passes every 20 ms until
+`is_current` or the deadline), 2296 (`case_repeated_delta_changes_nothing`). Spec 5.1
+(1165-1171: "A pass that consumed only update records, staging nothing and reaching no cursor
+item, writes nothing at all"), 5.8's F4 row (1673).
+
+Once FU6 has set `suspended` with the content cursor still pending (a content-only rebuild whose
+chain meets the cap: FV1's path, or a cap raised to a value the re-indexed chain still exceeds),
+every later pass has `content_allowed == false` (because `suspended`), sets `suspend_content =
+true` again, and decides `ManifestOnly`: a `commit_batch` asserting and re-setting identical
+manifest bytes on every keyed request of the account, for as long as the state lasts (until the
+cap is raised). A text search on such an account runs `za_search_ensure_current`, whose every
+iteration is one such write, for the whole `ZA_SEARCH_WAIT_SECS` (30 s at the default) before
+refusing `NotCurrent`. Correction: set `suspend_content` only on the transition,
+`suspend_content = !base.manifest.content_to.suspended`, so the block's skip on an
+already-suspended manifest stages nothing and the decision falls through to `Nothing`;
+`content_sources_stage_content_only`'s `s_over` still holds (its base is unsuspended), and a
+sibling `s_over_again` with `base.manifest.content_to.suspended = true`, `content_allowed:
+false` and empty records should assert `!suspend_content` and `PassDecision::Nothing`.
+
+#### FV4 — P2 — The `content_to` carry rule sits inside the content-blob clause now that `Behind` gates the shortcut (Tasks 8 and 14)
+
+Confidence: high that the placement is ambiguous; medium that an executor misreads it. Plan line
+2249: "Content, when the decision is `Publishing` or `ContentOnly` and `!staging.content.
+is_empty()`: `header = ..`; ..; `new.content = Some(..)`; `new.content_to.checkpoint =
+new.indexed_to` whenever `base.content_to.checkpoint == base.indexed_to` and every record this
+pass indexed has a content record (.., vacuously true for a pass that indexed none, so
+deletion-only and manifest-only passes carry `content_to` along with `indexed_to`)". The carry is
+the last item of a semicolon list under a condition that excludes deletion-only and
+manifest-only passes; only its parenthetical says it applies to them. Revisions 5 to 7 had the
+same text, but then `Behind` was evaluated only after a refused shortcut; revision 8 makes
+`needs` the shortcut's gate, so an executor who applies the carry only inside the clause leaves
+`content_to.checkpoint` behind after every `NonPublishing` or update-only `ManifestOnly` pass,
+`Behind` answers `Some` on the next request, and a chain-dropping content-only rebuild (E10)
+runs after every deletion. Correction: move the carry into the **New manifest** paragraph beside
+the three arms, as a rule of every decision but `Abort`, and keep the content clause to the
+blob and the head.
+
+#### FV5 — P3 — Who writes the shortcut's `needs` term (Tasks 8 and 14)
+
+Plan lines 2242 ("`za_search_content_needs_rebuild` is Task 14's and answers `None` until then")
+and 2998 (Task 14 step 4 adds the term). Task 8 cannot call a function Task 14 creates, and
+`ContentRebuildReason` is Task 14's enum. Say either that Task 8 writes the shortcut without the
+term and Task 14 step 4 adds it (as 2998 already reads), or that Task 8 places a `None`-returning
+`za_search_content_needs_rebuild` and the enum in `pass.rs` for Task 14 to move; and add it to
+Task 8's Consumes or Produces accordingly.
+
+#### FV6 — P3 — The two new `plan_pass` tests use fixtures the plan does not define (Task 8)
+
+Plan lines 2218 (`s2.staged_thread_of(5)`), 2202-2210, 2090 (the step-1 fixture: "a fake
+`Indexed` has .. `content: None`"). `Staging` (2070) carries no thread part, so
+`staged_thread_of` cannot be a method on it as written; define it as a test helper over the
+staging and the base, for example `fn staged_thread_of(s: &Staging, base: &LoadedIndex, d: u32)
+-> u32` (the record's `thread_id` when `s.records` holds `d`, else `base.thread.current_thread
+(d)`, resolved through `s.aliases`), or add a `#[cfg(test)]` overlay field. The content test
+needs a fake `Indexed` whose `content` is `Some(ContentRecord)` (built with Task 4's
+`ContentRecord::new`), and `s_over` needs empty `records` for its `ManifestOnly` (the pass worked
+no item and reads the records, FU5's reasoning); say both.
+
+#### FV7 — P3 — The barrier test's fixture (Task 6)
+
+Plan line 1802 (`pl11_concurrent_growth_is_admitted_atomically`: "both held by readers; two
+threads behind a `std::sync::Barrier` each grow their account's part by 150 KiB and call
+`admit_content_growth`"). `admit_content_growth` takes `&mut LoadedIndex`, which no thread can
+hold while a reader holds the entry's lock. Say that each thread holds its own entry's write
+guard (`blocking_write` from a std thread outside the runtime, so the test is a `#[test]` or
+spawns std threads), which is also what marks the entry in use, or that the two `LoadedIndex`es
+live outside the map with charges from `admit` while the map's entries are what the readers
+hold; either way the arithmetic stands.
+
+#### FV8 — P3 — The loader's shrink claim, and the `Whole` reload's own charge (Task 6)
+
+Plan lines 1731-1734 (`za_search_load_content`: "`grow(&mut charge, Content, part.loaded_bytes(),
+account)` sets the charge to the loaded size (down from the 3× ask, which always succeeds)") and
+1842-1846 (the `Whole` reload admits `3 × size` for the new content). The claim holds only while
+`loaded_bytes() <= 3 × sealed size`; Task 4's estimate (record bytes plus 16 bytes per posting
+key plus the bitmaps, 1250) makes that likely but not certain, and an `expect` on it would panic
+in production where the ratio is exceeded. Say what a `false` does (drop the part, answer
+`Err(Transient(Budget))`, as a refused admission does), or ask for `max(3 × size, ..)`. In the
+`Whole` reload the old content part is still charged when the new one is admitted and the own
+entry is `keep`, so a chain near the budget refuses its own replacement; drop the old `content`
+before the `admit`.
+
+#### FV9 — P3 — Two edges of the admission interface (Tasks 6 and 8)
+
+Plan lines 1658-1664 and 2274: `admit_content_growth` is called by the swap whether or not
+`index.content` is loaded; say it answers `true` on `None`. Plan lines 1646-1655 and 2243: the
+caller of `admit(Thread, ..)` traces `ZA_SEARCH_OVER_BUDGET` "when `thread_used() > budget`
+afterwards", and the pass's clone charge is such a call; say whether the pass traces it or the
+loader alone does.
+
+#### FV10 — P3 — What an `Abort`, a `Restart` and the `Lost` start carry (Tasks 8 and 14)
+
+Plan line 2234: the `Abort` branch lists what it resets (`cursor`, `content_cursor`, `marker`,
+`bookkeeping`) and not `marker_bound` or `suspend_content`; since the `Abort` write applies every
+arm, say they survive (harmless and right: both are facts of the pass) or are reset. Plan line
+2990: the `Restart` outcome "returns" without naming the value; step 4 (2998) implies
+`Recovery(Truncated)`, which Task 9 re-enters once; say so. Plan line 2970: the `Lost` arm of the
+content-only start reloads and answers `Lost` without the `ZA_SEARCH_LOST` trace `write_pass`
+emits on the same outcome (2272); trace it.
+
+#### FV11 — P3 — Bookkeeping after revision 8 (Tasks 6 and 8, the plan calls)
+
+Plan line 1858: "14 load tests" against nineteen in step 1 (revisions 6 to 8 added
+`pl11_an_evicted_generation..`, `pl11_growth_through..`, `pl11_growth_across..` and
+`pl11_concurrent_growth..`; the count predates them). Plan line 2059: Task 8's Consumes names
+`scanned_seed` and `BudgetCharge::detached` from Task 6 but not `ZaSearchCache::{admit, grow,
+admit_content_growth}` and `PartKind`, which steps 5 and 6 call. Plan lines 1666 and 1802:
+`set_content_bytes_for_test` "takes a `charge`" with `charge()` gone; say it builds the
+`BudgetCharge` in `cache.rs` (or admits through `admit`). Plan line 171: E10 is listed between
+E8 and E9.
+
+#### FV12 — P3 — The `OverCap` refusal is unreachable while suspended (Task 9; outside the diff)
+
+Plan lines 2338 (`is_current` requires `!content_to.suspended`) and 2355 (the `OverCap` check sits
+inside `if current`). An over-cap account's text search therefore waits the full
+`ZA_SEARCH_WAIT_SECS` (30 s) and refuses `NotCurrent`, never `OverCap` at once, which spec 7.4
+lists beside the load failures. Revision 8 did not touch Task 9; noted because trace (d) asked
+whether `is_current` stays false until the cap is raised (it does, by this term). Check
+`content_to.suspended || size > cap` before the current check, or accept and say so.
+
+#### FV13 — P3 — E10's cost against spec 5.4 and 9.2 (Task 14)
+
+Plan lines 171 and 2985. Spec 5.4 (1361-1372) says the raised-cap rebuild walks the messages
+"without a content record .. skipping on *content* presence rather than on the record's", and
+9.2 (2627-2631) says it "backfills the messages indexed while suspended". E10 drops the chain
+and re-indexes every present document; the observable outcome is the same (identities and epoch
+unchanged, content requests refused until `content_to` catches up, every message covered after),
+and the choice is named, so it stands under the rule. Its cost is proportional to the whole
+chain rather than to the suspended period: up to `account_max_mb` of content re-opened,
+re-indexed and re-sealed on keyed requests, 48 documents each, and the old blobs purged. Spec
+5.4's and 9.2's sentences should be amended at the next spec revision, or Jay should confirm the
+call explicitly.
+
+### Method and limits
+
+A reading review of `git diff aa594dc09 1e0b8b8c9` on the plan (155 lines, every hunk), of the
+Fable section it answers (FU1 to FU13) and of Codex's rev-7 section, and of the tasks the hunks
+touch where the new rule depends on their text (Tasks 6, 8, 9, 14 and 15 in full for the changed
+passages, the header's plan calls, the case map). The traces the brief asked for were walked by
+hand against the plan's rules: FU1's term on an idle ordinary account across a restart and on
+`case_f6_r23`'s deletion-ending variant, then on the account that has just crossed the cap (FV1);
+Task 6's admission under its lock in the loads, the `Append` and `Whole` reloads, the pass's
+swap and the compaction swaps, with the refused branch, the thread-part rule and the barrier
+test's arithmetic; FU2's gate on a cap-stopped loop, a delete-only difference and across two
+passes; FU6's step against the `Publishing` suspension rule, then in the steady state it leaves
+(FV3) and against `za_search_content_needs_rebuild` and `is_current`; FU3's carrier and stamps
+against the attribution and the earlier stamps, then against rule 5 in one pass (FV2); FU12's
+complement, the `Lost` arm and E10 against 5.4 and 9.2. Spec passages read: 4.2 (680-805), 4.3
+(805-904), 5.1 (1160-1195), 5.4 (1295-1447), 7.4 (2220-2256), 9.2 (2610-2640), decision 20.
+
+Not done: no build, test or runtime probe; no subagents; the plan, the spec and every other file
+are unchanged (this section is the only edit). The source tree was not consulted in this round:
+no revision-8 claim rested on upstream code beyond what the earlier sections verified (the
+earlier rounds' source checks stand). FV1's runtime trace rests on the `Publishing && !content_
+allowed` suspension rule at 2249 and the `Behind` rule at 2985 as written; FV2's on rule 4 being
+judged from the step-1 read on every reconciliation pass, as 2990 says, and on the arm order at
+2248. The closures of FS1 to FS10, FR1 to FR14, FT1 to FT9 and the Codex findings were not
+re-verified beyond what these traces exercised.
