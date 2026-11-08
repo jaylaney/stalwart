@@ -6,6 +6,7 @@
 
 //! Zero-access search format version 1 (search spec 4.2).
 
+pub mod content;
 pub mod thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
