@@ -10,6 +10,7 @@ pub mod harvest;
 pub mod imip;
 pub mod ingest;
 pub mod seal;
+pub mod search;
 pub mod sharing;
 pub mod view;
 
