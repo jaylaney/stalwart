@@ -1,6 +1,104 @@
 # Zero-access plan 16: Codex review
 
-## Current review — plan revision 7, 2026-11-08
+## Current review — plan revision 11, 2026-11-08
+
+**Verdict: APPROVE under the stopping rule. No P1 construction defect remains in scope.**
+
+Reviewed the [plan](2026-11-07-zero-access-16-search.md) at `c6a032796`, as requested after
+revision 11 landed during the review. This pass checks the two PL11 residuals from revision
+7, the intervening revisions 8–10, and revision 11's changes and direct interactions.
+Earlier accepted design decisions and the plan's model tiers remain outside the scope.
+
+- Reviewed commit: `c6a032796d4c4a9163209b5a348306fc8637b563`, branch `za-search-design`.
+- Worktree: `/Users/jay/Development/stalwart/.worktrees/za-search-design`.
+- Plan SHA-256: `19ad644a003a0c3f1c7726b6ce23953660baca805282e853eca5277d19d85043`.
+- Spec revision 20 SHA-256:
+  `6f2d9a2e3b9f5b28687c1e9ccbe94b41dd9fc3b7fbcd8b009e7aa6aae4dad0d4`.
+
+### Disposition and construction checks
+
+**PL11 is closed.** Admission and charge adjustment share the admission mutex through
+`admit` and `grow`; loads, incremental reloads, pass swaps and compaction swaps use the
+same protocol. Refused content growth drops the part and its charge while keeping committed
+progress. The pass calls the search cache on the correct receiver, outside the content
+borrow. The ownership and concurrent-growth fixtures cover the prior counterexamples.
+
+**Revision 11's backfill separation is sound in this scope.** The pass no longer loads
+content (2284–2285). An unavailable content source leaves its cursor pending and permits
+thread/log and gap work to continue (2276), so a cold node above the content cap no longer
+aborts every indexing pass. Content requests perform their own preload and handle cap and
+budget refusal (2397). `content_runnable` and the optional source distinguish an unprepared
+list from an empty one (2096, 3012). Reloading a manifest with no content head drops stale
+resident content and its charge (1747–1752).
+
+The reconciliation changes preserve insert-before-delete ordering across capped passes,
+write a moved bound only to a surviving marker, and supply the bound and completion state
+to the planner before it chooses whether to write. Abort preserves those facts while
+discarding staged records and cursor progress. No additional construction issue was found
+in these changes. Three P2 wording/test corrections remain below; none requires a new
+mechanism or changes the verdict under **approve unless a P1 construction defect remains**.
+
+### PL20 — P2 — Wording: Include the content cursor in the explicit currency predicate
+
+**Plan:** 2380, 2396–2397; the existing pending-cursor rule is at 3027.
+
+Task 14 already requires content requests to refuse while `content_to.cursor` is pending,
+but Task 9's explicit six-condition `is_current` predicate omits that check. Checkpoint
+equality alone is insufficient: a full rebuild does not advance `indexed_to` as it admits
+its cursor items, so content skipped while suspended can coexist with equal checkpoints.
+
+For example, both checkpoints are 100 during a rebuild: A has content, B was indexed while
+suspended, and C remains on the rebuild cursor. `CapRaised` preserves checkpoint 100 and
+starts the content cursor. If C is expunged at 103, a pass can exhaust the empty rebuild
+cursor, leave the unprepared content source pending, consume the records through 103,
+and carry both checkpoints to 103 (2290). All six listed conditions then pass despite
+B's missing content.
+
+**Correction:** add `content_to.cursor.is_none()` to `is_current` and update its references
+to six conditions. Add a regression for equal checkpoints with a pending content cursor,
+including the finishing-rebuild interaction. This makes the explicit predicate implement
+the refusal rule the plan already states; the cursor and its completion mechanism exist.
+
+### PL21 — P2 — Wording: Keep the compaction override through the backfill assertion
+
+**Plan:** 3050; override lifetime at 2378; default segments at 247; compaction at 3085.
+
+`case_f6_r23_over_the_cap_then_raised` sets `account_max_mb: 1, segments: 255` to suppress
+compaction, then clears that combined override before checking that `content.length`
+grew only by the backfill's blobs. Clearing it also restores the default segment threshold
+of 16. A valid pre-suspension chain of 16 tier-0 nodes can therefore compact when the first
+backfill blob is added, reducing its length despite correct backfill behavior.
+
+**Correction:** keep `segments: 255` for the whole case while restoring only the account
+cap, including the second raised-cap variant. For example, use an outer segment override
+and an inner cap override. The chain-length assertion then measures the intended behavior.
+
+### PL22 — P2 — Wording: Assert that the completion regression chooses a manifest write
+
+**Plan:** 2253–2254; corrected planner decision ordering at 2276.
+
+The new FW5 fixture says the decision must see `marker_bound` and `Finished`, but asserts
+only those two fields. The original defect still passes that assertion: compute `Nothing`
+first, then install the bound and completion on the returned staging value. The caller
+would then omit the manifest write even though the test passed.
+
+**Correction:** also assert `matches!(s3.decision, PassDecision::ManifestOnly)`, using no
+indexed records and fewer update-only records than the checkpoint threshold. That fixture
+requires the bound/completion itself to select the write and catches the stated regression.
+
+### Review method and limits
+
+Three read-only scopes checked memory admission and reloads, backfill/currency behavior,
+and reconciliation/test instructions. The primary inspected the changed text, traced the
+counterexamples, and adjudicated the findings. Existing parent-model routes were inherited
+because the originating capability ceiling remained unresolved; Claude tiers were ignored.
+
+No builds, tests, benchmarks, runtime probes or network checks ran. This approves the scoped
+plan under the stated stopping rule, not an implementation or runtime result. Only this
+review was edited. The plan, spec and Fable report were preserved. Earlier reviews follow
+unchanged except for renaming the previous current heading to historical.
+
+## Historical review — plan revision 7, 2026-11-08
 
 **Verdict: APPROVE under the stopping rule. No P1 construction defect remains in scope.**
 
