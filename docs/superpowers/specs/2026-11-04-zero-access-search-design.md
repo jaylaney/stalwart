@@ -1,6 +1,19 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 19 (2026-11-07), approved.
+Date: 2026-11-04. Status: revision 20 (2026-11-08), approved.
+Revision 20 is wording only, one correction plan 16 asked for (its call
+D13) and Jay ruled on 2026-11-08: a Thread method's state (`Thread/get`'s
+`state`, `E` for `Thread/changes`) is the validated view's cache
+counter, the Email group's counter the message cache was built at, which
+the view's check proves at or past the newest publication and the epoch,
+and which the Thread collection shares; it is not read from the store
+after the manifest (6.2's I5, 6.3). A store read after the cache paired a
+later state with an earlier cache: a message delivered between the two
+reads was absent at `E` by the cache and never rendered (plan review FR3),
+and a merge committed between them left the client with the old grouping
+under a state above the merge, so its next `Thread/changes` missed it
+(plan review PL3). I5's purpose stands; the view's counter check is that
+read.
 Revision 19 is wording only, two corrections plan 16 asked for and Jay
 ruled on 2026-11-07 (its calls B1 and E1). The record and alias maxima
 are the encoded sizes, `R = 304` and `a = 15` bytes, not the earlier
@@ -59,8 +72,8 @@ compaction-class residual is restated as sharply as the review put it
 and a public-count pad is offered under decision 2 for Jay (2, 13, I2);
 existence at the start of a range takes the log outside the range
 before the record, as the end already did (6.3, I3); the post-commit
-swap has a version precondition (5.1, I4); a Thread method reads its
-state after the manifest (6.2, I5); a store fault's remedy is named
+swap has a version precondition (5.1, I4); a Thread method's state is
+the validated view's cache counter (6.2, I5, as revision 20 reads it); a store fault's remedy is named
 (5.1, I6); and the clarity items (I7) where they fall.
 Revision 15 answered the ninth Codex round (R27 and R28 remaining, R29
 and R30 new) and the third Fable review (H1 to H23, saved in the Fable
@@ -1750,11 +1763,12 @@ thread map as loaded (5.2) and validated (below):
   (`crates/imap/src/op/fetch/mod.rs:585-592`).
 - **The validated snapshot** (R2, R18, F2). A response that carries both
   a state and mapped ids, or that depends on which revision the map is
-  at, takes its state and its map together: it reads the state from the
-  message cache, or, for a Thread method, from the store's change
-  counter (`Thread/get` reads `get_state(SyncCollection::Thread)`,
-  `crates/jmap/src/thread/get.rs:80-85`: the Email group's counter,
-  which Thread shares, `crates/types/src/collection.rs:230`; I5); then
+  at, takes its state and its map together: it reads the message cache,
+  whose `last_change_id` is the Email group's counter it was built at
+  (a Thread method's state too, since Thread shares that group,
+  `crates/types/src/collection.rs:230`; upstream's `Thread/get` reads the
+  store's counter instead, `crates/jmap/src/thread/get.rs:80-85`, a read
+  the fork replaces for a key account, I5 as revision 20 reads it); then
   reads the manifest (one key, the same read as 5.1
   step 0); if the manifest's hash differs from the loaded index's, it
   reloads (incrementally, 4.3); then it requires the cache's
@@ -1770,12 +1784,15 @@ thread map as loaded (5.2) and validated (below):
   manifest read, it fails as "no map, no ids" below. The state the
   method then returns, Email, Thread or Mailbox, reflects the
   publication because each publishing batch and each boundary batch
-  touches that method's log (6.3), and a Thread method reads the state
-  it returns from the store after the manifest, holding it to the same
-  bound and re-reading it when it falls short (I5: read before the
-  manifest, it could sit below a publication the map already holds, and
-  the client's next `Thread/changes` would render the transitions once
-  more as updates). Only then does it map, and the epoch
+  touches that method's log (6.3), and a Thread method returns the
+  validated cache's counter as its state, never a store read after the
+  cache (I5, revision 20: the counter check above holds it at or past
+  every publication the map holds, which is what a read before the
+  manifest could not promise; a store read after the cache would pair a
+  later state with the cache's earlier existence set, so a message
+  delivered between the reads would be absent at `E` and never rendered,
+  and a merge committed between them would leave the client the old
+  grouping under a state above it). Only then does it map, and the epoch
   checks of 6.3 use this loaded, validated epoch. Since a publication's
   log entry and its revision row commit in
   one batch, and a rebuild's boundary entry and its epoch do too, a
@@ -2086,9 +2103,11 @@ entries, so the fork renders a key account's `Email/changes` and
   records are the stub ingest's singleton container inserts,
   `log_threads_emptied`'s deletes and the witness's property change,
   none of which names a mapped thread. `E` for `Thread/changes`, and
-  `Thread/get`'s `state`, is the Thread log's change id, which the
-  pass's property change advances and which lags the Email state by
-  flag-only records;
+  `Thread/get`'s `state`, is the validated view's cache counter, the
+  Email group's counter the cache was built at, which the pass's
+  property change advances too (revision 20, 6.2); a flag-only record
+  lies inside `(S, E]` for the Thread stream, and renders nothing there,
+  since it changes no thread's member set;
 - `Email/queryChanges` consumes the same page through its `changes` call
   (`changes/query.rs:65-74`) and diffs it against the mapped query as
   upstream does (`:348-378`); its `collapseThreads` handling
