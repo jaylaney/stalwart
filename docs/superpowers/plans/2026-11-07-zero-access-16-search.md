@@ -82,6 +82,11 @@
 - FX5 to FX14: the cluster note on a shared cap (E10, for Jay); `<` at the loop-top load; that block is Task 14's; guard types and evictions; the FW1/FW2 wiring pinned in `case_f6_r23`; placements; "never loads for the backfill" (Task 15's merges read their inputs); Task 14's refusal sentence; case-map rows.
 Not re-reviewed: both reviews approved revision 11, and these are their P2 and P3 follow-ups.
 
+**Plan revision 13** (2026-11-08) changes execution routing at Jay's request: Sol implements
+every task and Astra independently reviews it, including a final review of the integrated
+branch. The Execution section and task-specific assignments below supersede historical
+Opus/Sonnet assignments in the revision notes. No search mechanism changes in this revision.
+
 **Plan revision 6** (2026-11-07) answers Codex's re-review of revision 2 (`36e125b8d`, the "Current review" section of the Codex review file), which reached the plan after revisions 3 to 5 had landed. Its one P1, the Thread state read from the store after the view's cache, is the defect Fable's FR3 found and revision 3 closed (`ZaSnapshot::state()`, plan call D13); revision 6 adds the regression case Codex asked for, `mail::threads::case_d13_thread_state_pairs_with_its_map` (Task 13), and applies its four P2s: the pass's swap and both compactions' swaps resize the `BudgetCharge`s as the parts grow, and the PL11 test releases every owner of a generation before expecting the counter to move (Task 6, 8, 15); Task 1's accessor returns the codec writer's raw buffer through a test-only `into_raw_bytes`, never `into_document`, which compresses above the watermark and appends a marker; the chain test expects `Loss(Hash)` where the hash check fires first and tests the header mismatch under the blob's real hash (Task 6); `case_content_wait_budget` drops the `indexed_to == last_change_id` equality (Task 9). Not re-reviewed.
 
 **Plan revision 7** (2026-11-08) carries Jay's ruling on D13 (spec revision 20) and Codex's re-review of revision 6 (`ad442af44`, the "Current review" section of the Codex review file: **APPROVE** under the stopping rule, three P2s): the pass's swap admits resident content growth against the process budget with `make_room` and drops the part when room cannot be made, the growth measured by `ContentPart::loaded_bytes` as loads measure it (Task 8, Task 6; a cross-account test); the D13 regression parks at a new `SEARCH_VIEW_PAUSE`, after the view is acquired and while its guard is held, since a pause inside the acquisition loop would be answered by the loop's own reload (Tasks 10, 13); Task 1's Files and commit name `codec.rs`. Not re-reviewed.
@@ -209,7 +214,34 @@ Each is the plan's choice; none changes a decision of the spec. B1 and E1, marke
 
 ## Execution
 
-Subagent-driven development on a new branch `release7-search` cut from `za-search-design` (the spec at revision 20 and this plan committed there). Implementers: `opus` for Tasks 3, 4, 5, 6, 8, 10, 11, 13, 14, 15 (the kernels: the model, the format, the cache, the pass, the validated view, ids, changes, rebuild, compaction); `sonnet` for Tasks 1, 2, 7, 9, 12, 16, 17, 18, 19. Reviewers: `opus` for every task; every finding reported with confidence and severity and filtered at adjudication (no severity filter in a reviewer brief). No Fable review during execution; Jay authorizes one at the PR stage. Briefs for Opus and Sonnet implementers carry a scope-discipline line ("deliver at the scope of the task; don't widen it") and never ask them to verify or double-check their work. Task 1's table goes to Jay before Task 3 starts (a checkpoint; Task 2 may run meanwhile). Ledger: `.superpowers/sdd/2026-11-07-zero-access-16-search/progress.md`. Commits: the plan gives each subject; the executing session adds a blank line and its trailer lines.
+Subagent-driven development on a new branch `release7-search` cut from `za-search-design`
+(the spec at revision 20 and this plan committed there). Start execution with an Astra
+primary (`gpt-6-astra`, `high` reasoning), which orchestrates, adjudicates, integrates and
+performs final verification. The primary dispatches both implementers and reviewers as
+siblings; Sol implementers do not dispatch Astra reviewers. This keeps both routes within
+the originating agent's capability ceiling.
+
+| Role | Model | Reasoning | Scope |
+|---|---|---|---|
+| Implementer | Sol (`gpt-6.1-sol`) | `high` | Tasks 3, 4, 5, 6, 8, 10, 11, 13, 14, 15 |
+| Implementer | Sol (`gpt-6.1-sol`) | `medium` | Tasks 1, 2, 7, 9, 12, 16, 17, 18, 19 |
+| Independent reviewer | Astra (`gpt-6-astra`) | `xhigh` | Every task and the whole branch |
+
+Set the model and reasoning effort explicitly in each dispatch. Implementers receive
+bounded task briefs; reviewers are independent and receive the requirements and actual
+diff, not an instruction to endorse the implementer's conclusions. Every finding is
+reported with confidence and severity and filtered at adjudication (no severity filter in
+a reviewer brief). The primary retains the repository's required tests and final checks.
+After Task 19 and its required checks, dispatch a fresh Astra reviewer with clean context,
+the base/head refs, repository guidance and accepted spec/plan to review the whole branch.
+Resolve its findings before declaring the implementation complete.
+
+No Fable review during execution; Jay authorizes one at the PR stage. Briefs for Sol
+implementers carry a scope-discipline line ("deliver at the scope of the task; don't widen
+it") and never ask them to verify or double-check their work. Task 1's table goes to Jay
+before Task 3 starts (a checkpoint; Task 2 may run meanwhile). Ledger:
+`.superpowers/sdd/2026-11-07-zero-access-16-search/progress.md`. Commits: the plan gives each
+subject; the executing session adds a blank line and its trailer lines.
 
 ## Global Constraints
 
@@ -2440,7 +2472,9 @@ git commit -m "Search: the pass runs before every keyed mail request and after k
 
 ### Task 10: Search serving: `Email/query`, IMAP SEARCH and SORT, snippets, the unavailable refusal
 
-Implementer: `opus` (plan revision 2: this task now owns the validated acquisition `za_view`, a concurrency kernel that Task 11's snapshot reuses, PL3; the rest is integration into upstream's query engine).
+Implementer: Sol (`gpt-6.1-sol`, `high`); reviewer: Astra (`gpt-6-astra`, `xhigh`).
+This task owns the validated acquisition `za_view`, a concurrency kernel that Task 11's
+snapshot reuses (PL3); the rest is integration into upstream's query engine.
 
 **Files:**
 - Create: `crates/email/src/message/za/search/view.rs` (`ZaView`, `ViewNeed`, `ViewError`, `za_view`, `counter_at_or_past`: the one validated acquisition of a key account's cache, loaded index and content, PL3; declared in `crates/email/src/message/za/search/mod.rs`)
@@ -2605,7 +2639,9 @@ git commit -m "Release 7: search and sorts served from the sealed index, with th
 
 ### Task 11: Ids and the validated snapshot
 
-Implementer: `opus` (a kernel: the consistency rule between a response's state and the thread map, and the gate that keeps singleton ids off every keyed response).
+Implementer: Sol (`gpt-6.1-sol`, `high`); reviewer: Astra (`gpt-6-astra`, `xhigh`).
+A kernel: the consistency rule between a response's state and the thread map, and the gate
+that keeps singleton ids off every keyed response.
 
 **Files:**
 - Create: `crates/email/src/message/za/search/snapshot.rs` (`ZaSnapshot`, the procedure, the id helpers)
@@ -2760,7 +2796,9 @@ git commit -m "Release 7: mapped Email ids under a validated snapshot, the metho
 
 ### Task 12: Thread-valued reads
 
-Implementer: `sonnet` (each site is one substitution of the cache's thread id by the map's, with the control comparisons as the test).
+Implementer: Sol (`gpt-6.1-sol`, `medium`); reviewer: Astra (`gpt-6-astra`, `xhigh`).
+Each site is one substitution of the cache's thread id by the map's, with the control
+comparisons as the test.
 
 **Files:**
 - Create: `crates/email/src/message/za/search/threads.rs` (`za_mailbox_counters`, `za_thread_keywords`, `za_group_by_thread`)
@@ -2851,7 +2889,9 @@ git commit -m "Release 7: thread-valued reads group by the sealed thread map"
 
 ### Task 13: Changes: `Email/changes`, `Thread/changes`, `Email/queryChanges`
 
-Implementer: `opus` (a kernel: the rendering of thread history as upstream's destroyed and created pairs over a pinned range, with existence decided from raw records first).
+Implementer: Sol (`gpt-6.1-sol`, `high`); reviewer: Astra (`gpt-6-astra`, `xhigh`).
+A kernel: the rendering of thread history as upstream's destroyed and created pairs over
+a pinned range, with existence decided from raw records first.
 
 **Files:**
 - Create: `crates/email/src/message/za/search/changes.rs` (the stream, pure over records and a present set; the epoch rule; the retained bound)
@@ -3167,7 +3207,8 @@ The call sites: `destroy_account.rs:214` gains `server.za_search_destroy(account
 
 ### Task 17: Variants that narrow
 
-Implementer: `sonnet` (test-harness work; every expected outcome is upstream's own body, cited by file and line).
+Implementer: Sol (`gpt-6.1-sol`, `medium`); reviewer: Astra (`gpt-6-astra`, `xhigh`).
+Test-harness work; every expected outcome is upstream's own body, cited by file and line.
 
 The key-mode variants of mail spec 11 assert, today, the refusals and singletons that release 3 required. With the index served they assert upstream's outcomes (spec 9.3). Rule (plan 13 R44): where a variant becomes upstream's body plus one difference, the variant says so in its doc comment and either calls upstream's public body or mirrors it line for line; the one difference for JMAP is the index wait (a keyed content request in place of `test.wait_for_tasks()`'s queue wait) and the keyless refusal on a keyless token (6.2's table); for IMAP there is none, since a key account's IMAP session always holds keys (mail spec 3.3).
 
@@ -3230,7 +3271,8 @@ git commit -m "Release 7: the key-mode variants assert upstream's outcomes; the 
 
 ### Task 18: Leak coverage and the differential test
 
-Implementer: `sonnet` (the rules, the controls and the corpus are specified; the comparisons are mechanical). Reviewer: `opus`.
+Implementer: Sol (`gpt-6.1-sol`, `medium`); reviewer: Astra (`gpt-6-astra`, `xhigh`).
+The rules, the controls and the corpus are specified; the comparisons are mechanical.
 
 **Files:**
 - Modify: `tests/src/za/leak.rs` (`Scan` `:340-375`; the `BlobLink` arm `:1347-1363`; the blob decode loop `:1518-1535`; a new field-152 arm in the `Property` match `:1380-1395`; `test_mail` `:2265-2572`; `purge_blobs` `:1946` becomes `pub(super)`)
@@ -3298,7 +3340,8 @@ git commit -m "Release 7: leak rules for the sealed index, the membership and or
 
 ### Task 19: System benchmark, mutation sample, documentation, outcome note, full verification
 
-Implementer: `sonnet` (measurements by a given method, mechanical mutation runs, documentation whose text this task carries). Reviewer: `opus`.
+Implementer: Sol (`gpt-6.1-sol`, `medium`); reviewer: Astra (`gpt-6-astra`, `xhigh`).
+Measurements by the given method, mechanical mutation runs, and the specified documentation.
 
 **Files:**
 - Modify: `tests/src/za/search_bench.rs` (Task 1's file; `#[tokio::test(flavor = "multi_thread")] #[ignore] pub async fn system()`)

@@ -1,6 +1,101 @@
 # Zero-access plan 16: Codex review
 
-## Current review — plan revision 11, 2026-11-08
+## Current review — plan revision 13, 2026-11-08
+
+**Verdict: APPROVE under the stopping rule. No P1 construction defect remains in scope.**
+
+Reviewed revision 12's follow-ups at `fc1911eab`, including the confirmed shared account-cap
+requirement, then independently reviewed the requested routing-only revision 13 edit to the
+[plan](2026-11-07-zero-access-16-search.md). This pass covers the changed requirements and
+their direct interactions; earlier accepted design decisions remain outside its scope.
+
+- Technical baseline: `fc1911eab7184af71f96f874e9208265febb454b`, branch `za-search-design`.
+- Worktree: `/Users/jay/Development/stalwart/.worktrees/za-search-design`.
+- Baseline plan SHA-256:
+  `c50462ce59365b33792942e73d906056f28829ad428148369761cea38ebed388`.
+- Plan SHA-256 after the routing-only edit:
+  `955597d598ac0f8eedc0e44fe30c26ab0660fdad5a38dcb2775ecbe5da6f63de`.
+- Spec revision 20 SHA-256:
+  `6f2d9a2e3b9f5b28687c1e9ccbe94b41dd9fc3b7fbcd8b009e7aa6aae4dad0d4`.
+
+Plan line references below use the revision 13 text, including the routing edit.
+
+### Disposition and routing
+
+| Finding | Disposition |
+|---|---|
+| PL20 | Closed: seven currency conditions include the content cursor; fixture added (2428, 2444). |
+| PL21 | Closed: both raised-cap variants keep the segment override through backfill (3106). |
+| PL22 | Closed: the completion fixture explicitly requires `ManifestOnly` (2300–2302). |
+
+FX1 clears stale content before either reload path when the manifest has no head. FX2
+reloads after a content-loss start or assertion loss before re-entering the wait loop.
+FX3 checks the source head before installing a load and drops a resident part behind the
+pass's base head instead of extending it. These close the reported stale-content cases;
+the new loader retry has the bounded-wait follow-up below. The shared cluster account cap
+is recorded as the accepted operator requirement and in Task 19's documentation changes.
+
+All active implementation assignments now select Sol (`gpt-6.1-sol`): `high` for the
+kernel tasks and `medium` for the other tasks. Every independent reviewer uses Astra
+(`gpt-6-astra`, `xhigh`), including a fresh review of the integrated branch after Task 19.
+An Astra primary dispatches implementers and reviewers as siblings, preserving the
+capability ceiling and reviewer independence. Required checks and the Task 1 checkpoint
+remain in place. Historical Opus/Sonnet references are explicitly superseded.
+
+This routing is a reasonable choice for a detailed implementation plan with demanding
+independent review. Official model guidance describes Sol for complex coding and Astra
+for the most demanding reasoning and coding work:
+[Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
+[Astra](https://developers.openai.com/api/docs/models/gpt-6-astra).
+This is a routing assessment, not measured performance on this repository.
+
+### PL23 — P2 — Construction: Bound the loader's head-change retries by the request deadline
+
+**Plan:** 1798–1804; callers at 2445; racing-load fixture at 1874.
+
+The FX3 correction walks content outside the index write lock, then retries from the newer
+head if a pass advanced it before installation. The loader takes no deadline or retry
+bound, and both content-wait call sites await it directly. The outer deadline is checked
+only after the loader returns.
+
+A load of H0 can lose its install check to a swap publishing H1, then its H1 retry to H2,
+and so on. Every individual read can succeed, yet the internal loop continues beyond
+`ZA_SEARCH_WAIT_SECS` without returning control to the content wait. This violates the
+bounded wait stated in Task 9 (2428) and spec 5.2, 1259–1263.
+
+**Correction:** wrap the load in `timeout_at(deadline, ...)`, or pass a deadline/bounded
+retry policy into it. On refusal or cancellation, release the temporary part and its
+charge. Extend the racing-load case from one head advance to repeated advances, asserting
+timely refusal and charge cleanup. The head validation itself is correct and should stay.
+
+### PL24 — P2 — Wording: Compare blob reads with the pre-request thread inventory
+
+**Plan:** 3106, the new FX9 portion of `case_f6_r23_over_the_cap_then_raised`.
+
+After restart, the case delivers a message, resets the counters, and runs `Mailbox/get`.
+That request loads N existing thread blobs and then indexes the new message, publishing
+one more thread blob. With compaction disabled, the post-request manifest therefore has
+N+1 thread blobs, but the read counter is N: writing the new blob is not a blob read.
+Comparing the counter with the manifest's count after the request rejects correct behavior.
+
+**Correction:** capture the thread-blob count before the request and compare with that
+value, or assert the exact fetched thread hashes. Keep the separate assertions that the
+new message was indexed and that no content blob was read.
+
+### Review method and limits
+
+Three read-only scopes checked reload/install races, content recovery/currency, and test
+instructions/documentation. An independent reviewer also checked the routing edit. The
+primary inspected the cited text and adjudicated the findings. This review reused the
+existing parent-model routes because the originating capability ceiling was unresolved;
+the explicit Sol/Astra routes are for the plan's future execution.
+
+No builds, tests, benchmarks or runtime probes ran. Official OpenAI documentation was
+consulted only for the requested routing assessment. The only edits were the plan's agent
+routing and this review. The spec and Fable report were preserved; earlier reviews follow
+unchanged except for renaming the previous current heading to historical.
+
+## Historical review — plan revision 11, 2026-11-08
 
 **Verdict: APPROVE under the stopping rule. No P1 construction defect remains in scope.**
 
