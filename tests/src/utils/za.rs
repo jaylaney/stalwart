@@ -15,6 +15,7 @@ use calcard::{
 };
 use common::{
     auth::vault::{RawValue, VaultRead, ZaMark, ZaVerification},
+    cache::invalidate::CacheInvalidationBuilder,
     ipc::CacheInvalidation,
     storage::{
         index::{GroupwareWrite, ObjectIndexBuilder},
@@ -22,6 +23,7 @@ use common::{
     },
     za::{
         lease::lease_key_range,
+        search::cache::EvictReason,
         test_hooks::{self, Pause as HookPause},
     },
 };
@@ -34,6 +36,7 @@ use email::{
         metadata::{ExtraHeaders, MessageMetadata},
         sortkeys::MessageSortKeys,
         thread::ThreadFields,
+        za::search::pass::{PassOutcome, ZaSearchPass},
     },
 };
 use groupware::{
@@ -64,11 +67,13 @@ use serde_json::{Value, json};
 use std::{future::Future, sync::Arc, time::Duration};
 use store::{
     Deserialize, IterateParams, Subspace, U32_LEN, U64_LEN, ValueKey,
+    query::log::Change,
     write::{
         AnyKey, Archive, ArchiveBytes, ArchiveVersion, BatchBuilder, BlobLink, BlobOp,
         IndexPropertyClass, QueueDocumentId, SearchIndex, SearchIndexClass, TaskId, TaskQueueClass,
         ValueClass, blob::BlobLinkValue, key::DeserializeBigEndian, now,
     },
+    za_search::{Checkpoint, manifest::ManifestValue},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -415,6 +420,111 @@ pub async fn za_unlock(test: &TestServer, account_id: u32, password: &str) -> Ar
         ZaVerification::Valid(keys) => keys,
         _ => panic!("the password does not unlock account {account_id}"),
     }
+}
+
+pub async fn run_search_pass(test: &TestServer, account_id: u32, password: &str) -> PassOutcome {
+    let keys = za_unlock(test, account_id, password).await;
+    test.server.za_search_pass(account_id, &keys).await.unwrap()
+}
+
+pub async fn manifest_bytes(test: &TestServer, account_id: u32) -> Option<Vec<u8>> {
+    test.server
+        .store()
+        .get_value::<RawValue>(ValueKey::property(
+            account_id,
+            Collection::Principal,
+            0,
+            PrincipalField::ZeroAccessSearch,
+        ))
+        .await
+        .unwrap()
+        .map(|value| value.0)
+}
+
+pub async fn read_manifest(test: &TestServer, account_id: u32) -> Option<ManifestValue> {
+    manifest_bytes(test, account_id)
+        .await
+        .map(|bytes| ManifestValue::decode_unverified(&bytes).unwrap())
+}
+
+/// Drop the search, key, and message caches lost when a process restarts.
+pub async fn simulate_restart(test: &TestServer, account_id: u32) {
+    test.server
+        .inner
+        .cache
+        .za_search
+        .remove_account(account_id, EvictReason::Invalidation);
+    test.server.inner.cache.za_keys.remove_account(account_id);
+    let mut changes = CacheInvalidationBuilder::default();
+    changes.invalidate(CacheInvalidation::MessageCache(account_id));
+    test.server.invalidate_caches(changes).await.unwrap();
+}
+
+pub async fn principal_blob_links(test: &TestServer, account_id: u32) -> Vec<(BlobHash, usize)> {
+    let mut links = Vec::new();
+    let range = |byte, len| AnyKey {
+        subspace: Subspace::BlobLink,
+        key: vec![byte; len],
+    };
+    let suffix = [
+        account_id.to_be_bytes().as_slice(),
+        &[Collection::Principal as u8],
+        &0u32.to_be_bytes(),
+    ]
+    .concat();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(
+                range(0, 1),
+                range(u8::MAX, BLOB_HASH_LEN + U32_LEN + U64_LEN),
+            ),
+            |key, value| {
+                if key.len() == BLOB_HASH_LEN + suffix.len() && key.ends_with(&suffix) {
+                    links.push((
+                        BlobHash::try_from_hash_slice(&key[..BLOB_HASH_LEN]).unwrap(),
+                        usize::try_from(BlobLinkValue::deserialize(value)?.size).unwrap(),
+                    ));
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    links
+}
+
+pub async fn index_holds(test: &TestServer, account_id: u32, document_id: u32) -> bool {
+    let Some(entry) = test.server.inner.cache.za_search.get(account_id) else {
+        return false;
+    };
+    entry
+        .read_loaded()
+        .await
+        .is_some_and(|index| index.thread.exists_at(document_id, u64::MAX) == Some(true))
+}
+
+pub async fn log_records_since(
+    test: &TestServer,
+    account_id: u32,
+    collection: SyncCollection,
+    since: u64,
+) -> Vec<(u64, Vec<Change>)> {
+    test.server
+        .store()
+        .za_changes_records(
+            account_id,
+            collection,
+            (since != 0).then_some(Checkpoint {
+                change_id: since,
+                position: 0,
+                complete: true,
+            }),
+            usize::MAX,
+        )
+        .await
+        .unwrap()
+        .records
 }
 
 /// Writes `ical` into the store as the event `name` in the account's

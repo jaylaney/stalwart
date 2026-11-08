@@ -895,7 +895,7 @@ async fn forward_race_imip_merge(test: &TestServer, admin: &Account) -> Account 
     .await;
     let mut record = VaultRecord::pending(vec![3; 32], now() as i64 + 3600);
     test.server
-        .za_vault_commit(id, &mut record, None, None)
+        .za_vault_commit(id, &mut record, None, None, None)
         .await
         .unwrap();
     parked.finish().await;
@@ -950,7 +950,7 @@ async fn reissue_repairs_an_aborted_issuance(test: &TestServer, admin: &Account)
     // The crash state: the pending record, no marker.
     let mut record = VaultRecord::pending(vec![4; 32], now() as i64 + 3600);
     test.server
-        .za_vault_commit(id, &mut record, None, None)
+        .za_vault_commit(id, &mut record, None, None, None)
         .await
         .unwrap();
 
@@ -1654,7 +1654,7 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
             tokio::time::sleep(Duration::from_millis(writer_delay)).await;
             let mut record = VaultRecord::pending(vec![1; 32], now() as i64 + 3600);
             server
-                .za_vault_commit(account_id, &mut record, None, None)
+                .za_vault_commit(account_id, &mut record, None, None, None)
                 .await
                 .unwrap();
             let saw_message = server

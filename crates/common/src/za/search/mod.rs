@@ -9,6 +9,7 @@ pub mod config;
 pub mod error;
 pub mod load;
 pub mod seal;
+pub mod setup;
 pub mod trace;
 
 pub use cache::ZaSearchCache;

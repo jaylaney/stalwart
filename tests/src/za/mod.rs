@@ -222,6 +222,7 @@ pub async fn za_tests() {
     mail::uploads::test(&mut test).await;
     mail::gates::test(&mut test).await;
     mail::search::test(&mut test).await;
+    mail::index::test(&mut test).await;
     mail::traces::test(&mut test).await;
     mail::gateway::test(&mut test).await;
     // Last: part 6a expects this case to reproduce a recorded residual (the

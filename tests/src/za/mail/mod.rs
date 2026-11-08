@@ -51,6 +51,7 @@ pub mod delivery;
 pub mod fence;
 pub mod gates;
 pub mod gateway;
+pub mod index;
 pub mod login;
 pub mod reads;
 pub mod search;

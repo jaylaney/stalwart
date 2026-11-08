@@ -13,8 +13,11 @@ use super::{
     },
     thread::RevisionRow,
 };
-use crate::write::{AssignedIds, SerializeWithIds, assert::AssertValue};
-use types::blob_hash::BlobHash;
+use crate::write::{AssignedIds, ChangeCounter, SerializeWithIds, assert::AssertValue};
+use types::{
+    blob_hash::BlobHash,
+    collection::{Collection, SyncCollection},
+};
 use xxhash_rust::xxh3::xxh3_64;
 
 fn manifest() -> Manifest {
@@ -214,5 +217,81 @@ fn malformed_manifest_is_refused_even_without_verifying_the_tag() {
     assert_eq!(
         ManifestValue::decode(&non_boolean, &key),
         Err(ManifestError::Parse)
+    );
+}
+
+#[test]
+fn a_principal_manifest_fill_uses_its_accounts_email_change_id() {
+    let key = ZaSearchKey::new([9; 32]);
+    let account_id = 5;
+    let mut manifest = manifest();
+    let mut write = ManifestWrite::for_account(
+        ManifestValue::Index(manifest.clone()),
+        key.clone(),
+        ManifestFill {
+            newest_row: true,
+            epoch: true,
+        },
+        account_id,
+    );
+    let mut ids = AssignedIds::default();
+    ids.push_change_id(
+        ChangeCounter {
+            account_id: 4,
+            group: SyncCollection::Email.change_group(),
+        },
+        111,
+    );
+    ids.push_change_id(
+        ChangeCounter {
+            account_id,
+            group: SyncCollection::Calendar.change_group(),
+        },
+        222,
+    );
+    ids.push_change_id(
+        ChangeCounter {
+            account_id,
+            group: Collection::Principal.change_group(),
+        },
+        333,
+    );
+    ids.set_current_change_id(account_id, Collection::Principal.change_group());
+    assert!(
+        write.serialize_with_ids(&ids).is_err(),
+        "a different counter cannot fill the Email row"
+    );
+    ids.push_change_id(
+        ChangeCounter {
+            account_id,
+            group: SyncCollection::Email.change_group(),
+        },
+        0,
+    );
+    assert!(
+        write.serialize_with_ids(&ids).is_err(),
+        "zero is not an allocated boundary"
+    );
+    ids.push_change_id(
+        ChangeCounter {
+            account_id,
+            group: SyncCollection::Email.change_group(),
+        },
+        444,
+    );
+    ids.push_change_id(
+        ChangeCounter {
+            account_id: 6,
+            group: SyncCollection::Email.change_group(),
+        },
+        555,
+    );
+
+    let (bytes, _) = write.serialize_with_ids(&ids).unwrap();
+    manifest.newest_row.change_id = 444;
+    manifest.epoch = 444;
+    assert_eq!(
+        ManifestValue::decode(&bytes, &key),
+        Ok(ManifestValue::Index(manifest))
     );
 }

@@ -11,7 +11,7 @@ use super::{
     thread::RevisionRow,
 };
 use crate::write::{AssignedIds, SerializeWithIds, assert::AssertValue};
-use types::blob_hash::BlobHash;
+use types::{blob_hash::BlobHash, collection::SyncCollection};
 use xxhash_rust::xxh3::xxh3_64;
 
 const INDEX: u8 = 1;
@@ -422,22 +422,55 @@ pub struct ManifestWrite {
     value: ManifestValue,
     key: ZaSearchKey,
     fill: ManifestFill,
+    account_id: Option<u32>,
 }
 
 impl ManifestWrite {
+    /// Use the batch cursor for an implicit change ID. Principal writers use `for_account`.
     pub fn new(value: ManifestValue, key: ZaSearchKey, fill: ManifestFill) -> Self {
-        Self { value, key, fill }
+        Self {
+            value,
+            key,
+            fill,
+            account_id: None,
+        }
+    }
+
+    /// Fill from the account's Email counter even though the field is stored
+    /// under Principal, whose batch cursor has no Email change id.
+    pub fn for_account(
+        value: ManifestValue,
+        key: ZaSearchKey,
+        fill: ManifestFill,
+        account_id: u32,
+    ) -> Self {
+        Self {
+            account_id: Some(account_id),
+            ..Self::new(value, key, fill)
+        }
     }
 }
 
 impl SerializeWithIds for ManifestWrite {
     fn serialize_with_ids(&mut self, ids: &AssignedIds) -> trc::Result<(Vec<u8>, Option<u32>)> {
-        if let ManifestValue::Index(manifest) = &mut self.value {
+        if let ManifestValue::Index(manifest) = &mut self.value
+            && (self.fill.newest_row || self.fill.epoch)
+        {
+            let change_id = match self.account_id {
+                Some(account_id) => ids.change_id(account_id, SyncCollection::Email.change_group()),
+                None => ids.try_current_change_id(),
+            }
+            .filter(|&id| id != 0)
+            .ok_or_else(|| {
+                trc::StoreEvent::UnexpectedError
+                    .into_err()
+                    .details("search publication requires a change id")
+            })?;
             if self.fill.newest_row {
-                manifest.newest_row.change_id = ids.current_change_id();
+                manifest.newest_row.change_id = change_id;
             }
             if self.fill.epoch {
-                manifest.epoch = ids.current_change_id();
+                manifest.epoch = change_id;
             }
         }
         Ok((self.value.encode(&self.key), None))
