@@ -1,6 +1,11 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 29 (2026-11-08), execution correction.
+Date: 2026-11-04. Status: revision 30 (2026-11-08), execution correction.
+Revision 30 bounds content compaction's authenticated one-byte tier.
+Full merges saturate at tier 255 and can keep succeeding. A tiered
+promotion beyond 255 refuses the proposed pass before any merge rewrite
+or commit. Section 5.5 defines both paths.
+
 Revision 29 binds a recovery write to the exact manifest version whose
 loss was established (P1-STALE-LOSS). A rebuild with neither present
 messages nor stored mailboxes uses one ordinary empty Email log record
@@ -1625,19 +1630,31 @@ own batch (new links, old unlinks, the manifest, atomically):
   twice the records' bytes at the design size (1.3), a 16 MiB class at
   30,000 messages, read once per load (4.3), and what keeps the manifest
   bounded (R8).
-- **Content compaction**, when the content chain reaches
-  `ZA_SEARCH_SEGMENTS` and no cursor is pending; while a cursor is
-  pending, a **tiered** merge instead (G17, H7, R32: a full merge every
+- **Content compaction** uses the chain with the pass's newly staged
+  content. Choose a full merge when the chain reaches
+  `ZA_SEARCH_SEGMENTS` and the proposed manifest has no rebuild cursor,
+  content cursor or reconciliation marker after applying the pass's
+  progress. While any of those remain, use a **tiered** merge instead (G17, H7, R32: a full merge every
   sixteenth pass would rewrite everything indexed so far, near-quadratic
   in writes; no merge at all would leave a rebuild's chain of hundreds
   of nodes to the first content load; and revision 15's rule, the
   youngest `ZA_SEARCH_SEGMENTS` blobs merged whenever the chain reached
   twice that count, re-selected the previous merge's result every time,
   a quadratic rewrite that only looked logarithmic). Every content blob
-  carries a **tier** in its authenticated header, `0` for a pass's own
-  blob; when the chain holds `ZA_SEARCH_SEGMENTS` blobs of one tier they
-  merge into one blob of the next tier, cascading within the pass when
-  the merge completes the next tier. Blobs of one tier are always a
+  carries a one-byte **tier** in its authenticated header, `0` for a
+  pass's own blob. In the tiered path, a young prefix of
+  `ZA_SEARCH_SEGMENTS` blobs of tier `t` merges into one blob of tier
+  `t.checked_add(1)`, cascading within the pass when the merge completes
+  the next tier. Preflight the complete cascade against the descriptors
+  before any merge rewrite. A promotion above 255 refuses the whole
+  proposed pass with `ZA_SEARCH_ABORTED` and the fixed reason
+  `"tier-overflow"`. The committed manifest, checkpoint, cursors and
+  reconciliation marker, failing-document attempt, publication, permanent
+  links and resident index all stay as they were. Any temporary holds
+  expire in the usual way. Retrying the same state refuses again without
+  appending. The limit grants no recovery, suspension or skip authority,
+  and any pending cursor or marker still bars a full merge. Progress
+  from such a tiered inventory is not guaranteed. Blobs of one tier are always a
   contiguous run at the chain's young end when they merge, since a
   tier's blob is made only when the tier below has been emptied, so the
   chain stays a sequence of tiers, oldest highest. Each byte is then
@@ -1648,8 +1665,13 @@ own batch (new links, old unlinks, the manifest, atomically):
   the default; the full merge follows once the cursor is exhausted: a
   node that has the content part loaded, or that can load
   it (under the account cap), loads it for this and merges the chain
-  into one content blob with no predecessor, dropping the content of
-  tombstoned messages. Above the cap the chain is not extended (4.2), so
+  into one content blob with a fresh segment id and no predecessor,
+  dropping the content of tombstoned messages. Its tier is
+  `max_input_tier.saturating_add(1)`, so repeated eligible full merges
+  with a tier-255 input still produce a new root at 255. The content
+  inventory uses its existing u32 length and u64 size. The thread
+  manifest's 255-entry limit and optional allowance fallback govern
+  thread compaction separately. Above the cap the chain is not extended (4.2), so
   it never grows past `ZA_SEARCH_SEGMENTS` plus one. Compaction is the
   only write proportional to the whole content; at the design size it
   is a second or two every sixteen passes.
@@ -2570,7 +2592,7 @@ event), with these constants:
 |---|---|---|
 | `ZA_SEARCH_PASS` | a pass committed | account id, inserts, tombstones, whether it published, revision, `indexed_to` |
 | `ZA_SEARCH_SKIPPED` | a message was skipped in a pass for loss (5.1) | account id, document id, the loss class (stub absent, blob absent, would not open) |
-| `ZA_SEARCH_ABORTED` | a pass aborted on a transient error (5.1) | account id, the error class |
+| `ZA_SEARCH_ABORTED` | a pass aborted on a transient error (5.1) or a tiered promotion limit (5.5) | account id, the error class or the fixed `"tier-overflow"` reason |
 | `ZA_SEARCH_LOST` | a manifest write lost its assertion | account id |
 | `ZA_SEARCH_REBUILD` | a rebuild, content-only rebuild or reconciliation started or finished | account id, which, the loss class, the cursor size, the epoch |
 | `ZA_SEARCH_SUSPENDED` | content indexing stopped above the account cap | account id, the chain's size |
