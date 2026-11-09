@@ -32,7 +32,9 @@ use serde_json::{Value, json};
 use std::{
     cell::Cell,
     collections::{BTreeMap, HashMap, HashSet},
+    error::Error,
     fmt::Write,
+    io,
     process::Command,
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -79,7 +81,13 @@ impl<'a> Wire<'a> {
         Self { account, client }
     }
 
-    async fn call(&self, method: &str, mut args: Value) -> (Duration, Value) {
+    async fn call(&self, method: &str, args: Value) -> (Duration, Value) {
+        self.try_call(method, args)
+            .await
+            .unwrap_or_else(|error| panic!("{method}: {error}"))
+    }
+
+    async fn try_call(&self, method: &str, mut args: Value) -> Result<(Duration, Value), String> {
         args["accountId"] = json!(self.account.id_string());
         let payload = json!({
             "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
@@ -94,22 +102,47 @@ impl<'a> Wire<'a> {
         let response = request
             .send()
             .await
-            .unwrap_or_else(|e| panic!("{method}: {e}"));
+            .map_err(|error| transport_failure("send", start.elapsed(), &error))?;
         let status = response.status();
-        let body = response.bytes().await.unwrap();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| transport_failure("body", start.elapsed(), &error))?;
         let elapsed = start.elapsed();
-        assert!(status.is_success(), "{method}: HTTP {status}");
-        let response: Value = serde_json::from_slice(&body).unwrap();
-        let calls = response["methodResponses"].as_array().unwrap();
-        assert_eq!(calls.len(), 1, "{response}");
-        assert_eq!(calls[0][2], "bench");
-        (elapsed, calls[0].clone())
+        assert!(
+            status.is_success(),
+            "{method}: HTTP {status} after {elapsed:?}"
+        );
+        let response: Value = serde_json::from_slice(&body).map_err(|error| {
+            format!(
+                "JSON decode failure after {:?} (wire {elapsed:?}): {:?}, line {}, column {}",
+                start.elapsed(),
+                error.classify(),
+                error.line(),
+                error.column()
+            )
+        })?;
+        let calls = response["methodResponses"].as_array().ok_or_else(|| {
+            format!("response envelope failure after {elapsed:?}: missing methodResponses array")
+        })?;
+        assert_eq!(calls.len(), 1, "{method}: unexpected method response count");
+        assert!(calls[0][2] == "bench", "{method}: unexpected call ID");
+        Ok((elapsed, calls[0].clone()))
     }
 
     async fn get(&self) -> Duration {
-        let (elapsed, call) = self.call("Email/get", json!({"ids": []})).await;
-        assert_eq!(reply("Email/get", &call)["list"], json!([]));
-        elapsed
+        self.try_get()
+            .await
+            .unwrap_or_else(|error| panic!("Email/get: {error}"))
+    }
+
+    async fn try_get(&self) -> Result<Duration, String> {
+        let (elapsed, call) = self.try_call("Email/get", json!({"ids": []})).await?;
+        assert!(
+            reply("Email/get", &call)["list"] == json!([]),
+            "empty Email/get returned a nonempty or invalid list"
+        );
+        Ok(elapsed)
     }
 
     async fn search(&self, term: &str, limit: usize) -> (Duration, Value) {
@@ -121,19 +154,63 @@ impl<'a> Wire<'a> {
     }
 }
 
+fn transport_failure(stage: &str, elapsed: Duration, error: &reqwest::Error) -> String {
+    // Error Display and Debug may include URLs or data from protocol parsing.
+    // Walk the source chain using only typed, non-payload classifications.
+    let mut causes = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        causes.push(if let Some(error) = cause.downcast_ref::<io::Error>() {
+            let tls = error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<rustls::Error>());
+            format!(
+                "io(kind={:?}, os_code={:?}, tls={tls})",
+                error.kind(),
+                error.raw_os_error()
+            )
+        } else if cause.is::<rustls::Error>() {
+            "tls".into()
+        } else if let Some(error) = cause.downcast_ref::<hyper::Error>() {
+            format!(
+                "http(parse={}, timeout={}, canceled={}, closed={}, incomplete={})",
+                error.is_parse(),
+                error.is_timeout(),
+                error.is_canceled(),
+                error.is_closed(),
+                error.is_incomplete_message()
+            )
+        } else {
+            "unclassified".into()
+        });
+        source = cause.source();
+    }
+    format!(
+        "{stage} failure after {elapsed:?}: timeout={}, connect={}, dns={}, request={}, body={}, decode={}; sources={causes:?}",
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_dns(),
+        error.is_request(),
+        error.is_body(),
+        error.is_decode()
+    )
+}
+
 fn reply<'a>(method: &str, call: &'a Value) -> &'a Value {
-    assert_eq!(call[0], method, "{call}");
+    assert!(call[0] == method, "{method}: unexpected response method");
     &call[1]
 }
 
 fn assert_unavailable(call: &Value) {
-    assert_eq!(call[0], "error", "{call}");
-    assert_eq!(call[1]["type"], "unsupportedFilter", "{call}");
+    assert!(call[0] == "error", "expected an unavailable error response");
+    assert!(
+        call[1]["type"] == "unsupportedFilter",
+        "unexpected unavailable error type"
+    );
     let description = format!("text: {ZA_MAIL_SEARCH_UNAVAILABLE}");
-    assert_eq!(
-        call[1]["description"].as_str(),
-        Some(description.as_str()),
-        "{call}"
+    assert!(
+        call[1]["description"].as_str() == Some(description.as_str()),
+        "unexpected unavailable description"
     );
 }
 
@@ -598,6 +675,7 @@ async fn drain(
     sampler: &Sampler,
     milestones: &[usize],
     loaded_growth: bool,
+    label: &str,
 ) -> (Progress, Serial) {
     let id = uid(wire.account);
     let cap = test.server.za_search_config().account_max_mb * MIB;
@@ -621,7 +699,12 @@ async fn drain(
         );
         ticks.tick().await;
         let began = start.elapsed();
-        let elapsed = wire.get().await;
+        let ordinal = serial.requests + 1;
+        let elapsed = wire.try_get().await.unwrap_or_else(|error| {
+            panic!(
+                "{label} serial Email/get request {ordinal}, phase start offset {began:?}, last settled (scanned, checkpoint, indexed, coverage, rebuild cursor) {previous:?}: {error}"
+            )
+        });
         serial.requests += 1;
         serial.overruns += usize::from(elapsed > period);
         let committed = capture.drain();
@@ -632,6 +715,7 @@ async fn drain(
         let p = progress(test, id, false)
             .await
             .expect("missing loaded map after keyed get");
+        let mut tiers = Vec::new();
         if let Some(commit) = committed.first() {
             serial.pass_time += elapsed;
             if commit.thread_compaction {
@@ -640,13 +724,13 @@ async fn drain(
             if commit.full_merge {
                 serial.full.push((p.indexed, elapsed));
             } else if let Some(content) = &commit.content {
-                let tiers: Vec<_> = content
+                tiers = content
                     .encoded
                     .iter()
                     .filter_map(|&(tier, _)| (tier != 0).then_some(tier))
                     .collect();
                 if !tiers.is_empty() {
-                    serial.tiered.push((p.indexed, elapsed, tiers));
+                    serial.tiered.push((p.indexed, elapsed, tiers.clone()));
                 }
             }
             if p.indexed.saturating_sub(prior_count) >= config.pass_cap
@@ -655,6 +739,31 @@ async fn drain(
                 cap_requests_over_budget += 1;
             }
         }
+        // Print only after the wire timer and the existing settled observations.
+        // A later failed request must not erase the preceding pass evidence.
+        println!(
+            "Serial request {label} #{ordinal}: start {began:?}, wire {elapsed:?}, commits {}, thread compaction {}, full merge {}, promoted tiers {tiers:?}, rewritten bytes {}, indexed {} (+{}), Email state {}, scanned {}, epoch/revision {}/{}, checkpoint {:?}, coverage {:?}, cursor {:?}, sealed bytes {}, chain length {}",
+            committed.len(),
+            committed
+                .first()
+                .is_some_and(|commit| commit.thread_compaction),
+            committed.first().is_some_and(|commit| commit.full_merge),
+            committed
+                .first()
+                .and_then(|commit| commit.content.as_ref())
+                .map_or(0, |content| content.rewritten()),
+            p.indexed,
+            p.indexed.saturating_sub(prior_count),
+            p.email_state,
+            p.scanned_to,
+            p.manifest.epoch,
+            p.manifest.revision,
+            p.manifest.indexed_to,
+            p.manifest.content_to,
+            p.manifest.cursor,
+            p.sealed(),
+            p.manifest.content.as_ref().map_or(0, |head| head.length),
+        );
         wire_spans.push((began, elapsed, committed.len(), p.indexed));
         prior_count = p.indexed;
         if previous_size <= cap && p.sealed() > cap {
@@ -745,7 +854,7 @@ async fn drain(
 
 async fn report_drain(test: &TestServer, account: &Account, count: usize, label: &str) -> String {
     let sampler = Sampler::start(test);
-    let (progress, metrics) = drain(test, &Wire::new(account), &sampler, &[], false).await;
+    let (progress, metrics) = drain(test, &Wire::new(account), &sampler, &[], false, label).await;
     growth_line(label, &progress, &sampler);
     sampler.finish(label);
     assert!(
@@ -785,7 +894,10 @@ async fn one_email(wire: &Wire<'_>, id: Id) -> Duration {
     let (elapsed, call) = wire
         .call("Email/get", json!({"ids": [id], "properties": ["id"]}))
         .await;
-    assert_eq!(reply("Email/get", &call)["list"], json!([{"id": id}]));
+    assert!(
+        reply("Email/get", &call)["list"] == json!([{"id": id}]),
+        "validation Email/get did not return the requested ID alone"
+    );
     elapsed
 }
 
@@ -912,7 +1024,10 @@ async fn mailbox_row(test: &TestServer, wire: &Wire<'_>, count: usize) -> String
     let changed = reply("Mailbox/changes", &call);
     let updated = ids(&changed["updated"]).into_iter().collect::<HashSet<_>>();
     assert_eq!(updated, expected);
-    assert_eq!(changed["hasMoreChanges"], false);
+    assert!(
+        changed["hasMoreChanges"] == false,
+        "incomplete Mailbox/changes response"
+    );
     capture.finish().await;
     format!(
         "{} updated, publishing get {}, Mailbox/changes {}",
@@ -985,7 +1100,7 @@ fn assert_match(call: &Value, delivered: &[u32]) {
     let hits = ids(&reply("Email/query", call)["ids"]);
     assert!(
         hits.iter().any(|id| delivered.contains(&id.document_id())),
-        "{call}"
+        "Email/query did not match a delivered document"
     );
 }
 
@@ -1267,13 +1382,19 @@ async fn d11_changes(test: &TestServer, wire: &Wire<'_>) -> String {
             .iter()
             .any(|id| id.document_id() == document)
     );
-    assert_eq!(email["hasMoreChanges"], false);
+    assert!(
+        email["hasMoreChanges"] == false,
+        "incomplete Email/changes response"
+    );
     let (thread_elapsed, call) = wire
         .call("Thread/changes", json!({"sinceState": thread}))
         .await;
     let thread = reply("Thread/changes", &call);
     assert!(!ids(&thread["created"]).is_empty());
-    assert_eq!(thread["hasMoreChanges"], false);
+    assert!(
+        thread["hasMoreChanges"] == false,
+        "incomplete Thread/changes response"
+    );
     format!(
         "Email/changes {}, Thread/changes {}; {} and {} creations, end-to-end request time",
         format_ms(email_elapsed),
@@ -1454,6 +1575,10 @@ async fn run_system() {
         std::env::consts::ARCH
     );
     let mut rows = Vec::new();
+    let mut row = |(name, value): (&'static str, String)| {
+        println!("Completed measurement | {name} | {value} |");
+        rows.push((name, value));
+    };
 
     let (account, setup) = key(&test, &admin, ACCOUNT).await;
     let first = uid(&account);
@@ -1468,7 +1593,7 @@ async fn run_system() {
     .await;
     assert_pristine_setup(&test, first, setup).await;
     assert_mailbox(&test, first, &delivered).await;
-    rows.push((
+    row((
         "Attachment-free pass rate",
         report_drain(&test, &account, SMALL, "attachment-free").await,
     ));
@@ -1479,7 +1604,7 @@ async fn run_system() {
     let delivered = deliver_cohort(&test, &account, generated(SEED).take(SMALL), SMALL).await;
     assert_pristine_setup(&test, uid(&account), setup).await;
     assert_mailbox(&test, uid(&account), &delivered).await;
-    rows.push((
+    row((
         "Mixed pass rate",
         report_drain(&test, &account, SMALL, "mixed").await,
     ));
@@ -1488,16 +1613,16 @@ async fn run_system() {
         .await;
     deliver_note(&test, &plain, 0, BODY_WORD).await;
     let wire = Wire::new(&account);
-    rows.push((
+    row((
         "Validation read cost",
         validate_cost(&test, &wire, &Wire::new(&plain)).await,
     ));
-    rows.push(("10 mailbox properties", mailbox_row(&test, &wire, 10).await));
-    rows.push((
+    row(("10 mailbox properties", mailbox_row(&test, &wire, 10).await));
+    row((
         "100 mailbox properties",
         mailbox_row(&test, &wire, 100).await,
     ));
-    rows.push((
+    row((
         "First search after 200 deliveries",
         first_search(&test, &wire).await,
     ));
@@ -1515,7 +1640,15 @@ async fn run_system() {
     assert_pristine_setup(&test, id, setup).await;
     assert_mailbox(&test, id, &delivered).await;
     let sampler = Sampler::start(&test);
-    let (indexed, serial) = drain(&test, &wire, &sampler, &GROWTH, false).await;
+    let (indexed, serial) = drain(
+        &test,
+        &wire,
+        &sampler,
+        &GROWTH,
+        false,
+        "design normal indexing",
+    )
+    .await;
     sampler.finish("design-size default serial indexing");
     assert_eq!(indexed.indexed, DESIGN);
     let manifest = disk_manifest(&test, id).await;
@@ -1542,11 +1675,11 @@ async fn run_system() {
             },
         )
     };
-    rows.push(("Thread compaction get", last(&serial.thread)));
-    rows.push(("Full content compaction get", last(&serial.full)));
+    row(("Thread compaction get", last(&serial.thread)));
+    row(("Full content compaction get", last(&serial.full)));
 
     if indexed.current && indexed.sealed() <= config.account_max_mb * MIB {
-        rows.push((
+        row((
             "Default sealed cap",
             format!(
                 "{} B, {} B headroom; 512 MiB crossing not reached",
@@ -1555,21 +1688,21 @@ async fn run_system() {
             ),
         ));
         let cold = cold_serve(&test, &wire, &delivered, "default cold both").await;
-        rows.push(("30,000-item cold wire serving", cold));
-        rows.push((
+        row(("30,000-item cold wire serving", cold));
+        row((
             "H7/R32 rebuild, tiered content compactions",
             rebuild(&test, &account, &delivered, &manifest).await,
         ));
-        rows.push((
+        row((
             "D11 retained-state changes",
             d11_changes(&test, &wire).await,
         ));
     } else {
-        rows.push((
+        row((
             "Default sealed cap",
             natural_cap(&test, &wire, &indexed).await,
         ));
-        rows.push((
+        row((
             "H7/R32 rebuild",
             "pending after default-cap suspension".into(),
         ));
@@ -1588,7 +1721,15 @@ async fn run_system() {
     write_manifest_bytes(&test, id, None).await;
     assert!(manifest_bytes(&test, id).await.is_none());
     let sampler = Sampler::start(&test);
-    let (growth, serial) = drain(&test, &wire, &sampler, &GROWTH, true).await;
+    let (growth, serial) = drain(
+        &test,
+        &wire,
+        &sampler,
+        &GROWTH,
+        true,
+        "serial rebuild with milestone warming",
+    )
+    .await;
     assert_eq!(growth.indexed, DESIGN);
     sampler.finish("serial absent-manifest rebuild with milestone warming");
     let tiered = serial.tiered.last().map_or_else(
@@ -1598,9 +1739,9 @@ async fn run_system() {
             format_ms(*elapsed), serial.tiered.len()
         ),
     );
-    rows.push(("Tiered content compaction get", tiered));
+    row(("Tiered content compaction get", tiered));
     admin.destroy_account(account).await;
-    rows.push(("Controlled cap lifecycle", cap_control(&test, &admin).await));
+    row(("Controlled cap lifecycle", cap_control(&test, &admin).await));
 
     println!("| Figure | Observed |\n|---|---|");
     for (name, value) in rows {
@@ -1633,7 +1774,15 @@ async fn observer_control() {
     assert_pristine_setup(&test, id, setup).await;
     assert_mailbox(&test, id, &delivered).await;
     let sampler = Sampler::start(&test);
-    let (complete, metrics) = drain(&test, &wire, &sampler, &[2, 5], false).await;
+    let (complete, metrics) = drain(
+        &test,
+        &wire,
+        &sampler,
+        &[2, 5],
+        false,
+        "small harness control",
+    )
+    .await;
     sampler.finish("small harness control");
     assert!(complete.current);
     assert!(!metrics.thread.is_empty() && !metrics.full.is_empty());
