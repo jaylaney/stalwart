@@ -2,6 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Plan revision 24** (2026-11-08) clarifies Task 11's IMAP identity boundary
+(spec revision 31): selected-account classification distinguishes an ordinary
+account from an owner's stale pre-provisioning session without keys. FETCH
+ObjectId and EMAILID/THREADID filters require keys for a key account; permitted
+metadata commands keep their policy. Task 12's K-bound fixture also deletes
+bridge M as well as roots r5..r20 in its second phase and asserts exact
+Message-ID membership, preserving the independently reviewed K deviation.
+
 **Plan revision 23** (2026-11-08) applies spec revision 30 to Task 15.
 Full content merges saturate the stored tier and keep succeeding at 255.
 A checked tiered overflow refuses the whole proposed pass before
@@ -2838,7 +2846,7 @@ that keeps singleton ids off every keyed response.
 - Modify: `crates/jmap/src/email/snippet.rs:183, 213` (supplied ids)
 - Modify: `crates/jmap/src/thread/get.rs:35-106` (the state from the view's cache, D13; members by the map are Task 12's), `crates/jmap/src/blob/get.rs:188-193`, `crates/jmap/src/submission/set.rs:449-450`, `crates/jmap/src/submission/get.rs:237-249`
 - Modify: `crates/jmap/src/api/request.rs:296` (`Mailbox/get`), `:304` (`Thread/get`), `:318` (`EmailSubmission/get`), `:439` (`Email/query`), `:455` (`EmailSubmission/query`), `:816` (`Blob/lookup`): `za_assert_mail_route` becomes `za_assert_mail_keys`; `crates/jmap/src/changes/get.rs:217-229` (`Email`, `Thread`, `EmailSubmission` changes need keys; `Mailbox` keeps the route)
-- Modify: `crates/imap/src/op/fetch/mod.rs:585-592` (`ObjectId`), `crates/imap/src/op/search.rs:565-586` (`EmailId`, `ThreadId`)
+- Modify: `crates/imap/src/op/fetch/mod.rs:585-592` (`ObjectId`), `crates/imap/src/op/search.rs:565-586` (`EmailId`, `ThreadId`), `crates/imap/src/op/thread.rs` and `crates/imap/src/op/za_search.rs` (selected-account identity gates and one-view acquisition).
 - Modify: `crates/email/src/cache/mod.rs:59-70` (`get_cached_messages`: the test-mode `SEARCH_CACHE_HOLD` line), `crates/common/src/za/search/load.rs` (`za_search_read_manifest`: the test-mode `SEARCH_MANIFEST_FAIL_ONCE` line)
 - Create: `tests/src/za/mail/threads.rs` (`pub mod threads;` in `tests/src/za/mail/mod.rs:50-59`; called in `tests/src/za/mod.rs` after `mail::search::test` and before `mail::traces::test`)
 - Test: `cargo test -p email --lib --features test_mode za::search::snapshot`, the za suite's `mail::threads`
@@ -2874,7 +2882,16 @@ that keeps singleton ids off every keyed response.
 
 **The validated snapshot** (6.2) is Task 10's **validated view** with `ViewNeed::Map` (PL3: the hash and the counter are checked against the very guard and cache the handler receives, and no guard is held across a reload). The handler reads each read-response state from `snapshot.cache` (Email, Mailbox) or `snapshot.state()` (Thread; D13, FR3), and each existence decision from that decision's validated cache, never paired with another cache or later store state. A keyed write selects `newState` and newly advertised mapped IDs from its final response view; `oldState` remains the original precondition state, and supplied-ID acknowledgement keys remain unchanged. `Email/set` uses the separate sequential input and response phases below (P1-STATE). A handler that already holds a content view (`Email/query` with a content filter or sort) uses that view as its snapshot and takes no second one: a second acquisition could pair the content checked against one cache with the state of another.
 
-Handlers of a key account take the snapshot first and use `snapshot.cache` where they used `get_cached_messages`; an ordinary account's path is unchanged (`keys.is_none()`).
+Handlers of a key account take the snapshot first and use `snapshot.cache` where they used `get_cached_messages`; an ordinary account's path is unchanged.
+A missing SessionKeys value does not identify an ordinary account: an owner's
+IMAP connection authenticated before provisioning can remain keyless. Before
+FETCH ObjectId or any EMAILID/THREADID filter in SEARCH, SORT or THREAD reads
+identities, classify the selected account with `za_mail_keys`. A key account
+without its own keys receives the existing keyless refusal; an ordinary
+account retains the upstream path. With keys, reuse the Content view or acquire
+one Map snapshot before the cache read, after capturing any saved-search
+dependency. Preserve the existing content and CC refusals and metadata-only
+owner commands. THREAD grouping remains Task 12.
 
 - [ ] **Step 1: Write the failing unit tests in `snapshot.rs`'s `mod tests`**
 
@@ -2940,7 +2957,7 @@ Task 11's real write fixture below still exercises the write floor.
 - `Thread/get` (`thread/get.rs:35-45, 80-85`): the snapshot's cache; `state` = `State::from((snapshot.state() != 0).then_some(snapshot.state()))` (`State` implements `From<Option<ChangeId>>` only, `crates/jmap-proto/src/types/state.rs:33-40`; FS8) in place of the store read at `:80-85` (D13, FR3); the members by the map are Task 12's (until then upstream's `thread_map` over the cache stands, under the mapped state).
 - `Blob/lookup` (`blob/get.rs:188-193`): `Id::from_parts(snapshot.thread_of(*document_id), *document_id)` and `Id::from(snapshot.thread_of(*document_id))`.
 - `EmailSubmission/set` (`submission/set.rs:449-450`): for a key account `snapshot.check_id(value)` must be `Some` (else `notFound` for the create), and `submission.thread_id = za_submission_prefix(value.document_id())`; `EmailSubmission/get` (`get.rs:237-249`): `EmailId` = `snapshot.map_id(email_id)`, `ThreadId` = `snapshot.thread_of(email_id)` (G22: the current thread, not the stored prefix).
-- IMAP `FETCH` `ObjectId` (`fetch/mod.rs:585-592`): one snapshot per FETCH command of a `za_key_session()` (`crates/imap/src/core/mod.rs:304-307`), taken before the window loop; `email_id: Id::from_parts(snapshot.thread_of(id), id)`, `thread_id: Id::from(snapshot.thread_of(id))`; `Err` → `NO [UNAVAILABLE]`. `SEARCH EMAILID` (`search.rs:565-574`): `snapshot.check_id(id)` decides the match; `THREADID` (`:576-586`): `snapshot.thread_members(thread_id)`; the snapshot is the command's content view when Task 10's `za_imap_content_guard` returned one, else one `za_snapshot` taken where the view would have been (FR8: one view or snapshot per request task at a time).
+- IMAP `FETCH` `ObjectId` (`fetch/mod.rs:585-592`): one snapshot per FETCH command with ObjectId when `za_mail_keys` returns the selected account's keys, taken before the window loop and after capturing any saved-search dependency; `email_id: Id::from_parts(snapshot.thread_of(id), id)`, `thread_id: Id::from(snapshot.thread_of(id))`; `Err` → `NO [UNAVAILABLE]`. `EMAILID` filters in SEARCH, SORT and THREAD (`search.rs:565-574`): `snapshot.check_id(id)` decides the match; `THREADID` (`:576-586`): `snapshot.thread_members(thread_id)`; the snapshot is the command's content view when Task 10's `za_imap_content_guard` returned one, else one `za_snapshot` taken where the view would have been (FR8: one view or snapshot per request task at a time).
 - The gates: `request.rs:296, 304, 318, 439, 455, 816` call `za_assert_mail_keys(self, access_token, req.account_id)`; `changes/get.rs:217-229`: `Email | Thread | EmailSubmission` → `za_assert_mail_keys`, `Mailbox` → `za_assert_mail_route`. The doc comment at `request.rs:853-864` lists the gated methods; extend it with 6.2's table.
 - "No map, no ids": every site above answers `za_no_map_error(reason)` when `za_snapshot` fails, traced `ZA_SEARCH_UNAVAILABLE` with the account id and the reason class, and emits nothing.
 
@@ -2998,6 +3015,16 @@ async fn case_failed_manifest_read(test: &TestServer, key: &Account) {
     // IMAP FETCH 1 (EMAILID) → NO [UNAVAILABLE]; then each succeeds and the ids match the keyed view
 }
 ```
+
+The existing real `owner_stale_keyless_session` fixture also keeps an owner
+socket open from before provisioning. After a fresh keyed session publishes a
+root and reply, the old socket must retain permitted metadata operations but
+refuse ObjectId and EMAILID/THREADID filters with the existing keyless error,
+including nested filters, unknown IDs and UID command forms. The fresh keyed
+socket checks mapped IDs and rejects stale singleton prefixes. Ordinary and
+ordinary-shared mailbox controls keep their existing identity behavior. Preserve
+content/CC refusal precedence and capture saved-search dependencies before any
+Map guard. THREAD's matched UID set is tested here; grouping is Task 12.
 
 P1-STATE regression cases in the same Task 11 suite (proposed execution ordering is part of each fixture):
 - `case_set_response_view_after_mutations`: in a quiescent keyed account, one Set creates C, updates U's flags and destroys D. Assert the original `oldState`, all outcomes, final `newState` equality with a following read, C's mapped IDs, changed U and absent D; a no-op Set with that `ifInState` succeeds when no intervening publication occurs. Cover keyed update-only/destroy-only and ordinary controls, plus unchanged supplied-ID acknowledgement echoes.
@@ -3098,9 +3125,14 @@ async fn case_g7_mailbox_counts(test: &TestServer, key: &Account, plain: &Accoun
 
 /// F1, 7.5: more than K references thread through the nearest ones; the K deviation is pinned.
 async fn case_f1_k_bound(test: &TestServer, key: &Account, plain: &Account) {
-    // 20 roots r1..r20 present on both; message M with References r1..r20 (r20 nearest): M joins on both (the `K = 16` hashes kept are its own id and its fifteen nearest references r6..r20, and those roots are present)
-    // delete r5..r20 on both (keyed Email/set destroy); message N with References r1..r20: the control joins r1's thread, the key account threads N as a singleton:
-    // assert_ne!(key_thread_of(N), key_thread_of(r1)); assert_eq!(plain_thread_of(N), plain_thread_of(r1))  // pinned deviation, 7.5
+    // 20 independent roots r1..r20 on both, all in the same normalized-subject bucket.
+    // M has References r1..r20 (r20 nearest), a distinct own id and no In-Reply-To.
+    // After indexing/ordinary merge completion, assert exact Message-ID members:
+    // key M's group is {M,r6..r20}; plain M's group is {M,r1..r20}.
+    // Resolve fresh mapped IDs and delete M AND r5..r20 on both; await completion.
+    // Insert N with the same subject and References, a distinct own id and no In-Reply-To.
+    // Fresh Thread/get members are exactly {N} on key and {r1,r2,r3,r4,N} on plain.
+    // N/r1 thread inequality/equality is secondary; it alone cannot prove singleton membership.
 }
 ```
 

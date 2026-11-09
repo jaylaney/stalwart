@@ -1,6 +1,11 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 30 (2026-11-08), execution correction.
+Date: 2026-11-04. Status: revision 31 (2026-11-08), execution clarification.
+Revision 31 makes the existing keyed-identity rule explicit for IMAP ObjectId
+and EMAILID/THREADID filters, including an owner's session opened before
+provisioning. It supersedes the older mail-spec keyless ObjectId carveout;
+permitted metadata-only commands retain their policy.
+
 Revision 30 bounds content compaction's authenticated one-byte tier.
 Full merges saturate at tier 255 and can keep succeeding. A tiered
 promotion beyond 255 refuses the proposed pass before any merge rewrite
@@ -2113,6 +2118,14 @@ management, flag and mailbox updates, identities and vacation, and
 nothing that carries an Email or thread id or depends on the map.
 Section 10's amendment of mail spec 3.3 says the same.
 
+For IMAP this key requirement includes FETCH (OBJECTID) and EMAILID/THREADID
+search keys in SEARCH, SORT and THREAD, including an owner's connection opened
+before provisioning. UID and sequence-number operations and other metadata-only
+commands retain their existing policy. This supersedes mail spec section 7's
+treatment of OBJECTID as a keyless cache field. Classify the selected account,
+not merely the session's current key presence. Preserve the existing content
+and unsupported-CC refusals.
+
 ### 6.3 Changes
 
 Upstream renders a thread merge as the old id destroyed and the new id
@@ -3115,7 +3128,9 @@ Mail spec invariants 24 to 32 hold, with these amendments:
   emits or takes an Email or thread id, or whose answer depends on the
   map, `Mailbox/get` included, requires keys; a keyless session keeps
   push, mailbox listing and management, flag and mailbox updates,
-  identities and vacation.
+  identities and vacation. For IMAP the same identity boundary includes
+  ObjectId and EMAILID/THREADID filters, superseding mail spec section 7's
+  keyless ObjectId exception; other metadata-only operations keep their policy.
 
 Added:
 
