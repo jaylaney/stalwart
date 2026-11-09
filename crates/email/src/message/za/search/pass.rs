@@ -1081,7 +1081,7 @@ mod tests {
                 .collect(),
         );
         for joined in [true, false] {
-            let mut opener = opener(1..=38);
+            let mut opener = opener(1..=39);
             let sixth = &mut opener.0.get_mut(&6).unwrap().as_mut().unwrap().fields;
             sixth.subject_hash = 5;
             if joined {
