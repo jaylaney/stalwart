@@ -1,6 +1,12 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 28 (2026-11-08), execution correction.
+Date: 2026-11-04. Status: revision 29 (2026-11-08), execution correction.
+Revision 29 binds a recovery write to the exact manifest version whose
+loss was established (P1-STALE-LOSS). A rebuild with neither present
+messages nor stored mailboxes uses one ordinary empty Email log record
+to publish its epoch (P2-ZERO-ROW-EPOCH). Both corrections use the
+existing manifest and log formats.
+
 Revision 28 pairs keyed changes and query evaluation with one validated view.
 A supplied since-state sets a minimum cache counter. Query evaluation keeps
 upstream current-row filter values and sort keys and applies the effective page
@@ -461,8 +467,9 @@ below (4.2; decision 2 in section 13).
   and a container update of every mailbox of the account. So: that a
   pass indexed something, which the arrivals already said, and nothing
   that depends on what the pass found in the mail. A pass that indexed
-  nothing writes no entry at all. The rebuild's boundary entry (5.4) is
-  the same shape, with the lowest message present as its witness.
+  nothing writes no entry at all. The rebuild boundary (5.4) uses the
+  lowest present message and the stored mailbox rows as witnesses. With
+  neither it writes one ordinary Email record with zero logical changes.
 
 **Nothing else.** No term, stem, position, header name, Message-ID,
 subject normalisation, sort key or thread membership leaves process
@@ -1384,32 +1391,59 @@ and resetting `content_to`, and no client resyncs. A manifest of a
 *newer* format version is not loss (F7): during
 a rolling upgrade the older binary answers "no map" (6.2) and
 unavailable (7.4) for that account until it is upgraded, and never
-rebuilds under the older format. A transient error is never loss.
+rebuilds under the older format. A destroying marker also gives no map.
+Transient and over-cap results do not authorize recovery.
 
-Its first batch (R3) is a publishing write by construction, whether or
-not it indexes anything: it writes a fresh manifest (no blobs, the
-revision counter continued from the old manifest, or restarted at 1
-when the manifest is missing or fails its tag, which is harmless since
-the manifest hash's equality and the fresh epoch, never the counter,
-decide validation (6.2, I7), `indexed_to` set to the account's current
-Email change id, and a rebuild cursor), the unlinks of every previous
-blob the old inventory reaches, and, when the account holds any message,
-the boundary entries: one Email item update of the lowest document id
-present, one Thread property change of that singleton, and a container
-property change of every mailbox (6.3). The boundary is a publishing
-write: it opens `revision + 1` and its row `(revision + 1, epoch)`, so
-`R(X)` for every `X` from the epoch on resolves to it (H14), and the
-batch's change id, filled in at commit as that row is (R33), becomes
-`epoch`. It is
-therefore newer than every state any client was ever issued, including
-the latest one, and distinct for every loss, so no issued state
-survives the boundary and no boundary is reused. An account that holds
-no message still writes the mailbox property changes (every key account
-has mailboxes), so its boundary is a fresh change id too (G3): a client
-at a pre-loss state can hold the mapped id of a message deleted since,
-whose record the loss took, and must resync like any other. Two nodes
-that find loss at once write competing first batches, and the manifest
-assertion decides (5.6).
+**Loss evidence** (P1-STALE-LOSS). A recovery write asserts the exact
+optional raw manifest value for which loss was established. Capture that
+value once and classify or decode the same capture. A missing manifest
+supplies raw absence and still requires the exact read-vault hash in the
+creating batch (5.7). A tag, parse or older-format failure supplies the
+actual failing bytes. For a decoded manifest, thread loss binds to the
+named thread input that failed. Content loss binds to that manifest's
+epoch and the exact content head and chain that failed. Construct the
+replacement and unlink inventory from the same asserted base.
+
+If the raw base moves, reload and re-enter without a recovery write, or
+establish fresh loss evidence against the current candidate before
+asserting it. A loss class alone supplies diagnostics. Decoding a
+successor or finding a resident part does not establish loss of that
+version. A healthy successor receives no recovery write. This applies
+to full and content-only loss recovery and uses the existing bounded
+re-entry and original content deadline, including any fresh proof
+reads. When that bound is exhausted, defer or refuse. No new persisted
+version field is required.
+
+Its first batch (R3) is a publishing write whether or not it indexes
+anything. It writes a fresh manifest with no blobs in its inventory and
+unlinks the old inventory. It sets `indexed_to` to the account's current
+Email change id and sets a rebuild cursor when mail is present. It
+continues the revision from a
+readable manifest or starts at 1. The manifest hash and fresh epoch
+decide validation (6.2, I7). When mail is present the boundary writes
+one Email item update of the lowest present document id and one Thread
+property change of that singleton. It writes an Email container property
+change for every stored mailbox, including when no message remains.
+The rebuild's input reads leave mailbox provisioning to the normal
+mailbox methods.
+
+Every rebuild boundary allocates a fresh ID from the account's Email
+change group in the same atomic batch as the manifest and unlinks.
+When both the present-message and stored-mailbox witness sets are empty
+(P2-ZERO-ROW-EPOCH), enqueue exactly one Email `Changes` record with
+zero logical changes through the normal encoder. Its value is the
+one-byte presence value `[0]`. A zero-length value is the retention
+marker. The row creates no message, mailbox, Thread row or change
+kind, and occupies one ordinary Email retention slot. It makes the
+allocation visible to readers of the Email log key and cache state.
+Fill the manifest's epoch and newest revision row with the assigned
+ID for this account's Email group (R33). The new row opens
+`(revision, epoch)` for `R(X)` at and above the epoch (H14). The epoch
+is strictly newer than every issued state and distinct for each
+committed rebuild. The rule below determines which earlier states
+are refused, including clients that still hold IDs deleted before
+the rebuild. Competing batches on the same loss base are decided by
+the manifest assertion (5.6).
 
 The old inventory is read as far as it goes: the thread list, and the
 content chain from its head. If the traversal is incomplete anywhere, a
@@ -1421,10 +1455,10 @@ From then on each pass works the cursor first, oldest document id
 first, and reads no log record after `indexed_to` until the cursor is
 exhausted (5.1's chronological order, R20); step 0's shortcut never
 applies while the cursor is pending (R10). The cursor is the set of
-document ids present in one message-cache snapshot taken when the
-rebuild started, walked upwards; the manifest stores the last id done
-and the highest id of that snapshot as the cursor's end, and the
-rebuild's `indexed_to` is that same snapshot's `last_change_id`, so a
+document ids present in one validated Email presence and state snapshot
+taken when the rebuild started, walked upwards. The manifest stores the
+last id done and the highest id of that snapshot as the cursor's end. The
+rebuild's `indexed_to` is that same snapshot's Email change id, so a
 message between the snapshot and the first batch is in the log after
 `indexed_to` and in neither gap (H15). Oldest first is
 upstream's own order, which is what bounds a merge (5.1); its cost is
@@ -1457,12 +1491,13 @@ Thread (the Email log also carries the mailbox container changes of
 6.3, which do not count; upstream's own kind filter,
 `crates/jmap/src/changes/get.rs:566-568`; R27), with a
 change id in `(S, epoch]`, closed at the epoch (R27, H1: the boundary
-batch's own Email witness update and Thread property change sit *at*
-the epoch, and they are what a client at the latest pre-loss state must
-not pass; an open interval let it through); when it holds none, nothing
-was lost for that client and the call is served (R27: an account whose
-messages were all deleted before the loss writes no Email or Thread
-entry at its boundary, so its clients' states stay usable). `Mailbox/*`
+batch's own Email item and Thread container witnesses, when present,
+sit *at* the epoch and fence the latest pre-loss state). A boundary
+with no message writes neither an Email item nor a Thread container
+change. When the interval has no record of the method's kind and
+retention still serves the state, the epoch check admits it (R27).
+A client whose state precedes real deletion records in the interval
+still must resync. `Mailbox/*`
 is outside the rule (H12): nothing of the mailbox history is lost at a
 loss, and a keyless session has no map to carry an epoch. A fresh `Initial`
 or `Exact(0)` is never refused by this rule: it holds no prior page. An
@@ -1479,12 +1514,14 @@ state, so nothing is invalidated there.
 A **reconciliation** runs when the change log is truncated below
 `indexed_to` (`is_truncated`; the log keeps `maxChangesHistory`
 records, 10,000 by default). It is the one place a pass consults the
-message cache for existence (an exception to 5.1's rule, G11): the pass
+account's validated Email presence for existence (an exception to 5.1's
+rule, G11): the pass
 writes a reconciliation marker into the manifest, with the retained
 log's bound as it read it (4.2, I7), and each
 pass recomputes the difference between the index's document set and a
-revalidated cache snapshot's, indexing what the index lacks and
-tombstoning what the cache lacks through a cursor over the difference,
+revalidated account snapshot's, using read-only presence and state inputs
+when the message cache is cold. It indexes what the index lacks and
+tombstones what the account lacks, through a cursor over the difference,
 in this order (H3, I1): the gap items first (those the retained log
 does not show), their inserts oldest document id first and then their
 deletions, so that a gap insert finds every message it references that
@@ -1800,7 +1837,7 @@ of 4.2, as one model rather than one patch each:
 | Tombstones and a soft insert cap put sizable bytes in the padded payload (R20, G1) | the public section; the enforced hidden budget `H` with a derived overshoot; `M` above the total | the hidden section always pads to `M` |
 | Two known Message-IDs tested for a shared thread through an amplified merge (R21) | aliases: a merge writes one entry, never its members | a merge's size does not depend on the threads' sizes |
 | A chosen message shrinking a content blob by what it shares with a target (G5) | per-record compression | no cross-record window |
-| An empty account refused every id-emitting method; a no-message rebuild without a boundary (G3) | the snapshot compares the Email group's counter; setup writes epoch 0; the no-message boundary writes mailbox entries | every boundary and publication moves what is compared |
+| An empty account refused every id-emitting method; a no-message rebuild without a boundary (G3) | the snapshot compares the Email group's counter; setup writes epoch 0; the boundary writes stored mailbox entries or an empty Email row when both witness sets are empty | every boundary and publication moves what is compared |
 | A `Thread/changes` state the Thread log serves but the Email log does not (G4) | the shorter log's bound for pruning, stamps and refusals | nothing needed is pruned while either log serves the state |
 | Thread parts crowded out, or an account cap no load can satisfy (G6) | a thread budget of its own; single-flight loads; the cap at a third of the budget | mail degrades after search, never before |
 | Evidence a pending cursor needs dropped at compaction (R16, compaction form) | a pending cursor holds every tombstone through compaction and reload | the discard rule and the pruning rule agree |
@@ -1894,19 +1931,19 @@ thread map as loaded (5.2) and validated (below):
   step 0); if the manifest's hash differs from the loaded index's, it
   reloads (incrementally, 4.3); then it requires the cache's
   `last_change_id`, the Email group's counter, which every publication's
-  entries and every boundary's advance (G3; the item state alone does
-  not move on a container-only record, `crates/email/src/cache/mod.rs:449-483`,
-  so comparing it would refuse an empty account for ever), to be at or
+  entries and every boundary's Email record advance (G3), to be at or
   past the change id of the manifest's newest revision row and at or
   past the epoch, and if it is not, the cache is behind a publication
   (another node's, within the cache's 5 s revalidation): it marks the
   account's Email group stale, re-reads the cache, and repeats; after
   three rounds without agreement, or on a transient error of the
-  manifest read, it fails as "no map, no ids" below. The state the
-  method then returns, Email, Thread or Mailbox, reflects the
-  publication because each publishing batch and each boundary batch
-  touches that method's log (6.3), and a Thread method returns the
-  validated cache's counter as its state, never a store read after the
+  manifest read, it fails as "no map, no ids" below. Publishing and
+  rebuild batches advance the shared group. Per-kind Email item state
+  does not move on a container-only record or the empty Email boundary.
+  That boundary advances the group without an item or mailbox change
+  or a Thread row (5.4). Method-specific state and kind checks keep their
+  rules (6.3). A keyed Thread method returns the validated cache's
+  counter as its state, never a store read after the
   cache (I5, revision 20: the counter check above holds it at or past
   every publication the map holds, which is what a read before the
   manifest could not promise; a store read after the cache would pair a
@@ -3144,9 +3181,12 @@ Added:
     item update and one Thread property change of the lowest indexed
     document id and a container property change of every mailbox;
     nothing for a pass that indexed none but a manifest-only checkpoint.
-    The rebuild's boundary batch is the same shape with the lowest
-    message present, and the mailbox entries alone when no message is
-    present.
+    A rebuild uses the lowest present message and all stored mailbox
+    rows as its boundary witnesses. If both witness sets are empty, it
+    writes exactly one ordinary Email record with zero logical changes
+    (encoded `[0]`), with no Thread row or change kind. The boundary
+    allocates the account's Email group ID atomically with the manifest
+    and unlinks, and fills both the epoch and newest revision row (5.4).
 54. Traces of the index carry account and document ids, counts, change
     ids, revisions and reason classes, never a term, header, Message-ID,
     sort key, query string or thread membership.
@@ -3165,8 +3205,8 @@ Added:
     leaves the shorter of the Email and Thread logs; a rebuild that
     loses identities allocates a fresh change id for its epoch, with or
     without a message to witness it, and refuses every sync state below
-    it whose method's log holds a record in `(S, epoch]`, the boundary's
-    own entries and the latest issued state included. Fresh `Initial` and
+    it whose method's log holds a record of that method's kind in
+    `(S, epoch]`, including the boundary's own witnesses when present. Fresh `Initial` and
     `Exact(0)` remain admissible; their continuations require a pinned end
     at or above retention and the validated map's epoch (P1-PAGING, 6.3).
     A newer manifest format is never loss, and loss of a content blob alone
