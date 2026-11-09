@@ -116,13 +116,13 @@ impl BlobStore {
         }
     }
 
-    fn shard_for(&self, key: &[u8]) -> &BlobStore {
+    fn shard_for(&self, _key: &[u8]) -> &BlobStore {
         match self {
             // SPDX-SnippetBegin
             // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
             // SPDX-License-Identifier: LicenseRef-SEL
             #[cfg(feature = "enterprise")]
-            BlobStore::Sharded(store) => store.get_store(key),
+            BlobStore::Sharded(store) => store.get_store(_key),
             // SPDX-SnippetEnd
             store => store,
         }

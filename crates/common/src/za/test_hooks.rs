@@ -1214,9 +1214,23 @@ pub enum SearchContentWrite {
     Original(u64),
     StagedMemory(u64),
     RetirementMemory(u64),
-    Encoded { tier: u8, bytes: u64 },
-    Uploaded { tier: u8, bytes: u64 },
-    Linked { tier: u8, bytes: u64 },
+    Encoded {
+        tier: u8,
+        bytes: u64,
+    },
+    Uploaded {
+        tier: u8,
+        bytes: u64,
+    },
+    Linked {
+        tier: u8,
+        bytes: u64,
+    },
+    Committed {
+        chain_length: u32,
+        full_merge: bool,
+        thread_compaction: bool,
+    },
 }
 
 static SEARCH_CONTENT_WRITES: std::sync::Mutex<Option<(u32, Vec<SearchContentWrite>)>> =

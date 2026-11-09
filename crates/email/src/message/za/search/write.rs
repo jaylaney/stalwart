@@ -738,6 +738,15 @@ async fn commit_and_swap(
             },
         );
     }
+    #[cfg(feature = "test_mode")]
+    note_search_content_write(
+        account_id,
+        SearchContentWrite::Committed {
+            chain_length: new.content.as_ref().map_or(0, |head| head.length),
+            full_merge: content.as_ref().is_some_and(|swap| swap.full),
+            thread_compaction: threads.is_some(),
+        },
+    );
     let new_hash = manifest_hash(&ManifestValue::Index(new.clone()).encode(&key));
     drop(key);
 

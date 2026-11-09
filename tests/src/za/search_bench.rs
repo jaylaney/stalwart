@@ -6,6 +6,7 @@
 
 use super::mail::{message_ids, row_is_stub, stored_blob, stored_metadata};
 use crate::utils::{
+    account::Account,
     server::{TestServer, TestServerBuilder},
     za::za_unlock,
 };
@@ -37,6 +38,9 @@ use store::{
 };
 use utils::{cheeky_hash::CheekyHash, codec::leb128::Leb128Reader};
 use vault::session::SessionKeys;
+
+mod accounting;
+mod system;
 
 const ACCOUNT: &str = "search-bench@example.com";
 const PASSWORD: &str = "bench-secret";
@@ -149,21 +153,24 @@ fn message_id(i: usize) -> String {
 
 /// Deterministic xorshift64 corpus, about 70 KB per message with the attachment mix.
 pub fn corpus(seed: u64, count: usize) -> Vec<Generated> {
+    generated(seed).take(count).collect()
+}
+
+fn generated(seed: u64) -> impl Iterator<Item = Generated> {
     let mut rng = Xorshift(if seed == 0 { 1 } else { seed });
     let vocabulary = Vocabulary::new(&mut rng);
     let mut date = 1_735_689_600;
     let mut body_sentences = 0;
     let mut attachment_sentences = 0;
-    let mut generated = Vec::with_capacity(count);
     let mut roots = Vec::new();
     let mut chain_tail = [None; 2];
     let mut replies_in_block = 0;
-    let mut ids = Vec::with_capacity(count);
-    let mut chains: Vec<Vec<usize>> = Vec::with_capacity(count);
-    let mut thread_roots = Vec::with_capacity(count);
+    let mut ids = Vec::new();
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    let mut thread_roots = Vec::new();
     let mut attachment_slots: [usize; 100] = std::array::from_fn(|i| i);
 
-    for i in 0..count {
+    (0usize..).map(move |i| {
         if i.is_multiple_of(1000) {
             roots.clear();
             chain_tail = [None; 2];
@@ -263,16 +270,16 @@ pub fn corpus(seed: u64, count: usize) -> Vec<Generated> {
             ));
         }
 
-        generated.push(Generated {
+        let generated = Generated {
             raw: builder.write_to_vec().unwrap(),
             attachment_bytes,
             references: references.len(),
-        });
+        };
         ids.push(id);
         chains.push(references);
         thread_roots.push(thread_root);
-    }
-    generated
+        generated
+    })
 }
 
 #[derive(Default)]
@@ -467,27 +474,7 @@ pub async fn format() {
     );
     let started = Instant::now();
     for (i, message) in messages.into_iter().enumerate() {
-        let parsed = parser.parse(&message.raw).unwrap();
-        test.server
-            .email_ingest(IngestEmail {
-                raw_message: &message.raw,
-                message: Some(&parsed),
-                blob_hash: None,
-                access_token: &token,
-                mailbox_ids: vec![INBOX_ID],
-                keywords: vec![],
-                received_at: None,
-                source: IngestSource::Smtp {
-                    deliver_to: ACCOUNT,
-                    envelope_from: "bench@remote.test",
-                    sender_authentication: SenderAuthentication::DmarcPass,
-                    is_spam: false,
-                },
-                metadata: None,
-                session_id: 0,
-            })
-            .await
-            .unwrap();
+        deliver(&test, &account, &token, &parser, &message.raw).await;
         if (i + 1).is_multiple_of(1000) {
             println!("Ingested {}/{count} messages", i + 1);
         }
@@ -608,4 +595,47 @@ pub async fn format() {
 
     test.shutdown();
     test.temp_dir.delete();
+}
+
+async fn deliver(
+    test: &TestServer,
+    account: &Account,
+    token: &AccessToken,
+    parser: &MessageParser,
+    raw: &[u8],
+) -> u32 {
+    let parsed = parser.parse(raw).unwrap();
+    let delivered = test
+        .server
+        .email_ingest(IngestEmail {
+            raw_message: raw,
+            message: Some(&parsed),
+            blob_hash: None,
+            access_token: token,
+            mailbox_ids: vec![INBOX_ID],
+            keywords: vec![],
+            received_at: None,
+            source: IngestSource::Smtp {
+                deliver_to: account.name(),
+                envelope_from: "bench@remote.test",
+                sender_authentication: SenderAuthentication::DmarcPass,
+                is_spam: false,
+            },
+            metadata: None,
+            session_id: 0,
+        })
+        .await
+        .unwrap();
+    assert_ne!(
+        delivered.change_id,
+        u64::MAX,
+        "corpus item was not delivered"
+    );
+    delivered.document_id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+pub async fn system() {
+    system::run().await;
 }
