@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::za_search::za_imap_content_guard;
+use super::za_search::{za_imap_content_guard, za_imap_map_guard};
 use crate::{
     core::{SelectedMailbox, Session, SessionData},
     spawn_op,
@@ -72,9 +72,16 @@ impl<T: SessionStream> SessionData<T> {
             .za_assert_mail_route(&self.access_token, mailbox.id.account_id)
             .await?;
         let mut saved_search = None;
-        let za = za_imap_content_guard(self, &mailbox, &arguments.filter, &[], &mut saved_search)
-            .await?;
-        let cache = match &za {
+        let content_view =
+            za_imap_content_guard(self, &mailbox, &arguments.filter, &[], &mut saved_search)
+                .await?;
+        let is_content = content_view.is_some();
+        let snapshot = if is_content {
+            content_view
+        } else {
+            za_imap_map_guard(self, &mailbox, &arguments.filter, &mut saved_search, false).await?
+        };
+        let cache = match &snapshot {
             Some(view) => view.cache.clone(),
             None => self
                 .server
@@ -94,7 +101,11 @@ impl<T: SessionStream> SessionData<T> {
                 &mailbox,
                 &cache,
                 &saved_search,
-                za.as_ref().map(ZaView::content),
+                snapshot.as_ref(),
+                snapshot
+                    .as_ref()
+                    .filter(|_| is_content)
+                    .map(ZaView::content),
             )
             .await?;
 

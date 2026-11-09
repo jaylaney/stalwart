@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::utils::{account::Account, http::HttpRequest, server::TestServer};
+use crate::{
+    utils::{account::Account, http::HttpRequest, server::TestServer},
+    za::tracing::{WsStream, ws_call},
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use calcard::{
     common::{IanaString, timezone::Tz},
@@ -2265,6 +2268,76 @@ pub async fn za_bearer_token(server: &common::Server, name: &str) -> String {
     za_grant_token(server, name, common::auth::oauth::scope::OAuthScopes::ALL)
         .await
         .1
+}
+
+/// The capabilities of a keyless request (`jmap_method_calls`' list, less
+/// the calendar, contact and file ones these calls do not use).
+pub(crate) const KEYLESS_JMAP_USING: &[&str] = &[
+    "urn:ietf:params:jmap:core",
+    "urn:ietf:params:jmap:mail",
+    "urn:ietf:params:jmap:submission",
+    "urn:ietf:params:jmap:vacationresponse",
+    "urn:ietf:params:jmap:sieve",
+    "urn:ietf:params:jmap:blob",
+    "urn:ietf:params:jmap:mail:share",
+];
+
+/// A keyless channel of the key account: its OAuth Bearer token over HTTP,
+/// or a WebSocket (which never holds keys, spec 3.3).
+pub(crate) enum Keyless {
+    Bearer(String),
+    WebSocket(WsStream),
+}
+
+impl Keyless {
+    pub async fn bearer(server: &common::Server, name: &str) -> Self {
+        Self::Bearer(za_bearer_token(server, name).await)
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Keyless::Bearer(_) => "Bearer",
+            Keyless::WebSocket(_) => "WebSocket",
+        }
+    }
+
+    /// One method call; its response.
+    pub async fn call(&mut self, account: &Account, method: &str, args: Value) -> Value {
+        let reply: Value = match self {
+            Keyless::Bearer(token) => reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .post(account.api_url())
+                .bearer_auth(token)
+                .body(
+                    json!({ "using": KEYLESS_JMAP_USING, "methodCalls": [[method, args, "c0"]] })
+                        .to_string(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap(),
+            Keyless::WebSocket(socket) => serde_json::from_str(
+                &ws_call(
+                    socket,
+                    &json!({
+                        "@type": "Request",
+                        "id": "1",
+                        "using": KEYLESS_JMAP_USING,
+                        "methodCalls": [[method, args, "c0"]]
+                    })
+                    .to_string(),
+                )
+                .await,
+            )
+            .unwrap(),
+        };
+        reply["methodResponses"][0].clone()
+    }
 }
 
 /// A fresh TOTP enrolment URL (a random 20-byte secret).

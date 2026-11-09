@@ -594,7 +594,7 @@ async fn ws_recv(stream: &mut (impl AsyncReadExt + Unpin)) -> Option<(u8, Vec<u8
     Some((head[0] & 0x0f, payload))
 }
 
-pub(super) type WsStream = BufReader<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+pub(crate) type WsStream = BufReader<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
 
 /// Open a JMAP WebSocket with Basic credentials.
 pub(super) async fn ws_connect(user: &str, secret: &str) -> WsStream {
@@ -639,7 +639,7 @@ pub(super) async fn ws_connect(user: &str, secret: &str) -> WsStream {
 
 /// Send `message` as one text frame and return the server's text reply,
 /// answering pings meanwhile.
-pub(super) async fn ws_call(stream: &mut WsStream, message: &str) -> String {
+pub(crate) async fn ws_call(stream: &mut WsStream, message: &str) -> String {
     ws_send(stream, 0x1, message.as_bytes()).await;
     let reply = loop {
         match ws_recv(stream)

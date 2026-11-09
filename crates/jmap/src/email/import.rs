@@ -13,7 +13,7 @@ use crate::{
     changes::state::JmapCacheState,
     email::{
         grouped::{GroupedIngest, QueuedEmail},
-        ingested_into_object, invalid_keywords,
+        ingested_into_object, invalid_keywords, map_created_ids,
     },
 };
 use common::storage::blob::FetchedBlob;
@@ -23,6 +23,7 @@ use common::{
     ipc::{EmailPush, PushNotification},
     za::mail::za_keyless_refusal,
 };
+use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
 use email::{
     cache::{MessageCacheFetch, mailbox::MailboxCacheAccess},
     mailbox::JUNK_ID,
@@ -308,7 +309,16 @@ impl EmailImport for Server {
                 }))
                 .await;
             }
+        }
 
+        if let Some(keys) = access_token.za_keys_for(account_id) {
+            let snapshot = self
+                .za_response_snapshot(account_id, keys, last_change_id)
+                .await
+                .map_err(|reason| za_no_map_error(reason, account_id))?;
+            map_created_ids(&snapshot, response.created.values_mut());
+            response.new_state = snapshot.cache.get_state(false);
+        } else if let Some(change_id) = last_change_id {
             response.new_state = metadata
                 .viewer_change_id(self, account_id)
                 .await?

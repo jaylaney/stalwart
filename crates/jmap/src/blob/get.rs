@@ -6,7 +6,13 @@
 
 use super::{download::BlobDownload, embedded::EmbeddedBlobs};
 use common::{Server, auth::AccessToken};
-use email::message::messagedata::MessageData;
+use email::{
+    cache::email::MessageCacheAccess,
+    message::{
+        messagedata::MessageData,
+        za::search::snapshot::{ZaSnapshotFetch, za_no_map_error},
+    },
+};
 use encodify::base64::STANDARD;
 use jmap_proto::{
     method::{
@@ -35,6 +41,7 @@ pub trait BlobOperations: Sync + Send {
     fn blob_lookup(
         &self,
         request: BlobLookupRequest,
+        access_token: &AccessToken,
     ) -> impl Future<Output = trc::Result<BlobLookupResponse>> + Send;
 }
 
@@ -139,7 +146,11 @@ impl BlobOperations for Server {
         Ok(response)
     }
 
-    async fn blob_lookup(&self, request: BlobLookupRequest) -> trc::Result<BlobLookupResponse> {
+    async fn blob_lookup(
+        &self,
+        request: BlobLookupRequest,
+        access_token: &AccessToken,
+    ) -> trc::Result<BlobLookupResponse> {
         let mut type_names = Vec::with_capacity(request.type_names.len());
         for type_name in request.type_names {
             let MaybeInvalid::Value(type_name) = type_name else {
@@ -150,6 +161,14 @@ impl BlobOperations for Server {
             }
         }
         let req_account_id = request.account_id.document_id();
+        let snapshot = match access_token.za_keys_for(req_account_id) {
+            Some(keys) => Some(
+                self.za_snapshot(req_account_id, keys)
+                    .await
+                    .map_err(|reason| za_no_map_error(reason, req_account_id))?,
+            ),
+            None => None,
+        };
         let mut response = BlobLookupResponse {
             account_id: request.account_id,
             list: Vec::with_capacity(request.ids.len()),
@@ -177,20 +196,27 @@ impl BlobOperations for Server {
                 {
                     match Collection::from(*collection) {
                         Collection::Email => {
-                            if let Some(data) = self
-                                .store()
-                                .get_value::<MessageData>(ValueKey::archive(
-                                    req_account_id,
-                                    Collection::Email,
-                                    *document_id,
-                                ))
-                                .await?
-                            {
+                            let data = match &snapshot {
+                                Some(snapshot) => snapshot.cache.message_data(*document_id),
+                                None => {
+                                    self.store()
+                                        .get_value::<MessageData>(ValueKey::archive(
+                                            req_account_id,
+                                            Collection::Email,
+                                            *document_id,
+                                        ))
+                                        .await?
+                                }
+                            };
+                            if let Some(data) = data {
+                                let thread_id = snapshot
+                                    .as_ref()
+                                    .map_or(data.thread_id, |view| view.thread_of(*document_id));
                                 if let Some(ids) = matched_ids.get_mut(&DataType::Email) {
-                                    ids.push(Id::from_parts(data.thread_id, *document_id));
+                                    ids.push(Id::from_parts(thread_id, *document_id));
                                 }
                                 if let Some(ids) = matched_ids.get_mut(&DataType::Thread) {
-                                    ids.push(Id::from(data.thread_id));
+                                    ids.push(Id::from(thread_id));
                                 }
                                 if let Some(ids) = matched_ids.get_mut(&DataType::Mailbox) {
                                     ids.extend(data.mailboxes.iter().map(|m| {

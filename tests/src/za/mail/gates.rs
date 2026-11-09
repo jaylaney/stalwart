@@ -14,18 +14,21 @@
 //! whatever the route (ruling R34): a grant made before provisioning (ruling
 //! R5), a group's grant, impersonation.
 
-use super::{Traced, deliver, fence::set_marker, key_mail_account, message_ids, message_with};
+use super::{
+    Traced, deliver, fence::set_marker, key_mail_account, message_ids, message_with, new_message,
+    reply_to,
+};
 use crate::{
     utils::{
         account::Account,
         imap::{AssertResult, ImapConnection, Type},
         jmap::JmapResponse,
         server::TestServer,
-        za::{wait_for_delivery, za_bearer_token, za_setup, za_setup_token},
+        za::{KEYLESS_JMAP_USING as USING, Keyless, wait_for_delivery, za_setup, za_setup_token},
     },
     za::{
         STRONG,
-        tracing::{WsStream, ws_call, ws_close, ws_connect},
+        tracing::{ws_close, ws_connect},
         user_permissions,
     },
 };
@@ -69,18 +72,6 @@ const ATTACHMENT: &[u8] = b"gates canary attachment \x00\x01\xfe\xff";
 const KEYLESS_REFUSED: &str = "zero-access: mail access without session keys";
 const COPY_REFUSED: &str = "zero-access: mail copy across accounts";
 const SHARING_REFUSED: &str = "zero-access: sharing refused on a key account's mailbox";
-/// The capabilities of a keyless request (`jmap_method_calls`' list, less
-/// the calendar, contact and file ones these calls do not use).
-const USING: &[&str] = &[
-    "urn:ietf:params:jmap:core",
-    "urn:ietf:params:jmap:mail",
-    "urn:ietf:params:jmap:submission",
-    "urn:ietf:params:jmap:vacationresponse",
-    "urn:ietf:params:jmap:sieve",
-    "urn:ietf:params:jmap:blob",
-    "urn:ietf:params:jmap:mail:share",
-];
-
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access mail access gate tests...");
     let admin = test.account("admin@example.com").clone();
@@ -271,57 +262,6 @@ async fn provision(test: &mut TestServer, admin: &Account, account: &mut Account
     test.insert_account(account.clone());
 }
 
-/// A keyless channel of the key account: its OAuth Bearer token over HTTP,
-/// or a WebSocket (which never holds keys, spec 3.3).
-enum Keyless {
-    Bearer(String),
-    WebSocket(WsStream),
-}
-
-impl Keyless {
-    fn name(&self) -> &'static str {
-        match self {
-            Keyless::Bearer(_) => "Bearer",
-            Keyless::WebSocket(_) => "WebSocket",
-        }
-    }
-
-    /// One method call; its response.
-    async fn call(&mut self, account: &Account, method: &str, args: Value) -> Value {
-        let reply: Value = match self {
-            Keyless::Bearer(token) => reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap()
-                .post(account.api_url())
-                .bearer_auth(token)
-                .body(json!({ "using": USING, "methodCalls": [[method, args, "c0"]] }).to_string())
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap(),
-            Keyless::WebSocket(socket) => serde_json::from_str(
-                &ws_call(
-                    socket,
-                    &json!({
-                        "@type": "Request",
-                        "id": "1",
-                        "using": USING,
-                        "methodCalls": [[method, args, "c0"]]
-                    })
-                    .to_string(),
-                )
-                .await,
-            )
-            .unwrap(),
-        };
-        reply["methodResponses"][0].clone()
-    }
-}
-
 /// Mail spec 4: over a keyless channel (the Bearer token, the WebSocket)
 /// the key-needing methods answer `forbidden` with `ZA_MAIL_KEYLESS` at the
 /// dispatcher, traced once per call as `Security(Unauthorized)` naming the
@@ -390,7 +330,59 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
         ["maxObjectsInGet"]
         .as_u64()
         .unwrap() as usize;
+    let mailbox_state = key
+        .jmap_method_call("Mailbox/get", json!({ "accountId": account, "ids": [] }))
+        .await
+        .state()
+        .to_string();
+    let submission_state = key
+        .jmap_method_call(
+            "EmailSubmission/get",
+            json!({ "accountId": account, "ids": [] }),
+        )
+        .await
+        .state()
+        .to_string();
     let key_needing = [
+        // Search spec 6.2 requires keys for the mapped identities and thread counters.
+        ("Mailbox/get", json!({ "accountId": account, "ids": null })),
+        (
+            "Email/query",
+            json!({ "accountId": account, "filter": filter }),
+        ),
+        (
+            "Email/queryChanges",
+            json!({ "accountId": account, "filter": filter, "sinceQueryState": query_state }),
+        ),
+        (
+            "Email/changes",
+            json!({ "accountId": account, "sinceState": email_state }),
+        ),
+        (
+            "Thread/get",
+            json!({ "accountId": account, "ids": [&thread_id] }),
+        ),
+        (
+            "Thread/changes",
+            json!({ "accountId": account, "sinceState": thread_state }),
+        ),
+        (
+            "EmailSubmission/get",
+            json!({ "accountId": account, "ids": [] }),
+        ),
+        ("EmailSubmission/query", json!({ "accountId": account })),
+        (
+            "EmailSubmission/changes",
+            json!({ "accountId": account, "sinceState": submission_state }),
+        ),
+        (
+            "Blob/lookup",
+            json!({ "accountId": account, "ids": [&missing_blob], "typeNames": ["Email"] }),
+        ),
+        (
+            "Blob/copy",
+            json!({ "fromAccountId": account, "accountId": account, "blobIds": [&missing_blob] }),
+        ),
         (
             "Email/get",
             json!({ "accountId": account, "ids": [&email_id], "properties": ["id"] }),
@@ -434,7 +426,7 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
     ];
 
     let channels = [
-        Keyless::Bearer(za_bearer_token(&test.server, KEY).await),
+        Keyless::bearer(&test.server, KEY).await,
         Keyless::WebSocket(ws_connect(KEY, STRONG).await),
     ];
     let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
@@ -445,27 +437,13 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
             assert_refused(&response, &format!("{method} over the {name} channel"));
         }
         let keyless = [
-            ("Mailbox/get", json!({ "accountId": account, "ids": null })),
+            ("Mailbox/query", json!({ "accountId": account })),
             (
-                "Email/query",
-                json!({ "accountId": account, "filter": filter }),
+                "Mailbox/changes",
+                json!({ "accountId": account, "sinceState": mailbox_state }),
             ),
-            (
-                "Email/queryChanges",
-                json!({ "accountId": account, "filter": filter, "sinceQueryState": query_state }),
-            ),
-            (
-                "Email/changes",
-                json!({ "accountId": account, "sinceState": email_state }),
-            ),
-            (
-                "Thread/get",
-                json!({ "accountId": account, "ids": [&thread_id] }),
-            ),
-            (
-                "Thread/changes",
-                json!({ "accountId": account, "sinceState": thread_state }),
-            ),
+            ("Mailbox/set", json!({ "accountId": account })),
+            ("Core/echo", json!({ "keylessControl": true })),
             (
                 "Email/set",
                 json!({
@@ -966,6 +944,16 @@ async fn sharing_is_refused_on_key_mailboxes(key: &Account, plain: &Account) {
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
         .assert_contains("gates body");
+    // Identity routing follows the selected plain account even though the
+    // authenticated owner of this connection has its own session keys.
+    imap.send("FETCH 1 (OBJECTID)").await;
+    let lines = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    let (email, thread) = imap_identity(&lines);
+    for filter in [format!("EMAILID {email}"), format!("THREADID {thread}")] {
+        imap.send(&format!("SEARCH {filter}")).await;
+        let found = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+        assert!(imap_matched_uids(&found, "* SEARCH").contains(&1));
+    }
     imap.send_ok("LOGOUT").await;
     owner.send_ok(&format!("DELETEACL INBOX {KEY}")).await;
     owner.send_ok("LOGOUT").await;
@@ -1502,7 +1490,7 @@ async fn group_member_stale_token(
 /// Ruling R33: the owner's IMAP session opened while its account was plain
 /// holds no keys (the login derived none). Once the account is provisioned
 /// it still reads flags, its NOOP reports another session's flag change,
-/// and a content FETCH answers `NO [NOPERM]`.
+/// and content FETCH and thread-valued requests answer `NO [NOPERM]`.
 async fn owner_stale_keyless_session(test: &mut TestServer, admin: &Account) -> Account {
     println!("owner_stale_keyless_session");
     let mut owner = admin
@@ -1513,18 +1501,106 @@ async fn owner_stale_keyless_session(test: &mut TestServer, admin: &Account) -> 
     imap.send_ok("SELECT INBOX").await;
 
     provision(test, admin, &mut owner).await;
-    deliver(
-        test,
-        SENDER,
-        OWNER,
-        &message_with(&format!("{CANARY} owner"), "owner canary"),
-    )
-    .await;
+    let subject = format!("{CANARY} owner");
+    let root = message_with(&subject, "owner canary");
+    deliver(test, SENDER, OWNER, &root).await;
+    let account_id = owner.id().document_id();
+    let root_id = new_message(test, account_id, &[]).await;
+    let reply = reply_to(&root, &subject, "stale owner reply");
+    deliver(test, SENDER, OWNER, &reply).await;
+    let reply_id = new_message(test, account_id, &[root_id]).await;
+    let mapped = Id::from_parts(root_id, reply_id);
+    let singleton = Id::from_parts(reply_id, reply_id);
+    let thread = Id::from(root_id);
     let mut keyed = ImapConnection::connect(b"_x ").await;
     keyed.authenticate(OWNER, STRONG).await;
     keyed.send_ok("SELECT INBOX").await;
     keyed.send_ok("STORE 1 +FLAGS (\\Flagged)").await;
-    keyed.send_ok("LOGOUT").await;
+    keyed.send("UID FETCH 2 (OBJECTID)").await;
+    let fetched = keyed.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert_eq!(
+        imap_identity(&fetched),
+        (mapped.to_string(), thread.to_string())
+    );
+
+    // The stale socket remains selected and keyless after the keyed
+    // socket has proved this reply's non-singleton wire identity.
+    for command in [
+        "UID FETCH 2 (OBJECTID)".to_string(),
+        format!("UID SEARCH EMAILID {singleton}"),
+        format!("UID SEARCH EMAILID {}", Id::from_parts(root_id, u32::MAX)),
+        format!("UID SEARCH OR EMAILID {mapped} NOT THREADID {thread}"),
+        format!("UID SORT (ARRIVAL) UTF-8 THREADID {thread}"),
+        format!("UID THREAD REFERENCES UTF-8 EMAILID {mapped}"),
+    ] {
+        imap.send(&command).await;
+        let lines = imap
+            .assert_read(Type::Tagged, ResponseType::No)
+            .await
+            .assert_response_code("NOPERM")
+            .assert_contains(ZA_MAIL_KEYLESS);
+        assert!(
+            lines.iter().all(|line| {
+                !line.contains("EMAILID ")
+                    && !line.contains("THREADID ")
+                    && !["* SEARCH", "* ESEARCH", "* SORT", "* THREAD"]
+                        .iter()
+                        .any(|prefix| line.starts_with(prefix))
+            }),
+            "{command}: {lines:?}"
+        );
+    }
+    imap.send(&format!("UID SEARCH OR EMAILID {mapped} BODY absent"))
+        .await;
+    imap.assert_read(Type::Tagged, ResponseType::No)
+        .await
+        .assert_response_code("CANNOT")
+        .assert_contains(common::za::ZA_MAIL_SEARCH_REFUSED);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        keyed.send(&format!("UID SEARCH EMAILID {mapped}")).await;
+        keyed
+            .assert_read(Type::Tagged, ResponseType::Ok)
+            .await
+            .assert_equals("* SEARCH 2");
+        keyed.send(&format!("UID SEARCH EMAILID {singleton}")).await;
+        keyed
+            .assert_read(Type::Tagged, ResponseType::Ok)
+            .await
+            .assert_equals("* SEARCH");
+        keyed.send(&format!("UID SEARCH THREADID {thread}")).await;
+        keyed
+            .assert_read(Type::Tagged, ResponseType::Ok)
+            .await
+            .assert_equals("* SEARCH 1 2");
+        keyed
+            .send(&format!("UID SORT (ARRIVAL) UTF-8 THREADID {thread}"))
+            .await;
+        let sort = keyed.assert_read(Type::Tagged, ResponseType::Ok).await;
+        assert_eq!(imap_matched_uids(&sort, "* SORT"), [1, 2]);
+        keyed
+            .send(&format!("UID THREAD REFERENCES UTF-8 THREADID {thread}"))
+            .await;
+        let threaded = keyed.assert_read(Type::Tagged, ResponseType::Ok).await;
+        assert_eq!(imap_matched_uids(&threaded, "* THREAD"), [1, 2]);
+        keyed
+            .send_ok(&format!("UID SEARCH RETURN (SAVE) EMAILID {mapped}"))
+            .await;
+        keyed
+            .send(&format!("UID THREAD REFERENCES UTF-8 $ THREADID {thread}"))
+            .await;
+        let threaded = keyed.assert_read(Type::Tagged, ResponseType::Ok).await;
+        assert_eq!(imap_matched_uids(&threaded, "* THREAD"), [2]);
+        keyed.send("UID FETCH $ (OBJECTID)").await;
+        let fetched = keyed.assert_read(Type::Tagged, ResponseType::Ok).await;
+        assert_eq!(
+            imap_identity(&fetched),
+            (mapped.to_string(), thread.to_string())
+        );
+        keyed.send_ok("LOGOUT").await;
+    })
+    .await
+    .expect("mapped identity commands must complete");
 
     imap.send("NOOP").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
@@ -1535,8 +1611,52 @@ async fn owner_stale_keyless_session(test: &mut TestServer, admin: &Account) -> 
         .await
         .assert_contains("\\Flagged");
     assert_imap_refused(&mut imap, "FETCH 1 (BODY[])").await;
+
+    imap.send(&format!("UID SORT (CC) UTF-8 THREADID {thread}"))
+        .await;
+    imap.assert_read(Type::Tagged, ResponseType::No)
+        .await
+        .assert_contains("Sorting by CC is not supported.");
+
+    imap.send("UID SEARCH ALL").await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* SEARCH 1 2");
+    imap.send("UID SORT (ARRIVAL) UTF-8 ALL").await;
+    let sorted = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert_eq!(imap_matched_uids(&sorted, "* SORT"), [1, 2]);
     imap.send_ok("LOGOUT").await;
     owner
+}
+
+fn imap_identity(lines: &[String]) -> (String, String) {
+    let line = lines
+        .iter()
+        .find(|line| line.contains("OBJECTID ("))
+        .unwrap();
+    let atom = |name| {
+        line.split_once(name)
+            .unwrap()
+            .1
+            .split([' ', ')'])
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    (atom("EMAILID "), atom("THREADID "))
+}
+
+fn imap_matched_uids(lines: &[String], prefix: &str) -> Vec<u32> {
+    let mut ids = lines
+        .iter()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap()
+        .split([' ', '(', ')'])
+        .filter(|item| !item.is_empty())
+        .map(|item| item.parse().unwrap())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
 }
 
 /// A method call with Basic credentials `user` and `secret` (a master-user

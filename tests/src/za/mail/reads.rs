@@ -126,7 +126,7 @@ pub async fn test(test: &mut TestServer) {
     legacy_plaintext_is_served_as_plaintext(test, &key, corpus_doc).await;
     plain_header_block_with_the_format_byte(test, &plain).await;
     clear_messages(&key).await;
-    threads_are_singletons(test, &key).await;
+    singleton_rows_have_mapped_wire_ids(test, &key).await;
     submission_strips_bcc(test, &key, &plain, &bcc).await;
     push_is_state_only(test, &key, &plain).await;
     rf_1_idle_delivery(test, &key).await;
@@ -1091,13 +1091,14 @@ async fn legacy_plaintext_is_served_as_plaintext(
     );
 }
 
-/// Mail spec 5.4: a key account's messages are singleton threads, however
-/// their headers chain.
-async fn threads_are_singletons(test: &TestServer, key: &Account) {
-    println!("threads_are_singletons");
+/// Search spec 6.2: persisted Email rows keep singleton thread IDs,
+/// and keyed Get and Query map the chained messages at the response.
+async fn singleton_rows_have_mapped_wire_ids(test: &TestServer, key: &Account) {
+    println!("singleton_rows_have_mapped_wire_ids");
     let key_id = key.id().document_id();
     let ids = ["t1", "t2", "t3"]
         .map(|id| format!("<{id}.{:016x}@example.org>", store::rand::random::<u64>()));
+    let mut documents = Vec::new();
     for (n, references) in [
         String::new(),
         format!("In-Reply-To: {}\r\nReferences: {}\r\n", ids[0], ids[0]),
@@ -1125,51 +1126,44 @@ async fn threads_are_singletons(test: &TestServer, key: &Account) {
             ),
         )
         .await;
+        let document_id = super::new_message(test, key_id, &documents).await;
+        documents.push(document_id);
     }
-    let documents = message_ids(test, key_id).await;
-    assert_eq!(documents.len(), 3);
 
-    let (list, _) = email_get(key, None, &["id", "threadId"]).await;
-    let mut thread_ids = list
+    for &document_id in &documents {
+        let row = test
+            .server
+            .store()
+            .get_value::<email::message::messagedata::MessageData>(store::ValueKey::archive(
+                key_id,
+                Collection::Email,
+                document_id,
+            ))
+            .await
+            .unwrap()
+            .expect("the stored Email row");
+        assert_eq!(row.thread_id, document_id);
+    }
+
+    let root = documents[0];
+    let (list, not_found) = email_get(key, None, &["id", "threadId"]).await;
+    assert!(not_found.is_empty(), "{not_found:?}");
+    let mut emitted = list
         .iter()
-        .map(|email| email["threadId"].as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-    thread_ids.sort();
-    thread_ids.dedup();
-    assert_eq!(thread_ids.len(), 3, "{list:?}");
-    let threads = key
-        .jmap_method_call(
-            "Thread/get",
-            json!({ "accountId": key.id_string(), "ids": thread_ids }),
-        )
-        .await;
-    assert_eq!(threads.list().len(), 3);
-    for thread in threads.list() {
-        assert_eq!(thread["emailIds"].as_array().unwrap().len(), 1, "{thread}");
-    }
-
-    let mut imap = imap_session(key, b"_t ").await;
-    let answer = imap_answer(&mut imap, "THREAD REFERENCES UTF-8 ALL").await;
-    let line = answer
-        .lines()
-        .find(|line| line.starts_with("* THREAD "))
-        .unwrap_or_else(|| panic!("{answer}"));
-    // One group per message, whatever the order.
-    let mut groups = line["* THREAD ".len()..]
-        .strip_prefix('(')
-        .and_then(|groups| groups.strip_suffix(')'))
-        .unwrap_or_else(|| panic!("{line}"))
-        .split(")(")
-        .map(|group| {
-            group
-                .parse::<u32>()
-                .unwrap_or_else(|_| panic!("not a singleton: {line}"))
+        .map(|email| {
+            assert_eq!(email["threadId"], Id::from(root).to_string());
+            email["id"].as_str().unwrap().parse::<Id>().unwrap()
         })
         .collect::<Vec<_>>();
-    groups.sort_unstable();
-    assert_eq!(groups, [1, 2, 3], "{line}");
-    imap.send_ok("LOGOUT").await;
+    emitted.sort_unstable();
+    let mut expected = documents
+        .iter()
+        .map(|&doc| Id::from_parts(root, doc))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(emitted, expected);
 
+    // Task 12 exercises Thread/get and IMAP THREAD mapped membership.
     let collapsed = key
         .jmap_method_call(
             "Email/query",
@@ -1180,7 +1174,10 @@ async fn threads_are_singletons(test: &TestServer, key: &Account) {
             }),
         )
         .await;
-    assert_eq!(collapsed.ids().count(), 3);
+    assert_eq!(collapsed.ids().count(), 1);
+    let selected: Id = collapsed.ids().next().unwrap().parse().unwrap();
+    assert_eq!(selected.prefix_id(), root);
+    assert!(documents.contains(&selected.document_id()));
     clear_messages(key).await;
 }
 

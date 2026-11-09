@@ -55,6 +55,7 @@ pub mod index;
 pub mod login;
 pub mod reads;
 pub mod search;
+pub mod threads;
 pub mod traces;
 pub mod uploads;
 pub mod writes;

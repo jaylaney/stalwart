@@ -689,6 +689,10 @@ impl Server {
         account_id: u32,
         key: &ZaSearchKey,
     ) -> Result<Option<(Vec<u8>, ManifestValue)>, LoadFailure> {
+        #[cfg(feature = "test_mode")]
+        if crate::za::test_hooks::take_search_manifest_fail(account_id) {
+            return Err(LoadFailure::Transient(TransientClass::Store));
+        }
         self.za_search_read_manifest_raw(account_id)
             .await
             .map_err(|_| LoadFailure::Transient(TransientClass::Store))?

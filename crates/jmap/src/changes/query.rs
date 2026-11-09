@@ -10,10 +10,7 @@ use crate::{
     calendar_event::query::CalendarEventQuery,
     calendar_event_notification::query::CalendarEventNotificationQuery,
     contact::query::ContactCardQuery,
-    email::{
-        query::{EmailQueryViewMode, email_query_with_view},
-        za_search::za_content_query,
-    },
+    email::query::{email_query_view, email_query_with_view},
     file::query::FileNodeQuery,
     mailbox::query::MailboxQuery,
     share_notification::query::ShareNotificationQuery,
@@ -74,7 +71,7 @@ impl QueryChanges for Server {
                     .await?
                     .response;
                 // An unchanged state can return before the query evaluator.
-                let view = za_content_query(
+                let (view, mode) = email_query_view(
                     self,
                     access_token,
                     request.account_id.document_id(),
@@ -100,7 +97,6 @@ impl QueryChanges for Server {
                         .is_some_and(|sort| sort.iter().any(|s| !s.is_immutable()));
                 let account_id = request.account_id.document_id();
 
-                let mode = view.as_ref().map(|_| EmailQueryViewMode::Content);
                 results = email_query_with_view(
                     self,
                     (*request).into(),

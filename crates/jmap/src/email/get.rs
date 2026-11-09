@@ -18,6 +18,7 @@ use common::{
     storage::batch::{DocumentBatch, Lookup, MAX_BATCH_BYTES, MAX_BATCH_DOCUMENTS},
 };
 use compact_str::format_compact;
+use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
 use email::{
     cache::{
         MessageCacheFetch,
@@ -172,10 +173,26 @@ impl EmailGet for Server {
                 Collection::Email,
             )
             .await?;
-        let cache = self
-            .get_cached_messages(account_id)
-            .await
-            .caused_by(trc::location!())?;
+        let keys = self.za_mail_keys(access_token, account_id).await?;
+        let snapshot = match &keys {
+            Some(keys) => Some(
+                self.za_snapshot(account_id, keys)
+                    .await
+                    .map_err(|reason| za_no_map_error(reason, account_id))?,
+            ),
+            None => None,
+        };
+        let cache = match &snapshot {
+            Some(snapshot) => snapshot.cache.clone(),
+            None => self
+                .get_cached_messages(account_id)
+                .await
+                .caused_by(trc::location!())?,
+        };
+        let lookup = |id| match &snapshot {
+            Some(snapshot) => cache.email_by_id(&snapshot.check_id(id)?),
+            None => cache.email_by_jmap_id(id),
+        };
         let access = if access_token.is_member(account_id) {
             MessageAccess::All
         } else {
@@ -190,13 +207,23 @@ impl EmailGet for Server {
                     .emails
                     .iter()
                     .filter(|item| access.allows(*item))
-                    .map(|item| Id::from_parts(item.thread_id(), item.document_id())),
+                    .map(|item| {
+                        snapshot.as_ref().map_or_else(
+                            || Id::from_parts(item.thread_id(), item.document_id()),
+                            |snapshot| snapshot.map_id(item.document_id()),
+                        )
+                    }),
                 self.core.jmap.get_max_objects,
             )?
         };
         let mut response = GetResponse {
             account_id: request.account_id.into(),
-            state: sampled.state(cache.get_state(false)).into(),
+            state: if snapshot.is_some() {
+                cache.get_state(false)
+            } else {
+                sampled.state(cache.get_state(false))
+            }
+            .into(),
             list: Vec::with_capacity(ids.len()),
             not_found: not_found_ids,
         };
@@ -207,7 +234,6 @@ impl EmailGet for Server {
         // opened row's); any other opens the stub. A key account's
         // `hasAttachment` is read from the opened row (ruling 55): its
         // message stores no attachment keyword.
-        let keys = self.za_mail_keys(access_token, account_id).await?;
         let needs_content = keys.is_some()
             && !properties.iter().all(|property| {
                 matches!(
@@ -229,10 +255,7 @@ impl EmailGet for Server {
             Some(metadata) => {
                 let mut documents = MetadataDocuments::default();
                 for &id in &ids {
-                    if let Some(email) = cache
-                        .email_by_jmap_id(id)
-                        .filter(|email| access.allows(*email))
-                    {
+                    if let Some(email) = lookup(id).filter(|email| access.allows(*email)) {
                         documents.insert(id.document_id(), cache.metadata_kinds(email));
                     }
                 }
@@ -257,10 +280,7 @@ impl EmailGet for Server {
             batch.reset();
             if needs_metadata {
                 for id in chunk {
-                    if cache
-                        .email_by_jmap_id(*id)
-                        .is_some_and(|data| access.allows(data))
-                    {
+                    if lookup(*id).is_some_and(|data| access.allows(data)) {
                         batch.request(id.document_id());
                     }
                 }
@@ -272,10 +292,7 @@ impl EmailGet for Server {
                     .caused_by(trc::location!())?;
 
                 for &id in chunk {
-                    let Some(data) = cache
-                        .email_by_jmap_id(id)
-                        .filter(|data| access.allows(*data))
-                    else {
+                    let Some(data) = lookup(id).filter(|data| access.allows(*data)) else {
                         if batch.is_first_round() {
                             response.push_not_found(id);
                         }

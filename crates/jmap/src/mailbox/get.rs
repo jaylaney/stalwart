@@ -6,6 +6,7 @@
 
 use common::{Server, auth::AccessToken, sharing::EffectiveAcl};
 use email::cache::{MessageCacheFetch, email::MessageCacheAccess, mailbox::MailboxCacheAccess};
+use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, all_ids},
     object::mailbox::{Mailbox, MailboxProperty, MailboxValue},
@@ -66,7 +67,18 @@ impl MailboxGet for Server {
         let account_id = request.account_id.document_id();
         let personal_id = access_token.personal_id(account_id, Collection::Mailbox);
         let sampled = object_metadata.viewer_change_id(self, account_id).await?;
-        let cache = self.get_cached_messages(account_id).await?;
+        let snapshot = match access_token.za_keys_for(account_id) {
+            Some(keys) => Some(
+                self.za_snapshot(account_id, keys)
+                    .await
+                    .map_err(|reason| za_no_map_error(reason, account_id))?,
+            ),
+            None => None,
+        };
+        let cache = match &snapshot {
+            Some(snapshot) => snapshot.cache.clone(),
+            None => self.get_cached_messages(account_id).await?,
+        };
         let shared_ids = if access_token.is_shared(account_id) {
             cache.shared_mailboxes(access_token, Acl::Read).into()
         } else {
@@ -88,7 +100,11 @@ impl MailboxGet for Server {
         };
         let mut response = GetResponse {
             account_id: request.account_id.into(),
-            state: Some(sampled.state(cache.get_state(true))),
+            state: Some(if snapshot.is_some() {
+                cache.get_state(true)
+            } else {
+                sampled.state(cache.get_state(true))
+            }),
             list: Vec::with_capacity(ids.len()),
             not_found: not_found_ids,
         };

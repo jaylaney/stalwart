@@ -13,6 +13,9 @@ use common::{
     storage::quota::ObjectQuotaUsage,
     za::ZA_MAIL_UNREADABLE,
 };
+use email::message::za::search::snapshot::{
+    ZaSnapshot, ZaSnapshotFetch, za_no_map_error, za_submission_prefix,
+};
 use email::{
     identity::Identity,
     message::{
@@ -74,6 +77,7 @@ pub trait EmailSubmissionSet: Sync + Send {
         response: &SetResponse<email_submission::EmailSubmission>,
         instance: &Arc<ServerInstance>,
         object: Value<'_, EmailSubmissionProperty, EmailSubmissionValue>,
+        snapshot: Option<&ZaSnapshot>,
     ) -> impl Future<
         Output = trc::Result<Result<EmailSubmission, SetError<EmailSubmissionProperty>>>,
     > + Send;
@@ -88,6 +92,14 @@ impl EmailSubmissionSet for Server {
         next_call: &mut Option<Call<RequestMethod<'x>>>,
     ) -> trc::Result<SetResponse<email_submission::EmailSubmission>> {
         let account_id = request.account_id.document_id();
+        let snapshot = match access_token.za_keys_for(account_id) {
+            Some(keys) => Some(
+                self.za_snapshot(account_id, keys)
+                    .await
+                    .map_err(|reason| za_no_map_error(reason, account_id))?,
+            ),
+            None => None,
+        };
         let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?;
         let will_destroy = response.collect_will_destroy(request.unwrap_destroy());
 
@@ -126,7 +138,14 @@ impl EmailSubmissionSet for Server {
             }
 
             match self
-                .send_message(account_id, access_token, &response, instance, object)
+                .send_message(
+                    account_id,
+                    access_token,
+                    &response,
+                    instance,
+                    object,
+                    snapshot.as_ref(),
+                )
                 .await?
             {
                 Ok(submission) => {
@@ -373,10 +392,17 @@ impl EmailSubmissionSet for Server {
         }
 
         // On success
-        let resolve_email_id = |id: MaybeIdReference<Id>| match id {
-            MaybeIdReference::Id(id) => changed_email_ids.get(&id).copied(),
-            MaybeIdReference::Reference(id_ref) => success_email_ids.get(&id_ref).copied(),
-            MaybeIdReference::Invalid(_) => None,
+        let resolve_email_id = |id: MaybeIdReference<Id>| {
+            let id = match id {
+                MaybeIdReference::Id(id) => changed_email_ids.get(&id).copied(),
+                MaybeIdReference::Reference(id_ref) => success_email_ids.get(&id_ref).copied(),
+                MaybeIdReference::Invalid(_) => None,
+            }?;
+            Some(
+                snapshot
+                    .as_ref()
+                    .map_or(id, |snapshot| snapshot.map_id(id.document_id())),
+            )
         };
         let update = request
             .arguments
@@ -426,6 +452,7 @@ impl EmailSubmissionSet for Server {
         response: &SetResponse<email_submission::EmailSubmission>,
         instance: &Arc<ServerInstance>,
         object: Value<'_, EmailSubmissionProperty, EmailSubmissionValue>,
+        snapshot: Option<&ZaSnapshot>,
     ) -> trc::Result<Result<EmailSubmission, SetError<EmailSubmissionProperty>>> {
         let mut submission = EmailSubmission {
             email_id: u32::MAX,
@@ -446,8 +473,16 @@ impl EmailSubmissionSet for Server {
                     Key::Property(EmailSubmissionProperty::EmailId),
                     Value::Element(EmailSubmissionValue::Id(value)),
                 ) => {
-                    submission.email_id = value.document_id();
-                    submission.thread_id = value.prefix_id();
+                    if let Some(snapshot) = snapshot {
+                        let Some(document_id) = snapshot.check_id(value) else {
+                            return Ok(Err(SetError::not_found()));
+                        };
+                        submission.email_id = document_id;
+                        submission.thread_id = za_submission_prefix(document_id);
+                    } else {
+                        submission.email_id = value.document_id();
+                        submission.thread_id = value.prefix_id();
+                    }
                 }
                 (
                     Key::Property(EmailSubmissionProperty::IdentityId),

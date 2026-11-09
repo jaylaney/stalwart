@@ -68,6 +68,16 @@ pub async fn za_view(
     keys: &SessionKeys,
     need: ViewNeed,
 ) -> Result<ZaView, ViewError> {
+    za_view_with_minimum(server, account_id, keys, need, None).await
+}
+
+pub async fn za_view_with_minimum(
+    server: &Server,
+    account_id: u32,
+    keys: &SessionKeys,
+    need: ViewNeed,
+    minimum_cache_counter: Option<u64>,
+) -> Result<ZaView, ViewError> {
     let deadline = match need {
         ViewNeed::Map => None,
         ViewNeed::Content { deadline } => Some(tokio::time::Instant::from_std(deadline)),
@@ -139,6 +149,7 @@ pub async fn za_view(
                     .await?
                     .map_err(failure)?;
             } else if !counter_at_or_past(cache.last_change_id, &guard.manifest)
+                || minimum_cache_counter.is_some_and(|minimum| cache.last_change_id < minimum)
                 || (deadline.is_some()
                     && cache.last_change_id < guard.manifest.indexed_to.change_id)
             {

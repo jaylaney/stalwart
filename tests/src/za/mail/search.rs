@@ -53,7 +53,7 @@ use imap::core::{MailboxId, MailboxView, SavedSearch, SelectedMailbox, SessionDa
 use imap_proto::{
     ResponseType,
     protocol::{
-        Sequence,
+        Sequence, fetch as imap_fetch,
         search::{self as imap_search, Filter as ImapFilter},
         thread as imap_thread,
     },
@@ -165,7 +165,7 @@ pub async fn test(test: &mut TestServer) {
     content_view_uses_the_original_read_deadline(test, &key.account).await;
     content_view_resamples_after_nonpublishing_deletion(test, &key.account).await;
     saved_search_previous_result(&key, &plain).await;
-    content_saved_search_dependency(test, &key.account).await;
+    guarded_saved_search_dependency(test, &key.account).await;
 
     for account in [&key.account, &plain.account] {
         test.destroy_all_mailboxes(account).await;
@@ -807,31 +807,27 @@ async fn jmap_served_filters_and_sorts(key: &mut Fixture, plain: &mut Fixture) {
     }
 }
 
-/// A reply and its parent still occupy distinct threads in a key account.
+/// Exercise collapse and queryChanges over independent threads. Spec 6.2
+/// changes the related-thread collapse in Task 11 (covered in mail::reads).
+/// Task 13 adds mapped historical deltas for related threads.
 async fn query_changes_collapse_threads(account: &Account) {
     let seed = Seed {
-        subject: "collapse related",
+        subject: "collapse first independent thread",
         ..fifth()
     };
-    let parent = message_with(seed.subject, "parent");
-    let reference = parent
-        .lines()
-        .find_map(|line| line.strip_prefix("Message-ID: "))
-        .unwrap();
-    let child = message_with("Re: collapse related", "reply").replacen(
-        "Message-ID: ",
-        &format!("References: {reference}\r\nMessage-ID: "),
-        1,
-    );
-
-    let removed = import_message(account, parent, &seed).await;
+    let removed = import_message(account, message_with(seed.subject, "first"), &seed).await;
     let args = query_args(account, Some(json!({ "inMailbox": inbox() })), None, true);
     let initial = account.jmap_method_call("Email/query", args.clone()).await;
     assert!(initial.ids().any(|id| id == removed));
     let mut args = args;
     args["sinceQueryState"] = initial.method_response()["queryState"].clone();
 
-    let added = import_message(account, child, &seed).await;
+    let added = import_message(
+        account,
+        message_with("collapse second independent thread", "second"),
+        &seed,
+    )
+    .await;
     let collapsed = account
         .jmap_method_call(
             "Email/query",
@@ -1207,11 +1203,12 @@ async fn keyless_search_refused(test: &TestServer, account: &Account) {
         .json()
         .await
         .unwrap();
-    assert_refusal(
-        &JmapResponse(reply),
-        "unsupportedFilter",
-        "text",
-        "keyless Bearer",
+    // Search spec 6.2 gates Email/query before evaluating its filter.
+    assert_eq!(reply["methodResponses"][0][0], "error", "{reply}");
+    assert_eq!(
+        reply["methodResponses"][0][1],
+        json!({ "type": "forbidden", "description": common::za::ZA_MAIL_KEYLESS }),
+        "{reply}"
     );
 }
 
@@ -1948,13 +1945,16 @@ async fn saved_search_previous_result(key: &Fixture, plain: &Fixture) {
 
 /// Drive the actual selected-mailbox workers with the watch registration
 /// used by handle_search. A fresh delivery forces the producer's real pass.
-async fn content_saved_search_dependency(test: &TestServer, account: &Account) {
-    println!("content_saved_search_dependency");
+async fn guarded_saved_search_dependency(test: &TestServer, account: &Account) {
+    println!("guarded_saved_search_dependency");
     #[derive(Clone, Copy, Debug)]
     enum Consumer {
         Search,
         Sort,
         Thread,
+        MapSearch,
+        MapThread,
+        ObjectIdFetch,
     }
 
     let id = account.id().document_id();
@@ -2005,7 +2005,14 @@ async fn content_saved_search_dependency(test: &TestServer, account: &Account) {
         in_flight: None,
     });
 
-    for command in [Consumer::Search, Consumer::Sort, Consumer::Thread] {
+    for command in [
+        Consumer::Search,
+        Consumer::Sort,
+        Consumer::Thread,
+        Consumer::MapSearch,
+        Consumer::MapThread,
+        Consumer::ObjectIdFetch,
+    ] {
         println!("saved-search consumer {command:?}");
         let previous = mailbox.get_saved_search().await;
         let (tx, rx) = watch::channel(Arc::new(Vec::new()));
@@ -2014,13 +2021,18 @@ async fn content_saved_search_dependency(test: &TestServer, account: &Account) {
 
         let consumer_mailbox = mailbox.clone();
         let consumer_data = data.clone();
+        let mapped_intersection = Id::from_parts(documents[0], documents[0]).to_string();
         let consumer = tokio::spawn(async move {
             let filter = vec![
                 ImapFilter::Sequence(Sequence::SavedSearch, true),
-                ImapFilter::Body("savebeta".into()),
+                if matches!(command, Consumer::MapSearch | Consumer::MapThread) {
+                    ImapFilter::EmailId(mapped_intersection.into())
+                } else {
+                    ImapFilter::Body("savebeta".into())
+                },
             ];
             match command {
-                Consumer::Thread => {
+                Consumer::Thread | Consumer::MapThread => {
                     let response = consumer_data
                         .thread(
                             imap_thread::Arguments {
@@ -2036,7 +2048,30 @@ async fn content_saved_search_dependency(test: &TestServer, account: &Account) {
                         .unwrap();
                     assert_eq!(response.threads, [vec![intersection]]);
                 }
-                Consumer::Search | Consumer::Sort => {
+                Consumer::ObjectIdFetch => {
+                    consumer_data
+                        .fetch(
+                            imap_fetch::Arguments {
+                                tag: "consumer".into(),
+                                sequence_set: Sequence::SavedSearch,
+                                attributes: vec![imap_fetch::Attribute::ObjectId],
+                                changed_since: None,
+                                include_vanished: false,
+                            },
+                            consumer_mailbox,
+                            None,
+                            true,
+                            false,
+                            false,
+                            false,
+                            false,
+                            100,
+                            Instant::now(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                Consumer::Search | Consumer::Sort | Consumer::MapSearch => {
                     let (response, _) = consumer_data
                         .search(
                             imap_search::Arguments {

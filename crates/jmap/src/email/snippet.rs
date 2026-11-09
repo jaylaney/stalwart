@@ -9,6 +9,7 @@ use common::{
     auth::AccessToken,
     storage::batch::{DocumentBatch, Lookup, MAX_BATCH_BYTES, MAX_BATCH_DOCUMENTS},
 };
+use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
 use email::{
     cache::{
         MessageCacheFetch,
@@ -133,10 +134,26 @@ impl EmailSearchSnippet for Server {
         }
 
         let account_id = request.account_id.document_id();
-        let cached_messages = self
-            .get_cached_messages(account_id)
-            .await
-            .caused_by(trc::location!())?;
+        let keys = self.za_mail_keys(access_token, account_id).await?;
+        let snapshot = match &keys {
+            Some(keys) => Some(
+                self.za_snapshot(account_id, keys)
+                    .await
+                    .map_err(|reason| za_no_map_error(reason, account_id))?,
+            ),
+            None => None,
+        };
+        let cached_messages = match &snapshot {
+            Some(snapshot) => snapshot.cache.clone(),
+            None => self
+                .get_cached_messages(account_id)
+                .await
+                .caused_by(trc::location!())?,
+        };
+        let lookup = |id| match &snapshot {
+            Some(snapshot) => cached_messages.email_by_id(&snapshot.check_id(id)?),
+            None => cached_messages.email_by_jmap_id(id),
+        };
         let access = if access_token.is_member(account_id) {
             MessageAccess::All
         } else {
@@ -151,12 +168,6 @@ impl EmailSearchSnippet for Server {
         let mut not_found = Vec::new();
         let mut batch = DocumentBatch::new(MAX_BATCH_BYTES);
 
-        // Release 7 spec 7.3. Snippets open the requested mail with its keys.
-        let keys = if terms.is_empty() {
-            None
-        } else {
-            self.za_mail_keys(access_token, account_id).await?
-        };
         // A key account's stub is read as a row: its structure alone names
         // only the sealed blob.
         let form = if keys.is_some() {
@@ -170,9 +181,7 @@ impl EmailSearchSnippet for Server {
             if !terms.is_empty() {
                 for email_id in chunk {
                     if let MaybeInvalid::Value(email_id) = email_id
-                        && cached_messages
-                            .email_by_jmap_id(*email_id)
-                            .is_some_and(|message| access.allows(message))
+                        && lookup(*email_id).is_some_and(|message| access.allows(message))
                     {
                         batch.request(email_id.document_id());
                     }
@@ -200,10 +209,7 @@ impl EmailSearchSnippet for Server {
                         subject: None,
                         preview: None,
                     };
-                    if !cached_messages
-                        .email_by_jmap_id(email_id)
-                        .is_some_and(|message| access.allows(message))
-                    {
+                    if !lookup(email_id).is_some_and(|message| access.allows(message)) {
                         if batch.is_first_round() {
                             not_found.push(MaybeInvalid::Value(email_id));
                         }

@@ -5,6 +5,7 @@
  */
 
 use crate::{
+    api::request::za_assert_mail_keys,
     api::{
         auth::JmapAuthorization,
         metadata::{MetadataType, ObjectMetadata, za_metadata_refused},
@@ -235,18 +236,17 @@ impl ChangesLookup for Server {
                 return Err(trc::JmapEvent::CannotCalculateChanges.into_err());
             }
         };
-        // Mail spec 6.3, ruling R34: a key account's mail changes are read only
-        // by its own sessions (Email, Mailbox, Thread and EmailSubmission
-        // `/changes`, and the `/queryChanges` built on them).
-        if matches!(
-            object,
-            MethodObject::Email
-                | MethodObject::Mailbox
-                | MethodObject::Thread
-                | MethodObject::EmailSubmission
-        ) {
-            self.za_assert_mail_route(access_token, request.account_id.document_id())
-                .await?;
+        // Search spec 6.2: mailbox state is keyless. Email, Thread and
+        // submission changes require keys, including the queryChanges caller.
+        match object {
+            MethodObject::Email | MethodObject::Thread | MethodObject::EmailSubmission => {
+                za_assert_mail_keys(self, access_token, request.account_id).await?;
+            }
+            MethodObject::Mailbox => {
+                self.za_assert_mail_route(access_token, request.account_id.document_id())
+                    .await?;
+            }
+            _ => {}
         }
         let max_changes = match request.max_changes {
             Some(0) => {

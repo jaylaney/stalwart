@@ -5,13 +5,14 @@
  */
 
 use super::za_search::{
-    za_imap_condition, za_imap_content_guard, za_imap_sort, za_imap_unavailable,
+    za_imap_condition, za_imap_content_guard, za_imap_map_guard, za_imap_sort, za_imap_unavailable,
 };
 use crate::{
     core::{Resolved, Row, SavedSearch, SelectedMailbox, Session, SessionData},
     spawn_op,
 };
 use common::{MessageStoreCache, network::SessionStream};
+use email::message::za::search::snapshot::ZaSnapshot;
 use email::{
     cache::{
         MessageCacheFetch,
@@ -158,7 +159,7 @@ impl<T: SessionStream> SessionData<T> {
         self.server
             .za_assert_mail_route(&self.access_token, mailbox.id.account_id)
             .await?;
-        let za = za_imap_content_guard(
+        let content_view = za_imap_content_guard(
             self,
             &mailbox,
             &arguments.filter,
@@ -166,7 +167,25 @@ impl<T: SessionStream> SessionData<T> {
             &mut prev_saved_search,
         )
         .await?;
-        let cache = match &za {
+        let is_content = content_view.is_some();
+        let unsupported_cc = arguments.sort.as_ref().is_some_and(|sorts| {
+            sorts
+                .iter()
+                .any(|comparator| matches!(comparator.sort, search::Sort::Cc))
+        });
+        let snapshot = if is_content || unsupported_cc {
+            content_view
+        } else {
+            za_imap_map_guard(
+                self,
+                &mailbox,
+                &arguments.filter,
+                &mut prev_saved_search,
+                true,
+            )
+            .await?
+        };
+        let cache = match &snapshot {
             Some(view) => view.cache.clone(),
             None => self
                 .server
@@ -187,7 +206,11 @@ impl<T: SessionStream> SessionData<T> {
                 &mailbox,
                 &cache,
                 &prev_saved_search,
-                za.as_ref().map(ZaView::content),
+                snapshot.as_ref(),
+                snapshot
+                    .as_ref()
+                    .filter(|_| is_content)
+                    .map(ZaView::content),
             )
             .await?;
         // Sort and map ids
@@ -306,6 +329,7 @@ impl<T: SessionStream> SessionData<T> {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn query(
         &self,
         imap_filter: Vec<Filter>,
@@ -313,6 +337,7 @@ impl<T: SessionStream> SessionData<T> {
         mailbox: &SelectedMailbox,
         cache: &MessageStoreCache,
         prev_saved_search: &Option<Option<Arc<Vec<Row>>>>,
+        snapshot: Option<&ZaSnapshot>,
         content: Option<&ContentPart>,
     ) -> trc::Result<(Vec<u32>, bool)> {
         // Mail spec 6.3, ruling R34: the callers (`search`, `thread`) check
@@ -321,7 +346,7 @@ impl<T: SessionStream> SessionData<T> {
         // Obtain message ids
         let mut filters = Vec::with_capacity(imap_filter.len() + 1);
         let mut message_ids = mailbox.view.lock().document_ids();
-        if content.is_some() {
+        if snapshot.is_some() {
             // A selected view can already be ahead of the paired cache.
             // Restrict its mask to this cache before complementing any set.
             message_ids = message_ids
@@ -345,9 +370,9 @@ impl<T: SessionStream> SessionData<T> {
                 Filter::Sequence(sequence, uid_filter) => {
                     let bare_saved = matches!(sequence, Sequence::SavedSearch);
                     let resolved = if (bare_saved && prev_saved_search.is_some())
-                        || (content.is_some() && sequence.is_saved_search())
+                        || (snapshot.is_some() && sequence.is_saved_search())
                     {
-                        // Never fall back to the watch channel with a Content guard.
+                        // Never fall back to the watch channel with an index guard.
                         let rows = prev_saved_search
                             .as_ref()
                             .and_then(Option::as_deref)
@@ -583,12 +608,14 @@ impl<T: SessionStream> SessionData<T> {
                 }
                 Filter::EmailId(id) => {
                     let mut matches = RoaringBitmap::new();
-                    if let Some(id) = ObjectId::decode_id(id.as_bytes())
-                        && cache
-                            .email_by_id(&id.document_id())
-                            .is_some_and(|message| message.thread_id() == id.prefix_id())
-                    {
-                        matches.insert(id.document_id());
+                    if let Some(id) = ObjectId::decode_id(id.as_bytes()) {
+                        let matched = match snapshot {
+                            Some(snapshot) => snapshot.check_id(id),
+                            None => cache.email_by_jmap_id(id).map(|_| id.document_id()),
+                        };
+                        if let Some(document_id) = matched {
+                            matches.insert(document_id);
+                        }
                     }
                     filters.push(SearchFilter::is_in_set(matches));
                 }
@@ -596,9 +623,15 @@ impl<T: SessionStream> SessionData<T> {
                     let matches = match ObjectId::decode_id(id.as_bytes())
                         .and_then(|id| u32::try_from(id.id()).ok())
                     {
-                        Some(thread_id) => RoaringBitmap::from_iter(
-                            cache.in_thread(thread_id).map(|m| m.document_id()),
-                        ),
+                        Some(thread_id) => match snapshot {
+                            Some(snapshot) => {
+                                snapshot.thread_members(thread_id).into_iter().collect()
+                            }
+                            None => cache
+                                .in_thread(thread_id)
+                                .map(|m| m.document_id())
+                                .collect(),
+                        },
                         None => RoaringBitmap::new(),
                     };
                     filters.push(SearchFilter::is_in_set(matches));

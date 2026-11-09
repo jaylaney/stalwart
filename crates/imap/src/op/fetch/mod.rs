@@ -24,6 +24,7 @@ use common::{
     za::ZA_MAIL_UNREADABLE,
 };
 use compact_str::{CompactString, format_compact};
+use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess},
     message::{
@@ -195,9 +196,37 @@ impl<T: SessionStream> SessionData<T> {
             .za_assert_mail_route(&self.access_token, account_id)
             .await
             .imap_ctx(&arguments.tag, trc::location!())?;
-        let cache = match cache {
-            Some(cache) => cache,
-            None => self
+        let keys = if arguments.attributes.contains(&Attribute::ObjectId) {
+            self.server
+                .za_mail_keys(&self.access_token, account_id)
+                .await
+                .imap_ctx(&arguments.tag, trc::location!())?
+        } else {
+            None
+        };
+        // A SAVE producer can need the index write lock before sending rows.
+        let saved = if keys.is_some() && arguments.sequence_set.is_saved_search() {
+            Some(mailbox.get_saved_search().await)
+        } else {
+            None
+        };
+        let snapshot = if let Some(keys) = keys.as_deref() {
+            Some(
+                self.server
+                    .za_snapshot(account_id, keys)
+                    .await
+                    .map_err(|reason| {
+                        za_no_map_error(reason, account_id).code(ResponseCode::Unavailable)
+                    })
+                    .imap_ctx(&arguments.tag, trc::location!())?,
+            )
+        } else {
+            None
+        };
+        let cache = match (snapshot.as_ref(), cache) {
+            (Some(snapshot), _) => snapshot.cache.clone(),
+            (None, Some(cache)) => cache,
+            (None, None) => self
                 .server
                 .get_cached_messages(account_id)
                 .await
@@ -220,11 +249,36 @@ impl<T: SessionStream> SessionData<T> {
         let is_changed_only = changed_ids.is_some();
         let mut ids = match changed_ids {
             Some(ids) => ids,
+            None if snapshot.is_some() => {
+                let saved = match saved {
+                    Some(Some(rows)) => Some(rows),
+                    Some(None) => {
+                        return Err(trc::ImapEvent::Error
+                            .into_err()
+                            .details("No saved search found.")
+                            .id(arguments.tag));
+                    }
+                    None => None,
+                };
+                mailbox.view.lock().resolve(
+                    &arguments.sequence_set,
+                    is_uid,
+                    saved.as_deref().map(Vec::as_slice),
+                )
+            }
             None => mailbox
                 .resolve(&arguments.sequence_set, is_uid)
                 .await
                 .imap_ctx(&arguments.tag, trc::location!())?,
         };
+
+        if snapshot.is_some() {
+            ids.retain(|resolved| {
+                cache
+                    .email_by_id(&resolved.id)
+                    .is_some_and(|message| message.has_mailbox_id(mailbox.id.mailbox_id))
+            });
+        }
 
         // Convert state to modseq
         if let Some(changed_since) = arguments.changed_since {
@@ -343,11 +397,9 @@ impl<T: SessionStream> SessionData<T> {
             None
         };
 
-        // Mail spec 7, ruling R33: the account's keys, once for the command,
-        // only when an attribute reads content (`needs.structure`); a FETCH
-        // of flags, sizes, dates and ids reads the cache alone, so the owner's
-        // session opened before its account was provisioned, which holds
-        // none, still reads them. A keyless read of a key account is refused.
+        // Mail spec 7, ruling R33: content reads use the account's keys.
+        // Cache-only metadata remains accessible to a stale owner session.
+        // OBJECTID is gated separately under search spec 6.2.
         let keys = if needs.structure {
             self.server
                 .za_mail_keys(&self.access_token, account_id)
@@ -592,9 +644,13 @@ impl<T: SessionStream> SessionData<T> {
                             }
                             Attribute::ObjectId => {
                                 separate(&mut output, &mut has_items);
+                                let thread_id = snapshot.as_ref().map_or_else(
+                                    || data.thread_id(),
+                                    |snapshot| snapshot.thread_of(id),
+                                );
                                 DataItem::ObjectId(ObjectId {
-                                    email_id: Some(Id::from_parts(data.thread_id(), id)),
-                                    thread_id: Some(Id::from(data.thread_id())),
+                                    email_id: Some(Id::from_parts(thread_id, id)),
+                                    thread_id: Some(Id::from(thread_id)),
                                     ..Default::default()
                                 })
                                 .serialize(&mut output);

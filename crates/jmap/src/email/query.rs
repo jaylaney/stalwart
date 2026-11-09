@@ -28,6 +28,7 @@ use common::{
     MessageStoreCache, MessagesCache, Server, auth::AccessToken, cache::email::MessageRef,
 };
 use compact_str::ToCompactString;
+use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
 use email::{
     cache::{
         MessageCacheFetch,
@@ -87,22 +88,23 @@ enum Candidates {
     Positions(Vec<u32>),
 }
 
-enum Pending {
-    Ready(Page),
+enum Pending<'a> {
+    Ready(Page<'a>),
     Sort {
-        page: Page,
+        page: Page<'a>,
         matches: RoaringBitmap,
         comparators: Vec<MessageComparator>,
     },
     Window {
-        page: Page,
+        page: Page<'a>,
         candidates: Candidates,
         order: WalkOrder,
         text: TextWindow,
     },
 }
 
-struct Page {
+struct Page<'a> {
+    snapshot: Option<&'a ZaView>,
     builder: QueryResponseBuilder,
     threads: Option<RoaringBitmap>,
     total: usize,
@@ -115,7 +117,7 @@ impl EmailQuery for Server {
         access_token: &AccessToken,
         using: CapabilityIds,
     ) -> trc::Result<QueryResponse> {
-        let view = za_content_query(
+        let (view, mode) = email_query_view(
             self,
             access_token,
             request.account_id.document_id(),
@@ -123,7 +125,6 @@ impl EmailQuery for Server {
             request.sort.as_deref().unwrap_or_default(),
         )
         .await?;
-        let mode = view.as_ref().map(|_| EmailQueryViewMode::Content);
         email_query_with_view(self, request, access_token, using, view.as_ref(), mode).await
     }
 }
@@ -132,6 +133,26 @@ impl EmailQuery for Server {
 pub enum EmailQueryViewMode {
     Map,
     Content,
+}
+
+pub(crate) async fn email_query_view(
+    server: &Server,
+    access_token: &AccessToken,
+    account_id: u32,
+    filters: &[Filter<EmailQueryFilter>],
+    sorts: &[Comparator<EmailComparator>],
+) -> trc::Result<(Option<ZaView>, Option<EmailQueryViewMode>)> {
+    if let Some(view) = za_content_query(server, access_token, account_id, filters, sorts).await? {
+        Ok((Some(view), Some(EmailQueryViewMode::Content)))
+    } else if let Some(keys) = access_token.za_keys_for(account_id) {
+        let view = server
+            .za_snapshot(account_id, keys)
+            .await
+            .map_err(|reason| za_no_map_error(reason, account_id))?;
+        Ok((Some(view), Some(EmailQueryViewMode::Map)))
+    } else {
+        Ok((None, None))
+    }
 }
 
 /// Evaluate using the caller's already acquired view and selected mode.
@@ -202,11 +223,15 @@ pub(crate) async fn email_query_with_view(
             .zip(documents.as_ref())
             .map(|(part, documents)| (part, &*cache, documents)),
     )?;
-    let query_state = sampled.state(cache.get_state(false));
+    let query_state = if view.is_some() {
+        cache.get_state(false)
+    } else {
+        sampled.state(cache.get_state(false))
+    };
     let max_results = server.core.jmap.query_max_results;
 
     let Some(mut filter) = filter.filter(|query| !query.row.access.is_empty()) else {
-        return Page::new(&request, max_results, query_state).finish();
+        return Page::new(&request, max_results, query_state, view).finish();
     };
 
     restrict_thread_keywords(&mut comparators, &cache, &mut filter);
@@ -251,7 +276,7 @@ pub(crate) async fn email_query_with_view(
                 .caused_by(trc::location!())?
         };
         if residual.is_empty() {
-            return Page::new(&request, max_results, query_state).finish();
+            return Page::new(&request, max_results, query_state, view).finish();
         }
         filter.row.residual = Some(residual);
     }
@@ -265,6 +290,7 @@ pub(crate) async fn email_query_with_view(
         max_results,
         query_state,
         windowed,
+        view,
     ) {
         Pending::Ready(page) => page.finish(),
         Pending::Window {
@@ -311,7 +337,8 @@ pub(crate) async fn email_query_with_view(
     }
 }
 
-impl Pending {
+impl<'a> Pending<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         cache: &MessageStoreCache,
         filter: &mut RowFilter,
@@ -320,6 +347,7 @@ impl Pending {
         max_results: usize,
         query_state: State,
         windowed: Option<WindowedWalk>,
+        view: Option<&'a ZaView>,
     ) -> Self {
         let candidates = Candidates::new(&cache.emails, filter);
         if let Some(WindowedWalk {
@@ -328,7 +356,7 @@ impl Pending {
             resolve_rows,
         }) = windowed
         {
-            let page = Page::new(&request, max_results, query_state);
+            let page = Page::new(&request, max_results, query_state, view);
             let wanted = usize::try_from(request.position.unwrap_or(0))
                 .unwrap_or(0)
                 .saturating_add(page.builder.limit);
@@ -353,7 +381,7 @@ impl Pending {
             && let Some(position) = request.position.filter(|position| *position < 0)
             && !matches!(plan, Plan::Sorted(_))
         {
-            let total = candidates.count(&cache.emails, filter, collapse_threads(&request));
+            let total = candidates.count(&cache.emails, filter, collapse_threads(&request), view);
             let start = i64::try_from(total)
                 .unwrap_or(i64::MAX)
                 .saturating_add(i64::from(position))
@@ -361,7 +389,7 @@ impl Pending {
             request.position = Some(i32::try_from(start).unwrap_or(i32::MAX));
         }
 
-        let mut page = Page::new(&request, max_results, query_state);
+        let mut page = Page::new(&request, max_results, query_state, view);
         match plan {
             Plan::Walk(order) => {
                 page.walk(&cache.emails, filter, &candidates, order);
@@ -493,13 +521,20 @@ impl Candidates {
         }
     }
 
-    fn count(&self, cache: &MessagesCache, filter: &RowFilter, collapse_threads: bool) -> usize {
+    fn count(
+        &self,
+        cache: &MessagesCache,
+        filter: &RowFilter,
+        collapse_threads: bool,
+        snapshot: Option<&ZaView>,
+    ) -> usize {
         match self {
-            Candidates::All => count_matches(cache.iter(), filter, collapse_threads),
+            Candidates::All => count_matches(cache.iter(), filter, collapse_threads, snapshot),
             Candidates::Positions(positions) => count_matches(
                 positions.iter().filter_map(|position| cache.at(*position)),
                 filter,
                 collapse_threads,
+                snapshot,
             ),
         }
     }
@@ -519,11 +554,14 @@ fn count_matches<'x>(
     messages: impl Iterator<Item = MessageRef<'x>>,
     filter: &RowFilter,
     collapse_threads: bool,
+    snapshot: Option<&ZaView>,
 ) -> usize {
     if collapse_threads {
         let mut threads = RoaringBitmap::new();
         messages
-            .filter(|message| filter.matches(*message) && threads.insert(message.thread_id()))
+            .filter(|message| {
+                filter.matches(*message) && threads.insert(thread_prefix(snapshot, *message))
+            })
             .count()
     } else {
         messages.filter(|message| filter.matches(*message)).count()
@@ -540,9 +578,22 @@ fn matching_ids<'x>(
         .collect()
 }
 
-impl Page {
-    fn new(request: &QueryRequest<Email>, max_results: usize, query_state: State) -> Self {
+fn thread_prefix(snapshot: Option<&ZaView>, message: MessageRef<'_>) -> u32 {
+    snapshot.map_or_else(
+        || message.thread_id(),
+        |snapshot| snapshot.thread_of(message.document_id()),
+    )
+}
+
+impl<'a> Page<'a> {
+    fn new(
+        request: &QueryRequest<Email>,
+        max_results: usize,
+        query_state: State,
+        snapshot: Option<&'a ZaView>,
+    ) -> Self {
         Page {
+            snapshot,
             builder: QueryResponseBuilder::new_streaming(max_results, query_state, request),
             threads: collapse_threads(request).then(RoaringBitmap::new),
             total: 0,
@@ -550,22 +601,24 @@ impl Page {
     }
 
     fn emit(&mut self, message: MessageRef<'_>) -> bool {
+        let thread_id = thread_prefix(self.snapshot, message);
         if self
             .threads
             .as_mut()
-            .is_some_and(|threads| !threads.insert(message.thread_id()))
+            .is_some_and(|threads| !threads.insert(thread_id))
         {
             return true;
         }
         self.total += 1;
-        self.builder.add(message.thread_id(), message.document_id())
+        self.builder.add(thread_id, message.document_id())
     }
 
     fn count(&mut self, message: MessageRef<'_>) {
+        let thread_id = thread_prefix(self.snapshot, message);
         if self
             .threads
             .as_mut()
-            .is_none_or(|threads| threads.insert(message.thread_id()))
+            .is_none_or(|threads| threads.insert(thread_id))
         {
             self.total += 1;
         }
@@ -664,6 +717,9 @@ impl Page {
         };
         self.total = total;
         for (document_id, thread_id) in messages {
+            let thread_id = self
+                .snapshot
+                .map_or(thread_id, |snapshot| snapshot.thread_of(document_id));
             if !self.builder.add(thread_id, document_id) {
                 break;
             }

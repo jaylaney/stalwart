@@ -17,7 +17,7 @@ use crate::{
     email::{
         PatchResult,
         grouped::{GroupedIngest, QueuedEmail},
-        handle_email_patch, ingested_into_object, parse_keywords,
+        handle_email_patch, ingested_into_object, map_created_ids, parse_keywords,
     },
 };
 use common::{
@@ -25,6 +25,7 @@ use common::{
     network::memory::MemoryReservation, storage::index::ObjectIndexBuilder, za::ZA_MAIL_KEYLESS,
 };
 use email::message::headers::{BuildHeader, ValueToHeader};
+use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
 use email::{
     cache::{
         MessageCacheFetch,
@@ -1139,6 +1140,29 @@ impl EmailSet for Server {
             post_write.attempt(self).await;
         }
 
+        let keys = access_token.za_keys_for(account_id);
+        let has_mutations = request
+            .update
+            .as_ref()
+            .is_some_and(|updates| !updates.is_empty())
+            || !will_destroy.is_empty();
+        let input = if let Some(keys) = keys.filter(|_| has_mutations) {
+            Some(
+                self.za_snapshot(account_id, keys)
+                    .await
+                    .map_err(|reason| za_no_map_error(reason, account_id))?,
+            )
+        } else {
+            None
+        };
+        let keyless_update =
+            keys.is_none() && has_mutations && self.za_is_key_account(account_id).await?;
+        let cache = input.as_ref().map_or(&cache, |input| &input.cache);
+        let check_prefix = |id: Id, stored_prefix| match &input {
+            Some(input) => input.check_id(id).is_some(),
+            None => keyless_update || stored_prefix == id.prefix_id(),
+        };
+
         // Process updates
         let mut batch = BatchBuilder::new();
         let mut spam_samples = SpamSamples::default();
@@ -1162,6 +1186,13 @@ impl EmailSet for Server {
                     continue 'update;
                 }
             };
+            if input
+                .as_ref()
+                .is_some_and(|input| input.check_id(id).is_none())
+            {
+                response.not_updated.append(id, SetError::not_found());
+                continue 'update;
+            }
             // Make sure id won't be destroyed
             if will_destroy.contains(&id) {
                 response.not_updated.append(id, SetError::will_destroy());
@@ -1181,7 +1212,7 @@ impl EmailSet for Server {
 
                 // Obtain message data
                 let Some(data) = cache.message_data(document_id).filter(|data| {
-                    data.thread_id == id.prefix_id()
+                    (input.is_some() || check_prefix(id, data.thread_id))
                         && can_read_mailbox_ids.as_ref().is_none_or(|ids| {
                             data.mailboxes
                                 .iter()
@@ -1627,10 +1658,9 @@ impl EmailSet for Server {
             for destroy_id in will_destroy {
                 let document_id = destroy_id.document_id();
 
-                match cache
-                    .email_by_jmap_id(destroy_id)
-                    .filter(|message| can_read.allows(*message))
-                {
+                match cache.email_by_id(&document_id).filter(|message| {
+                    check_prefix(destroy_id, message.thread_id()) && can_read.allows(*message)
+                }) {
                     Some(message) if can_destroy.allows(message) => {
                         destroy_ids.insert(document_id);
                         response.destroyed.push(destroy_id);
@@ -1703,6 +1733,10 @@ impl EmailSet for Server {
             }
         }
 
+        // Release the input generation before the response acquisition.
+        let ordinary_state = cache.get_state(false);
+        drop(input);
+
         // Update state
         if let Some(change_id) = last_change_id {
             if !shared_updates_committed && response.destroyed.is_empty() {
@@ -1726,12 +1760,19 @@ impl EmailSet for Server {
                 .await;
             }
         }
-        if last_change_id.is_some() || has_private_changes {
+        if let Some(keys) = keys {
+            let snapshot = self
+                .za_response_snapshot(account_id, keys, last_change_id)
+                .await
+                .map_err(|reason| za_no_map_error(reason, account_id))?;
+            map_created_ids(&snapshot, response.created.values_mut());
+            response.new_state = Some(snapshot.cache.get_state(false));
+        } else if last_change_id.is_some() || has_private_changes {
             response.new_state = metadata_writer
                 .metadata()
                 .viewer_change_id(self, account_id)
                 .await?
-                .state(last_change_id.map_or_else(|| cache.get_state(false), State::Exact))
+                .state(last_change_id.map_or(ordinary_state, State::Exact))
                 .into();
         }
 

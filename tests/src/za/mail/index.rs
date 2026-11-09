@@ -274,14 +274,33 @@ fn email_id(document_id: u32) -> String {
 }
 
 async fn clean_messages(test: &TestServer, account: &Account) {
-    let id = account_id(account);
-    let ids = message_ids(test, id)
-        .await
-        .into_iter()
-        .map(email_id)
-        .collect::<Vec<_>>();
-    destroy(account, &ids).await;
-    if !ids.is_empty() {
+    let expected = message_ids(test, account_id(account)).await.len();
+    if expected == 0 {
+        destroy(account, &[]).await;
+    } else {
+        // Search spec 6.2: use the IDs emitted by Get after the request's
+        // pre-pass. The result reference avoids a second request pre-pass
+        // changing their prefixes before the keyed Set checks them.
+        let reply = account
+            .jmap_method_calls(json!([
+                ["Email/get", {
+                    "accountId": account.id_string(), "ids": null, "properties": ["id"],
+                }, "ids"],
+                ["Email/set", {
+                    "accountId": account.id_string(),
+                    "#destroy": { "resultOf": "ids", "name": "Email/get", "path": "/list/*/id" },
+                }, "cleanup"]
+            ]))
+            .await;
+        let responses = reply.0["methodResponses"].as_array().unwrap();
+        assert_eq!(responses[0][0], "Email/get", "{:?}", reply.0);
+        assert_eq!(responses[1][0], "Email/set", "{:?}", reply.0);
+        assert_eq!(
+            responses[1][1]["destroyed"].as_array().map(Vec::len),
+            Some(expected),
+            "{:?}",
+            reply.0
+        );
         advanced(test, account, false).await;
     }
     test.wait_for_tasks().await;

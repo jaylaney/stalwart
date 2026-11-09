@@ -15,7 +15,13 @@ use common::{
 };
 use email::message::{
     sortkeys::MessageComparator,
-    za::search::view::{ViewNeed, ZaView, za_view},
+    za::{
+        search::{
+            snapshot::{ZaSnapshotFetch, za_no_map_error},
+            view::{ViewNeed, ZaView, za_view},
+        },
+        view::ZaMailView,
+    },
 };
 use imap_proto::{
     ResponseCode,
@@ -64,16 +70,7 @@ pub async fn za_imap_content_guard<T: SessionStream>(
         }
         None => return Ok(None),
     };
-    // A SAVE producer may need to publish under the index write lock
-    // before it can send rows. Finish that dependency before taking the
-    // Content read guard. SAVE itself already captured its previous rows.
-    if saved_search.is_none()
-        && filters.iter().any(
-            |filter| matches!(filter, Filter::Sequence(sequence, _) if sequence.is_saved_search()),
-        )
-    {
-        *saved_search = Some(mailbox.get_saved_search().await);
-    }
+    capture_saved_search(mailbox, filters, saved_search).await;
     let deadline = Instant::now() + Duration::from_secs(server.za_search_config().wait_secs);
     za_view(server, account_id, keys, ViewNeed::Content { deadline })
         .await
@@ -86,6 +83,58 @@ pub async fn za_imap_content_guard<T: SessionStream>(
             );
             za_imap_unavailable()
         })
+}
+
+/// Map fallback after Content has been ruled out. THREAD needs this
+/// for identity filters now. Task 12 also uses the map for its grouping.
+pub(super) async fn za_imap_map_guard<T: SessionStream>(
+    data: &SessionData<T>,
+    mailbox: &SelectedMailbox,
+    filters: &[Filter],
+    saved_search: &mut Option<Option<Arc<Vec<Row>>>>,
+    map_metadata: bool,
+) -> trc::Result<Option<ZaView>> {
+    let account_id = mailbox.id.account_id;
+    let keys = if filters
+        .iter()
+        .any(|filter| matches!(filter, Filter::EmailId(_) | Filter::ThreadId(_)))
+    {
+        // A selected owner connection authenticated before provisioning
+        // can remain keyless. Check the selected account before using IDs.
+        data.server
+            .za_mail_keys(&data.access_token, account_id)
+            .await?
+    } else if map_metadata {
+        data.access_token.za_keys_for(account_id).cloned()
+    } else {
+        None
+    };
+    let Some(keys) = keys else {
+        return Ok(None);
+    };
+    capture_saved_search(mailbox, filters, saved_search).await;
+    data.server
+        .za_snapshot(account_id, &keys)
+        .await
+        .map(Some)
+        .map_err(|reason| za_no_map_error(reason, account_id).code(ResponseCode::Unavailable))
+}
+
+async fn capture_saved_search(
+    mailbox: &SelectedMailbox,
+    filters: &[Filter],
+    saved_search: &mut Option<Option<Arc<Vec<Row>>>>,
+) {
+    // A SAVE producer may need the index write lock before sending its
+    // rows. Capture before acquiring either view mode. SAVE has already
+    // captured its prior result, even if that result was missing.
+    if saved_search.is_none()
+        && filters.iter().any(
+            |filter| matches!(filter, Filter::Sequence(sequence, _) if sequence.is_saved_search()),
+        )
+    {
+        *saved_search = Some(mailbox.get_saved_search().await);
+    }
 }
 
 pub(super) fn za_imap_unavailable() -> trc::Error {

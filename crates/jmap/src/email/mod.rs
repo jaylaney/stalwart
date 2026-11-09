@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use email::message::ingest::IngestedEmail;
+use email::message::{ingest::IngestedEmail, za::search::snapshot::ZaSnapshot};
 use jmap_proto::{
     error::set::SetError,
     object::email::{EmailProperty, EmailValue},
@@ -36,6 +36,24 @@ fn ingested_into_object(email: IngestedEmail) -> Map<'static, EmailProperty, Ema
         .with_key_value(EmailProperty::ThreadId, Id::from(email.thread_id))
         .with_key_value(EmailProperty::BlobId, email.blob_id)
         .with_key_value(EmailProperty::Size, email.size)
+}
+
+/// Keep provisional IDs available to ingestion references and expose the
+/// final mapped identity once the response view is known.
+fn map_created_ids<'a>(
+    snapshot: &ZaSnapshot,
+    objects: impl Iterator<Item = &'a mut Value<'static, EmailProperty, EmailValue>>,
+) {
+    for object in objects {
+        if let Value::Object(object) = object
+            && let Some(Value::Element(EmailValue::Id(id))) =
+                object.get(&Key::Property(EmailProperty::Id))
+        {
+            let mapped = snapshot.map_id(id.document_id());
+            object.insert(EmailProperty::Id, mapped);
+            object.insert(EmailProperty::ThreadId, Id::from(mapped.prefix_id()));
+        }
+    }
 }
 
 pub(crate) enum PatchResult<'x> {

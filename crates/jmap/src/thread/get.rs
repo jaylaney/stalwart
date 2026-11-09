@@ -7,10 +7,12 @@
 use crate::changes::state::StateManager;
 use common::{Server, auth::AccessToken};
 use email::cache::{MessageCacheFetch, email::MessageAccess, mailbox::MailboxCacheAccess};
+use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, all_ids},
     object::thread::{Thread, ThreadProperty, ThreadValue},
     request::MaybeInvalid,
+    types::state::State,
 };
 use jmap_tools::Map;
 use std::future::Future;
@@ -33,10 +35,21 @@ impl ThreadGet for Server {
         access_token: &AccessToken,
     ) -> trc::Result<GetResponse<Thread>> {
         let account_id = request.account_id.document_id();
-        let cache = self
-            .get_cached_messages(account_id)
-            .await
-            .caused_by(trc::location!())?;
+        let snapshot = match access_token.za_keys_for(account_id) {
+            Some(keys) => Some(
+                self.za_snapshot(account_id, keys)
+                    .await
+                    .map_err(|reason| za_no_map_error(reason, account_id))?,
+            ),
+            None => None,
+        };
+        let cache = match &snapshot {
+            Some(snapshot) => snapshot.cache.clone(),
+            None => self
+                .get_cached_messages(account_id)
+                .await
+                .caused_by(trc::location!())?,
+        };
         let access = if access_token.is_shared(account_id) {
             MessageAccess::Mailboxes(cache.shared_mailboxes(access_token, Acl::ReadItems))
         } else {
@@ -79,10 +92,14 @@ impl ThreadGet for Server {
         });
         let mut response = GetResponse {
             account_id: request.account_id.into(),
-            state: self
-                .get_state(account_id, SyncCollection::Thread)
-                .await?
-                .into(),
+            state: match &snapshot {
+                Some(snapshot) => {
+                    let state = snapshot.state();
+                    State::from((state != 0).then_some(state))
+                }
+                None => self.get_state(account_id, SyncCollection::Thread).await?,
+            }
+            .into(),
             list: Vec::with_capacity(ids.len()),
             not_found: not_found_ids,
         };
