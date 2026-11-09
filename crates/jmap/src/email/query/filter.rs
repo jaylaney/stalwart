@@ -5,6 +5,7 @@
  */
 
 use super::text::{push_text, strip_subject_prefix};
+use crate::email::za_search::za_resolve_condition;
 use common::{MessageStoreCache, cache::email::MessageRef};
 use compact_str::ToCompactString;
 use email::cache::email::{MessageAccess, MessageCacheAccess, SearchOperator, thread_keywords};
@@ -19,6 +20,7 @@ use store::{
     ahash::AHashSet,
     roaring::RoaringBitmap,
     search::{EmailSearchField, KeyValueMatch, SearchFilter},
+    za_search::content::ContentPart,
 };
 use types::keyword::{HASATTACHMENT, HASNOATTACHMENT, Keyword};
 
@@ -215,6 +217,7 @@ impl QueryFilter {
         access: MessageAccess,
         mut metadata_matches: impl Iterator<Item = RoaringBitmap>,
         default_language: Language,
+        content: Option<&ContentPart>,
     ) -> trc::Result<Option<Self>> {
         let mut row = RowFilter::new(access);
         let mut residual = Vec::new();
@@ -230,36 +233,43 @@ impl QueryFilter {
                 Filter::Property(EmailQueryFilter::Metadata(_)) => residual.push(
                     SearchFilter::is_in_set(metadata_matches.next().unwrap_or_default()),
                 ),
-                Filter::Property(EmailQueryFilter::Email(condition)) if top_level => {
-                    match row.absorb(condition) {
-                        Ok(Absorbed::Yes) => (),
-                        Ok(Absorbed::Contradiction) => is_empty = true,
-                        Err(condition) if is_text(&condition) => push_condition(
-                            &mut text,
-                            condition,
-                            cache,
-                            &row.access,
-                            &mut visible,
-                            default_language,
-                        )?,
-                        Err(condition) => push_condition(
+                Filter::Property(EmailQueryFilter::Email(condition)) => {
+                    if let Some(set) = content
+                        .and_then(|part| za_resolve_condition(&condition, part, cache, &row.access))
+                    {
+                        residual.push(SearchFilter::is_in_set(set));
+                    } else if top_level {
+                        match row.absorb(condition) {
+                            Ok(Absorbed::Yes) => (),
+                            Ok(Absorbed::Contradiction) => is_empty = true,
+                            Err(condition) if is_text(&condition) => push_condition(
+                                &mut text,
+                                condition,
+                                cache,
+                                &row.access,
+                                &mut visible,
+                                default_language,
+                            )?,
+                            Err(condition) => push_condition(
+                                &mut residual,
+                                condition,
+                                cache,
+                                &row.access,
+                                &mut visible,
+                                default_language,
+                            )?,
+                        }
+                    } else {
+                        push_condition(
                             &mut residual,
                             condition,
                             cache,
                             &row.access,
                             &mut visible,
                             default_language,
-                        )?,
+                        )?;
                     }
                 }
-                Filter::Property(EmailQueryFilter::Email(condition)) => push_condition(
-                    &mut residual,
-                    condition,
-                    cache,
-                    &row.access,
-                    &mut visible,
-                    default_language,
-                )?,
                 Filter::And if top_level => (),
                 Filter::And => {
                     subtrees += 1;

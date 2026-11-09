@@ -5,13 +5,15 @@
  */
 
 use super::get::ChangesLookup;
-use crate::email::za::za_refuse_content_query;
 use crate::{
     api::{auth::JmapAuthorization, request::resolve_account_id},
     calendar_event::query::CalendarEventQuery,
     calendar_event_notification::query::CalendarEventNotificationQuery,
     contact::query::ContactCardQuery,
-    email::query::EmailQuery,
+    email::{
+        query::{EmailQueryViewMode, email_query_with_view},
+        za_search::za_content_query,
+    },
     file::query::FileNodeQuery,
     mailbox::query::MailboxQuery,
     share_notification::query::ShareNotificationQuery,
@@ -71,10 +73,10 @@ impl QueryChanges for Server {
                     )
                     .await?
                     .response;
-                // Mail spec 8: refused here as well, since an unchanged state
-                // returns below without running the query.
-                za_refuse_content_query(
+                // An unchanged state can return before the query evaluator.
+                let view = za_content_query(
                     self,
+                    access_token,
                     request.account_id.document_id(),
                     &request.filter,
                     request.sort.as_deref().unwrap_or_default(),
@@ -98,9 +100,16 @@ impl QueryChanges for Server {
                         .is_some_and(|sort| sort.iter().any(|s| !s.is_immutable()));
                 let account_id = request.account_id.document_id();
 
-                results = self
-                    .email_query((*request).into(), access_token, using)
-                    .await?;
+                let mode = view.as_ref().map(|_| EmailQueryViewMode::Content);
+                results = email_query_with_view(
+                    self,
+                    (*request).into(),
+                    access_token,
+                    using,
+                    view.as_ref(),
+                    mode,
+                )
+                .await?;
 
                 if collapse_threads && has_changes {
                     let mut touched_threads = RoaringBitmap::new();
@@ -110,10 +119,13 @@ impl QueryChanges for Server {
                         changed_ids.insert(id.id());
                     }
                     touched_threads.extend(changes.destroyed.iter().map(|id| id.prefix_id()));
-                    let cache = self
-                        .get_cached_messages(account_id)
-                        .await
-                        .caused_by(trc::location!())?;
+                    let cache = match &view {
+                        Some(view) => view.cache.clone(),
+                        None => self
+                            .get_cached_messages(account_id)
+                            .await
+                            .caused_by(trc::location!())?,
+                    };
                     let access = if access_token.is_shared(account_id) {
                         MessageAccess::Mailboxes(
                             cache.shared_mailboxes(access_token, Acl::ReadItems),

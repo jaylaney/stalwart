@@ -25,6 +25,7 @@ pub mod query;
 pub mod set;
 pub mod snippet;
 pub mod za;
+pub mod za_search;
 
 fn ingested_into_object(email: IngestedEmail) -> Map<'static, EmailProperty, EmailValue> {
     Map::with_capacity(3)

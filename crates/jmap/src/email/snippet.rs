@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::email::za::za_refuse_snippet_terms;
 use common::{
     Server,
     auth::AccessToken,
@@ -54,11 +53,6 @@ impl EmailSearchSnippet for Server {
         request: GetSearchSnippetRequest,
         access_token: &AccessToken,
     ) -> trc::Result<GetSearchSnippetResponse> {
-        // Mail spec 8: snippets mark terms in sealed content, which a search
-        // cannot find; a key account's request carrying a text, subject or
-        // body property is refused before any message is read, whatever the
-        // property tokenises to.
-        za_refuse_snippet_terms(self, request.account_id.document_id(), &request.filter).await?;
         let mut filter_stack = vec![];
         let mut include_term = true;
         let mut terms = vec![];
@@ -157,10 +151,7 @@ impl EmailSearchSnippet for Server {
         let mut not_found = Vec::new();
         let mut batch = DocumentBatch::new(MAX_BATCH_BYTES);
 
-        // Mail spec 7, 8: the account's keys, once for the request; without
-        // terms nothing is read. Defence in depth: a key account's request
-        // with terms is refused above, so this branch and the sealed reads
-        // below are unreachable for one.
+        // Release 7 spec 7.3. Snippets open the requested mail with its keys.
         let keys = if terms.is_empty() {
             None
         } else {

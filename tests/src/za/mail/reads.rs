@@ -38,7 +38,7 @@ use base64::{
 use common::{
     auth::AccessToken,
     ipc::PushNotification,
-    za::{ZA_MAIL_KEYLESS, ZA_MAIL_SEARCH_REFUSED, ZA_MAIL_UNREADABLE, test_hooks},
+    za::{ZA_MAIL_KEYLESS, ZA_MAIL_UNREADABLE, test_hooks},
 };
 use email::{
     mailbox::{DRAFTS_ID, SENT_ID},
@@ -484,9 +484,7 @@ async fn offsets_round_trip(key: &Account, plain: &Account) {
             ))
             .unwrap_or_else(|| panic!("Email/parse: {:?}", parsed.0))
             .clone();
-        // Mail spec 8: a term snippet is refused for the key account
-        // (`search.rs` covers the refusals in full); the control still
-        // marks the term in its preview.
+        // Release 7 spec 7.3. The opened mail produces the same term preview.
         let snippets = account
             .jmap_method_call(
                 "SearchSnippet/get",
@@ -497,27 +495,17 @@ async fn offsets_round_trip(key: &Account, plain: &Account) {
                 }),
             )
             .await;
-        if account.name() == key.name() {
-            let error = &snippets.0["methodResponses"][0];
-            assert_eq!(error[0], "error", "{}: {error}", account.name());
-            assert_eq!(error[1]["type"], "unsupportedFilter", "{error}");
-            assert!(
-                error[1]["description"]
-                    .as_str()
-                    .is_some_and(|text| text.contains(ZA_MAIL_SEARCH_REFUSED)),
-                "{error}"
-            );
-        } else {
-            let snippet = &snippets.list()[0];
-            assert!(
-                snippet["preview"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("canary"),
-                "{}: {snippet}",
-                account.name()
-            );
-        }
+        assert_eq!(snippets.name_at(0), "SearchSnippet/get", "{:?}", snippets.0);
+        assert_eq!(snippets.list().len(), 1, "{:?}", snippets.0);
+        let snippet = &snippets.list()[0];
+        assert!(
+            snippet["preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("canary"),
+            "{}: {snippet}",
+            account.name()
+        );
 
         let mut imap = imap_session(account, b"_r ").await;
         let mut fetched = Vec::new();

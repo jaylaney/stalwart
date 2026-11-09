@@ -19,7 +19,10 @@ use crate::{
         query::QueryResponseBuilder,
     },
     changes::state::JmapCacheState,
-    email::za::za_refuse_content_query,
+    email::{
+        za::sort_needs_content,
+        za_search::{za_content_query, za_sort_comparator, za_unavailable},
+    },
 };
 use common::{
     MessageStoreCache, MessagesCache, Server, auth::AccessToken, cache::email::MessageRef,
@@ -31,8 +34,11 @@ use email::{
         email::{MessageAccess, MessageCacheAccess, thread_keywords},
         mailbox::MailboxCacheAccess,
     },
-    message::sortkeys::{
-        CacheSorter, EmailSortKeys, MessageCacheField, MessageComparator, MessageSortField,
+    message::{
+        sortkeys::{
+            CacheSorter, EmailSortKeys, MessageCacheField, MessageComparator, MessageSortField,
+        },
+        za::search::{query::za_resolve_residual, view::ZaView},
     },
 };
 use filter::{QueryFilter, RowFilter};
@@ -47,6 +53,7 @@ use store::{
     roaring::RoaringBitmap,
     search::{SearchComparator, SearchQuery},
     write::SearchIndex,
+    za_search::content::ContentPart,
 };
 use trc::AddContext;
 use types::acl::Acl;
@@ -104,83 +111,135 @@ struct Page {
 impl EmailQuery for Server {
     async fn email_query(
         &self,
-        mut request: QueryRequest<Email>,
+        request: QueryRequest<Email>,
         access_token: &AccessToken,
         using: CapabilityIds,
     ) -> trc::Result<QueryResponse> {
-        let account_id = request.account_id.document_id();
-
-        // Mail spec 8: a key account's search index holds the arrival time
-        // and the size only; a filter or sort that needs content is refused
-        // before the query runs, rather than left to match nothing.
-        // `Email/queryChanges` makes the same check itself, because it
-        // returns before this method when nothing has changed.
-        za_refuse_content_query(
+        let view = za_content_query(
             self,
-            account_id,
+            access_token,
+            request.account_id.document_id(),
             &request.filter,
             request.sort.as_deref().unwrap_or_default(),
         )
         .await?;
+        let mode = view.as_ref().map(|_| EmailQueryViewMode::Content);
+        email_query_with_view(self, request, access_token, using, view.as_ref(), mode).await
+    }
+}
 
-        let object_metadata = ObjectMetadata::new(self, access_token, using, MetadataType::Email);
-        let sampled = object_metadata.viewer_change_id(self, account_id).await?;
-        let cache = self
+#[derive(Clone, Copy)]
+pub enum EmailQueryViewMode {
+    Map,
+    Content,
+}
+
+/// Evaluate using the caller's already acquired view and selected mode.
+pub(crate) async fn email_query_with_view(
+    server: &Server,
+    mut request: QueryRequest<Email>,
+    access_token: &AccessToken,
+    using: CapabilityIds,
+    view: Option<&ZaView>,
+    mode: Option<EmailQueryViewMode>,
+) -> trc::Result<QueryResponse> {
+    let account_id = request.account_id.document_id();
+    let content = match mode {
+        Some(EmailQueryViewMode::Content) => Some(view.expect("a selected content view").content()),
+        _ => None,
+    };
+    let object_metadata = ObjectMetadata::new(server, access_token, using, MetadataType::Email);
+    let sampled = object_metadata.viewer_change_id(server, account_id).await?;
+    let cache = match view {
+        Some(view) => view.cache.clone(),
+        None => server
             .get_cached_messages(account_id)
             .await
-            .caused_by(trc::location!())?;
-        let access = if access_token.is_shared(account_id) {
-            MessageAccess::Mailboxes(cache.shared_mailboxes(access_token, Acl::ReadItems))
-        } else {
-            MessageAccess::All
-        };
-        let metadata =
-            object_metadata.query(request.filter.iter().filter_map(|filter| match filter {
-                Filter::Property(EmailQueryFilter::Metadata(filter)) => Some(filter),
-                _ => None,
-            }))?;
-        let metadata_matches = object_metadata
-            .evaluate(self, account_id, &metadata, || {
-                cache
-                    .with_metadata()
-                    .filter(|message| access.allows(*message))
-                    .map(|message| message.document_id())
-                    .collect::<RoaringBitmap>()
-            })
-            .await?;
-        let filter = QueryFilter::parse(
-            std::mem::take(&mut request.filter),
-            &cache,
-            access,
-            metadata_matches.into_iter(),
-            self.core.email.default_language,
-        )?;
-        let mut comparators = sort_comparators(request.sort.take())?;
-        let query_state = sampled.state(cache.get_state(false));
-        let max_results = self.core.jmap.query_max_results;
+            .caused_by(trc::location!())?,
+    };
+    let access = if access_token.is_shared(account_id) {
+        MessageAccess::Mailboxes(cache.shared_mailboxes(access_token, Acl::ReadItems))
+    } else {
+        MessageAccess::All
+    };
+    let metadata =
+        object_metadata.query(request.filter.iter().filter_map(|filter| match filter {
+            Filter::Property(EmailQueryFilter::Metadata(filter)) => Some(filter),
+            _ => None,
+        }))?;
+    let metadata_matches = object_metadata
+        .evaluate(server, account_id, &metadata, || {
+            cache
+                .with_metadata()
+                .filter(|message| access.allows(*message))
+                .map(|message| message.document_id())
+                .collect::<RoaringBitmap>()
+        })
+        .await?;
+    let mut filter = QueryFilter::parse(
+        std::mem::take(&mut request.filter),
+        &cache,
+        access,
+        metadata_matches.into_iter(),
+        server.core.email.default_language,
+        content,
+    )?;
+    let sort = request.sort.take();
+    let documents = content
+        .filter(|_| {
+            sort.as_ref()
+                .is_some_and(|sort| sort.iter().any(|sort| sort_needs_content(&sort.property)))
+        })
+        .map(|_| {
+            filter
+                .as_mut()
+                .map(|filter| filter.readable(&cache))
+                .unwrap_or_default()
+        });
+    let mut comparators = sort_comparators(
+        sort,
+        content
+            .zip(documents.as_ref())
+            .map(|(part, documents)| (part, &*cache, documents)),
+    )?;
+    let query_state = sampled.state(cache.get_state(false));
+    let max_results = server.core.jmap.query_max_results;
 
-        let Some(mut filter) = filter.filter(|query| !query.row.access.is_empty()) else {
-            return Page::new(&request, max_results, query_state).finish();
-        };
+    let Some(mut filter) = filter.filter(|query| !query.row.access.is_empty()) else {
+        return Page::new(&request, max_results, query_state).finish();
+    };
 
-        restrict_thread_keywords(&mut comparators, &cache, &mut filter);
-        let windowed = if self.search_store().supports_windowed_walk() {
-            let resolve_rows = self
-                .search_store()
-                .account_query_rows(cache.emails.len() as u64);
-            WindowedWalk::of(
-                &request,
-                &comparators,
-                &mut filter,
-                account_id,
-                resolve_rows,
-            )
+    restrict_thread_keywords(&mut comparators, &cache, &mut filter);
+    let windowed = if view.is_none() && server.search_store().supports_windowed_walk() {
+        let resolve_rows = server
+            .search_store()
+            .account_query_rows(cache.emails.len() as u64);
+        WindowedWalk::of(
+            &request,
+            &comparators,
+            &mut filter,
+            account_id,
+            resolve_rows,
+        )
+    } else {
+        None
+    };
+    let residual_filters = filter.residual_filters();
+    if !residual_filters.is_empty() {
+        let residual = if view.is_some() {
+            let filters = match content {
+                Some(content) => za_resolve_residual(account_id, residual_filters, content)
+                    .map_err(|reason| za_unavailable(&"residual", false, &reason))?,
+                // Map mode only admits metadata conditions.
+                None => residual_filters,
+            };
+            SearchQuery::new(SearchIndex::Email)
+                .with_filters(filters)
+                .with_mask(filter.readable(&cache))
+                .filter()
+                .into_bitmap()
         } else {
-            None
-        };
-        let residual_filters = filter.residual_filters();
-        if !residual_filters.is_empty() {
-            let residual = self
+            server
                 .search_store()
                 .filter_account(
                     SearchQuery::new(SearchIndex::Email)
@@ -189,47 +248,53 @@ impl EmailQuery for Server {
                         .with_mask(filter.readable(&cache)),
                 )
                 .await
-                .caused_by(trc::location!())?;
-            if residual.is_empty() {
-                return Page::new(&request, max_results, query_state).finish();
-            }
-            filter.row.residual = Some(residual);
+                .caused_by(trc::location!())?
+        };
+        if residual.is_empty() {
+            return Page::new(&request, max_results, query_state).finish();
         }
+        filter.row.residual = Some(residual);
+    }
 
-        let mut row = filter.into_row();
-        match Pending::new(
-            &cache,
-            &mut row,
-            comparators,
-            request,
-            max_results,
-            query_state,
-            windowed,
-        ) {
-            Pending::Ready(page) => page.finish(),
-            Pending::Window {
-                mut page,
-                candidates,
+    let mut row = filter.into_row();
+    match Pending::new(
+        &cache,
+        &mut row,
+        comparators,
+        request,
+        max_results,
+        query_state,
+        windowed,
+    ) {
+        Pending::Ready(page) => page.finish(),
+        Pending::Window {
+            mut page,
+            candidates,
+            order,
+            text,
+        } => {
+            page.walk_windowed(
+                TextSource::Store(server),
+                &cache,
+                &mut row,
+                &candidates,
                 order,
                 text,
-            } => {
-                page.walk_windowed(
-                    TextSource::Store(self),
-                    &cache,
-                    &mut row,
-                    &candidates,
-                    order,
-                    text,
-                )
-                .await?;
-                page.finish()
-            }
-            Pending::Sort {
-                mut page,
-                matches,
-                comparators,
-            } => {
-                let results = self
+            )
+            .await?;
+            page.finish()
+        }
+        Pending::Sort {
+            mut page,
+            matches,
+            comparators,
+        } => {
+            let results = if view.is_some() {
+                server
+                    .sort_email_matches(account_id, &cache, matches, comparators)
+                    .await?
+            } else {
+                server
                     .query_emails(
                         account_id,
                         &cache,
@@ -238,10 +303,10 @@ impl EmailQuery for Server {
                             .with_mask(matches),
                         comparators,
                     )
-                    .await?;
-                page.feed(&cache, results);
-                page.finish()
-            }
+                    .await?
+            };
+            page.feed(&cache, results);
+            page.finish()
         }
     }
 }
@@ -630,11 +695,19 @@ impl Page {
 
 fn sort_comparators(
     sort: Option<Vec<Comparator<EmailComparator>>>,
+    content_sort: Option<(&ContentPart, &MessageStoreCache, &RoaringBitmap)>,
 ) -> trc::Result<Vec<MessageComparator>> {
     let sort = sort.filter(|sort| !sort.is_empty()).unwrap_or_default();
     let mut comparators = Vec::with_capacity(sort.len());
     for comparator in sort {
         let ascending = comparator.is_ascending;
+        if let Some((content, cache, documents)) = content_sort
+            && let Some(comparator) =
+                za_sort_comparator(&comparator.property, ascending, content, cache, documents)
+        {
+            comparators.push(comparator);
+            continue;
+        }
         comparators.push(match comparator.property {
             EmailComparator::ReceivedAt => MessageComparator::Cache {
                 field: MessageCacheField::ReceivedAt,

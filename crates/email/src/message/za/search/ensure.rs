@@ -208,7 +208,7 @@ fn map_no_map(reason: NoMapReason) -> Unavailable {
     }
 }
 
-fn map_load(failure: LoadFailure) -> Unavailable {
+pub(super) fn map_load(failure: LoadFailure) -> Unavailable {
     match failure {
         LoadFailure::Loss(_) => Unavailable::Rebuilding,
         LoadFailure::Transient(TransientClass::Budget) => Unavailable::Budget,
