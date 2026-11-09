@@ -149,6 +149,36 @@ fn marker_batch(
 }
 
 impl Server {
+    /// Resolve the exact inventory or fall back to the account's Principal
+    /// document-0 links. The caller supplies the fence for any subsequent write.
+    pub async fn za_search_inventory_links(
+        &self,
+        account_id: u32,
+        inventory: Option<Inventory>,
+    ) -> trc::Result<(Vec<BlobHash>, &'static str)> {
+        let mut scanned = false;
+        let hashes = unlink_set(
+            inventory,
+            |hash| async move {
+                match self.get_blob(hash.as_slice(), 0..BlobHeader::LEN).await {
+                    Ok(bytes) => Ok(bytes.and_then(|bytes| {
+                        BlobHeader::decode(&bytes).ok().map(|(header, _)| header)
+                    })),
+                    Err(err) if matches!(classify_blob_error(&err), LoadFailure::Loss(_)) => {
+                        Ok(None)
+                    }
+                    Err(err) => Err(err.caused_by(trc::location!())),
+                }
+            },
+            async {
+                scanned = true;
+                self.store().za_principal_blob_links(account_id).await
+            },
+        )
+        .await?;
+        Ok((hashes, if scanned { "scan" } else { "inventory" }))
+    }
+
     pub async fn za_search_destroy(&self, account_id: u32, clear_field: bool) -> trc::Result<()> {
         let live_account = clear_field.then(|| {
             ValueClass::Registry(RegistryClass::Item {
@@ -171,22 +201,9 @@ impl Server {
             }
         }
 
-        let hashes = unlink_set(
-            inventory,
-            |hash| async move {
-                match self.get_blob(hash.as_slice(), 0..BlobHeader::LEN).await {
-                    Ok(bytes) => Ok(bytes.and_then(|bytes| {
-                        BlobHeader::decode(&bytes).ok().map(|(header, _)| header)
-                    })),
-                    Err(err) if matches!(classify_blob_error(&err), LoadFailure::Loss(_)) => {
-                        Ok(None)
-                    }
-                    Err(err) => Err(err.caused_by(trc::location!())),
-                }
-            },
-            self.store().za_principal_blob_links(account_id),
-        )
-        .await?;
+        let (hashes, _) = self
+            .za_search_inventory_links(account_id, inventory)
+            .await?;
 
         let mut batch = principal_batch(account_id);
         for hash in hashes {

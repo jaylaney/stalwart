@@ -5,25 +5,28 @@
  */
 
 use super::{
+    changes::ZaRetainedBound,
     fields::za_thread_fields_k,
     open::{OpenFailure, ZaSearchMessageOpen, classify_open_error},
+    rebuild::{
+        SecondTruncation, ZaSearchRebuild, content_cursor_items, cursor_items, difference,
+        observe_present, second_truncation, za_search_content_needs_rebuild,
+        za_search_reconcile_start,
+    },
     write::write_pass,
 };
 use crate::{
     cache::MessageCacheFetch,
-    message::{
-        messagedata::{EmailMessageData, MessageData},
-        sortkeys::MessageSortKeys,
-        za::view::za_has_attachment,
-    },
+    message::{messagedata::MessageData, sortkeys::MessageSortKeys, za::view::za_has_attachment},
 };
 use common::{
     Server,
     za::search::{
         cache::{IndexEntry, LoadedIndex, PartKind, scanned_seed},
         error::{LoadFailure, LossClass, NoMapReason, TransientClass},
+        load::{MapLoss, ObservedLoadError},
         seal::za_search_key,
-        trace::{ZA_SEARCH_ABORTED, ZA_SEARCH_LOST, ZA_SEARCH_SKIPPED},
+        trace::{ZA_SEARCH_ABORTED, ZA_SEARCH_LOST, ZA_SEARCH_REBUILD, ZA_SEARCH_SKIPPED},
     },
     za_search_trace,
 };
@@ -37,7 +40,7 @@ use store::{
     za_search::{
         Checkpoint, ThreadFieldsK,
         content::{ContentRecord, SortKeys},
-        manifest::{FailingDocument, ManifestValue, manifest_hash},
+        manifest::{FailingDocument, Manifest, ManifestValue, manifest_hash},
         reservation,
         thread::{Alias, ThreadPart, ThreadRecord, Tombstone},
     },
@@ -45,7 +48,7 @@ use store::{
 use types::collection::SyncCollection;
 use vault::session::SessionKeys;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum PassOutcome {
     Current,
     Advanced {
@@ -59,28 +62,28 @@ pub enum PassOutcome {
     Recovery(RecoveryCause),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum RecoveryCause {
-    Loss(LossClass),
+    Loss(MapLoss),
     Truncated,
 }
 
 impl RecoveryCause {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Loss(class) => class.as_str(),
+            Self::Loss(loss) => loss.class().as_str(),
             Self::Truncated => "truncated",
         }
     }
 }
 
-impl From<LoadFailure> for PassOutcome {
-    fn from(failure: LoadFailure) -> Self {
+impl From<ObservedLoadError> for PassOutcome {
+    fn from(failure: ObservedLoadError) -> Self {
         match failure {
-            LoadFailure::Loss(class) => Self::Recovery(RecoveryCause::Loss(class)),
-            LoadFailure::Transient(class) => Self::Aborted(class),
-            LoadFailure::NoMap(reason) => Self::NoMap(reason),
-            LoadFailure::OverCap => unreachable!("the thread part is always admitted"),
+            ObservedLoadError::MapLoss(loss) => Self::Recovery(RecoveryCause::Loss(loss)),
+            ObservedLoadError::Other(LoadFailure::Transient(class)) => Self::Aborted(class),
+            ObservedLoadError::Other(LoadFailure::NoMap(reason)) => Self::NoMap(reason),
+            _ => unreachable!("a map load produces only map loss, transients and no-map"),
         }
     }
 }
@@ -352,7 +355,6 @@ impl Planner<'_> {
             }
         }
 
-        // Task 14 supplies the gap view. Until then leave any existing marker untouched.
         if manifest.reconciliation.is_some()
             && let Some(stamp) = sources.gap_stamp
         {
@@ -373,7 +375,19 @@ impl Planner<'_> {
     }
 
     async fn read_records(&mut self, records: &ZaChangeRecords, opener: &mut impl Opener) -> bool {
-        if self.staging.checkpoint.complete
+        if self.base.manifest.reconciliation.is_some() {
+            // The store exposes the empty retention marker separately. Once
+            // the gap is processed, move through it even when no ordinary
+            // Email log record survived the purge.
+            let checkpoint = self.staging.checkpoint;
+            if let Some(first) = records.first_retained
+                && (first > checkpoint.change_id
+                    || (first == checkpoint.change_id && !checkpoint.complete))
+            {
+                self.staging.checkpoint = complete_checkpoint(first);
+                self.consumed = true;
+            }
+        } else if self.staging.checkpoint.complete
             && self.base.scanned_to > self.staging.checkpoint.change_id
         {
             self.staging.checkpoint = complete_checkpoint(self.base.scanned_to);
@@ -432,6 +446,7 @@ impl Planner<'_> {
         if self.base.manifest.reconciliation.is_some()
             && sources.gap_inserts.is_empty()
             && sources.gap_deletes.is_empty()
+            && staging.checkpoint.complete
             && sources
                 .finish_at
                 .is_some_and(|finish| staging.checkpoint.change_id >= finish)
@@ -496,7 +511,10 @@ pub(crate) async fn plan_pass(
         consumed: false,
     };
     if !planner.read_sources(&sources, opener).await
-        || (planner.items == 0 && !planner.consumed && !planner.read_records(records, opener).await)
+        || (planner.items == 0
+            && !planner.consumed
+            && matches!(planner.staging.content_cursor, CursorStep::None)
+            && !planner.read_records(records, opener).await)
     {
         return planner.staging;
     }
@@ -628,6 +646,7 @@ impl ZaSearchPass for Server {
             if manifest.cursor.is_none()
                 && manifest.reconciliation.is_none()
                 && manifest.content_to.cursor.is_none()
+                && za_search_content_needs_rebuild(manifest, &config).is_none()
                 && manifest.indexed_to.complete
                 && state <= index.scanned_to
             {
@@ -649,21 +668,45 @@ impl ZaSearchPass for Server {
             }
             read = self.za_search_read_manifest(account_id, &key).await;
         }
-        let bytes = match read {
-            Ok(Some((bytes, ManifestValue::Index(_)))) => bytes,
+        let (bytes, manifest) = match read {
+            Ok(Some((bytes, ManifestValue::Index(manifest)))) => (bytes, manifest),
             Ok(Some((_, ManifestValue::Destroying(_)))) => {
                 return Ok(PassOutcome::NoMap(NoMapReason::Destroying));
             }
             Ok(None) => {
                 return Ok(PassOutcome::Recovery(RecoveryCause::Loss(
-                    LossClass::ManifestMissing,
+                    MapLoss::missing(),
                 )));
             }
             Err(failure) => return Ok(failure.into()),
         };
         drop(key);
+        if let Some(reason) = za_search_content_needs_rebuild(&manifest, &config) {
+            match self
+                .za_search_content_rebuild_start(account_id, keys, reason, None)
+                .await
+            {
+                Ok(()) => {
+                    if let Err(failure) = self.za_search_reload_if_moved(&entry, keys).await {
+                        return Ok(failure.into());
+                    }
+                    return Ok(PassOutcome::Advanced {
+                        published: false,
+                        indexed_to: manifest.indexed_to,
+                    });
+                }
+                Err(err) if err.is_assertion_failure() => {
+                    za_search_trace!(ZA_SEARCH_LOST, AccountId = account_id);
+                    self.za_search_reload_if_moved(&entry, keys).await.ok();
+                    return Ok(PassOutcome::Lost);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
         let hash = manifest_hash(&bytes);
         let search_cache = &self.inner.cache.za_search;
+        let mut sources = PassSources::default();
         let base = {
             let Some(index) = entry.read_loaded().await else {
                 return Ok(PassOutcome::Lost);
@@ -672,12 +715,18 @@ impl ZaSearchPass for Server {
                 za_search_trace!(ZA_SEARCH_LOST, AccountId = account_id);
                 return Ok(PassOutcome::Lost);
             }
+            if let Some(cursor) = &manifest.content_to.cursor
+                && let Some(items) = content_cursor_items(cursor, &index)
+            {
+                sources.content = items;
+                sources.content_runnable = true;
+            }
             let thread_charge = search_cache
                 .admit(PartKind::Thread, index.thread_bytes, account_id)
                 .expect("a thread part is always admitted");
             LoadedIndex {
                 manifest_bytes_hash: hash,
-                manifest: index.manifest.clone(),
+                manifest,
                 thread: index.thread.clone(),
                 thread_segments: Vec::new(),
                 content: None,
@@ -687,42 +736,77 @@ impl ZaSearchPass for Server {
                 thread_charge,
             }
         };
-        let mut cursor = Vec::new();
-        if let Some(bounds) = &base.manifest.cursor {
-            let in_bounds = |id: &u32| bounds.next <= *id && *id <= bounds.end;
-            if let Some(cache) = self.fresh_messages(account_id) {
-                cursor.extend(cache.emails.document_ids().filter(in_bounds));
-            } else {
-                self.message_datas(account_id, &(), |document_id, _| {
-                    if in_bounds(&document_id) {
-                        cursor.push(document_id);
-                    }
-                    Ok(true)
-                })
+        let records = if let Some(marker) = &base.manifest.reconciliation {
+            let Some(present) = observe_present(self, account_id).await? else {
+                return Ok(PassOutcome::Lost);
+            };
+            let mut retained = self
+                .store()
+                .za_changes_records(account_id, SyncCollection::Email, None, usize::MAX)
                 .await?;
+            let bound = self
+                .za_retained_bound(account_id)
+                .await?
+                .max(retained.first_retained.unwrap_or_default());
+            match second_truncation(marker.bound, bound, &base.manifest.indexed_to) {
+                SecondTruncation::Restart => {
+                    return start_reconciliation(self, &entry, keys, &bytes, base.manifest, bound)
+                        .await;
+                }
+                SecondTruncation::BoundMoved => sources.marker_bound = Some(bound),
+                SecondTruncation::No => (),
             }
-            cursor.sort_unstable();
-        }
-        let records = if cursor.is_empty() {
+            let diff = difference(&base, present.documents, &retained, marker);
+            sources.gap_inserts = diff.gap_inserts;
+            sources.gap_deletes = diff.gap_deletes;
+            sources.gap_stamp = Some(sources.marker_bound.unwrap_or(marker.bound) - 1);
+            sources.finish_at = Some(present.state);
+            if let Some(checkpoint) = diff.retained_from {
+                // Reuse the unfolded read for both attribution and consumption.
+                // A partial checkpoint includes the resumed record.
+                let first = retained.records.partition_point(|(id, _)| {
+                    *id < checkpoint.change_id
+                        || (*id == checkpoint.change_id && checkpoint.complete)
+                });
+                retained.records.drain(..first);
+            }
+            retained
+        } else if let Some(bounds) = &base.manifest.cursor {
+            let bound = self.za_retained_bound(account_id).await?;
+            if second_truncation(0, bound, &base.manifest.indexed_to) == SecondTruncation::Restart {
+                return start_reconciliation(self, &entry, keys, &bytes, base.manifest, bound)
+                    .await;
+            }
+            let Some(present) = observe_present(self, account_id).await? else {
+                return Ok(PassOutcome::Lost);
+            };
+            sources.cursor = cursor_items(bounds, present.documents);
+            ZaChangeRecords::default()
+        } else {
             let checkpoint = if base.scanned_to > base.manifest.indexed_to.change_id {
                 complete_checkpoint(base.scanned_to)
             } else {
                 base.manifest.indexed_to
             };
-            self.store()
+            let records = self
+                .store()
                 .za_changes_records(
                     account_id,
                     SyncCollection::Email,
                     Some(checkpoint),
                     config.checkpoint.max(config.pass_cap.saturating_add(1)),
                 )
-                .await?
-        } else {
-            ZaChangeRecords::default()
+                .await?;
+            if records.truncated || records.resumed_record_lost {
+                let bound = self
+                    .za_retained_bound(account_id)
+                    .await?
+                    .max(records.first_retained.unwrap_or_default());
+                return start_reconciliation(self, &entry, keys, &bytes, base.manifest, bound)
+                    .await;
+            }
+            records
         };
-        if records.truncated {
-            return Ok(PassOutcome::Recovery(RecoveryCause::Truncated));
-        }
         let limits = PassLimits {
             cap: config.pass_cap,
             hidden_bytes: config.pass_hidden_kb * 1024,
@@ -748,10 +832,7 @@ impl ZaSearchPass for Server {
                 .expect("a thread part is always admitted");
             plan_pass(
                 &base,
-                PassSources {
-                    cursor,
-                    ..PassSources::default()
-                },
+                sources,
                 &records,
                 &limits,
                 Instant::now(),
@@ -796,7 +877,19 @@ impl ZaSearchPass for Server {
             }
             Ok(PassOutcome::Current)
         } else {
-            write_pass(
+            let finished = [
+                (matches!(staging.cursor, CursorStep::Exhausted), "rebuild"),
+                (
+                    matches!(staging.content_cursor, CursorStep::Exhausted),
+                    "content",
+                ),
+                (
+                    matches!(staging.marker, MarkerStep::Finished),
+                    "reconciliation",
+                ),
+            ];
+            let epoch = base.manifest.epoch;
+            let outcome = write_pass(
                 self,
                 account_id,
                 keys,
@@ -806,8 +899,49 @@ impl ZaSearchPass for Server {
                 base.manifest,
                 staging,
             )
-            .await
+            .await?;
+            if matches!(outcome, PassOutcome::Advanced { .. }) {
+                for (done, kind) in finished {
+                    if done {
+                        za_search_trace!(
+                            ZA_SEARCH_REBUILD,
+                            AccountId = account_id,
+                            Type = kind,
+                            Reason = "finished",
+                            ChangeId = epoch
+                        );
+                    }
+                }
+            }
+            Ok(outcome)
         }
+    }
+}
+
+async fn start_reconciliation(
+    server: &Server,
+    entry: &IndexEntry,
+    keys: &SessionKeys,
+    bytes: &[u8],
+    manifest: Manifest,
+    bound: u64,
+) -> trc::Result<PassOutcome> {
+    let id = entry.account_id;
+    match za_search_reconcile_start(server, id, keys, bytes, manifest, bound).await {
+        Ok(()) => {
+            // The next pass must start from the committed marker, even on an
+            // idle account where the prior resident scanned_to was current.
+            match server.za_search_reload_if_moved(entry, keys).await {
+                Ok(_) => Ok(PassOutcome::Recovery(RecoveryCause::Truncated)),
+                Err(failure) => Ok(failure.into()),
+            }
+        }
+        Err(err) if err.is_assertion_failure() => {
+            za_search_trace!(ZA_SEARCH_LOST, AccountId = id);
+            server.za_search_reload_if_moved(entry, keys).await.ok();
+            Ok(PassOutcome::Lost)
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -1458,6 +1592,35 @@ mod tests {
         );
         assert!(staged.witness.is_none());
         assert_eq!(staged.revision, base.manifest.revision);
+    }
+
+    #[tokio::test]
+    async fn retention_marker_alone_finishes_reconciliation() {
+        let mut base = base();
+        base.manifest.reconciliation = Some(ReconciliationMarker {
+            bound: 40,
+            gap_next: 0,
+        });
+        let staged = plan_pass(
+            &base,
+            PassSources {
+                gap_stamp: Some(39),
+                finish_at: Some(40),
+                ..Default::default()
+            },
+            &ZaChangeRecords {
+                truncated: true,
+                first_retained: Some(40),
+                ..Default::default()
+            },
+            &limits(),
+            Instant::now(),
+            &mut opener([]),
+        )
+        .await;
+        assert_eq!(staged.checkpoint, complete(40));
+        assert!(matches!(staged.marker, MarkerStep::Finished));
+        assert!(matches!(staged.decision, PassDecision::ManifestOnly));
     }
 
     #[tokio::test]

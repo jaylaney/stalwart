@@ -1,6 +1,12 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 31 (2026-11-08), execution clarification.
+Date: 2026-11-04. Status: revision 32 (2026-11-08), execution clarification.
+Revision 32 corrects the expected partition in the rebuild's missing-evidence
+fixture. With D absent before its cursor turn, N and N2 can still match each
+other through their shared reference to D, but remain separate from A. The
+ordinary control keeps all three together. Section 7.5's accepted deviation
+and the threading algorithm are unchanged.
+
 Revision 31 makes the existing keyed-identity rule explicit for IMAP ObjectId
 and EMAILID/THREADID filters, including an owner's session opened before
 provisioning. It supersedes the older mail-spec keyless ObjectId carveout;
@@ -2803,10 +2809,12 @@ and `fence.rs` and `index_task.rs` reach `keymail45` and `plainmail49`):
   through POP3 and a new `N2` replying to `D` delivered mid-rebuild,
   the cursor finished and then the log consumed, with `A`, `N` and `N2`
   grouped as the control groups them, `D` absent from every read, and
-  no alias count above `K − 1` in any pass; and its residual, `D`
-  deleted while still pending in the cursor, where `N2` threads as a
-  singleton and the control does not (the accepted missing-evidence
-  case of 7.5, pinned rather than expected to match); the checkpoint case (R21):
+  no admitted item writing more than `K − 1` aliases; and its residual,
+  `D` deleted while still pending in the cursor after only `A` was indexed:
+  the key account keeps `A` separate from the `N`, `N2` pair (their shared
+  reference to `D` still matches), while the control groups `A`, `N`, `N2`
+  together. Assert both exact partitions and that `D` is absent (the accepted
+  missing-evidence case of 7.5, pinned rather than expected to match); the checkpoint case (R21):
   two accounts with identical public inputs, thirty-seven fillers and a
   probe whose two references share a thread in one account and not the
   other, with equal `indexed_to`, cursor bound, publication sequence

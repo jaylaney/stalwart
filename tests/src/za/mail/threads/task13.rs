@@ -10,7 +10,10 @@ use crate::za::{STRONG, user_permissions};
 use email::mailbox::INBOX_ID;
 use jmap_proto::types::state::State;
 use serde_json::{Value, json};
-use store::query::log::{Change, ZaChangeRecords};
+use store::{
+    query::log::{Change, ZaChangeRecords},
+    za_search::Checkpoint,
+};
 use types::{collection::SyncCollection, id::Id};
 
 async fn changes(
@@ -207,6 +210,7 @@ async fn case_initial_after_truncation(test: &TestServer, key: &Account) {
         .await
         .unwrap()
         .expect("truncation must replace a real row");
+    assert!(manifest.indexed_to.change_id < marker);
     let before = range(test, key, SyncCollection::Email, 0, exact(&latest)).await;
     assert!(before.truncated && before.first_retained == Some(marker));
     assert_eq!(before.records.len(), 1);
@@ -243,8 +247,30 @@ async fn case_initial_after_truncation(test: &TestServer, key: &Account) {
     let reloaded = cache.get(account_id).unwrap();
     assert!(!std::sync::Arc::ptr_eq(&original, &reloaded));
     let after = composition::manifest(test, key).await;
-    assert_eq!(manifest.indexed_to, after.indexed_to);
+    // The cold pass reconciles across the marker and consumes the sole
+    // retained record without publishing a new identity revision.
+    let retained_end = before.records[0].0;
+    assert_eq!(
+        after.indexed_to,
+        Checkpoint {
+            change_id: retained_end,
+            position: 0,
+            complete: true,
+        }
+    );
+    assert!(after.reconciliation.is_none());
     assert_eq!(manifest.epoch, after.epoch);
+    assert_eq!(manifest.newest_row, after.newest_row);
+    assert_eq!(manifest.thread_blobs, after.thread_blobs);
+    assert_eq!(manifest.content, after.content);
+    for collection in [SyncCollection::Email, SyncCollection::Thread] {
+        assert!(
+            range(test, key, collection, retained_end, u64::MAX)
+                .await
+                .records
+                .is_empty()
+        );
+    }
 }
 
 fn first_page(reply: &Value) -> (State, u64, Id) {

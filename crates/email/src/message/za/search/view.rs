@@ -4,15 +4,21 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::ensure::{Unavailable, ZaSearchEnsure, check_content_cap, is_current, map_load};
+use super::{
+    ensure::{
+        MapRecoveryError, Unavailable, ZaSearchEnsure, check_content_cap, is_current, map_load,
+        recover_map, trace_recovery_limit,
+    },
+    pass::{PassOutcome, ZaSearchPass},
+};
 use crate::cache::MessageCacheFetch;
 use common::{
     MessageStoreCache, Server,
     za::search::{
         cache::{IndexEntry, LoadedGuard},
-        error::{LoadFailure, LossClass, NoMapReason, TransientClass},
+        error::{LoadFailure, NoMapReason, TransientClass},
+        load::{MapLoss, ObservedLoadError},
         seal::za_search_key,
-        trace::{ZA_SEARCH_REBUILD, za_search_trace},
     },
 };
 use std::{future::Future, sync::Arc, time::Instant};
@@ -82,33 +88,10 @@ pub async fn za_view_with_minimum(
         ViewNeed::Map => None,
         ViewNeed::Content { deadline } => Some(tokio::time::Instant::from_std(deadline)),
     };
-    let failure = |failure| {
-        if deadline.is_some() {
-            ViewError::Unavailable(map_load(failure))
-        } else {
-            ViewError::NoMap(match failure {
-                LoadFailure::Loss(class) => {
-                    // Task 14 adds recovery at the exact observed base.
-                    za_search_trace!(
-                        ZA_SEARCH_REBUILD,
-                        AccountId = account_id,
-                        Reason = class.as_str()
-                    );
-                    NoMapReason::Transient(TransientClass::Store)
-                }
-                LoadFailure::Transient(class) => NoMapReason::Transient(class),
-                LoadFailure::NoMap(reason) => reason,
-                LoadFailure::OverCap => NoMapReason::Transient(TransientClass::Budget),
-            })
-        }
-    };
+    let failure = |error| view_load_failure(error, deadline);
+    let mut recovered = false;
     let mut map_entry = if deadline.is_none() {
-        Some(
-            server
-                .za_search_entry(account_id, keys)
-                .await
-                .map_err(failure)?,
-        )
+        Some(load_map_entry(server, account_id, keys, &mut recovered).await?)
     } else {
         None
     };
@@ -134,10 +117,17 @@ pub async fn za_view_with_minimum(
         #[cfg(feature = "test_mode")]
         common::za::test_hooks::search_snapshot_pause_point(account_id).await;
 
-        let (bytes, value) = wait(deadline, server.za_search_read_manifest(account_id, &key))
+        let observed = wait(deadline, server.za_search_read_manifest(account_id, &key))
             .await?
-            .map_err(failure)?
-            .ok_or_else(|| failure(LoadFailure::Loss(LossClass::ManifestMissing)))?;
+            .and_then(|value| value.ok_or_else(|| ObservedLoadError::MapLoss(MapLoss::missing())));
+        let (bytes, value) = match observed {
+            Ok(value) => value,
+            Err(error) => {
+                recover_view_loss(server, account_id, keys, error, &mut recovered, deadline)
+                    .await?;
+                continue;
+            }
+        };
         if matches!(value, ManifestValue::Destroying(_)) {
             return Err(failure(LoadFailure::NoMap(NoMapReason::Destroying)));
         }
@@ -145,9 +135,13 @@ pub async fn za_view_with_minimum(
         if let Some(guard) = wait(deadline, entry.read_loaded()).await? {
             if manifest_hash(&bytes) != guard.manifest_bytes_hash {
                 drop(guard);
-                wait(deadline, server.za_search_reload_if_moved(&entry, keys))
-                    .await?
-                    .map_err(failure)?;
+                if let Err(error) =
+                    wait(deadline, server.za_search_reload_if_moved(&entry, keys)).await?
+                {
+                    recover_view_loss(server, account_id, keys, error, &mut recovered, deadline)
+                        .await?;
+                    continue;
+                }
             } else if !counter_at_or_past(cache.last_change_id, &guard.manifest)
                 || minimum_cache_counter.is_some_and(|minimum| cache.last_change_id < minimum)
                 || (deadline.is_some()
@@ -179,17 +173,81 @@ pub async fn za_view_with_minimum(
                 });
             }
         } else if deadline.is_none() {
-            map_entry = Some(
-                server
-                    .za_search_entry(account_id, keys)
-                    .await
-                    .map_err(failure)?,
-            );
+            map_entry = Some(load_map_entry(server, account_id, keys, &mut recovered).await?);
         }
         rounds += 1;
         if rounds > 3 {
             return Err(failure(LoadFailure::Transient(TransientClass::Validation)));
         }
+    }
+}
+
+async fn load_map_entry(
+    server: &Server,
+    account_id: u32,
+    keys: &SessionKeys,
+    recovered: &mut bool,
+) -> Result<Arc<IndexEntry>, ViewError> {
+    match server.za_search_entry(account_id, keys).await {
+        Ok(entry) => Ok(entry),
+        Err(error) => {
+            recover_view_loss(server, account_id, keys, error, recovered, None).await?;
+            server
+                .za_search_entry(account_id, keys)
+                .await
+                .map_err(|error| view_load_failure(error.classification(), None))
+        }
+    }
+}
+
+fn view_load_failure(failure: LoadFailure, deadline: Option<tokio::time::Instant>) -> ViewError {
+    if deadline.is_some() {
+        ViewError::Unavailable(map_load(failure))
+    } else {
+        ViewError::NoMap(match failure {
+            LoadFailure::Loss(_) => NoMapReason::Transient(TransientClass::Store),
+            LoadFailure::Transient(class) => NoMapReason::Transient(class),
+            LoadFailure::NoMap(reason) => reason,
+            LoadFailure::OverCap => NoMapReason::Transient(TransientClass::Budget),
+        })
+    }
+}
+
+async fn recover_view_loss(
+    server: &Server,
+    account_id: u32,
+    keys: &SessionKeys,
+    error: ObservedLoadError,
+    recovered: &mut bool,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), ViewError> {
+    match error {
+        ObservedLoadError::MapLoss(loss) if !*recovered => {
+            *recovered = true;
+            recover_map(server, account_id, keys, loss, deadline)
+                .await
+                .map_err(|error| match error {
+                    MapRecoveryError::NoMap(reason) => {
+                        view_load_failure(LoadFailure::NoMap(reason), deadline)
+                    }
+                    MapRecoveryError::Unavailable(reason) if deadline.is_some() => {
+                        ViewError::Unavailable(reason)
+                    }
+                    MapRecoveryError::Unavailable(_) => {
+                        ViewError::NoMap(NoMapReason::Transient(TransientClass::Store))
+                    }
+                })?;
+            // Map views give the cursor one re-entry. Content views next
+            // enter ensure-current under the same deadline.
+            if deadline.is_none()
+                && let Ok(PassOutcome::Recovery(cause)) =
+                    server.za_search_pass(account_id, keys).await
+            {
+                trace_recovery_limit(account_id, &cause);
+            }
+            Ok(())
+        }
+        other => Err(view_load_failure(other.classification(), deadline)),
     }
 }
 

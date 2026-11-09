@@ -439,19 +439,22 @@ async fn pl1_a_stripped_hidden_section_is_loss() {
             .is_none()
     );
     altered.insert(descriptor.hash.clone(), stripped);
-    assert!(matches!(
-        load_thread_part(
-            &altered,
-            &entry,
-            &key,
-            &manifest_bytes,
-            manifest.clone(),
-            10,
-            100
-        )
-        .await,
-        Err(LoadFailure::Loss(LossClass::Hash))
-    ));
+    let Err(ObservedLoadError::MapLoss(loss)) = load_thread_part(
+        &altered,
+        &entry,
+        &key,
+        &manifest_bytes,
+        manifest.clone(),
+        10,
+        100,
+    )
+    .await
+    else {
+        panic!("the failed named thread blob must carry map loss evidence");
+    };
+    assert_eq!(loss.class(), LossClass::Hash);
+    assert_eq!(loss.raw(), Some(manifest_bytes.as_slice()));
+    assert_eq!(loss.failed_thread(), Some(&descriptor.hash));
 
     let first = predecessor_of_head(&altered, &manifest);
     let (header, _) = BlobHeader::decode(&altered[&first]).unwrap();
@@ -680,11 +683,15 @@ async fn f3_h6_error_classes() {
     let hash = manifest.thread_blobs[0].hash.clone();
     let missing = map.remove(&hash).unwrap();
     assert!(matches!(
-        load_thread_part(&map, &entry, &key, &bytes, manifest.clone(), 10, 100).await,
+        load_thread_part(&map, &entry, &key, &bytes, manifest.clone(), 10, 100)
+            .await
+            .map_err(|failure| failure.classification()),
         Err(LoadFailure::Transient(TransientClass::AbsentWithinWindow))
     ));
     assert!(matches!(
-        load_thread_part(&map, &entry, &key, &bytes, manifest.clone(), 10, 111).await,
+        load_thread_part(&map, &entry, &key, &bytes, manifest.clone(), 10, 111)
+            .await
+            .map_err(|failure| failure.classification()),
         Err(LoadFailure::Loss(LossClass::BlobAbsent))
     ));
     map.insert(hash.clone(), missing);
@@ -991,12 +998,18 @@ async fn content_failure_during_reload_does_not_turn_into_thread_loss() {
     assert!(index.thread.is_present(5));
     assert_eq!(index.manifest_bytes_hash, manifest_hash(&v2_bytes));
     assert!(index.content.is_none());
+    let current = index.manifest.clone();
     drop(index);
     assert_eq!(cache.content_used(), 0);
-    assert_eq!(
-        load_current_content(&map, &entry, &key, cache.config()).await,
-        Err(LoadFailure::Loss(LossClass::Hash))
-    );
+    let Err(ObservedLoadError::ContentLoss(loss)) =
+        load_current_content(&map, &entry, &key, cache.config()).await
+    else {
+        panic!("the failed content walk must carry content loss evidence");
+    };
+    assert_eq!(loss.class(), LossClass::Hash);
+    assert!(loss.matches(&v2_bytes, &current));
+    assert!(!loss.matches(&bytes, &current));
+    assert!(!loss.matches(&v2_bytes, &v1));
 }
 
 struct GatedSource<'a> {

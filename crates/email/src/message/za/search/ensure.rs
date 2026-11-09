@@ -4,13 +4,17 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::pass::{PassOutcome, ZaSearchPass, read_change_id};
+use super::{
+    pass::{PassOutcome, RecoveryCause, ZaSearchPass, read_change_id},
+    rebuild::{ContentRebuildReason, RebuildStarted, ZaSearchRebuild, recovery_timed_out},
+};
 use common::{
     Server,
     za::search::{
         cache::{IndexEntry, LoadedIndex},
         error::{LoadFailure, NoMapReason, TransientClass},
-        trace::{ZA_SEARCH_REBUILD, ZA_SEARCH_UNAVAILABLE},
+        load::{MapLoss, ObservedLoadError},
+        trace::{ZA_SEARCH_LOST, ZA_SEARCH_REBUILD, ZA_SEARCH_UNAVAILABLE},
     },
     za_search_trace,
 };
@@ -66,26 +70,39 @@ pub trait ZaSearchEnsure: Sync + Send {
 
 impl ZaSearchEnsure for Server {
     async fn za_search_pass_hook(&self, account_id: u32, keys: &SessionKeys) {
-        match self.za_search_pass(account_id, keys).await {
-            Ok(
-                PassOutcome::Current
-                | PassOutcome::Advanced { .. }
-                | PassOutcome::Running
-                | PassOutcome::Lost
-                | PassOutcome::Aborted(_),
-            ) => {}
-            Ok(PassOutcome::NoMap(reason)) => za_search_trace!(
-                ZA_SEARCH_UNAVAILABLE,
-                AccountId = account_id,
-                Reason = reason.as_str()
-            ),
-            Ok(PassOutcome::Recovery(cause)) => za_search_trace!(
-                ZA_SEARCH_REBUILD,
-                AccountId = account_id,
-                Reason = cause.as_str()
-            ),
-            Err(err) => {
-                trc::error!(err.account_id(account_id));
+        let mut reentered = false;
+        loop {
+            match self.za_search_pass(account_id, keys).await {
+                Ok(PassOutcome::Recovery(cause)) if !reentered => {
+                    reentered = true;
+                    if let RecoveryCause::Loss(loss) = cause
+                        && let Err(reason) = recover_map(self, account_id, keys, loss, None).await
+                    {
+                        za_search_trace!(
+                            ZA_SEARCH_UNAVAILABLE,
+                            AccountId = account_id,
+                            Reason = reason.as_str()
+                        );
+                        break;
+                    }
+                }
+                Ok(PassOutcome::Recovery(cause)) => {
+                    trace_recovery_limit(account_id, &cause);
+                    break;
+                }
+                Ok(PassOutcome::NoMap(reason)) => {
+                    za_search_trace!(
+                        ZA_SEARCH_UNAVAILABLE,
+                        AccountId = account_id,
+                        Reason = reason.as_str()
+                    );
+                    break;
+                }
+                Ok(_) => break,
+                Err(err) => {
+                    trc::error!(err.account_id(account_id));
+                    break;
+                }
             }
         }
     }
@@ -98,7 +115,28 @@ impl ZaSearchEnsure for Server {
     ) -> Result<Arc<IndexEntry>, Unavailable> {
         let deadline = tokio::time::Instant::from_std(deadline);
         let cap = self.za_search_config().account_max_mb << 20;
+        let mut reentered = false;
+        let mut recovered_content = false;
         while tokio::time::Instant::now() < deadline {
+            // Do not wait for the resident guard here. A running pass can
+            // hold it, in which case the pass-lock wait below owns the wait.
+            if let Some(entry) = self.inner.cache.za_search.get(account_id) {
+                let backfill = {
+                    let guard = entry.index.try_read().ok();
+                    if let Some(index) = guard.as_deref().and_then(Option::as_ref) {
+                        check_content_cap(index, cap)?;
+                        index.manifest.content_to.cursor.is_some()
+                            && !index.manifest.content_to.suspended
+                    } else {
+                        false
+                    }
+                };
+                if backfill
+                    && load_content(self, &entry, keys, deadline, &mut recovered_content).await?
+                {
+                    continue;
+                }
+            }
             // A pass owns its transaction through its outcome. Check the
             // deadline between passes and bound waits separately.
             match self.za_search_pass(account_id, keys).await {
@@ -117,10 +155,20 @@ impl ZaSearchEnsure for Server {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(Unavailable::NotCurrent);
                     }
-                    let entry = timeout_at(deadline, self.za_search_entry(account_id, keys))
+                    let entry = match timeout_at(deadline, self.za_search_entry(account_id, keys))
                         .await
                         .map_err(|_| Unavailable::NotCurrent)?
-                        .map_err(map_load)?;
+                    {
+                        Ok(entry) => entry,
+                        Err(ObservedLoadError::MapLoss(loss)) if !reentered => {
+                            reentered = true;
+                            recover_map(self, account_id, keys, loss, Some(deadline))
+                                .await
+                                .map_err(MapRecoveryError::unavailable)?;
+                            continue;
+                        }
+                        Err(error) => return Err(map_load(error.classification())),
+                    };
                     let state = timeout_at(deadline, read_change_id(self, account_id))
                         .await
                         .map_err(|_| Unavailable::NotCurrent)?
@@ -138,10 +186,11 @@ impl ZaSearchEnsure for Server {
                     if current {
                         // The loader can retry moving heads. Use the request's
                         // original deadline for that entire load and its retries.
-                        timeout_at(deadline, self.za_search_load_content(&entry, keys))
-                            .await
-                            .map_err(|_| Unavailable::NotCurrent)?
-                            .map_err(map_load)?;
+                        if load_content(self, &entry, keys, deadline, &mut recovered_content)
+                            .await?
+                        {
+                            continue;
+                        }
                         if let Some(index) = timeout_at(deadline, entry.read_loaded())
                             .await
                             .map_err(|_| Unavailable::NotCurrent)?
@@ -171,11 +220,170 @@ impl ZaSearchEnsure for Server {
                     }
                 }
                 Ok(PassOutcome::NoMap(reason)) => return Err(map_no_map(reason)),
-                Ok(PassOutcome::Recovery(_)) => return Err(Unavailable::Rebuilding),
+                Ok(PassOutcome::Recovery(cause)) if !reentered => {
+                    reentered = true;
+                    if let RecoveryCause::Loss(loss) = cause {
+                        recover_map(self, account_id, keys, loss, Some(deadline))
+                            .await
+                            .map_err(MapRecoveryError::unavailable)?;
+                    }
+                }
+                Ok(PassOutcome::Recovery(cause)) => {
+                    trace_recovery_limit(account_id, &cause);
+                    return Err(Unavailable::Rebuilding);
+                }
                 Err(_) => return Err(Unavailable::Transient(TransientClass::Store)),
             }
         }
         Err(Unavailable::NotCurrent)
+    }
+}
+
+pub(super) fn trace_recovery_limit(account_id: u32, cause: &RecoveryCause) {
+    za_search_trace!(
+        ZA_SEARCH_REBUILD,
+        AccountId = account_id,
+        Reason = cause.as_str()
+    );
+}
+
+pub(super) enum MapRecoveryError {
+    NoMap(NoMapReason),
+    Unavailable(Unavailable),
+}
+
+impl MapRecoveryError {
+    fn unavailable(self) -> Unavailable {
+        match self {
+            Self::NoMap(reason) => map_no_map(reason),
+            Self::Unavailable(reason) => reason,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoMap(reason) => reason.as_str(),
+            Self::Unavailable(reason) => reason.as_str(),
+        }
+    }
+}
+
+impl From<Unavailable> for MapRecoveryError {
+    fn from(reason: Unavailable) -> Self {
+        Self::Unavailable(reason)
+    }
+}
+
+pub(super) async fn recover_map(
+    server: &Server,
+    account_id: u32,
+    keys: &SessionKeys,
+    loss: MapLoss,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), MapRecoveryError> {
+    recovery_pause(account_id, deadline).await?;
+    match server
+        .za_search_rebuild_start(account_id, keys, loss, deadline)
+        .await
+    {
+        Ok(RebuildStarted::Destroying) => {
+            return Err(MapRecoveryError::NoMap(NoMapReason::Destroying));
+        }
+        Ok(RebuildStarted::Written | RebuildStarted::LostToAnotherNode) => (),
+        Err(error) if recovery_timed_out(&error) => return Err(Unavailable::NotCurrent.into()),
+        Err(error) => {
+            trc::error!(error.account_id(account_id));
+            return Err(Unavailable::Transient(TransientClass::Store).into());
+        }
+    }
+    wait_for_recovery(deadline, async {
+        let entry = server.za_search_entry(account_id, keys).await?;
+        server.za_search_reload_if_moved(&entry, keys).await
+    })
+    .await?
+    .map_err(|error| match error.classification() {
+        LoadFailure::NoMap(reason) => MapRecoveryError::NoMap(reason),
+        other => map_load(other).into(),
+    })?;
+    Ok(())
+}
+
+async fn load_content(
+    server: &Server,
+    entry: &IndexEntry,
+    keys: &SessionKeys,
+    deadline: tokio::time::Instant,
+    recovered: &mut bool,
+) -> Result<bool, Unavailable> {
+    let id = entry.account_id;
+    match timeout_at(deadline, server.za_search_load_content(entry, keys))
+        .await
+        .map_err(|_| Unavailable::NotCurrent)?
+    {
+        Ok(()) => return Ok(false),
+        Err(ObservedLoadError::ContentLoss(loss)) if !*recovered => {
+            *recovered = true;
+            recovery_pause(id, Some(deadline)).await?;
+            match server
+                .za_search_content_rebuild_start(
+                    id,
+                    keys,
+                    ContentRebuildReason::ContentLoss(loss),
+                    Some(deadline),
+                )
+                .await
+            {
+                Ok(()) => (),
+                Err(error) if error.is_assertion_failure() => {
+                    za_search_trace!(ZA_SEARCH_LOST, AccountId = id);
+                }
+                Err(error) if recovery_timed_out(&error) => return Err(Unavailable::NotCurrent),
+                Err(error) => {
+                    trc::error!(error.account_id(id));
+                    return Err(Unavailable::Transient(TransientClass::Store));
+                }
+            }
+        }
+        Err(error) => return Err(map_load(error.classification())),
+    }
+    wait_for_recovery(
+        Some(deadline),
+        server.za_search_reload_if_moved(entry, keys),
+    )
+    .await?
+    .map_err(|error| map_load(error.classification()))?;
+    Ok(true)
+}
+
+async fn recovery_pause(
+    _account_id: u32,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), Unavailable> {
+    #[cfg(feature = "test_mode")]
+    wait_for_recovery(
+        deadline,
+        common::za::test_hooks::search_recovery_pause_point(_account_id),
+    )
+    .await?;
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        return Err(Unavailable::NotCurrent);
+    }
+    Ok(())
+}
+
+async fn wait_for_recovery<F: Future>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Result<F::Output, Unavailable> {
+    if let Some(deadline) = deadline {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Unavailable::NotCurrent);
+        }
+        timeout_at(deadline, future)
+            .await
+            .map_err(|_| Unavailable::NotCurrent)
+    } else {
+        Ok(future.await)
     }
 }
 

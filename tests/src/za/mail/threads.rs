@@ -10,7 +10,11 @@ use crate::{
         account::Account,
         jmap::JmapResponse,
         server::TestServer,
-        za::{Keyless, manifest_bytes, read_manifest, run_search_pass, wait_for_delivery},
+        za::{
+            Keyless, force_loss, lower_changes_history, manifest_bytes, pop3_delete, purge_account,
+            read_manifest, run_search_pass, search_config_guard, simulate_restart,
+            wait_for_delivery,
+        },
     },
     za::{STRONG, user_permissions},
 };
@@ -561,4 +565,357 @@ async fn case_keyless_stale_prefix(test: &TestServer, key: &Account, root: u32, 
         method(&readback, 0, "Email/get")["notFound"],
         json!([&current])
     );
+}
+
+pub(super) async fn test_recovery(test: &mut TestServer, key: &Account) {
+    let admin = test.account("admin@example.com").clone();
+    let plain = admin
+        .create_user_account(
+            "plainmail56@example.com",
+            STRONG,
+            "Rebuild threading control",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    for residual in [false, true] {
+        case_r16_r20_rebuild_form(test, key, &plain, residual).await;
+        for account in [key, &plain] {
+            test.destroy_all_mailboxes(account).await;
+        }
+    }
+    admin.destroy_account(plain).await;
+    test.wait_for_tasks().await;
+    for (name, recovery) in [
+        (
+            "keymail-task14-page-loss@example.com",
+            PagingRecovery::Thread,
+        ),
+        (
+            "keymail-task14-page-content@example.com",
+            PagingRecovery::Content,
+        ),
+        (
+            "keymail-task14-page-retention@example.com",
+            PagingRecovery::Reconcile,
+        ),
+    ] {
+        let fixture = key_mail_account(test, name, STRONG).await;
+        case_initial_continuation_epoch_loss(test, &fixture, &admin, recovery).await;
+        test.destroy_all_mailboxes(&fixture).await;
+    }
+}
+
+async fn recovery_manifest(
+    test: &TestServer,
+    key: &Account,
+) -> store::za_search::manifest::Manifest {
+    let Some(ManifestValue::Index(manifest)) = read_manifest(test, key.id().document_id()).await
+    else {
+        panic!("recovery fixture needs a search index");
+    };
+    manifest
+}
+
+async fn trigger_recovery_pass(account: &Account) {
+    let reply = account
+        .jmap_method_call("Mailbox/get", json!({"accountId": account.id_string()}))
+        .await;
+    assert_eq!(reply.name_at(0), "Mailbox/get", "{:?}", reply.0);
+}
+
+async fn case_r16_r20_rebuild_form(
+    test: &TestServer,
+    key: &Account,
+    plain: &Account,
+    residual: bool,
+) {
+    use common::za::test_hooks::{reset_za_search_counters, za_search_max_item_aliases};
+    use trc::Key;
+    println!("case_r16_r20_rebuild_form: pending parent={residual}");
+    let id = key.id().document_id();
+    let subject = if residual {
+        "Rebuild missing parent"
+    } else {
+        "Rebuild indexed parent"
+    };
+    let a = message_with(subject, "root");
+    let d = reply_to(&a, subject, "parent");
+    let n = reply_to(&d, subject, "first descendant");
+    let n2 = reply_to(&d, subject, "new descendant");
+    let mut tracks = Vec::new();
+    for account in [key, plain] {
+        let root = deliver_doc(test, account, &a).await;
+        let parent = deliver_doc(test, account, &d).await;
+        let child = deliver_doc(test, account, &n).await;
+        tracks.push((root, parent, child));
+    }
+    trigger_recovery_pass(key).await;
+    let _cap = search_config_guard!(test, pass_cap: if residual { 1 } else { 2 });
+    force_loss(test, id).await;
+    let trace = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    reset_za_search_counters(id);
+    trigger_recovery_pass(key).await;
+    let pending = recovery_manifest(test, key)
+        .await
+        .cursor
+        .expect("rebuild left work pending");
+    assert_eq!(pending.next > tracks[0].1, !residual);
+
+    for (account, (_, parent, _)) in [key, plain].into_iter().zip(&tracks) {
+        pop3_delete(test, account, *parent).await;
+    }
+    let mut next = Vec::new();
+    for account in [key, plain] {
+        next.push(deliver_doc(test, account, &n2).await);
+    }
+    for _ in 0..6 {
+        trigger_recovery_pass(key).await;
+    }
+    assert!(recovery_manifest(test, key).await.cursor.is_none());
+    for ((account, (root, parent, child)), n2) in [key, plain].into_iter().zip(tracks).zip(next) {
+        let reply = account
+            .jmap_method_call("Thread/get", json!({"accountId": account.id_string()}))
+            .await;
+        let list = method(&reply, 0, "Thread/get")["list"].as_array().unwrap();
+        let mut groups = Vec::new();
+        for thread in list {
+            let mut ids = thread["emailIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|email| email_id(email).document_id())
+                .collect::<Vec<_>>();
+            assert!(!ids.contains(&parent));
+            ids.sort_unstable();
+            groups.push(ids);
+        }
+        groups.sort_unstable();
+        let mut joined = vec![root, child, n2];
+        joined.sort_unstable();
+        if residual && account.id() == key.id() {
+            // Spec 7.5: the lost parent never entered the cursor. Its two
+            // replies still share D's hash but have no bridge to A.
+            let mut replies = vec![child, n2];
+            replies.sort_unstable();
+            let mut separate = vec![vec![root], replies];
+            separate.sort_unstable();
+            assert_ne!(groups, [joined]);
+            assert_eq!(groups, separate);
+        } else {
+            assert_eq!(groups, [joined]);
+        }
+        let reply = get(account, Value::Null).await;
+        let listed = method(&reply, 0, "Email/get")["list"].as_array().unwrap();
+        assert!(
+            !listed
+                .iter()
+                .any(|item| email_id(&item["id"]).document_id() == parent)
+        );
+    }
+
+    assert!(za_search_max_item_aliases(id) <= store::za_search::K - 1);
+    let events = trace.finish().await;
+    let passes = events
+        .iter()
+        .filter(|event| event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_PASS)
+        .collect::<Vec<_>>();
+    assert!(!passes.is_empty());
+    for event in passes {
+        assert!(
+            event.keys.iter().all(|(key, _)| matches!(
+                key,
+                Key::Details
+                    | Key::AccountId
+                    | Key::Total
+                    | Key::TotalFailures
+                    | Key::Result
+                    | Key::Version
+                    | Key::ChangeId
+                    | Key::Size
+                    | Key::Used
+            )),
+            "unexpected search pass field: {}",
+            event.text
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PagingRecovery {
+    Thread,
+    Content,
+    Reconcile,
+}
+
+async fn recovery_page(key: &Account, method: &str, since: &State, max: u32) -> JmapResponse {
+    key.jmap_method_call(
+        method,
+        json!({
+            "accountId": key.id_string(), "sinceState": since.to_string(), "maxChanges": max
+        }),
+    )
+    .await
+}
+
+async fn case_initial_continuation_epoch_loss(
+    test: &TestServer,
+    key: &Account,
+    admin: &Account,
+    recovery: PagingRecovery,
+) {
+    use email::message::za::search::changes::ZaRetainedBound;
+    println!("case_initial_continuation_epoch_loss: {recovery:?}");
+    let id = key.id().document_id();
+    for ordinal in 0..3 {
+        deliver_doc(
+            test,
+            key,
+            &message_with(&format!("Recovery page {ordinal}"), "pagingrecovery"),
+        )
+        .await;
+    }
+    trigger_recovery_pass(key).await;
+    let original = recovery_manifest(test, key).await;
+    let reconciliation = matches!(recovery, PagingRecovery::Reconcile);
+    if reconciliation {
+        for ordinal in 3..15 {
+            deliver_doc(
+                test,
+                key,
+                &message_with(&format!("Recovery page {ordinal}"), "pagingrecovery"),
+            )
+            .await;
+        }
+    }
+    let total = if reconciliation { 15 } else { 3 };
+    let entry = test.server.inner.cache.za_search.entry(id);
+    let held = entry.pass_lock.lock().await;
+    let mut tokens = Vec::new();
+    for name in ["Email/changes", "Thread/changes"] {
+        let first = recovery_page(key, name, &State::Initial, 1).await;
+        let response = method(&first, 0, name);
+        let token = State::parse(response["newState"].as_str().unwrap()).unwrap();
+        let State::Intermediate(page) = &token else {
+            panic!("expected a pinned first page: {response}")
+        };
+        assert_eq!((page.from_id, page.items_sent), (0, 1));
+        assert_eq!(response["hasMoreChanges"], true);
+        assert_eq!(response["created"].as_array().unwrap().len(), 1);
+        tokens.push((
+            name,
+            token.clone(),
+            page.to_id,
+            email_id(&response["created"][0]),
+        ));
+    }
+    drop(held);
+    assert_eq!(
+        recovery_manifest(test, key).await.indexed_to,
+        original.indexed_to
+    );
+
+    match recovery {
+        PagingRecovery::Thread => {
+            force_loss(test, id).await;
+            trigger_recovery_pass(key).await;
+        }
+        PagingRecovery::Content => {
+            let hash = &original.content.as_ref().unwrap().hash;
+            test.server
+                .blob_store()
+                .delete_blobs(&[hash.as_slice()])
+                .await
+                .unwrap();
+            simulate_restart(test, id).await;
+            let reply = key
+                .jmap_method_call(
+                    "Email/query",
+                    json!({
+                        "accountId": key.id_string(), "filter": {"text": "pagingrecovery"}
+                    }),
+                )
+                .await;
+            assert_eq!(
+                method(&reply, 0, "Email/query")["ids"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                total
+            );
+        }
+        PagingRecovery::Reconcile => {
+            lower_changes_history(admin, Some(5)).await;
+            purge_account(test, admin, key).await;
+            let bound = test.server.za_retained_bound(id).await.unwrap();
+            assert!(bound > original.indexed_to.change_id);
+            for _ in 0..8 {
+                trigger_recovery_pass(key).await;
+            }
+            lower_changes_history(admin, None).await;
+        }
+    }
+    let current = recovery_manifest(test, key).await;
+    let bound = test.server.za_retained_bound(id).await.unwrap();
+    assert!(
+        current.cursor.is_none()
+            && current.content_to.cursor.is_none()
+            && current.reconciliation.is_none()
+    );
+    if matches!(recovery, PagingRecovery::Thread) {
+        assert_eq!(
+            bound, 0,
+            "the refusal must be caused by loss of the identity epoch"
+        );
+        assert!(current.epoch > original.epoch);
+    } else {
+        assert_eq!(current.epoch, original.epoch);
+        if matches!(recovery, PagingRecovery::Content) {
+            assert_ne!(current.content, original.content);
+        }
+    }
+    for (name, token, end, first) in tokens {
+        assert!(bound <= end);
+        let continued = recovery_page(key, name, &token, 50).await;
+        let resumed = if matches!(recovery, PagingRecovery::Thread) {
+            assert!(end < current.epoch);
+            assert_eq!(
+                continued.error_type_at(0),
+                Some("cannotCalculateChanges"),
+                "{:?}",
+                continued.0
+            );
+            None
+        } else {
+            let response = method(&continued, 0, name);
+            assert_eq!(
+                State::parse(response["newState"].as_str().unwrap()),
+                Some(State::new_exact(end))
+            );
+            assert_eq!(response["hasMoreChanges"], false);
+            let mut seen = response["created"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(email_id)
+                .collect::<Vec<_>>();
+            assert!(!seen.contains(&first));
+            seen.push(first);
+            seen.sort_unstable();
+            Some(seen)
+        };
+        let fresh = recovery_page(key, name, &State::Initial, 50).await;
+        let mut fresh = method(&fresh, 0, name)["created"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(email_id)
+            .collect::<Vec<_>>();
+        fresh.sort_unstable();
+        assert_eq!(fresh.len(), total, "{name}");
+        assert!(fresh.windows(2).all(|pair| pair[0] != pair[1]));
+        if let Some(resumed) = resumed {
+            assert_eq!(resumed, fresh);
+        }
+    }
 }

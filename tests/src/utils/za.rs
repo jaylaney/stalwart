@@ -67,8 +67,9 @@ use http::auth::authenticate::za_test::{self, Pause};
 use hyper::{Method, StatusCode};
 use mail_parser::MessageParser;
 use registry::schema::{
-    enums::TaskStoreMaintenanceType,
-    structs::{Task, TaskStatus, TaskStoreMaintenance},
+    enums::{TaskAccountMaintenanceType, TaskStoreMaintenanceType},
+    prelude::Property,
+    structs::{DataRetention, Task, TaskAccountMaintenance, TaskStatus, TaskStoreMaintenance},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -480,6 +481,55 @@ pub async fn simulate_restart(test: &TestServer, account_id: u32) {
     let mut changes = CacheInvalidationBuilder::default();
     changes.invalidate(CacheInvalidation::MessageCache(account_id));
     test.server.invalidate_caches(changes).await.unwrap();
+}
+
+/// Lose a named, committed thread blob and evict this node's search part.
+pub async fn force_loss(test: &TestServer, account_id: u32) {
+    let Some(ManifestValue::Index(manifest)) = read_manifest(test, account_id).await else {
+        panic!("loss fixture needs a search index");
+    };
+    let hash = &manifest
+        .thread_blobs
+        .first()
+        .expect("loss fixture needs a thread blob")
+        .hash;
+    test.server
+        .blob_store()
+        .delete_blobs(&[hash.as_slice()])
+        .await
+        .unwrap();
+    assert!(
+        test.server
+            .get_blob(hash.as_slice(), 0..1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    simulate_restart(test, account_id).await;
+}
+
+pub async fn lower_changes_history(admin: &Account, max: Option<u64>) {
+    admin
+        .registry_update_setting(
+            DataRetention {
+                max_changes_history: max,
+                ..Default::default()
+            },
+            &[Property::MaxChangesHistory],
+        )
+        .await;
+    admin.reload_settings().await;
+}
+
+pub async fn purge_account(test: &TestServer, admin: &Account, account: &Account) {
+    admin
+        .registry_create_object(Task::AccountMaintenance(TaskAccountMaintenance {
+            account_id: account.id(),
+            maintenance_type: TaskAccountMaintenanceType::Purge,
+            status: TaskStatus::now(),
+        }))
+        .await;
+    test.wait_for_tasks().await;
 }
 
 pub async fn principal_blob_links(test: &TestServer, account_id: u32) -> Vec<(BlobHash, usize)> {

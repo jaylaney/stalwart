@@ -861,6 +861,7 @@ pub static SEARCH_SNAPSHOT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_VIEW_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 static SEARCH_PAGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_SWEEP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+static SEARCH_RECOVERY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_PASS_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_DESTROY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_HOLD_EXPIRE: Mutex<Option<u32>> = Mutex::new(None);
@@ -922,6 +923,16 @@ pub fn set_search_sweep_pause(pause: Option<Arc<Pause>>) {
 
 pub async fn search_sweep_pause_point(account_id: u32) {
     wait(take_for(&SEARCH_SWEEP_PAUSE, account_id)).await;
+}
+
+/// A single request takes the slot after observing loss, before it attempts
+/// recovery. It holds no pass or loader guard while parked.
+pub fn set_search_recovery_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_RECOVERY_PAUSE, pause);
+}
+
+pub async fn search_recovery_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_RECOVERY_PAUSE, account_id)).await;
 }
 
 pub fn set_search_pass_pause(pause: Option<Arc<Pause>>) {

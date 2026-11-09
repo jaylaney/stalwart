@@ -376,6 +376,18 @@ impl BatchBuilder {
         self
     }
 
+    /// Publish the search epoch for an account with no Email or Mailbox
+    /// witnesses. The ordinary serializer writes an empty Email record.
+    pub fn za_log_empty_email(&mut self) -> &mut Self {
+        if let Some(account_id) = self.current_account_id {
+            self.changes
+                .get_mut_or_insert(account_id)
+                .changes
+                .get_mut_or_insert(SyncCollection::Email);
+        }
+        self
+    }
+
     pub fn log_item_insert(
         &mut self,
         collection: SyncCollection,

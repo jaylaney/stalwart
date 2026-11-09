@@ -14,13 +14,15 @@ use crate::{
     utils::{
         account::Account,
         imap::{ImapConnection, Type},
+        jmap::JmapResponse,
         pop3::{Pop3Connection, ResponseType as Pop3Reply},
         server::TestServer,
         za::{
-            HookParked, expire_and_purge_blobs, index_holds, log_records_since, manifest_bytes,
-            principal_blob_links, read_manifest, run_search_pass, search_config_guard,
-            simulate_restart, temporary_blob_hashes, wait_for_delivery, write_manifest_bytes,
-            za_setup_token, za_unlock,
+            HookParked, expire_and_purge_blobs, force_loss, index_holds, log_records_since,
+            lower_changes_history, manifest_bytes, pop3_delete, principal_blob_links,
+            purge_account, read_manifest, run_search_pass, search_config_guard, simulate_restart,
+            temporary_blob_hashes, wait_for_delivery, write_manifest_bytes, za_setup_token,
+            za_unlock,
         },
     },
     za::{
@@ -37,19 +39,25 @@ use common::za::{
         load::entry_outcome,
         seal::za_search_key,
         setup::za_setup_manifest,
-        trace::{ZA_SEARCH_EVENT_TYPE, ZA_SEARCH_LOST, ZA_SEARCH_PASS, ZA_SEARCH_SKIPPED},
+        trace::{
+            ZA_SEARCH_EVENT_TYPE, ZA_SEARCH_LOST, ZA_SEARCH_PASS, ZA_SEARCH_REBUILD,
+            ZA_SEARCH_SKIPPED,
+        },
     },
     test_hooks::{
         reset_za_search_counters, set_search_blob_fail_once, set_search_blob_slow,
         set_search_commit_pause, set_search_config_override, set_search_destroy_fail_once,
         set_search_destroy_pause, set_search_hold_expire, set_search_pass_pause,
-        set_search_swap_pause, set_search_swap_skip, za_search_blob_reads, za_search_message_opens,
+        set_search_recovery_pause, set_search_snapshot_pause, set_search_swap_pause,
+        set_search_swap_skip, za_search_blob_reads, za_search_message_opens,
     },
 };
 use email::{
     cache::MessageCacheFetch,
     mailbox::{DRAFTS_ID, INBOX_ID},
+    message::messagedata::EmailMessageData,
     message::za::search::{
+        changes::ZaRetainedBound,
         ensure::{Unavailable, ZaSearchEnsure, is_current},
         pass::{PassOutcome, ZaSearchPass},
     },
@@ -201,6 +209,7 @@ pub async fn test(test: &mut TestServer) {
     case_blob_hook_does_not_create_mailboxes(test, &triggers, false).await;
     test.wait_for_tasks().await;
     destroy_cases(test, &admin).await;
+    test_recovery(test).await;
     println!("Zero-access mail index pass tests finished");
 }
 
@@ -1474,10 +1483,9 @@ async fn case_catch_up_after_offline_deliveries(test: &TestServer, key: &Account
     test.wait_for_tasks().await;
 }
 
-async fn multiappend(test: &TestServer, key: &Account, count: usize) -> (u64, Vec<u32>) {
+async fn append_many(test: &TestServer, key: &Account, count: usize) -> Vec<u32> {
     let id = account_id(key);
     assert!(message_ids(test, id).await.is_empty());
-    let before = change_id(test, id).await;
     // Seed one grouped insert for the explicit checkpoint pass below. Task 9's
     // command and APPEND hooks see the real busy slot during this fixture.
     let entry = test.server.inner.cache.za_search.entry(id);
@@ -1505,6 +1513,14 @@ async fn multiappend(test: &TestServer, key: &Account, count: usize) -> (u64, Ve
     drop(seed_guard);
     test.wait_for_tasks().await;
     let docs = message_ids(test, id).await;
+    assert_eq!(docs.len(), count);
+    docs
+}
+
+async fn multiappend(test: &TestServer, key: &Account, count: usize) -> (u64, Vec<u32>) {
+    let id = account_id(key);
+    let before = change_id(test, id).await;
+    let docs = append_many(test, key, count).await;
     let groups = log_records_since(test, id, SyncCollection::Email, before)
         .await
         .into_iter()
@@ -2647,4 +2663,1188 @@ async fn case_double_absence_scan_refuses_new_state(
         assert!(test.server.za_vault_record(id).await.unwrap().is_none());
         assert!(read_manifest(test, id).await.is_none());
     }
+}
+
+pub(crate) async fn test_recovery(test: &mut TestServer) {
+    let _config = search_config_guard!(test, absent_retry_secs: 0, segments: 255, wait_secs: 15);
+    let admin = test.account("admin@example.com").clone();
+    let key = key_mail_account(test, "keymail58@example.com", "Keymail-58!").await;
+    let content = key_mail_account(test, "keymail59@example.com", "Keymail-59!").await;
+    let gap = key_mail_account(test, "keymail60@example.com", "Keymail-60!").await;
+    case_zero_row_epoch(test, &key, "fresh").await;
+    mailbox_get(&key).await;
+    assert!(!mailbox_archives(test, account_id(&key)).await.is_empty());
+    test.destroy_all_mailboxes(&key).await;
+    case_zero_row_epoch(test, &key, "after mailbox deletion").await;
+    case_r3_rebuild_moves_the_epoch(test, &key).await;
+    case_f7_newer_format_is_no_map(test, &key).await;
+    clean_messages(test, &key).await;
+    case_r10_cursor_finishes_across_restarts(test, &key).await;
+    clean_messages(test, &key).await;
+    case_r22_vanished_cursor_checkpoints(test, &key).await;
+    clean_messages(test, &key).await;
+    case_h11_missing_manifest_on_an_empty_account(test, &key).await;
+
+    case_h23_content_loss_is_content_only(test, &content).await;
+    clean_messages(test, &content).await;
+    case_pl5_content_chain_break_keeps_the_thread_blobs(test, &content, &admin).await;
+    clean_messages(test, &content).await;
+    case_f6_r23_over_the_cap_then_raised(test, &content).await;
+    clean_messages(test, &content).await;
+
+    case_f9_reconciliation_renders_nothing_seen(test, &gap, &admin).await;
+    clean_messages(test, &gap).await;
+    case_pl6_unreadable_gap_and_retained_inserts_finish(test, &gap, &admin).await;
+    clean_messages(test, &gap).await;
+    case_f9_truncation_during_a_pending_rebuild(test, &gap, &admin).await;
+    clean_messages(test, &gap).await;
+    case_r24_g2_retained_deletion_rendered_once(test, &gap, &admin).await;
+    clean_messages(test, &gap).await;
+
+    case_r27_empty_rebuild_keeps_clients(test, &key).await;
+    case_g3_loss_with_all_deleted_refuses_holders(test, &key).await;
+    case_r2_old_epoch_map_never_served(test, &key).await;
+    clean_messages(test, &key).await;
+    for (name, loss) in [
+        ("keymail-task14-stale-thread@example.com", StaleLoss::Thread),
+        (
+            "keymail-task14-stale-content@example.com",
+            StaleLoss::Content,
+        ),
+        (
+            "keymail-task14-stale-missing@example.com",
+            StaleLoss::Missing,
+        ),
+        ("keymail-task14-stale-older@example.com", StaleLoss::Older),
+        ("keymail-task14-stale-tag@example.com", StaleLoss::Tag),
+        ("keymail-task14-stale-parse@example.com", StaleLoss::Parse),
+    ] {
+        let fixture = key_mail_account(test, name, "Keymail-Recovery!").await;
+        case_stale_loss_keeps_successor(test, &fixture, loss).await;
+        test.destroy_all_mailboxes(&fixture).await;
+    }
+    super::threads::test_recovery(test, &key).await;
+    for account in [&key, &content, &gap] {
+        test.destroy_all_mailboxes(account).await;
+    }
+}
+
+async fn mailbox_archives(test: &TestServer, id: u32) -> Vec<u32> {
+    let mut ids = Vec::new();
+    test.server
+        .archives(id, Collection::Mailbox, Field::ARCHIVE, &(), |id, _| {
+            ids.push(id);
+            Ok(true)
+        })
+        .await
+        .unwrap();
+    ids
+}
+
+async fn upload_contact(account: &Account) {
+    let reply = account.jmap_method_call("Blob/upload", json!({
+        "accountId": account.id_string(),
+        "create": { "vcard": { "data": [{ "data:asText": "BEGIN:VCARD\r\nEND:VCARD\r\n" }] }},
+    })).await;
+    assert!(
+        reply.0["methodResponses"][0][1]["created"]["vcard"]["id"].is_string(),
+        "{:?}",
+        reply.0
+    );
+}
+
+async fn email_boundary(test: &TestServer, id: u32) -> u64 {
+    test.server
+        .store()
+        .get_last_change_id(id, SyncCollection::Email.into())
+        .await
+        .unwrap()
+        .unwrap_or_default()
+}
+
+async fn case_zero_row_epoch(test: &TestServer, key: &Account, phase: &str) {
+    use common::auth::vault::RawValue;
+    use store::write::LogCollection;
+    println!("case_zero_row_epoch: {phase}");
+    let id = account_id(key);
+    assert!(mailbox_archives(test, id).await.is_empty());
+    test.server
+        .message_datas(id, &(), |_, _| {
+            panic!("zero-row fixture contains an Email row")
+        })
+        .await
+        .unwrap();
+    let original = manifest_bytes(test, id).await.unwrap();
+    let previous = email_boundary(test, id).await;
+    upload_contact(key).await;
+    assert_eq!(manifest_bytes(test, id).await.unwrap(), original);
+    assert_eq!(email_boundary(test, id).await, previous);
+
+    write_manifest_bytes(test, id, None).await;
+    simulate_restart(test, id).await;
+    upload_contact(key).await;
+    assert!(mailbox_archives(test, id).await.is_empty());
+    assert!(
+        manifest_bytes(test, id).await.is_some(),
+        "{phase}: keyed upload left the manifest absent"
+    );
+
+    let rebuilt = index(test, id).await;
+    assert_eq!(rebuilt.revision, 1);
+    assert!(rebuilt.epoch > previous);
+    assert_eq!(rebuilt.epoch, rebuilt.newest_row.change_id);
+    assert_eq!(rebuilt.newest_row.revision, rebuilt.revision);
+    assert_eq!(rebuilt.epoch, email_boundary(test, id).await);
+    assert!(rebuilt.thread_blobs.is_empty());
+    assert!(rebuilt.cursor.is_none() && rebuilt.content.is_none());
+    let store = test.server.store();
+    assert_eq!(
+        store
+            .get_counter(ValueKey {
+                account_id: id,
+                collection: Collection::Email.into(),
+                document_id: 0,
+                class: ValueClass::ChangeId(SyncCollection::Email.change_group()),
+            })
+            .await
+            .unwrap() as u64,
+        rebuilt.epoch
+    );
+    let bytes = store
+        .get_value::<RawValue>(
+            LogCollection::Sync(SyncCollection::Email).log_key(id, rebuilt.epoch),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(bytes, [0]);
+    let records = store
+        .za_changes_records(
+            id,
+            SyncCollection::Email,
+            Some(Checkpoint {
+                change_id: previous,
+                position: 0,
+                complete: true,
+            }),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+    assert!(!records.truncated && !records.resumed_record_lost && records.first_retained.is_none());
+    assert_eq!(records.records, [(rebuilt.epoch, vec![])]);
+    assert!(
+        store
+            .get_value::<RawValue>(
+                LogCollection::Sync(SyncCollection::Thread).log_key(id, rebuilt.epoch)
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let stable = manifest_bytes(test, id).await.unwrap();
+    upload_contact(key).await;
+    assert_eq!(manifest_bytes(test, id).await.unwrap(), stable);
+    assert_eq!(email_boundary(test, id).await, rebuilt.epoch);
+    assert!(mailbox_archives(test, id).await.is_empty());
+}
+
+async fn get_recovery_ids(key: &Account) -> Vec<String> {
+    let reply = recovery_get(key).await;
+    assert_eq!(reply.name_at(0), "Email/get", "{:?}", reply.0);
+    let mut ids: Vec<_> = reply.method_response()["list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value["id"].as_str().unwrap().to_owned())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+async fn recovery_get(key: &Account) -> JmapResponse {
+    key.jmap_method_call(
+        "Email/get",
+        json!({
+            "accountId": key.id_string(), "ids": null, "properties": ["id", "threadId"]
+        }),
+    )
+    .await
+}
+
+async fn recovery_query(key: &Account, text: Option<&str>) -> JmapResponse {
+    let mut request = json!({"accountId": key.id_string(), "limit": 500});
+    if let Some(text) = text {
+        request["filter"] = json!({"text": text});
+    }
+    key.jmap_method_call("Email/query", request).await
+}
+
+fn queried(reply: &JmapResponse) -> Vec<String> {
+    assert_eq!(reply.name_at(0), "Email/query", "{:?}", reply.0);
+    let mut ids = reply_ids(reply.method_response(), "ids");
+    ids.sort_unstable();
+    ids
+}
+
+fn reply_ids(body: &Value, field: &str) -> Vec<String> {
+    body[field]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_owned())
+        .collect()
+}
+
+async fn recovery_changes(key: &Account, method: &str, since: &State) -> JmapResponse {
+    key.jmap_method_call(
+        method,
+        json!({
+            "accountId": key.id_string(), "sinceState": since.to_string(), "maxChanges": 500
+        }),
+    )
+    .await
+}
+
+fn recovery_state(reply: &JmapResponse) -> State {
+    State::parse(reply.method_response()["newState"].as_str().unwrap()).unwrap()
+}
+
+fn assert_no_changes(reply: &JmapResponse, method: &str) {
+    assert_eq!(reply.name_at(0), method, "{:?}", reply.0);
+    for field in ["created", "updated", "destroyed"] {
+        assert!(
+            reply_ids(reply.method_response(), field).is_empty(),
+            "{:?}",
+            reply.0
+        );
+    }
+}
+
+async fn append_recovery_messages(test: &TestServer, key: &Account, count: usize) -> Vec<u32> {
+    let id = account_id(key);
+    let before = message_ids(test, id).await;
+    // Each command commits a distinct Email record. Suppress the
+    // opportunistic hooks to model arrivals before the next keyed pass.
+    let entry = test.server.inner.cache.za_search.entry(id);
+    let pass = entry.pass_lock.lock().await;
+    let mut imap = ImapConnection::connect(b"_recovery ").await;
+    imap.authenticate(key.name(), key.secret()).await;
+    imap.send_ok("SELECT INBOX").await;
+    for n in 0..count {
+        let message = message_with(&format!("Recovery fixture {n}"), "recoveryneedle");
+        imap.send(&format!("APPEND INBOX {{{}}}", message.len()))
+            .await;
+        imap.assert_read(Type::Continuation, ResponseType::Ok).await;
+        imap.send_untagged(&message).await;
+        imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    }
+    drop(imap);
+    drop(pass);
+    test.wait_for_tasks().await;
+    let ids: Vec<_> = message_ids(test, id)
+        .await
+        .into_iter()
+        .filter(|d| !before.contains(d))
+        .collect();
+    assert_eq!(ids.len(), count);
+    ids
+}
+
+async fn case_r3_rebuild_moves_the_epoch(test: &TestServer, key: &Account) {
+    println!("case_r3_rebuild_moves_the_epoch");
+    let id = account_id(key);
+    append_recovery_messages(test, key, 3).await;
+    assert_eq!(get_recovery_ids(key).await.len(), 3);
+    let mut since = recovery_state(&recovery_changes(key, "Email/changes", &State::Initial).await);
+    let original = index(test, id).await;
+    let mut prior = original.epoch;
+    for mode in ["thread", "missing", "older"] {
+        match mode {
+            "thread" => force_loss(test, id).await,
+            "missing" => {
+                write_manifest_bytes(test, id, None).await;
+                simulate_restart(test, id).await;
+            }
+            "older" => {
+                let mut bytes = manifest_bytes(test, id).await.unwrap();
+                bytes[0] = 0;
+                write_manifest_bytes(test, id, Some(bytes)).await;
+                simulate_restart(test, id).await;
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(get_recovery_ids(key).await.len(), 3);
+        let rebuilt = index(test, id).await;
+        assert!(rebuilt.epoch > prior, "{mode}: {rebuilt:?}");
+        assert_eq!(
+            rebuilt.revision,
+            if mode == "thread" {
+                original.revision + 2
+            } else {
+                2
+            }
+        );
+        prior = rebuilt.epoch;
+        assert_eq!(
+            recovery_changes(key, "Email/changes", &since)
+                .await
+                .error_type_at(0),
+            Some("cannotCalculateChanges"),
+        );
+        let query = recovery_query(key, Some("recoveryneedle")).await;
+        assert_eq!(queried(&query).len(), 3);
+        since = State::parse(query.method_response()["queryState"].as_str().unwrap()).unwrap();
+        assert_no_changes(
+            &recovery_changes(key, "Email/changes", &since).await,
+            "Email/changes",
+        );
+    }
+}
+
+async fn case_f7_newer_format_is_no_map(test: &TestServer, key: &Account) {
+    println!("case_f7_newer_format_is_no_map");
+    let id = account_id(key);
+    let original = manifest_bytes(test, id).await.unwrap();
+    let mut newer = original.clone();
+    newer[0] = store::za_search::SEARCH_FORMAT_V1 + 1;
+    write_manifest_bytes(test, id, Some(newer.clone())).await;
+    simulate_restart(test, id).await;
+    assert_eq!(
+        recovery_get(key).await.error_type_at(0),
+        Some("serverUnavailable")
+    );
+    assert_search_unavailable(&recovery_query(key, Some("recoveryneedle")).await);
+    assert_eq!(manifest_bytes(test, id).await.unwrap(), newer);
+    write_manifest_bytes(test, id, Some(original)).await;
+    simulate_restart(test, id).await;
+}
+
+async fn case_r10_cursor_finishes_across_restarts(test: &TestServer, key: &Account) {
+    println!("case_r10_cursor_finishes_across_restarts");
+    let id = account_id(key);
+    append_many(test, key, 200).await;
+    mailbox_get(key).await;
+    force_loss(test, id).await;
+    for step in 1..=6 {
+        mailbox_get(key).await;
+        let manifest = index(test, id).await;
+        if step == 1 {
+            assert_eq!(loaded(test, id).await.thread.records().count(), 48);
+        }
+        simulate_restart(test, id).await;
+        if manifest.cursor.is_none() {
+            assert_eq!(
+                queried(&recovery_query(key, Some("grouped")).await).len(),
+                200
+            );
+            return;
+        }
+    }
+    panic!("the rebuild cursor did not finish in six keyed requests");
+}
+
+async fn case_r22_vanished_cursor_checkpoints(test: &TestServer, key: &Account) {
+    println!("case_r22_vanished_cursor_checkpoints");
+    let id = account_id(key);
+    let documents = append_many(test, key, 60).await;
+    mailbox_get(key).await;
+    force_loss(test, id).await;
+    mailbox_get(key).await;
+    let before = index(test, id).await;
+    assert!(before.cursor.is_some());
+    assert_held(test, id, &documents, 48).await;
+    for &document in &documents[48..] {
+        pop3_delete(test, key, document).await;
+    }
+    let after_expunge = email_boundary(test, id).await;
+    assert!(after_expunge > before.newest_row.change_id);
+    simulate_restart(test, id).await;
+    mailbox_get(key).await;
+    let after = index(test, id).await;
+    assert!(after.cursor.is_none());
+    assert_eq!(after.thread_blobs, before.thread_blobs);
+    assert_eq!(email_boundary(test, id).await, after_expunge);
+}
+
+async fn case_h11_missing_manifest_on_an_empty_account(test: &TestServer, key: &Account) {
+    println!("case_h11_missing_manifest_on_an_empty_account");
+    let id = account_id(key);
+    let mut mailboxes = mailbox_archives(test, id).await;
+    assert!(!mailboxes.is_empty());
+    assert!(message_ids(test, id).await.is_empty());
+    let previous = email_boundary(test, id).await;
+    write_manifest_bytes(test, id, None).await;
+    simulate_restart(test, id).await;
+    mailbox_get(key).await;
+    let after = index(test, id).await;
+    assert!(after.epoch > previous && after.thread_blobs.is_empty() && after.cursor.is_none());
+    let records = log_records_since(test, id, SyncCollection::Email, previous).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0, after.epoch);
+    let mut witnessed = records[0]
+        .1
+        .iter()
+        .map(|change| match *change {
+            Change::UpdateContainerPartial(id, changes) if changes.has_properties() => id as u32,
+            _ => panic!("unexpected boundary: {records:?}"),
+        })
+        .collect::<Vec<_>>();
+    mailboxes.sort_unstable();
+    witnessed.sort_unstable();
+    assert_eq!(witnessed, mailboxes);
+    let raw = manifest_bytes(test, id).await.unwrap();
+    mailbox_get(key).await;
+    assert_eq!(manifest_bytes(test, id).await.unwrap(), raw);
+}
+
+async fn content_hashes(test: &TestServer, manifest: &Manifest) -> Vec<BlobHash> {
+    let mut next = manifest.content.as_ref().map(|head| head.hash.clone());
+    let mut hashes = Vec::new();
+    while let Some(hash) = next {
+        let bytes = stored_blob(test, &hash).await;
+        next = BlobHeader::decode(&bytes)
+            .unwrap()
+            .0
+            .predecessor
+            .map(|(hash, _)| hash);
+        hashes.push(hash);
+    }
+    hashes
+}
+
+async fn case_h23_content_loss_is_content_only(test: &TestServer, key: &Account) {
+    println!("case_h23_content_loss_is_content_only");
+    let _config = search_config_guard!(test, absent_retry_secs: 0);
+    let id = account_id(key);
+    append_recovery_messages(test, key, 4).await;
+    let mapped = get_recovery_ids(key).await;
+    let before = index(test, id).await;
+    let hashes = content_hashes(test, &before).await;
+    test.server
+        .blob_store()
+        .delete_blobs(&[hashes[0].as_slice()])
+        .await
+        .unwrap();
+    simulate_restart(test, id).await;
+    assert_eq!(get_recovery_ids(key).await, mapped);
+    assert_eq!(index(test, id).await.epoch, before.epoch);
+    assert_eq!(
+        queried(&recovery_query(key, Some("recoveryneedle")).await),
+        mapped
+    );
+    let after = index(test, id).await;
+    assert_eq!(after.epoch, before.epoch);
+    assert_eq!(after.newest_row, before.newest_row);
+    assert!(after.content_to.cursor.is_none());
+    let linked = principal_hashes(test, id).await;
+    assert!(hashes.iter().all(|hash| !linked.contains(hash)));
+}
+
+fn rebuild_trace(event: &super::TracedEvent, id: u32, kind: &str) -> bool {
+    event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_REBUILD
+        && event.keys.iter().any(|(key, value)| {
+            matches!((key, value), (Key::Type, TraceValue::String(value)) if value.as_str() == kind)
+        })
+}
+
+async fn case_pl5_content_chain_break_keeps_the_thread_blobs(
+    test: &TestServer,
+    key: &Account,
+    admin: &Account,
+) {
+    println!("case_pl5_content_chain_break_keeps_the_thread_blobs");
+    let _config = search_config_guard!(test, segments: 64, absent_retry_secs: 0);
+    let id = account_id(key);
+    for _ in 0..3 {
+        append_recovery_messages(test, key, 1).await;
+        mailbox_get(key).await;
+    }
+    let mapped = get_recovery_ids(key).await;
+    let before = index(test, id).await;
+    let hashes = content_hashes(test, &before).await;
+    assert!(hashes.len() >= 3 && before.thread_blobs.len() >= 3);
+    test.server
+        .blob_store()
+        .delete_blobs(&[hashes[1].as_slice()])
+        .await
+        .unwrap();
+    simulate_restart(test, id).await;
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    assert_eq!(
+        queried(&recovery_query(key, Some("recoveryneedle")).await),
+        mapped
+    );
+    expire_and_purge_blobs(test, admin).await;
+    simulate_restart(test, id).await;
+    assert_eq!(get_recovery_ids(key).await, mapped);
+    let after = index(test, id).await;
+    assert_eq!(after.epoch, before.epoch);
+    assert_eq!(after.thread_blobs, before.thread_blobs);
+    let linked = principal_hashes(test, id).await;
+    for blob in &before.thread_blobs {
+        assert!(linked.contains(&blob.hash));
+        assert_eq!(
+            stored_blob(test, &blob.hash).await.len(),
+            blob.size as usize
+        );
+    }
+    assert!(hashes.iter().all(|hash| !linked.contains(hash)));
+    let events = traces.finish().await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| rebuild_trace(event, id, "rebuild"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| rebuild_trace(event, id, "content"))
+    );
+}
+
+fn assert_search_unavailable(reply: &JmapResponse) {
+    assert_eq!(
+        reply.error_type_at(0),
+        Some("unsupportedFilter"),
+        "{:?}",
+        reply.0
+    );
+    assert!(
+        reply
+            .method_response()
+            .to_string()
+            .contains(common::za::ZA_MAIL_SEARCH_UNAVAILABLE),
+        "{:?}",
+        reply.0
+    );
+}
+
+async fn deliver_large_recovery(test: &TestServer, key: &Account, ordinal: usize) -> u32 {
+    use std::fmt::Write;
+    let id = account_id(key);
+    let before = message_ids(test, id).await;
+    let mut body = String::with_capacity(220_000);
+    for n in 0..16_000 {
+        let mut number = n + ordinal * 16_000;
+        let mut word = [b'a'; 6];
+        for byte in &mut word {
+            *byte += (number % 26) as u8;
+            number /= 26;
+        }
+        write!(body, " term{}recover", std::str::from_utf8(&word).unwrap()).unwrap();
+        if n % 16 == 15 {
+            body.push_str("\r\n");
+        }
+    }
+    body.push_str("recoveryneedle\r\n");
+    deliver(
+        test,
+        SENDER,
+        key.name(),
+        &message_with(&format!("Cap fixture {ordinal}"), &body),
+    )
+    .await;
+    super::new_message(test, id, &before).await
+}
+
+async fn case_f6_r23_over_the_cap_then_raised(test: &TestServer, key: &Account) {
+    println!("case_f6_r23_over_the_cap_then_raised");
+    let id = account_id(key);
+    let held = search_config_guard!(test, account_max_mb: 1, segments: 255);
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let mut first_crossing = false;
+    let mut next = 0;
+    let suspended = loop {
+        assert!(next < 15, "large documents did not cross the cap");
+        deliver_large_recovery(test, key, next).await;
+        next += 1;
+        mailbox_get(key).await;
+        let manifest = index(test, id).await;
+        if manifest.content_to.suspended {
+            break manifest;
+        }
+        if !first_crossing
+            && manifest
+                .content
+                .as_ref()
+                .is_some_and(|head| head.size > 1 << 20)
+        {
+            first_crossing = true;
+            assert_search_unavailable(
+                &tokio::time::timeout(
+                    Duration::from_secs(2),
+                    recovery_query(key, Some("recoveryneedle")),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+    };
+    assert!(first_crossing);
+    let length = suspended.content.as_ref().unwrap().length;
+    let links = principal_hashes(test, id).await;
+    let thread = key
+        .jmap_method_call("Thread/get", json!({"accountId": key.id_string()}))
+        .await;
+    assert_eq!(thread.name_at(0), "Thread/get", "{:?}", thread.0);
+    assert_search_unavailable(
+        &tokio::time::timeout(
+            Duration::from_secs(2),
+            recovery_query(key, Some("recoveryneedle")),
+        )
+        .await
+        .unwrap(),
+    );
+    let after = index(test, id).await;
+    assert!(after.content_to.cursor.is_none());
+    assert_eq!(after.content.as_ref().unwrap().length, length);
+    assert_eq!(principal_hashes(test, id).await, links);
+    assert!(
+        !traces
+            .finish()
+            .await
+            .iter()
+            .any(|event| event.account_id == Some(u64::from(id))
+                && event.details == ZA_SEARCH_REBUILD)
+    );
+
+    let mut missing = 1;
+    for _ in 0..2 {
+        deliver_large_recovery(test, key, next).await;
+        next += 1;
+        mailbox_get(key).await;
+        missing += 1;
+        assert_eq!(
+            index(test, id).await.content.as_ref().unwrap().length,
+            length
+        );
+    }
+    let mapped = get_recovery_ids(key).await;
+    let prior_links = principal_hashes(test, id).await;
+    drop(held);
+    let raised = search_config_guard!(test, segments: 255);
+    simulate_restart(test, id).await;
+    mailbox_get(key).await;
+    let started = index(test, id).await;
+    assert!(started.content_to.cursor.is_some());
+    assert_eq!(started.content, suspended.content);
+    assert_eq!(principal_hashes(test, id).await, prior_links);
+
+    simulate_restart(test, id).await;
+    let new_document = append_recovery_messages(test, key, 1).await[0];
+    let pre_request_threads = index(test, id).await.thread_blobs.len();
+    let delivered = email_boundary(test, id).await;
+    reset_za_search_counters(id);
+    mailbox_get(key).await;
+    assert!(index_holds(test, id, new_document).await);
+    let before_backfill = index(test, id).await;
+    assert!(before_backfill.indexed_to.change_id >= delivered);
+    assert_eq!(za_search_blob_reads(id), pre_request_threads as u64);
+    let expected = get_recovery_ids(key).await;
+    assert!(mapped.iter().all(|id| expected.contains(id)));
+
+    // A pre-backfill load uses the caller's original deadline while another
+    // loader owns the flight.
+    let keys = za_unlock(test, id, key.secret()).await;
+    let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+    let flight = entry.load_flight.lock().await;
+    let budget = test.server.inner.cache.za_search.content_used();
+    let raw = manifest_bytes(test, id).await.unwrap();
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        test.server
+            .za_search_ensure_current(id, &keys, start + Duration::from_millis(150)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(Unavailable::NotCurrent)));
+    assert!(start.elapsed() >= Duration::from_millis(140));
+    assert_eq!(test.server.inner.cache.za_search.content_used(), budget);
+    assert_eq!(manifest_bytes(test, id).await.unwrap(), raw);
+    drop(flight);
+
+    reset_za_search_counters(id);
+    assert_eq!(
+        queried(&recovery_query(key, Some("recoveryneedle")).await),
+        expected
+    );
+    assert_eq!(za_search_message_opens(id), missing);
+    let backfilled = index(test, id).await;
+    assert_eq!(
+        backfilled.content.as_ref().unwrap().length,
+        before_backfill.content.as_ref().unwrap().length + 1
+    );
+    assert!(backfilled.content_to.cursor.is_none());
+    assert_eq!(get_recovery_ids(key).await, expected);
+
+    drop(raised);
+    let held = search_config_guard!(test, account_max_mb: 1, segments: 255);
+    deliver_large_recovery(test, key, next).await;
+    mailbox_get(key).await;
+    assert!(index(test, id).await.content_to.suspended);
+    destroy(key, &expected[..1]).await;
+    let deleted = email_boundary(test, id).await;
+    mailbox_get(key).await;
+    let complete = index(test, id).await;
+    assert_eq!(complete.indexed_to.change_id, deleted);
+    assert_eq!(email_boundary(test, id).await, deleted);
+    assert!(complete.indexed_to.complete && complete.content_to.cursor.is_none());
+    drop(held);
+    let _raised = search_config_guard!(test, segments: 255);
+    simulate_restart(test, id).await;
+    mailbox_get(key).await;
+    assert!(index(test, id).await.content_to.cursor.is_some());
+    let expected = get_recovery_ids(key).await;
+    assert_eq!(
+        queried(&recovery_query(key, Some("recoveryneedle")).await),
+        expected
+    );
+}
+
+async fn finish_reconciliation(test: &TestServer, key: &Account, attempts: usize, restart: bool) {
+    let id = account_id(key);
+    for turn in 0..attempts {
+        mailbox_get(key).await;
+        if index(test, id).await.reconciliation.is_none() {
+            return;
+        }
+        if restart && turn % 3 == 2 {
+            simulate_restart(test, id).await;
+        }
+    }
+    panic!("reconciliation did not finish for {}", key.name());
+}
+
+async fn case_f9_reconciliation_renders_nothing_seen(
+    test: &TestServer,
+    key: &Account,
+    admin: &Account,
+) {
+    println!("case_f9_reconciliation_renders_nothing_seen");
+    let id = account_id(key);
+    append_recovery_messages(test, key, 30).await;
+    let before = recovery_changes(key, "Email/changes", &State::Initial).await;
+    assert_eq!(reply_ids(before.method_response(), "created").len(), 30);
+    let state = recovery_state(&before);
+    let epoch = index(test, id).await.epoch;
+    append_recovery_messages(test, key, 20).await;
+    lower_changes_history(admin, Some(5)).await;
+    purge_account(test, admin, key).await;
+    finish_reconciliation(test, key, 8, false).await;
+    assert_eq!(index(test, id).await.epoch, epoch);
+    assert_eq!(
+        recovery_changes(key, "Email/changes", &state)
+            .await
+            .error_type_at(0),
+        Some("cannotCalculateChanges")
+    );
+    let reply = recovery_changes(key, "Email/changes", &State::Initial).await;
+    let mut created = reply_ids(reply.method_response(), "created");
+    created.sort_unstable();
+    assert_eq!(created, get_recovery_ids(key).await);
+    assert_eq!(created.len(), 50);
+    lower_changes_history(admin, None).await;
+}
+
+async fn case_pl6_unreadable_gap_and_retained_inserts_finish(
+    test: &TestServer,
+    key: &Account,
+    admin: &Account,
+) {
+    println!("case_pl6_unreadable_gap_and_retained_inserts_finish");
+    let id = account_id(key);
+    append_recovery_messages(test, key, 30).await;
+    mailbox_get(key).await;
+    let base = index(test, id).await;
+    let documents = append_recovery_messages(test, key, 20).await;
+    let skipped = [documents[2], documents[18]];
+    for document in skipped {
+        corrupt_blob(test, &stored_hash(test, id, document).await).await;
+    }
+    lower_changes_history(admin, Some(5)).await;
+    purge_account(test, admin, key).await;
+    let retained = test
+        .server
+        .store()
+        .za_changes_records(id, SyncCollection::Email, None, usize::MAX)
+        .await
+        .unwrap();
+    let inserts = retained
+        .records
+        .iter()
+        .flat_map(|(_, changes)| changes)
+        .filter_map(|change| match change {
+            Change::InsertItem(id) => Some(*id as u32),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!inserts.contains(&skipped[0]) && inserts.contains(&skipped[1]));
+    assert!(retained.first_retained.unwrap() > base.indexed_to.change_id);
+
+    let _cap = search_config_guard!(test, pass_cap: 4);
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    finish_reconciliation(test, key, 20, true).await;
+    let results = queried(&recovery_query(key, Some("recoveryneedle")).await);
+    let results = results
+        .iter()
+        .map(|id| id.parse::<Id>().unwrap().document_id())
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = message_ids(test, id)
+        .await
+        .into_iter()
+        .filter(|id| !skipped.contains(id))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(results, expected);
+    let mut events = traces
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| {
+            event.details == ZA_SEARCH_SKIPPED && event.account_id == Some(u64::from(id))
+        })
+        .map(|event| {
+            event
+                .keys
+                .iter()
+                .find_map(|(key, value)| match (key, value) {
+                    (Key::DocumentId, TraceValue::UInt(id)) => Some(*id as u32),
+                    _ => None,
+                })
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    events.sort_unstable();
+    assert_eq!(events, skipped);
+    let next = append_recovery_messages(test, key, 1).await[0];
+    mailbox_get(key).await;
+    assert!(index_holds(test, id, next).await);
+    lower_changes_history(admin, None).await;
+}
+
+async fn case_f9_truncation_during_a_pending_rebuild(
+    test: &TestServer,
+    key: &Account,
+    admin: &Account,
+) {
+    println!("case_f9_truncation_during_a_pending_rebuild");
+    let id = account_id(key);
+    append_many(test, key, 100).await;
+    mailbox_get(key).await;
+    force_loss(test, id).await;
+    mailbox_get(key).await;
+    let pending = index(test, id).await;
+    assert!(pending.cursor.is_some());
+    let records = log_records_since(
+        test,
+        id,
+        SyncCollection::Email,
+        pending.indexed_to.change_id,
+    )
+    .await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].0, pending.epoch);
+    lower_changes_history(admin, Some(1)).await;
+    purge_account(test, admin, key).await;
+    assert_eq!(
+        test.server.za_retained_bound(id).await.unwrap(),
+        pending.epoch
+    );
+    mailbox_get(key).await;
+    let after = index(test, id).await;
+    assert!(after.cursor.is_none() && after.reconciliation.is_some());
+    assert_eq!(after.epoch, pending.epoch);
+    finish_reconciliation(test, key, 8, false).await;
+    assert_eq!(queried(&recovery_query(key, None).await).len(), 100);
+    lower_changes_history(admin, None).await;
+}
+
+async fn case_r24_g2_retained_deletion_rendered_once(
+    test: &TestServer,
+    key: &Account,
+    admin: &Account,
+) {
+    println!("case_r24_g2_retained_deletion_rendered_once");
+    let id = account_id(key);
+    let doc = append_recovery_messages(test, key, 1).await[0];
+    let held = get_recovery_ids(key).await.pop().unwrap();
+    let indexed = index(test, id).await.indexed_to.change_id;
+    append_recovery_messages(test, key, 12).await;
+    // Sample an actual retained JMAP state before the deletion without
+    // letting its hook advance the durable index checkpoint.
+    let entry = test.server.inner.cache.za_search.entry(id);
+    let pass = entry.pass_lock.lock().await;
+    let before = recovery_changes(key, "Email/changes", &State::Initial).await;
+    assert!(reply_ids(before.method_response(), "created").contains(&held));
+    let since = recovery_state(&before);
+    drop(pass);
+    assert_eq!(index(test, id).await.indexed_to.change_id, indexed);
+    pop3_delete(test, key, doc).await;
+    lower_changes_history(admin, Some(8)).await;
+    purge_account(test, admin, key).await;
+    let bound = test.server.za_retained_bound(id).await.unwrap();
+    let State::Exact(s) = since else {
+        panic!("expected exact state");
+    };
+    assert!(indexed < bound && bound <= s);
+    finish_reconciliation(test, key, 8, false).await;
+    let reply = recovery_changes(key, "Email/changes", &since).await;
+    assert_eq!(reply.name_at(0), "Email/changes", "{:?}", reply.0);
+    assert_eq!(reply_ids(reply.method_response(), "destroyed"), [held]);
+    assert_no_changes(
+        &recovery_changes(key, "Email/changes", &recovery_state(&reply)).await,
+        "Email/changes",
+    );
+    lower_changes_history(admin, None).await;
+}
+
+async fn case_r27_empty_rebuild_keeps_clients(test: &TestServer, key: &Account) {
+    println!("case_r27_empty_rebuild_keeps_clients");
+    let id = account_id(key);
+    append_recovery_messages(test, key, 2).await;
+    mailbox_get(key).await;
+    clean_messages(test, key).await;
+    let email = recovery_state(&recovery_changes(key, "Email/changes", &State::Initial).await);
+    let thread = recovery_state(&recovery_changes(key, "Thread/changes", &State::Initial).await);
+    force_loss(test, id).await;
+    mailbox_get(key).await;
+    assert_no_changes(
+        &recovery_changes(key, "Email/changes", &email).await,
+        "Email/changes",
+    );
+    assert_no_changes(
+        &recovery_changes(key, "Thread/changes", &thread).await,
+        "Thread/changes",
+    );
+}
+
+async fn case_g3_loss_with_all_deleted_refuses_holders(test: &TestServer, key: &Account) {
+    println!("case_g3_loss_with_all_deleted_refuses_holders");
+    let id = account_id(key);
+    append_recovery_messages(test, key, 2).await;
+    let ids = get_recovery_ids(key).await;
+    assert_eq!(ids.len(), 2);
+    let email = recovery_state(&recovery_changes(key, "Email/changes", &State::Initial).await);
+    let thread = recovery_state(&recovery_changes(key, "Thread/changes", &State::Initial).await);
+    destroy(key, &ids).await;
+    force_loss(test, id).await;
+    mailbox_get(key).await;
+    assert!(index(test, id).await.thread_blobs.is_empty());
+    for (method, since) in [("Email/changes", email), ("Thread/changes", thread)] {
+        assert_eq!(
+            recovery_changes(key, method, &since).await.error_type_at(0),
+            Some("cannotCalculateChanges")
+        );
+        assert_no_changes(
+            &recovery_changes(key, method, &State::Initial).await,
+            method,
+        );
+    }
+}
+
+async fn case_r2_old_epoch_map_never_served(test: &TestServer, key: &Account) {
+    println!("case_r2_old_epoch_map_never_served");
+    let id = account_id(key);
+    let root = message_with("Rebuild snapshot era", "recoveryneedle");
+    deliver(test, SENDER, key.name(), &root).await;
+    let root_id = message_ids(test, id).await[0];
+    let child = super::reply_to(&root, "Rebuild snapshot era", "recoveryneedle");
+    deliver(test, SENDER, key.name(), &child).await;
+    let before = get_recovery_ids(key).await;
+    assert_eq!(before.len(), 2);
+    let survivor = before
+        .iter()
+        .find(|mail| mail.parse::<Id>().unwrap().document_id() != root_id)
+        .unwrap();
+    let old_epoch = index(test, id).await.epoch;
+    let b = key.clone();
+    let parked = HookParked::start(id, set_search_snapshot_pause, async move {
+        recovery_get(&b).await
+    })
+    .await;
+    pop3_delete(test, key, root_id).await;
+    force_loss(test, id).await;
+    let successor = get_recovery_ids(key).await;
+    assert_eq!(successor.len(), 1);
+    assert_ne!(&successor[0], survivor);
+    assert!(index(test, id).await.epoch > old_epoch);
+    let result = parked.finish().await;
+    if result.error_type_at(0).is_some() {
+        assert_eq!(
+            result.error_type_at(0),
+            Some("serverUnavailable"),
+            "{:?}",
+            result.0
+        );
+    } else {
+        assert_eq!(result.name_at(0), "Email/get");
+        let mut returned = result.method_response()["list"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        returned.sort_unstable();
+        assert_eq!(returned, successor);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StaleLoss {
+    Thread,
+    Content,
+    Missing,
+    Older,
+    Tag,
+    Parse,
+}
+
+async fn case_stale_loss_keeps_successor(test: &TestServer, key: &Account, loss: StaleLoss) {
+    use store::za_search::{SEARCH_FORMAT_V1, manifest::ManifestError};
+    match loss {
+        StaleLoss::Thread => println!("case_stale_thread_loss_keeps_successor"),
+        StaleLoss::Content => println!("case_stale_content_loss_keeps_successor"),
+        StaleLoss::Missing => println!("case_stale_missing_manifest_keeps_successor"),
+        _ => println!("case_stale_invalid_manifest_keeps_successor: {loss:?}"),
+    }
+    let id = account_id(key);
+    append_recovery_messages(test, key, 3).await;
+    let original_ids = get_recovery_ids(key).await;
+    let original = index(test, id).await;
+    let mut raw = manifest_bytes(test, id).await.unwrap();
+    match loss {
+        StaleLoss::Thread => force_loss(test, id).await,
+        StaleLoss::Content => {
+            let head = original.content.as_ref().unwrap();
+            test.server
+                .blob_store()
+                .delete_blobs(&[head.hash.as_slice()])
+                .await
+                .unwrap();
+            simulate_restart(test, id).await;
+        }
+        StaleLoss::Missing => {
+            write_manifest_bytes(test, id, None).await;
+            simulate_restart(test, id).await;
+            assert!(manifest_bytes(test, id).await.is_none());
+        }
+        StaleLoss::Older | StaleLoss::Tag | StaleLoss::Parse => {
+            let expected = match loss {
+                StaleLoss::Older => {
+                    raw[0] = SEARCH_FORMAT_V1 - 1;
+                    ManifestError::OlderFormat(raw[0])
+                }
+                StaleLoss::Tag => {
+                    *raw.last_mut().unwrap() ^= 1;
+                    ManifestError::Tag
+                }
+                StaleLoss::Parse => {
+                    raw.truncate(1);
+                    ManifestError::Parse
+                }
+                _ => unreachable!(),
+            };
+            write_manifest_bytes(test, id, Some(raw.clone())).await;
+            let keys = za_unlock(test, id, key.secret()).await;
+            assert_eq!(
+                manifest_bytes(test, id).await.as_deref(),
+                Some(raw.as_slice())
+            );
+            assert_eq!(
+                ManifestValue::decode(&raw, &za_search_key(keys.swk())),
+                Err(expected)
+            );
+            drop(keys);
+            simulate_restart(test, id).await;
+        }
+    }
+    let content = matches!(loss, StaleLoss::Content);
+    let b = key.clone();
+    let start = Instant::now();
+    let parked = HookParked::start(id, set_search_recovery_pause, async move {
+        if content {
+            recovery_query(&b, Some("recoveryneedle")).await
+        } else {
+            recovery_get(&b).await
+        }
+    })
+    .await;
+    // This is a second wire request. The one-shot slot was already consumed
+    // by B, before A is admitted into the production recovery path.
+    let successor_ids = queried(&recovery_query(key, Some("recoveryneedle")).await);
+    let successor = index(test, id).await;
+    let successor_raw = manifest_bytes(test, id).await.unwrap();
+    let successor_links = principal_blob_links(test, id).await;
+    let email = log_records_since(test, id, SyncCollection::Email, 0).await;
+    let thread = log_records_since(test, id, SyncCollection::Thread, 0).await;
+    assert_eq!(successor_ids.len(), 3);
+    assert!(successor.cursor.is_none() && successor.content_to.cursor.is_none());
+    assert_eq!(successor.content_to.checkpoint, successor.indexed_to);
+    assert_manifest_links(test, id, &successor).await;
+    if content {
+        assert_eq!(successor_ids, original_ids);
+        assert_eq!(successor.epoch, original.epoch);
+        assert_eq!(successor.newest_row, original.newest_row);
+        assert_eq!(successor.thread_blobs, original.thread_blobs);
+        assert_ne!(successor.content, original.content);
+    } else {
+        assert!(successor.epoch > original.epoch);
+        assert_ne!(successor.thread_blobs, original.thread_blobs);
+    }
+
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let reply = tokio::time::timeout(Duration::from_secs(5), parked.finish())
+        .await
+        .unwrap();
+    if content {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "B exceeded its original content wait"
+        );
+        if reply.error_type_at(0).is_none() {
+            assert_eq!(queried(&reply), successor_ids);
+        } else {
+            assert_search_unavailable(&reply);
+        }
+    } else if reply.error_type_at(0).is_some() {
+        assert_eq!(
+            reply.error_type_at(0),
+            Some("serverUnavailable"),
+            "{:?}",
+            reply.0
+        );
+    } else {
+        assert_eq!(reply.name_at(0), "Email/get");
+    }
+    assert!(
+        manifest_bytes(test, id).await.unwrap() == successor_raw,
+        "B changed the exact successor manifest for {loss:?}"
+    );
+    let events = traces.finish().await;
+    assert!(events.iter().any(|event| event.account_id == Some(u64::from(id))
+        && event.details == ZA_SEARCH_LOST), "B did not reach the moved-base decision");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.account_id == Some(u64::from(id))
+                && event.details == ZA_SEARCH_REBUILD)
+    );
+    assert_eq!(index(test, id).await, successor);
+    assert_eq!(principal_blob_links(test, id).await, successor_links);
+    assert_eq!(
+        log_records_since(test, id, SyncCollection::Email, 0).await,
+        email
+    );
+    assert_eq!(
+        log_records_since(test, id, SyncCollection::Thread, 0).await,
+        thread
+    );
+    assert_eq!(get_recovery_ids(key).await, successor_ids);
+    assert_eq!(
+        queried(&recovery_query(key, Some("recoveryneedle")).await),
+        successor_ids
+    );
 }

@@ -10,6 +10,7 @@ pub mod fields;
 pub mod open;
 pub mod pass;
 pub mod query;
+pub mod rebuild;
 pub mod snapshot;
 pub mod threads;
 pub mod view;

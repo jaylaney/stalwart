@@ -38,6 +38,100 @@ use vault::{keys::Secret, session::SessionKeys};
 #[path = "load_tests.rs"]
 mod tests;
 
+/// Recovery evidence at the failed read. Map loss carries the optional
+/// store value. A content walk starts from a resident part, so its evidence
+/// names the exact raw-manifest digest, epoch and head.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ObservedLoadError {
+    Other(LoadFailure),
+    MapLoss(MapLoss),
+    ContentLoss(ContentLoss),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct MapLoss {
+    class: LossClass,
+    raw: Option<Vec<u8>>,
+    failed_thread: Option<BlobHash>,
+}
+
+impl MapLoss {
+    pub fn missing() -> Self {
+        Self {
+            class: LossClass::ManifestMissing,
+            raw: None,
+            failed_thread: None,
+        }
+    }
+
+    pub fn class(&self) -> LossClass {
+        self.class
+    }
+
+    pub fn raw(&self) -> Option<&[u8]> {
+        self.raw.as_deref()
+    }
+
+    pub fn failed_thread(&self) -> Option<&BlobHash> {
+        self.failed_thread.as_ref()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ContentLoss {
+    class: LossClass,
+    manifest_hash: [u8; 32],
+    epoch: u64,
+    head: ContentHead,
+}
+
+impl ContentLoss {
+    pub fn class(&self) -> LossClass {
+        self.class
+    }
+
+    pub fn matches(&self, bytes: &[u8], manifest: &Manifest) -> bool {
+        self.manifest_hash == manifest_hash(bytes)
+            && self.epoch == manifest.epoch
+            && manifest.content.as_ref() == Some(&self.head)
+    }
+}
+
+impl ObservedLoadError {
+    fn map_read(
+        failure: LoadFailure,
+        raw: impl FnOnce() -> Vec<u8>,
+        failed_thread: Option<BlobHash>,
+    ) -> Self {
+        match failure {
+            LoadFailure::Loss(class) => Self::MapLoss(MapLoss {
+                class,
+                raw: Some(raw()),
+                failed_thread,
+            }),
+            other => Self::Other(other),
+        }
+    }
+
+    pub fn classification(&self) -> LoadFailure {
+        match self {
+            Self::Other(failure) => *failure,
+            Self::MapLoss(loss) => LoadFailure::Loss(loss.class()),
+            Self::ContentLoss(loss) => LoadFailure::Loss(loss.class()),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        self.classification().as_str()
+    }
+}
+
+impl From<LoadFailure> for ObservedLoadError {
+    fn from(failure: LoadFailure) -> Self {
+        Self::Other(failure)
+    }
+}
+
 pub trait BlobSource: Sync {
     fn fetch(&self, hash: &BlobHash) -> impl Future<Output = trc::Result<Option<Vec<u8>>>> + Send;
 
@@ -169,7 +263,7 @@ impl ThreadDelta {
         descriptors: &[ThreadBlobEntry],
         window_secs: u64,
         now: u64,
-    ) -> Result<Self, LoadFailure> {
+    ) -> Result<Self, (LoadFailure, BlobHash)> {
         let mut blobs = Vec::with_capacity(descriptors.len());
         for descriptor in descriptors {
             let header = BlobHeader {
@@ -178,9 +272,11 @@ impl ThreadDelta {
                 segment: descriptor.segment,
                 predecessor: None,
             };
-            let bytes = fetch_verified(source, entry, &descriptor.hash, window_secs, now).await?;
+            let bytes = fetch_verified(source, entry, &descriptor.hash, window_secs, now)
+                .await
+                .map_err(|failure| (failure, descriptor.hash.clone()))?;
             let (hidden, public) = parse_thread_blob(key, entry.account_id, &header, &bytes)
-                .map_err(LoadFailure::Loss)?;
+                .map_err(|class| (LoadFailure::Loss(class), descriptor.hash.clone()))?;
             blobs.push((descriptor.segment, hidden, public));
         }
         Ok(Self { blobs })
@@ -210,9 +306,12 @@ pub async fn load_thread_part<S: BlobSource>(
     manifest: Manifest,
     window_secs: u64,
     now: u64,
-) -> Result<LoadedIndex, LoadFailure> {
-    let delta =
-        ThreadDelta::read(source, entry, key, &manifest.thread_blobs, window_secs, now).await?;
+) -> Result<LoadedIndex, ObservedLoadError> {
+    let delta = ThreadDelta::read(source, entry, key, &manifest.thread_blobs, window_secs, now)
+        .await
+        .map_err(|(failure, hash)| {
+            ObservedLoadError::map_read(failure, || manifest_bytes.to_vec(), Some(hash))
+        })?;
     let row = manifest.newest_row;
     let mut loaded = LoadedIndex::empty(manifest);
     loaded.manifest_bytes_hash = manifest_hash(manifest_bytes);
@@ -354,8 +453,8 @@ async fn load_entry<S: BlobSource>(
     entry: &IndexEntry,
     key: &Secret,
     config: &ZaSearchConfig,
-    read_manifest: impl Future<Output = Result<(Vec<u8>, Manifest), LoadFailure>>,
-) -> Result<(), LoadFailure> {
+    read_manifest: impl Future<Output = Result<(Vec<u8>, Manifest), ObservedLoadError>>,
+) -> Result<(), ObservedLoadError> {
     // A resident thread part is available even while content is loading.
     if entry.index.read().await.is_some() {
         return Ok(());
@@ -414,7 +513,7 @@ async fn load_current_content<S: BlobSource>(
     entry: &IndexEntry,
     key: &Secret,
     config: &ZaSearchConfig,
-) -> Result<(), LoadFailure> {
+) -> Result<(), ObservedLoadError> {
     let _flight = entry.load_flight.lock().await;
     let cache = entry
         .cache()
@@ -425,7 +524,7 @@ async fn load_current_content<S: BlobSource>(
     let mut staged_head: Option<(u64, ContentHead)> = None;
 
     loop {
-        let (epoch, head) = {
+        let (version, epoch, head) = {
             let guard = entry.index.read().await;
             let index = guard.as_ref().ok_or(invalid)?;
             if let Some(head) = &index.manifest.content {
@@ -434,7 +533,11 @@ async fn load_current_content<S: BlobSource>(
             if content_head_is_resident(index) {
                 return Ok(());
             }
-            (index.manifest.epoch, index.manifest.content.clone())
+            (
+                index.manifest_bytes_hash,
+                index.manifest.epoch,
+                index.manifest.content.clone(),
+            )
         };
 
         if head.is_none()
@@ -504,7 +607,15 @@ async fn load_current_content<S: BlobSource>(
             tokio::task::yield_now().await;
             continue;
         }
-        result?;
+        result.map_err(|failure| match failure {
+            LoadFailure::Loss(class) => ObservedLoadError::ContentLoss(ContentLoss {
+                class,
+                manifest_hash: version,
+                epoch,
+                head: head.expect("content loss requires a named head"),
+            }),
+            other => ObservedLoadError::Other(other),
+        })?;
         apply_tombstones(&mut staged, &index.thread);
         cache.grow(
             &mut staged.charge,
@@ -540,6 +651,7 @@ pub async fn apply_reload<S: BlobSource>(
     )
     .await
     .map(|_| ())
+    .map_err(|failure| failure.classification())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -552,7 +664,7 @@ async fn apply_reload_locked<S: BlobSource>(
     manifest_bytes: &[u8],
     manifest: Manifest,
     now: u64,
-) -> Result<bool, LoadFailure> {
+) -> Result<bool, ObservedLoadError> {
     let cache = entry
         .cache()
         .ok_or(LoadFailure::Transient(TransientClass::Validation))?;
@@ -580,7 +692,11 @@ async fn apply_reload_locked<S: BlobSource>(
     } else {
         None
     };
-    let delta = ThreadDelta::read(source, entry, key, thread, window, now).await?;
+    let delta = ThreadDelta::read(source, entry, key, thread, window, now)
+        .await
+        .map_err(|(failure, hash)| {
+            ObservedLoadError::map_read(failure, || manifest_bytes.to_vec(), Some(hash))
+        })?;
 
     let mut new_content = None;
     if let Some(head) = manifest.content.as_ref()
@@ -621,7 +737,7 @@ async fn apply_reload_locked<S: BlobSource>(
             // Keep content-only loss out of the thread load contract. An
             // explicit content load retries this head and reports its loss.
             Err(LoadFailure::Loss(_)) => old.content = None,
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
     }
 
@@ -688,17 +804,20 @@ impl Server {
         &self,
         account_id: u32,
         key: &ZaSearchKey,
-    ) -> Result<Option<(Vec<u8>, ManifestValue)>, LoadFailure> {
+    ) -> Result<Option<(Vec<u8>, ManifestValue)>, ObservedLoadError> {
         #[cfg(feature = "test_mode")]
         if crate::za::test_hooks::take_search_manifest_fail(account_id) {
-            return Err(LoadFailure::Transient(TransientClass::Store));
+            return Err(LoadFailure::Transient(TransientClass::Store).into());
         }
         self.za_search_read_manifest_raw(account_id)
             .await
             .map_err(|_| LoadFailure::Transient(TransientClass::Store))?
-            .map(|bytes| {
-                classify_manifest(ManifestValue::decode(&bytes, key)).map(|value| (bytes, value))
-            })
+            .map(
+                |bytes| match classify_manifest(ManifestValue::decode(&bytes, key)) {
+                    Ok(value) => Ok((bytes, value)),
+                    Err(failure) => Err(ObservedLoadError::map_read(failure, || bytes, None)),
+                },
+            )
             .transpose()
     }
 
@@ -706,22 +825,21 @@ impl Server {
         &self,
         account_id: u32,
         key: &Secret,
-    ) -> Result<(Vec<u8>, Manifest), LoadFailure> {
-        let (bytes, value) = match self
+    ) -> Result<(Vec<u8>, Manifest), ObservedLoadError> {
+        let Some((bytes, value)) = self
             .za_search_read_manifest(account_id, &za_search_key(key))
             .await?
-        {
-            Some((bytes, value)) => (bytes, Some(value)),
-            None => (Vec::new(), None),
+        else {
+            return Err(ObservedLoadError::MapLoss(MapLoss::missing()));
         };
-        Ok((bytes, entry_outcome(value)?))
+        Ok((bytes, entry_outcome(Some(value))?))
     }
 
     pub async fn za_search_entry(
         &self,
         account_id: u32,
         keys: &SessionKeys,
-    ) -> Result<Arc<IndexEntry>, LoadFailure> {
+    ) -> Result<Arc<IndexEntry>, ObservedLoadError> {
         let entry = self.inner.cache.za_search.entry(account_id);
         self.za_search_load_entry(&entry, keys).await?;
         Ok(entry)
@@ -733,7 +851,7 @@ impl Server {
         &self,
         entry: &IndexEntry,
         keys: &SessionKeys,
-    ) -> Result<(), LoadFailure> {
+    ) -> Result<(), ObservedLoadError> {
         let key = keys.swk();
         load_entry(
             self,
@@ -749,7 +867,7 @@ impl Server {
         &self,
         entry: &IndexEntry,
         keys: &SessionKeys,
-    ) -> Result<bool, LoadFailure> {
+    ) -> Result<bool, ObservedLoadError> {
         let key = keys.swk();
         let _flight = entry.load_flight.lock().await;
         // Serialize the manifest read with applying it. A delayed reload can
@@ -775,7 +893,7 @@ impl Server {
         &self,
         entry: &IndexEntry,
         keys: &SessionKeys,
-    ) -> Result<(), LoadFailure> {
+    ) -> Result<(), ObservedLoadError> {
         load_current_content(self, entry, keys.swk(), &self.za_search_config()).await
     }
 }
