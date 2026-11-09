@@ -77,7 +77,12 @@ impl ThreadGet for Server {
                                 .email_by_id(id)
                                 .is_some_and(|item| access.allows(item))
                         });
-                        members.sort_unstable();
+                        members.sort_by_cached_key(|id| {
+                            cache
+                                .email_by_id(id)
+                                .expect("retained thread member is in the pinned cache")
+                                .sort_rank()
+                        });
                         (thread_id, members)
                     })
                     .collect();

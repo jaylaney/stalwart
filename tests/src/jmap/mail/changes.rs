@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::utils::server::TestServer;
+use crate::{
+    utils::{account::Account, server::TestServer, za::key_accounts_mode},
+    za::{STRONG, user_permissions},
+};
 use jmap_proto::types::state::State;
 use std::str::FromStr;
 use store::{ahash::AHashSet, write::BatchBuilder};
@@ -16,8 +19,48 @@ use types::{
 pub async fn test(test: &TestServer) {
     println!("Running Email Changes tests...");
 
+    let admin = test.account("admin@example.com");
+    let control = if key_accounts_mode() {
+        // This fixture writes logs without storing any messages. Initial
+        // keyed changes enumerate real messages; threads/task13.rs tests
+        // that lifecycle and paging on key accounts.
+        println!("Running the synthetic Email/changes log on an ordinary account in key mode");
+        let account = admin
+            .create_user_account(
+                "task17-synthetic-changes@example.com",
+                STRONG,
+                "Synthetic changes control",
+                &[],
+                user_permissions(),
+            )
+            .await;
+        assert!(
+            !test
+                .server
+                .account(account.id().document_id())
+                .await
+                .unwrap()
+                .is_key_account()
+        );
+        Some(account)
+    } else {
+        None
+    };
+    let account = control
+        .as_ref()
+        .unwrap_or_else(|| test.account("jdoe@example.com"));
+
+    assert_synthetic_changes(test, account).await;
+
+    if let Some(account) = control {
+        admin.destroy_account(account).await;
+        test.wait_for_tasks().await;
+    }
+    test.assert_is_empty().await;
+}
+
+async fn assert_synthetic_changes(test: &TestServer, account: &Account) {
     let server = test.server.clone();
-    let account = test.account("jdoe@example.com");
     let client = account.jmap_client().await;
     let mut states = vec![State::Initial];
 
@@ -318,7 +361,6 @@ pub async fn test(test: &TestServer) {
     assert_eq!(changes.updated(), Vec::<String>::new());
     assert_eq!(changes.destroyed(), Vec::<String>::new());
     test.destroy_all_mailboxes(account).await;
-    test.assert_is_empty().await;
 }
 
 #[derive(Debug, Clone, Copy)]

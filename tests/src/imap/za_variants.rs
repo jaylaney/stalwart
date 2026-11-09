@@ -4,49 +4,26 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-//! Key-account variants of the IMAP sub-tests (mail spec 11), run with
-//! `ZA_KEY_ACCOUNTS=1`: every user is a key account, so the steps that search
-//! or sort on sealed content (spec 8), share a key account's mailbox or copy
-//! across accounts (6.3) or train the spam filter (9) assert the refusal or
-//! the designed outcome, and every other step runs as upstream runs it. The
-//! group `support@example.com` and the admin stay plain.
+//! Key-account IMAP variants (mail spec 11), run with `ZA_KEY_ACCOUNTS=1`.
+//! Search, sort and thread commands are served (release 7 spec 9.3).
+//! Sharing, copying and spam training retain their key-account restrictions.
+//! FETCH retains the sealed-row flags. The Support group and admin stay plain.
 
 use super::{
-    AssertResult, ImapConnection, Type,
-    antispam::spam_classifier_model,
-    append::{assert_append_message, build_messages},
-    expand_uid_list,
+    AssertResult, ImapConnection, Type, antispam::spam_classifier_model,
+    append::assert_append_message,
 };
 use crate::{
     system::antispam::{HAM, SPAM, TEST},
-    utils::{server::TestServer, smtp::SmtpConnection},
+    utils::{server::TestServer, smtp::SmtpConnection, za::imap_index_current},
 };
-use common::za::{ZA_MAIL_KEYLESS, ZA_MAIL_SEARCH_REFUSED};
+use common::za::ZA_MAIL_KEYLESS;
 use imap_proto::ResponseType;
 use registry::schema::{
     enums::TaskSpamFilterMaintenanceType,
     prelude::ObjectType,
     structs::{Task, TaskSpamFilterMaintenance, TaskStatus},
 };
-
-/// Mail spec 8: `command` answers `NO [CANNOT]` with the fixed text and no
-/// result line.
-async fn assert_search_refused(imap: &mut ImapConnection, command: &str) {
-    imap.send(command).await;
-    let lines = imap
-        .assert_read(Type::Tagged, ResponseType::No)
-        .await
-        .assert_response_code("CANNOT")
-        .assert_contains(ZA_MAIL_SEARCH_REFUSED);
-    assert!(
-        !lines
-            .iter()
-            .any(|line| ["* SEARCH", "* SORT", "* THREAD", "* ESEARCH"]
-                .iter()
-                .any(|prefix| line.starts_with(prefix))),
-        "{command}: {lines:?}"
-    );
-}
 
 /// Mail spec 6.3: `command` answers `NO [NOPERM]` with the keyless text.
 async fn assert_noperm(imap: &mut ImapConnection, command: &str) {
@@ -57,224 +34,7 @@ async fn assert_noperm(imap: &mut ImapConnection, command: &str) {
         .assert_contains(ZA_MAIL_KEYLESS);
 }
 
-/// The `RFC822.SIZE` of every message of the selected mailbox, by UID.
-async fn sizes_by_uid(imap: &mut ImapConnection) -> Vec<(u32, u64)> {
-    imap.send("UID FETCH 1:* (UID RFC822.SIZE)").await;
-    let mut sizes = imap
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .iter()
-        .filter(|line| line.starts_with("* "))
-        .map(|line| {
-            let field = |name: &str| {
-                line.split_once(name)
-                    .and_then(|(_, rest)| rest.split([' ', ')']).next())
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or_else(|| panic!("no {name} in {line}"))
-            };
-            (field("UID ") as u32, field("RFC822.SIZE "))
-        })
-        .collect::<Vec<_>>();
-    sizes.sort_unstable();
-    sizes
-}
-
-/// `search::test` in key mode. INBOX holds `append::test`'s ten messages,
-/// sealed; UID `n` carries the keyword `Flag_00<n - 1>`. Flag, UID, size and
-/// result-option searches are served with upstream's results; the FROM,
-/// SUBJECT, TEXT, SENTON and SORT-by-header steps are refused, and the saved
-/// search and the sorts are rebuilt from served keys.
-pub async fn search(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
-    println!("Running key-account SEARCH tests...");
-
-    // Searches without selecting a mailbox should fail.
-    imap.send("SEARCH RETURN (MIN MAX COUNT ALL) ALL").await;
-    imap.assert_read(Type::Tagged, ResponseType::Bad).await;
-
-    // Select INBOX
-    imap.send("SELECT INBOX").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("10 EXISTS")
-        .assert_contains("[UIDNEXT 11]");
-    imap_check.send("SELECT INBOX").await;
-    imap_check.assert_read(Type::Tagged, ResponseType::Ok).await;
-
-    // Min, Max and Count
-    imap.send("SEARCH RETURN (MIN MAX COUNT ALL) ALL").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("COUNT 10 MIN 1 MAX 10 ALL 1:10");
-    imap_check.send("UID SEARCH ALL").await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_equals("* SEARCH 1 2 3 4 5 6 7 8 9 10");
-
-    // Filters on content are refused; flag, UID and size filters are served.
-    assert_search_refused(imap_check, "UID SEARCH OR FROM nathaniel SUBJECT argentina").await;
-    imap_check
-        .send("UID SEARCH UNSEEN OR KEYWORD Flag_007 KEYWORD Flag_004")
-        .await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_equals("* SEARCH 5 8");
-    assert_search_refused(
-        imap_check,
-        "UID SEARCH TEXT coffee FROM vandelay SUBJECT exporting SENTON 20-Nov-2021",
-    )
-    .await;
-    assert_search_refused(
-        imap_check,
-        concat!(
-            "UID SEARCH CHARSET UTF-8 TEXT {75+}\r\n",
-            "ℌ𝔢𝔩𝔭 𝔪𝔢 𝔢𝔵𝔭𝔬𝔯𝔱 𝔪𝔶 𝔟𝔬𝔬𝔨"
-        ),
-    )
-    .await;
-    // A served key mixed with a refused one is refused as a whole.
-    assert_search_refused(imap_check, "UID SEARCH NOT (FROM nathaniel ANSWERED)").await;
-    imap_check
-        .send("UID SEARCH UID 0:6 LARGER 1000 SMALLER 2000")
-        .await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_equals("* SEARCH 1 2");
-
-    // Saved search: upstream's FROM/SUBJECT search is refused; the same
-    // operations run on a saved flag search (UIDs 1, 3, 4 and 6).
-    assert_search_refused(
-        imap_check,
-        "UID SEARCH RETURN (SAVE ALL) OR OR FROM nathaniel FROM vandelay OR SUBJECT rfc FROM gore",
-    )
-    .await;
-    imap_check
-        .send(concat!(
-            "UID SEARCH RETURN (SAVE ALL) OR OR KEYWORD Flag_000 KEYWORD Flag_002 ",
-            "OR KEYWORD Flag_003 KEYWORD Flag_005"
-        ))
-        .await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("1,3:4,6");
-    imap_check.send("UID SEARCH NOT $").await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_equals("* SEARCH 2 5 7 8 9 10");
-    // Of UIDs 1 to 6 only 1 and 2 are between 1000 and 2000 bytes.
-    imap_check
-        .send("UID SEARCH $ LARGER 1000 SMALLER 2000")
-        .await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_equals("* SEARCH 1");
-    assert_search_refused(imap_check, "UID SEARCH $ SMALLER 1000 SUBJECT section").await;
-    imap_check.send("UID SEARCH RETURN (MIN MAX) NOT $").await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("MIN 2 MAX 10");
-
-    // ALL retains every saved flag match even when MIN and MAX are requested.
-    imap_check
-        .send(concat!(
-            "UID SEARCH RETURN (SAVE MIN MAX ALL) OR OR KEYWORD Flag_000 KEYWORD Flag_002 ",
-            "OR KEYWORD Flag_003 KEYWORD Flag_005"
-        ))
-        .await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("MIN 1 MAX 6 ALL 1,3:4,6");
-    imap_check.send("UID SEARCH $").await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_equals("* SEARCH 1 3 4 6");
-
-    // COUNT retains every saved flag match even when MIN is requested.
-    imap_check
-        .send(concat!(
-            "UID SEARCH RETURN (SAVE MIN COUNT) OR OR KEYWORD Flag_000 KEYWORD Flag_002 ",
-            "OR KEYWORD Flag_003 KEYWORD Flag_005"
-        ))
-        .await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("COUNT 4 MIN 1");
-    imap_check.send("UID SEARCH $").await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_equals("* SEARCH 1 3 4 6");
-
-    // Saved search with only MIN and MAX saves the extremes.
-    imap_check
-        .send(concat!(
-            "UID SEARCH RETURN (SAVE MIN MAX) OR OR KEYWORD Flag_000 KEYWORD Flag_002 ",
-            "OR KEYWORD Flag_003 KEYWORD Flag_005"
-        ))
-        .await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("MIN 1 MAX 6");
-    imap_check.send("UID SEARCH $").await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_equals("* SEARCH 1 6");
-
-    // Saved search with MIN and MAX on a single match saves it once.
-    imap_check
-        .send("UID SEARCH RETURN (SAVE MIN MAX) UID 8")
-        .await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("MIN 8 MAX 8");
-    imap_check.send("UID SEARCH $").await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_equals("* SEARCH 8");
-
-    // Sort: by subject, date or sender is refused; by size and arrival is
-    // served, the size order matching the messages' sizes.
-    assert_search_refused(
-        imap_check,
-        "UID SORT (REVERSE SUBJECT REVERSE DATE) UTF-8 FROM Nathaniel",
-    )
-    .await;
-    assert_search_refused(imap, "UID SORT RETURN (COUNT ALL) (DATE SUBJECT) UTF-8 ALL").await;
-    let mut by_size = sizes_by_uid(imap_check).await;
-    by_size.sort_by_key(|(uid, size)| (*size, *uid));
-    let expected = by_size
-        .iter()
-        .map(|(uid, _)| uid.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    imap_check.send("UID SORT (SIZE) UTF-8 ALL").await;
-    imap_check
-        .assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_equals(&format!("* SORT {expected}"));
-    imap.send("UID SORT RETURN (COUNT ALL) (ARRIVAL) UTF-8 ALL")
-        .await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("COUNT 10 ALL");
-}
-
-/// `fetch::test` in key mode: the session holds the account's keys, so every
-/// FETCH runs as upstream; only the saved search is rebuilt on the UIDs
-/// upstream's refused `FROM` search finds (1, 4 and 6).
+/// `fetch::test` in key mode, with sealed-row attachment flags.
 pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     println!("Running key-account FETCH tests...");
 
@@ -430,11 +190,10 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
         .assert_contains("* 9 FETCH (UID 9 ")
         .assert_contains("* 10 FETCH (UID 10 ");
 
-    // Fetch using a saved search: upstream's `FROM` search is refused (spec
-    // 8); a saved search on the UIDs it finds (1, 4 and 6) fetches upstream's
-    // three previews.
-    assert_search_refused(imap, "UID SEARCH RETURN (SAVE) FROM \"nathaniel\"").await;
-    imap.send("UID SEARCH RETURN (SAVE) UID 1,4,6").await;
+    // Fetch using a saved search
+    imap_index_current(imap).await;
+    imap.send("UID SEARCH RETURN (SAVE) FROM \"nathaniel\"")
+        .await;
     imap.assert_read(Type::Tagged, ResponseType::Ok).await;
     imap.send("FETCH $ (UID PREVIEW)").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
@@ -461,184 +220,9 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
         .assert_contains("* 1 FETCH (UID 1");
 }
 
-/// `store::test` in key mode: flags are keyless data and every STORE runs as
-/// upstream; the saved search is rebuilt on `SEEN` over UIDs 1, 4 and 6 (the
-/// three messages upstream's `FROM nathaniel` finds) instead of `FROM`.
-pub async fn store(imap: &mut ImapConnection, test: &TestServer) {
-    println!("Running key-account STORE tests...");
-
-    // Select INBOX
-    imap.send("SELECT INBOX").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("10 EXISTS")
-        .assert_contains("[UIDNEXT 11]");
-
-    // Set all messages to flag "Seen"
-    imap.send("UID STORE 1:10 +FLAGS.SILENT (\\Seen)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_count("FLAGS", 0);
-
-    // Check that the flags were set
-    imap.send("UID FETCH 1:* (Flags)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_count("\\Seen", 10);
-
-    // Check status
-    imap.send("STATUS INBOX (UIDNEXT MESSAGES UNSEEN)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("MESSAGES 10")
-        .assert_contains("UNSEEN 0")
-        .assert_contains("UIDNEXT 11");
-
-    // Remove Seen flag from all messages
-    imap.send("UID STORE 1:10 -FLAGS (\\Seen)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_count("FLAGS", 10)
-        .assert_count("Seen", 0);
-
-    // Check that the flags were removed
-    imap.send("UID FETCH 1:* (Flags)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_count("\\Seen", 0);
-    imap.send("STATUS INBOX (UIDNEXT MESSAGES UNSEEN)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("MESSAGES 10")
-        .assert_contains("UNSEEN 10")
-        .assert_contains("UIDNEXT 11");
-
-    // Store using saved searches: `FROM` is refused (spec 8); the saved
-    // search is `SEEN`, over the three messages marked seen for it.
-    test.wait_for_tasks().await;
-    assert_search_refused(imap, "SEARCH RETURN (SAVE) FROM nathaniel").await;
-    imap.send("UID STORE 1,4,6 +FLAGS.SILENT (\\Seen)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
-    imap.send("SEARCH RETURN (SAVE) SEEN").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
-    imap.send("UID STORE $ +FLAGS (\\Answered)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_count("FLAGS", 3);
-
-    // Remove Answered flag
-    imap.send("UID STORE 1:* -FLAGS (\\Answered)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_count("FLAGS", 3)
-        .assert_count("Answered", 0);
-
-    // The variant's own Seen flags go, leaving upstream's end state.
-    imap.send("UID STORE 1,4,6 -FLAGS.SILENT (\\Seen)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
-}
-
-/// `thread::test` in key mode: a key account's messages are never threaded
-/// (mail spec 5.4), so THREAD answers twelve singletons where upstream finds
-/// three threads of four, a THREADID search finds the one message, and a
-/// SUBJECT filter is refused (spec 8).
-pub async fn thread(imap: &mut ImapConnection, test: &TestServer) {
-    println!("Running key-account THREAD tests...");
-
-    // Create test messages
-    let messages = build_messages();
-
-    // Insert messages using Multiappend
-    imap.send("CREATE Manchego").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
-    for (pos, message) in messages.iter().enumerate() {
-        if pos == 0 {
-            imap.send(&format!("APPEND Manchego {{{}}}", message.len()))
-                .await;
-        } else {
-            imap.send_untagged(&format!(" {{{}}}", message.len())).await;
-        }
-        imap.assert_read(Type::Continuation, ResponseType::Ok).await;
-        if pos < messages.len() - 1 {
-            imap.send_raw(message).await;
-        } else {
-            imap.send_untagged(message).await;
-            assert_eq!(
-                expand_uid_list(
-                    &imap
-                        .assert_read(Type::Tagged, ResponseType::Ok)
-                        .await
-                        .into_append_uid()
-                )
-                .len(),
-                messages.len(),
-            );
-        }
-    }
-
-    // Obtain ThreadId and MessageId of the first message
-    test.wait_for_tasks().await;
-    imap.send("SELECT Manchego").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
-
-    let mut email_id = None;
-    let mut thread_id = None;
-    imap.send("UID FETCH 1 (OBJECTID)").await;
-    for line in imap.assert_read(Type::Tagged, ResponseType::Ok).await {
-        if let Some((_, value)) = line.split_once("EMAILID ") {
-            email_id = value
-                .split([' ', ')'])
-                .next()
-                .expect("Missing delimiter")
-                .to_string()
-                .into();
-        }
-        if let Some((_, value)) = line.split_once("THREADID ") {
-            thread_id = value
-                .split([' ', ')'])
-                .next()
-                .expect("Missing delimiter")
-                .to_string()
-                .into();
-        }
-    }
-    let email_id = email_id.expect("Missing EMAILID");
-    let thread_id = thread_id.expect("Missing THREADID");
-
-    // Twelve singleton threads
-    imap.send("THREAD REFERENCES UTF-8 1:*").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_equals("* THREAD (1)(2)(3)(4)(5)(6)(7)(8)(9)(10)(11)(12)");
-
-    // Filtering by subject is refused
-    assert_search_refused(imap, "THREAD REFERENCES UTF-8 SUBJECT T1").await;
-
-    // Filter by threadId and messageId: both find the first message alone
-    imap.send(&format!(
-        "UID THREAD REFERENCES UTF-8 THREADID {}",
-        thread_id
-    ))
-    .await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("(1)")
-        .assert_count("(", 1);
-
-    imap.send(&format!("UID THREAD REFERENCES UTF-8 EMAILID {}", email_id))
-        .await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("(1)")
-        .assert_count("(", 1);
-
-    // Delete all messages
-    imap.send("STORE 1:* +FLAGS.SILENT (\\Deleted)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
-    imap.send("EXPUNGE").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_count("EXPUNGE", 13);
+/// The upstream STORE body also applies to a key account.
+pub async fn store(imap: &mut ImapConnection, imap_check: &mut ImapConnection, test: &TestServer) {
+    super::store::test(imap, imap_check, test).await;
 }
 
 /// `acl::test` in key mode. John, Jane and Bill are key accounts and the

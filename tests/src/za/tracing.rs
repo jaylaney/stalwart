@@ -559,7 +559,7 @@ async fn jmap_upload(user: &str, secret: &str, account_id: &str, canary: &str) {
 }
 
 /// Write one masked client frame (RFC 6455 section 5.2).
-async fn ws_send(stream: &mut (impl AsyncWriteExt + Unpin), opcode: u8, payload: &[u8]) {
+pub(super) async fn ws_send(stream: &mut (impl AsyncWriteExt + Unpin), opcode: u8, payload: &[u8]) {
     let mask = [0x5a, 0x17, 0xc3, 0x8e];
     let mut frame = vec![0x80 | opcode];
     match payload.len() {
@@ -581,7 +581,7 @@ async fn ws_send(stream: &mut (impl AsyncWriteExt + Unpin), opcode: u8, payload:
 
 /// Read one unmasked server frame: its opcode and payload, or `None` once
 /// the server has hung up.
-async fn ws_recv(stream: &mut (impl AsyncReadExt + Unpin)) -> Option<(u8, Vec<u8>)> {
+pub(super) async fn ws_recv(stream: &mut (impl AsyncReadExt + Unpin)) -> Option<(u8, Vec<u8>)> {
     let mut head = [0u8; 2];
     stream.read_exact(&mut head).await.ok()?;
     let len = match head[1] & 0x7f {

@@ -38,6 +38,7 @@ pub fn za_thread_keywords(
     )
 }
 
+/// Groups mapped thread members in the input order within each thread.
 pub fn za_group_by_thread<'x>(
     snapshot: &ZaSnapshot,
     messages: impl Iterator<Item = MessageRef<'x>>,
@@ -49,9 +50,6 @@ pub fn za_group_by_thread<'x>(
             .entry(snapshot.thread_of(document_id))
             .or_default()
             .push(document_id);
-    }
-    for members in threads.values_mut() {
-        members.sort_unstable();
     }
     threads
 }
@@ -97,9 +95,9 @@ mod tests {
         );
         *entry.index.write().await = Some(index);
         let index = entry.read_loaded().await.unwrap();
-        let messages = [(1, 1 << SEEN), (2, 0), (3, 1 << DRAFT)]
+        let messages = [(2, 0, 10), (3, 1 << DRAFT, 20), (1, 1 << SEEN, 30)]
             .into_iter()
-            .map(|(id, keywords)| {
+            .map(|(id, keywords, received_at)| {
                 MessageCache::new(
                     id,
                     [MessageUid {
@@ -112,7 +110,7 @@ mod tests {
                     id,
                     2,
                     0,
-                    u64::from(id),
+                    received_at,
                     0,
                 )
             })
@@ -164,7 +162,7 @@ mod tests {
         assert!(some_seen(Some(&documents), Some(&documents)).is_empty());
 
         let groups = za_group_by_thread(&snapshot, snapshot.cache.emails.iter());
-        assert_eq!(groups[&1], [1, 2]);
+        assert_eq!(groups[&1], [2, 1]);
         assert_eq!(groups[&3], [3]);
     }
 }

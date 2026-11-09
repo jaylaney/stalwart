@@ -8,6 +8,7 @@ use crate::{
     utils::{
         account::Account,
         http::HttpRequest,
+        imap::{ImapConnection, Type as ImapReplyType},
         pop3::{Pop3Connection, ResponseType as Pop3Reply},
         server::TestServer,
     },
@@ -44,7 +45,10 @@ use email::{
         metadata::{ExtraHeaders, MessageMetadata},
         sortkeys::MessageSortKeys,
         thread::ThreadFields,
-        za::search::pass::{PassOutcome, ZaSearchPass},
+        za::search::{
+            ensure::is_current,
+            pass::{PassOutcome, ZaSearchPass},
+        },
     },
 };
 use groupware::{
@@ -2352,6 +2356,140 @@ pub async fn za_revoke_grant(server: &common::Server, grant_id: u64) {
             .unwrap()
     );
     server.invalidate_caches(invalidator).await.unwrap();
+}
+
+/// Bring a finished bulk-delivery fixture to its durable Email log boundary.
+/// Each empty keyed Email/get drives one normal opportunistic search pass.
+/// The caller still checks that a content query is served.
+pub async fn finish_bulk_delivery_indexing(test: &TestServer, account: &Account) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let account_id = account.id().document_id();
+    let boundary = tokio::time::timeout_at(
+        deadline,
+        test.server
+            .store()
+            .get_last_change_id(account_id, SyncCollection::Email.into()),
+    )
+    .await
+    .expect("timed out reading the bulk-delivery Email boundary")
+    .unwrap()
+    .expect("bulk delivery must leave an Email log boundary");
+    let request = json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [["Email/get", { "accountId": account.id_string(), "ids": [] }, "0"]],
+    });
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(45))
+        .build()
+        .unwrap();
+    let mut attempts = 0;
+    let mut stalled = 0;
+    let mut previous = None;
+    loop {
+        let progress = test
+            .server
+            .inner
+            .cache
+            .za_search
+            .get(account_id)
+            .and_then(|entry| {
+                let guard = entry.index.try_read().ok()?;
+                let index = guard.as_ref()?;
+                Some((
+                    is_current(index, boundary),
+                    index.scanned_to,
+                    index.manifest.revision,
+                ))
+            });
+        if let Some((true, scanned_to, revision)) = progress {
+            println!(
+                "Bulk delivery indexing reached boundary {boundary} after {attempts} keyed requests (scanned_to={scanned_to}, revision={revision})"
+            );
+            return;
+        }
+        stalled = if progress == previous { stalled + 1 } else { 0 };
+        assert!(
+            stalled <= 8,
+            "bulk delivery indexing stalled at {progress:?} after {attempts} keyed requests, target {boundary}"
+        );
+        previous = progress;
+
+        attempts += 1;
+        let reply = tokio::time::timeout_at(deadline, async {
+            client
+                .post(account.api_url())
+                .basic_auth(account.name(), Some(account.secret()))
+                .json(&request)
+                .send()
+                .await?
+                .json::<Value>()
+                .await
+        })
+        .await
+        .unwrap_or_else(|_| panic!(
+            "bulk delivery indexing timed out on request {attempts}, progress {progress:?}, target {boundary}"
+        ))
+        .unwrap_or_else(|error| panic!(
+            "bulk delivery indexing request {attempts} failed: {error}, progress {progress:?}, target {boundary}"
+        ));
+        let method = &reply["methodResponses"][0];
+        assert_eq!(
+            method[0], "Email/get",
+            "bulk delivery indexing request {attempts}: {reply}, progress {progress:?}, target {boundary}"
+        );
+        assert!(
+            method[1]["list"].as_array().is_some_and(Vec::is_empty),
+            "bulk delivery indexing request {attempts}: {reply}, progress {progress:?}, target {boundary}"
+        );
+    }
+}
+
+/// Complete pending keyed indexing with a real content query.
+pub async fn za_index_current(account: &Account) {
+    let payload = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        // Allow the default 30 s content wait, the 2 s request-triggered
+        // pass, and transport overhead in the canonical test configuration.
+        .timeout(Duration::from_secs(45))
+        .build()
+        .unwrap()
+        .post(account.api_url())
+        .basic_auth(account.name(), Some(account.secret()))
+        .json(&json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [[
+                "Email/query",
+                { "accountId": account.id_string(), "filter": { "text": "za-index-current" } },
+                "0"
+            ]],
+        }))
+        .send()
+        .await
+        .expect("keyed index currentness request failed")
+        .bytes()
+        .await
+        .unwrap();
+    let reply = crate::utils::jmap::JmapResponse(
+        serde_json::from_slice(&payload)
+            .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&payload))),
+    );
+    assert_eq!(
+        reply.name_at(0),
+        "Email/query",
+        "keyed index did not serve the request: {reply:?}"
+    );
+    assert!(
+        reply.0["methodResponses"][0][1]["ids"].is_array(),
+        "{reply:?}"
+    );
+}
+
+/// Complete pending keyed indexing on an IMAP connection with a selected mailbox.
+pub async fn imap_index_current(imap: &mut ImapConnection) {
+    imap.send("SEARCH TEXT za-index-current").await;
+    imap.assert_read(ImapReplyType::Tagged, imap_proto::ResponseType::Ok)
+        .await;
 }
 
 /// An OAuth access token of `name` with every scope (`za_grant_token`). The

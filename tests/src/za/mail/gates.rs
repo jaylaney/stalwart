@@ -24,26 +24,32 @@ use crate::{
         imap::{AssertResult, ImapConnection, Type},
         jmap::JmapResponse,
         server::TestServer,
-        za::{KEYLESS_JMAP_USING as USING, Keyless, wait_for_delivery, za_setup, za_setup_token},
+        za::{
+            KEYLESS_JMAP_USING as USING, Keyless, log_records_since, wait_for_delivery,
+            za_index_current, za_setup, za_setup_token,
+        },
     },
     za::{
         STRONG,
         tracing::{ws_close, ws_connect},
         user_permissions,
+        websocket::{assert_state_push, enable_state_push},
     },
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::za::ZA_MAIL_KEYLESS;
 use email::mailbox::{DRAFTS_ID, INBOX_ID, TRASH_ID};
 use imap_proto::ResponseType;
+use jmap_proto::types::state::State;
 use registry::schema::prelude::ObjectType;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
+use store::query::log::Change;
 use trc::{EventType, SecurityEvent, StoreEvent};
 use types::{
     blob::{BlobClass, BlobId},
     blob_hash::BlobHash,
-    collection::Collection,
+    collection::{Collection, SyncCollection},
     id::Id,
 };
 
@@ -442,8 +448,7 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
                 "Mailbox/changes",
                 json!({ "accountId": account, "sinceState": mailbox_state }),
             ),
-            ("Mailbox/set", json!({ "accountId": account })),
-            ("Core/echo", json!({ "keylessControl": true })),
+            ("Core/echo", json!({ "hello": true })),
             (
                 "Email/set",
                 json!({
@@ -481,6 +486,9 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
             let response = channel.call(key, method, args).await;
             assert_eq!(response[0], method, "{what}: {response}");
             assert!(!response.to_string().contains(CANARY), "{what}: {response}");
+            if method == "Core/echo" {
+                assert_eq!(response[1], json!({ "hello": true }), "{what}: {response}");
+            }
             if method == "Email/set" {
                 assert!(
                     response[1]
@@ -492,7 +500,82 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
                 );
             }
         }
-        if let Keyless::WebSocket(socket) = channel {
+        let created = channel
+            .call(
+                key,
+                "Mailbox/set",
+                json!({
+                    "accountId": account,
+                    "create": { "keyless": { "name": "keyless-mailbox" } },
+                }),
+            )
+            .await;
+        assert_eq!(created[0], "Mailbox/set", "{created}");
+        let mailbox_id = created[1]["created"]["keyless"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} did not create a mailbox: {created}"));
+        let destroyed = channel
+            .call(
+                key,
+                "Mailbox/set",
+                json!({
+                    "accountId": account, "destroy": [mailbox_id],
+                }),
+            )
+            .await;
+        assert_eq!(destroyed[0], "Mailbox/set", "{destroyed}");
+        assert_eq!(
+            destroyed[1]["destroyed"],
+            json!([mailbox_id]),
+            "{destroyed}"
+        );
+
+        if let Keyless::WebSocket(mut socket) = channel {
+            // Leave no pending indexing work when taking the log boundary.
+            za_index_current(key).await;
+            enable_state_push(&mut socket, "Email").await;
+            let since = test
+                .server
+                .store()
+                .get_last_change_id(key_id, SyncCollection::Email.into())
+                .await
+                .unwrap()
+                .unwrap();
+            let reply = key
+                .jmap_method_call(
+                    "Email/set",
+                    json!({
+                        "accountId": account,
+                        "update": { &email_id: { "keywords/$flagged": true } },
+                    }),
+                )
+                .await;
+            assert_eq!(reply.name_at(0), "Email/set", "{reply:?}");
+            assert!(
+                reply.0["methodResponses"][0][1]["updated"]
+                    .get(&email_id)
+                    .is_some(),
+                "{reply:?}"
+            );
+
+            // The response may use a later mapped snapshot. A state push
+            // carries the change id of the actual metadata commit.
+            let document_id = Id::from_str(&email_id).unwrap().document_id();
+            let records = log_records_since(test, key_id, SyncCollection::Email, since).await;
+            let updates = records.iter().filter_map(|(change_id, changes)| {
+                changes.iter().any(|change| {
+                    matches!(change, Change::UpdateItem(id) if Id::new(*id).document_id() == document_id)
+                }).then_some(*change_id)
+            }).collect::<Vec<_>>();
+            assert_eq!(updates.len(), 1, "flag update log: {records:?}");
+            assert_state_push(
+                &mut socket,
+                account,
+                "Email",
+                &State::Exact(updates[0]).to_string(),
+                &[&email_id, &thread_id],
+            )
+            .await;
             ws_close(socket).await;
         }
     }
