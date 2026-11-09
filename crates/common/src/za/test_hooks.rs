@@ -859,6 +859,7 @@ pub static SEARCH_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_SWAP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_SNAPSHOT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_VIEW_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+static SEARCH_PAGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_SWEEP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_PASS_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_DESTROY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -905,6 +906,14 @@ pub fn set_search_view_pause(pause: Option<Arc<Pause>>) {
 
 pub async fn search_view_pause_point(account_id: u32) {
     wait(take_for(&SEARCH_VIEW_PAUSE, account_id)).await;
+}
+
+pub fn set_search_page_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_PAGE_PAUSE, pause);
+}
+
+pub(super) async fn search_page_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_PAGE_PAUSE, account_id)).await;
 }
 
 pub fn set_search_sweep_pause(pause: Option<Arc<Pause>>) {

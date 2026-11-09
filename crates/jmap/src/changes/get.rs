@@ -17,6 +17,7 @@ use crate::{
             ViewerChange, ViewerChanges, fill_page, private_query,
         },
         state::{JmapCacheState, max_state},
+        za::{ZaChangesSince, za_changes_page},
     },
     participant_identity::changes::ParticipantIdentityChanges,
 };
@@ -25,7 +26,10 @@ use common::{
     GroupwareResources, MessageStoreCache, Server, auth::AccessToken,
     storage::metadata::MetadataViewer,
 };
-use email::cache::{MessageCacheFetch, email::MessageCacheAccess, mailbox::MailboxCacheAccess};
+use email::{
+    cache::{MessageCacheFetch, email::MessageCacheAccess, mailbox::MailboxCacheAccess},
+    message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error},
+};
 use groupware::{
     cache::GroupwareCache,
     calendar::{EVENT_SECRET, notification::CalendarNotificationViewers},
@@ -248,15 +252,20 @@ impl ChangesLookup for Server {
             }
             _ => {}
         }
-        let max_changes = match request.max_changes {
-            Some(0) => {
-                return Err(trc::JmapEvent::InvalidArguments
-                    .into_err()
-                    .details("maxChanges must be greater than 0."));
-            }
-            Some(max_changes) => max_changes.min(self.core.jmap.changes_max_results),
-            None => self.core.jmap.changes_max_results,
-        };
+        let max_changes = changes_limit(self, request.max_changes)?;
+        if matches!(object, MethodObject::Email | MethodObject::Thread)
+            && let Some(keys) = access_token.za_keys_for(request.account_id.document_id())
+        {
+            let since = ZaChangesSince::new(request.since_state);
+            let account_id = request.account_id.document_id();
+            let view = self
+                .za_response_snapshot(account_id, keys, since.minimum())
+                .await
+                .map_err(|reason| za_no_map_error(reason, account_id))?;
+            return za_changes_page(self, request.account_id, object, since, max_changes, &view)
+                .await
+                .map(|page| page.changes);
+        }
         let mut response: ChangesResponse<NullObject> = ChangesResponse {
             account_id: request.account_id,
             old_state: request.since_state.clone(),
@@ -799,4 +808,15 @@ fn transmute_response<T: JmapObject>(
         destroyed: response.destroyed,
         updated_properties,
     })
+}
+
+pub(super) fn changes_limit(server: &Server, requested: Option<usize>) -> trc::Result<usize> {
+    let limit = server.core.jmap.changes_max_results;
+    match requested {
+        Some(0) => Err(trc::JmapEvent::InvalidArguments
+            .into_err()
+            .details("maxChanges must be greater than 0.")),
+        Some(requested) => Ok(requested.min(limit)),
+        None => Ok(limit),
+    }
 }

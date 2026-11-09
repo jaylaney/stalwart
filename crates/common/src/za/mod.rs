@@ -46,6 +46,14 @@ pub const ZA_TRACE_MAIL_COPY: &str = "zero-access: mail copy across accounts";
 /// account's mailbox.
 pub const ZA_TRACE_MAIL_SHARING: &str = "zero-access: sharing refused on a key account's mailbox";
 
+/// JMAP changes pause after the first retained-bound check.
+pub async fn search_page_pause_point(account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::search_page_pause_point(account_id).await;
+    #[cfg(not(feature = "test_mode"))]
+    let _ = account_id;
+}
+
 /// Key pinning spec 6.4: `contacts/pin`'s pause point after its last event
 /// commit, before the step 5 retirement (`test_hooks::REDELIVER_CLEANUP_PAUSE`).
 /// The HTTP crate calls it from its own test builds; it pauses only when

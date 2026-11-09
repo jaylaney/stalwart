@@ -18,7 +18,7 @@ use crate::{
         metadata::{MetadataType, ObjectMetadata},
         query::QueryResponseBuilder,
     },
-    changes::state::JmapCacheState,
+    changes::{state::JmapCacheState, za::ZaChangesEndpoint},
     email::{
         za::sort_needs_content,
         za_search::{za_content_query, za_sort_comparator, za_unavailable},
@@ -106,7 +106,7 @@ enum Pending<'a> {
 }
 
 struct Page<'a> {
-    snapshot: Option<&'a ZaView>,
+    map: Option<EmailQueryMap<'a>>,
     builder: QueryResponseBuilder,
     threads: Option<RoaringBitmap>,
     total: usize,
@@ -125,9 +125,14 @@ impl EmailQuery for Server {
             request.account_id.document_id(),
             &request.filter,
             request.sort.as_deref().unwrap_or_default(),
+            None,
         )
         .await?;
-        email_query_with_view(self, request, access_token, using, view.as_ref(), mode).await
+        let map = view.as_ref().map(|view| EmailQueryMap {
+            view,
+            endpoint: None,
+        });
+        email_query_with_view(self, request, access_token, using, map, mode).await
     }
 }
 
@@ -143,17 +148,40 @@ pub(crate) async fn email_query_view(
     account_id: u32,
     filters: &[Filter<EmailQueryFilter>],
     sorts: &[Comparator<EmailComparator>],
+    minimum: Option<u64>,
 ) -> trc::Result<(Option<ZaView>, Option<EmailQueryViewMode>)> {
-    if let Some(view) = za_content_query(server, access_token, account_id, filters, sorts).await? {
+    if let Some(view) =
+        za_content_query(server, access_token, account_id, filters, sorts, minimum).await?
+    {
         Ok((Some(view), Some(EmailQueryViewMode::Content)))
     } else if let Some(keys) = access_token.za_keys_for(account_id) {
         let view = server
-            .za_snapshot(account_id, keys)
+            .za_response_snapshot(account_id, keys, minimum)
             .await
             .map_err(|reason| za_no_map_error(reason, account_id))?;
         Ok((Some(view), Some(EmailQueryViewMode::Map)))
     } else {
         Ok((None, None))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct EmailQueryMap<'a> {
+    pub(crate) view: &'a ZaView,
+    pub(crate) endpoint: Option<&'a ZaChangesEndpoint>,
+}
+
+impl EmailQueryMap<'_> {
+    fn thread_of(self, document_id: u32) -> u32 {
+        self.endpoint.map_or_else(
+            || self.view.thread_of(document_id),
+            |endpoint| endpoint.thread_of(self.view, document_id),
+        )
+    }
+
+    fn contains(self, document_id: u32) -> bool {
+        self.endpoint
+            .is_none_or(|endpoint| endpoint.contains(self.view, document_id))
     }
 }
 
@@ -163,9 +191,10 @@ pub(crate) async fn email_query_with_view(
     mut request: QueryRequest<Email>,
     access_token: &AccessToken,
     using: CapabilityIds,
-    view: Option<&ZaView>,
+    map: Option<EmailQueryMap<'_>>,
     mode: Option<EmailQueryViewMode>,
 ) -> trc::Result<QueryResponse> {
+    let view = map.map(|map| map.view);
     let account_id = request.account_id.document_id();
     let content = match mode {
         Some(EmailQueryViewMode::Content) => Some(view.expect("a selected content view").content()),
@@ -205,7 +234,7 @@ pub(crate) async fn email_query_with_view(
         access,
         metadata_matches.into_iter(),
         server.core.email.default_language,
-        view,
+        map,
         content,
     )?;
     let sort = request.sort.take();
@@ -220,8 +249,11 @@ pub(crate) async fn email_query_with_view(
                 .map(|filter| filter.readable(&cache))
                 .unwrap_or_default()
         });
-    let mut comparators = sort_comparators(sort, view.zip(documents.as_ref()))?;
-    let query_state = if view.is_some() {
+    let mut comparators = sort_comparators(sort, map.zip(documents.as_ref()))?;
+    let query_state = if let Some(endpoint) = map.and_then(|map| map.endpoint) {
+        debug_assert!(endpoint.since <= endpoint.end);
+        State::new_exact(endpoint.end)
+    } else if view.is_some() {
         cache.get_state(false)
     } else {
         sampled.state(cache.get_state(false))
@@ -229,10 +261,10 @@ pub(crate) async fn email_query_with_view(
     let max_results = server.core.jmap.query_max_results;
 
     let Some(mut filter) = filter.filter(|query| !query.row.access.is_empty()) else {
-        return Page::new(&request, max_results, query_state, view).finish();
+        return Page::new(&request, max_results, query_state, map).finish();
     };
 
-    restrict_thread_keywords(&mut comparators, &cache, &mut filter, view);
+    restrict_thread_keywords(&mut comparators, &cache, &mut filter, map);
     let windowed = if view.is_none() && server.search_store().supports_windowed_walk() {
         let resolve_rows = server
             .search_store()
@@ -274,7 +306,7 @@ pub(crate) async fn email_query_with_view(
                 .caused_by(trc::location!())?
         };
         if residual.is_empty() {
-            return Page::new(&request, max_results, query_state, view).finish();
+            return Page::new(&request, max_results, query_state, map).finish();
         }
         filter.row.residual = Some(residual);
     }
@@ -288,7 +320,7 @@ pub(crate) async fn email_query_with_view(
         max_results,
         query_state,
         windowed,
-        view,
+        map,
     ) {
         Pending::Ready(page) => page.finish(),
         Pending::Window {
@@ -345,7 +377,7 @@ impl<'a> Pending<'a> {
         max_results: usize,
         query_state: State,
         windowed: Option<WindowedWalk>,
-        view: Option<&'a ZaView>,
+        map: Option<EmailQueryMap<'a>>,
     ) -> Self {
         let candidates = Candidates::new(&cache.emails, filter);
         if let Some(WindowedWalk {
@@ -354,7 +386,7 @@ impl<'a> Pending<'a> {
             resolve_rows,
         }) = windowed
         {
-            let page = Page::new(&request, max_results, query_state, view);
+            let page = Page::new(&request, max_results, query_state, map);
             let wanted = usize::try_from(request.position.unwrap_or(0))
                 .unwrap_or(0)
                 .saturating_add(page.builder.limit);
@@ -379,7 +411,7 @@ impl<'a> Pending<'a> {
             && let Some(position) = request.position.filter(|position| *position < 0)
             && !matches!(plan, Plan::Sorted(_))
         {
-            let total = candidates.count(&cache.emails, filter, collapse_threads(&request), view);
+            let total = candidates.count(&cache.emails, filter, collapse_threads(&request), map);
             let start = i64::try_from(total)
                 .unwrap_or(i64::MAX)
                 .saturating_add(i64::from(position))
@@ -387,7 +419,7 @@ impl<'a> Pending<'a> {
             request.position = Some(i32::try_from(start).unwrap_or(i32::MAX));
         }
 
-        let mut page = Page::new(&request, max_results, query_state, view);
+        let mut page = Page::new(&request, max_results, query_state, map);
         match plan {
             Plan::Walk(order) => {
                 page.walk(&cache.emails, filter, &candidates, order);
@@ -411,7 +443,7 @@ fn restrict_thread_keywords(
     comparators: &mut [MessageComparator],
     cache: &MessageStoreCache,
     filter: &mut QueryFilter,
-    snapshot: Option<&ZaView>,
+    map: Option<EmailQueryMap<'_>>,
 ) {
     for comparator in comparators {
         if let MessageComparator::Cache {
@@ -420,8 +452,10 @@ fn restrict_thread_keywords(
         } = comparator
         {
             let visible = filter.visible(cache);
-            let documents = if let Some(snapshot) = snapshot {
-                za_thread_keywords(snapshot, keyword, *match_all, None, visible)
+            let documents = if let Some(map) = map {
+                za_thread_keywords(map.view, keyword, *match_all, None, visible, |message| {
+                    map.thread_of(message.document_id())
+                })
             } else if let Some(visible) = visible {
                 thread_keywords(cache, keyword, *match_all, None, Some(visible))
             } else {
@@ -531,15 +565,15 @@ impl Candidates {
         cache: &MessagesCache,
         filter: &RowFilter,
         collapse_threads: bool,
-        snapshot: Option<&ZaView>,
+        map: Option<EmailQueryMap<'_>>,
     ) -> usize {
         match self {
-            Candidates::All => count_matches(cache.iter(), filter, collapse_threads, snapshot),
+            Candidates::All => count_matches(cache.iter(), filter, collapse_threads, map),
             Candidates::Positions(positions) => count_matches(
                 positions.iter().filter_map(|position| cache.at(*position)),
                 filter,
                 collapse_threads,
-                snapshot,
+                map,
             ),
         }
     }
@@ -559,13 +593,13 @@ fn count_matches<'x>(
     messages: impl Iterator<Item = MessageRef<'x>>,
     filter: &RowFilter,
     collapse_threads: bool,
-    snapshot: Option<&ZaView>,
+    map: Option<EmailQueryMap<'_>>,
 ) -> usize {
     if collapse_threads {
         let mut threads = RoaringBitmap::new();
         messages
             .filter(|message| {
-                filter.matches(*message) && threads.insert(thread_prefix(snapshot, *message))
+                filter.matches(*message) && threads.insert(thread_prefix(map, *message))
             })
             .count()
     } else {
@@ -583,10 +617,10 @@ fn matching_ids<'x>(
         .collect()
 }
 
-fn thread_prefix(snapshot: Option<&ZaView>, message: MessageRef<'_>) -> u32 {
-    snapshot.map_or_else(
+fn thread_prefix(map: Option<EmailQueryMap<'_>>, message: MessageRef<'_>) -> u32 {
+    map.map_or_else(
         || message.thread_id(),
-        |snapshot| snapshot.thread_of(message.document_id()),
+        |map| map.thread_of(message.document_id()),
     )
 }
 
@@ -595,10 +629,10 @@ impl<'a> Page<'a> {
         request: &QueryRequest<Email>,
         max_results: usize,
         query_state: State,
-        snapshot: Option<&'a ZaView>,
+        map: Option<EmailQueryMap<'a>>,
     ) -> Self {
         Page {
-            snapshot,
+            map,
             builder: QueryResponseBuilder::new_streaming(max_results, query_state, request),
             threads: collapse_threads(request).then(RoaringBitmap::new),
             total: 0,
@@ -606,7 +640,7 @@ impl<'a> Page<'a> {
     }
 
     fn emit(&mut self, message: MessageRef<'_>) -> bool {
-        let thread_id = thread_prefix(self.snapshot, message);
+        let thread_id = thread_prefix(self.map, message);
         if self
             .threads
             .as_mut()
@@ -619,7 +653,7 @@ impl<'a> Page<'a> {
     }
 
     fn count(&mut self, message: MessageRef<'_>) {
-        let thread_id = thread_prefix(self.snapshot, message);
+        let thread_id = thread_prefix(self.map, message);
         if self
             .threads
             .as_mut()
@@ -722,9 +756,7 @@ impl<'a> Page<'a> {
         };
         self.total = total;
         for (document_id, thread_id) in messages {
-            let thread_id = self
-                .snapshot
-                .map_or(thread_id, |snapshot| snapshot.thread_of(document_id));
+            let thread_id = self.map.map_or(thread_id, |map| map.thread_of(document_id));
             if !self.builder.add(thread_id, document_id) {
                 break;
             }
@@ -756,20 +788,20 @@ impl<'a> Page<'a> {
 
 fn sort_comparators(
     sort: Option<Vec<Comparator<EmailComparator>>>,
-    content_sort: Option<(&ZaView, &RoaringBitmap)>,
+    content_sort: Option<(EmailQueryMap<'_>, &RoaringBitmap)>,
 ) -> trc::Result<Vec<MessageComparator>> {
     let sort = sort.filter(|sort| !sort.is_empty()).unwrap_or_default();
     let mut comparators = Vec::with_capacity(sort.len());
     for comparator in sort {
         let ascending = comparator.is_ascending;
-        if let Some((view, documents)) = content_sort
+        if let Some((map, documents)) = content_sort
             && let Some(comparator) = za_sort_comparator(
                 &comparator.property,
                 ascending,
-                view.content(),
-                &view.cache,
+                map.view.content(),
+                &map.view.cache,
                 documents,
-                |message| view.thread_of(message.document_id()),
+                |message| map.thread_of(message.document_id()),
             )
         {
             comparators.push(comparator);

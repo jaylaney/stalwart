@@ -26,6 +26,7 @@ pub fn za_thread_keywords(
     match_all: bool,
     documents: Option<&RoaringBitmap>,
     visible: Option<&RoaringBitmap>,
+    thread_of: impl Fn(&MessageRef<'_>) -> u32,
 ) -> RoaringBitmap {
     thread_keywords_by(
         &snapshot.cache,
@@ -33,7 +34,7 @@ pub fn za_thread_keywords(
         match_all,
         documents,
         visible,
-        |message| snapshot.thread_of(message.document_id()),
+        thread_of,
     )
 }
 
@@ -144,11 +145,19 @@ mod tests {
             [1].into_iter().collect::<AHashSet<_>>()
         );
 
-        let some_seen = |documents, visible| {
-            za_thread_keywords(&snapshot, &Keyword::Seen, false, documents, visible)
+        let keywords = |all, documents, visible| {
+            za_thread_keywords(
+                &snapshot,
+                &Keyword::Seen,
+                all,
+                documents,
+                visible,
+                |message| snapshot.thread_of(message.document_id()),
+            )
         };
+        let some_seen = |documents, visible| keywords(false, documents, visible);
         assert_eq!(some_seen(None, None), RoaringBitmap::from([1, 2]));
-        assert!(za_thread_keywords(&snapshot, &Keyword::Seen, true, None, None).is_empty());
+        assert!(keywords(true, None, None).is_empty());
         let documents = RoaringBitmap::from([2]);
         let visible = RoaringBitmap::from([1, 2]);
         assert_eq!(some_seen(Some(&documents), Some(&visible)), documents);

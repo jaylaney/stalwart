@@ -5,7 +5,12 @@
  */
 
 use crate::{
-    utils::{account::Account, http::HttpRequest, server::TestServer},
+    utils::{
+        account::Account,
+        http::HttpRequest,
+        pop3::{Pop3Connection, ResponseType as Pop3Reply},
+        server::TestServer,
+    },
     za::tracing::{WsStream, ws_call},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -547,6 +552,28 @@ pub async fn index_holds(test: &TestServer, account_id: u32, document_id: u32) -
         .read_loaded()
         .await
         .is_some_and(|index| index.thread.exists_at(document_id, u64::MAX) == Some(true))
+}
+
+/// Delete an INBOX document through POP3 without triggering a search pass.
+pub async fn pop3_delete(test: &TestServer, account: &Account, document_id: u32) {
+    let cache = test
+        .server
+        .get_cached_messages(account.id().document_id())
+        .await
+        .unwrap();
+    let mailbox = imap::core::MailboxView::build(&cache, INBOX_ID);
+    let position = mailbox
+        .live_rows_by_uid()
+        .iter()
+        .position(|row| row.id == document_id)
+        .unwrap()
+        + 1;
+    let mut pop3 = Pop3Connection::connect().await;
+    pop3.authenticate(account.name(), account.secret()).await;
+    pop3.send(&format!("DELE {position}")).await;
+    pop3.assert_read(Pop3Reply::Ok).await;
+    pop3.send("QUIT").await;
+    pop3.assert_read(Pop3Reply::Ok).await;
 }
 
 pub async fn log_records_since(

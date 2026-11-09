@@ -145,8 +145,12 @@ impl ThreadPart {
     }
 
     pub fn thread_of(&self, document_id: u32, change_id: u64) -> u32 {
+        self.thread_of_revision(document_id, self.revision_at(change_id))
+    }
+
+    pub fn thread_of_revision(&self, document_id: u32, revision: u32) -> u32 {
         self.record(document_id).map_or(document_id, |record| {
-            self.thread_at_revision(record, self.revision_at(change_id))
+            self.thread_at_revision(record, revision)
         })
     }
 

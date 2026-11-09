@@ -14,14 +14,11 @@ use common::{
         search::trace::{ZA_SEARCH_UNAVAILABLE, za_search_trace},
     },
 };
-use email::{
-    cache::email::MessageAccess,
-    message::{
-        sortkeys::MessageComparator,
-        za::search::{
-            ensure::Unavailable,
-            view::{ViewNeed, ZaView, za_view},
-        },
+use email::message::{
+    sortkeys::MessageComparator,
+    za::search::{
+        ensure::Unavailable,
+        view::{ViewNeed, ZaView, za_view_with_minimum},
     },
 };
 use jmap_proto::{
@@ -46,6 +43,7 @@ pub async fn za_content_query(
     account_id: u32,
     filters: &[Filter<EmailQueryFilter>],
     sorts: &[Comparator<EmailComparator>],
+    minimum: Option<u64>,
 ) -> trc::Result<Option<ZaView>> {
     let first_filter = first_refused_filter(filters);
     let first_sort = first_refused_sort(sorts);
@@ -80,18 +78,24 @@ pub async fn za_content_query(
     }
 
     let deadline = Instant::now() + Duration::from_secs(server.za_search_config().wait_secs);
-    za_view(server, account_id, keys, ViewNeed::Content { deadline })
-        .await
-        .map(Some)
-        .map_err(|error| {
-            let reason = error.into_unavailable();
-            za_search_trace!(
-                ZA_SEARCH_UNAVAILABLE,
-                AccountId = account_id,
-                Reason = reason.as_str()
-            );
-            za_unavailable(property, is_sort, &reason)
-        })
+    za_view_with_minimum(
+        server,
+        account_id,
+        keys,
+        ViewNeed::Content { deadline },
+        minimum,
+    )
+    .await
+    .map(Some)
+    .map_err(|error| {
+        let reason = error.into_unavailable();
+        za_search_trace!(
+            ZA_SEARCH_UNAVAILABLE,
+            AccountId = account_id,
+            Reason = reason.as_str()
+        );
+        za_unavailable(property, is_sort, &reason)
+    })
 }
 
 fn refusal(property: &dyn Display, is_sort: bool, text: &str) -> trc::Error {
@@ -111,7 +115,7 @@ pub fn za_resolve_condition(
     condition: &EmailFilter,
     content: &ContentPart,
     cache: &MessageStoreCache,
-    access: &MessageAccess,
+    is_visible: impl Fn(MessageRef<'_>) -> bool,
     thread_of: impl Fn(&MessageRef<'_>) -> u32,
 ) -> Option<RoaringBitmap> {
     let documents = content.document_ids();
@@ -145,12 +149,7 @@ pub fn za_resolve_condition(
             let wanted = attachment_keyword(keyword)?;
             let all = matches!(condition, EmailFilter::AllInThreadHaveKeyword(_));
             let none = matches!(condition, EmailFilter::NoneInThreadHaveKeyword(_));
-            let visible = || {
-                cache
-                    .emails
-                    .iter()
-                    .filter(|message| access.allows(*message))
-            };
+            let visible = || cache.emails.iter().filter(|message| is_visible(*message));
             let threads = attachment_threads(content, wanted, all, visible(), &thread_of);
             visible()
                 .filter(|message| threads.contains(thread_of(message)) != none)

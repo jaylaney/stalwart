@@ -327,7 +327,7 @@ async fn case_metadata_query_changes_borrows_one_map(test: &TestServer, key: &Ac
     );
 }
 
-async fn separate_publisher(test: &TestServer) -> Server {
+pub(super) async fn separate_publisher(test: &TestServer) -> Server {
     let core = test.server.core.clone();
     let mut bootstrap = Bootstrap::new(test.server.registry().clone()).await;
     let data = Data::parse(&mut bootstrap).await;
