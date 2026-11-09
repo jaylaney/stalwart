@@ -179,6 +179,13 @@ impl Server {
         Ok((hashes, if scanned { "scan" } else { "inventory" }))
     }
 
+    pub async fn za_search_reset(&self, account_id: u32) -> trc::Result<()> {
+        if self.za_is_key_account(account_id).await? {
+            self.za_search_destroy(account_id, true).await?;
+        }
+        Ok(())
+    }
+
     pub async fn za_search_destroy(&self, account_id: u32, clear_field: bool) -> trc::Result<()> {
         let live_account = clear_field.then(|| {
             ValueClass::Registry(RegistryClass::Item {

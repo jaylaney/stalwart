@@ -7,8 +7,8 @@
 //! Request-owned indexing against sealed LMTP/IMAP mail and the real store.
 
 use super::{
-    Traced, corrupt_blob, deliver, key_mail_account, message_ids, message_with, stored_blob,
-    stored_hash,
+    Traced, corrupt_blob, deliver, key_mail_account, message_ids, message_with, metadata_key,
+    stored_blob, stored_hash,
 };
 use crate::{
     utils::{
@@ -26,6 +26,7 @@ use crate::{
         },
     },
     za::{
+        leak::{create_blob_codec_key, recode_blobs, retire_blob_codec_key},
         tracing::{ws_call, ws_close, ws_connect},
         user_permissions,
     },
@@ -47,9 +48,9 @@ use common::za::{
     test_hooks::{
         reset_za_search_counters, set_search_blob_fail_once, set_search_blob_slow,
         set_search_commit_pause, set_search_config_override, set_search_destroy_fail_once,
-        set_search_destroy_pause, set_search_hold_expire, set_search_pass_pause,
-        set_search_recovery_pause, set_search_snapshot_pause, set_search_swap_pause,
-        set_search_swap_skip, za_search_blob_reads, za_search_message_opens,
+        set_search_destroy_pause, set_search_hold_expire, set_search_open_fail_all,
+        set_search_pass_pause, set_search_recovery_pause, set_search_snapshot_pause,
+        set_search_swap_pause, set_search_swap_skip, za_search_blob_reads, za_search_message_opens,
     },
 };
 use email::{
@@ -64,7 +65,16 @@ use email::{
 };
 use imap_proto::ResponseType;
 use jmap_proto::types::state::State;
-use registry::{schema::prelude::ObjectType, types::EnumImpl};
+use registry::{
+    schema::{
+        enums::{CompressionAlgo, TaskAccountMaintenanceType, TaskBlobRecodeCompression},
+        prelude::ObjectType,
+        structs::{
+            Task, TaskAccountMaintenance, TaskBlobRecodeEncryption, TaskBlobRecodeKey, TaskStatus,
+        },
+    },
+    types::EnumImpl,
+};
 use serde_json::{Value, json};
 use std::{
     str::FromStr,
@@ -74,8 +84,10 @@ use store::{
     ValueKey,
     query::log::{Change, PartialChange},
     write::{
-        BatchBuilder, BlobLink, BlobOp, RegistryClass, ValueClass, assert::AssertValue,
-        blob::BlobLinkValue, blob_codec::BlobOpts,
+        BatchBuilder, BlobLink, BlobOp, RegistryClass, ValueClass,
+        assert::AssertValue,
+        blob::BlobLinkValue,
+        blob_codec::{BlobFormat, BlobOpts},
     },
     za_search::{
         BlobHeader, Checkpoint,
@@ -208,6 +220,9 @@ pub async fn test(test: &mut TestServer) {
     }
     case_blob_hook_does_not_create_mailboxes(test, &triggers, false).await;
     test.wait_for_tasks().await;
+    case_i6_reindex_resets_the_index(test, &admin).await;
+    case_reindex_without_email_rows(test, &admin).await;
+    case_blob_recode_recodes_the_index(test, &admin).await;
     destroy_cases(test, &admin).await;
     test_recovery(test).await;
     test_compaction(test, &admin).await;
@@ -1995,13 +2010,285 @@ async fn case_repeated_delta_changes_nothing(test: &TestServer, key: &Account) {
     assert_eq!(view.thread.present_members(thread), ids);
 }
 
+async fn reindex_account(test: &TestServer, admin: &Account, key: &Account) {
+    admin
+        .registry_create_object(Task::AccountMaintenance(TaskAccountMaintenance {
+            account_id: key.id(),
+            maintenance_type: TaskAccountMaintenanceType::Reindex,
+            status: TaskStatus::now(),
+        }))
+        .await;
+    tokio::time::timeout(Duration::from_secs(30), test.wait_for_tasks())
+        .await
+        .expect("search fixture's reindex task did not finish");
+}
+
+async fn case_i6_reindex_resets_the_index(test: &TestServer, admin: &Account) {
+    use store::write::serialize::RawValue;
+
+    println!("case_i6_reindex_resets_the_index");
+    let key = destroy_fixture(admin, "keymail63@example.com").await;
+    let id = account_id(&key);
+    for number in 1..=4 {
+        deliver_one(
+            test,
+            &key,
+            &format!("reindexneedle indexedfixture {number}"),
+        )
+        .await;
+    }
+    let indexed = get_recovery_ids(&key).await;
+    assert_eq!(indexed.len(), 4);
+    assert_eq!(
+        queried(&recovery_query(&key, Some("reindexneedle")).await),
+        indexed
+    );
+    let before = index(test, id).await;
+
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    set_search_open_fail_all(Some(id));
+    let mut skipped = Vec::new();
+    for number in 1..=3 {
+        skipped.push(
+            deliver_one(
+                test,
+                &key,
+                &format!("reindexneedle skippedfixture {number}"),
+            )
+            .await,
+        );
+        mailbox_get(&key).await;
+    }
+    let all = get_recovery_ids(&key).await;
+    assert_eq!(all.len(), 7);
+    assert!(queried(&recovery_query(&key, Some("skippedfixture")).await).is_empty());
+    let threads = key
+        .jmap_method_call("Thread/get", json!({"accountId": key.id_string()}))
+        .await;
+    assert_eq!(threads.name_at(0), "Thread/get", "{:?}", threads.0);
+    set_search_open_fail_all(None);
+
+    let events = traces.finish().await;
+    let mut skipped_events = events
+        .iter()
+        .filter(|event| {
+            event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_SKIPPED
+        })
+        .map(|event| {
+            event
+                .keys
+                .iter()
+                .find_map(|(key, value)| match (key, value) {
+                    (Key::DocumentId, TraceValue::UInt(value)) => {
+                        Some(u32::try_from(*value).unwrap())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    skipped.sort_unstable();
+    skipped_events.sort_unstable();
+    assert_eq!(skipped_events, skipped);
+    let skipped_ids = all
+        .iter()
+        .filter(|email| skipped.contains(&Id::from_str(email).unwrap().document_id()))
+        .collect::<Vec<_>>();
+    assert_eq!(skipped_ids.len(), 3);
+    for email in skipped_ids {
+        assert!(
+            threads
+                .list()
+                .iter()
+                .any(|thread| { reply_ids(thread, "emailIds").as_slice() == [email.as_str()] }),
+            "missing singleton for skipped message {email}"
+        );
+    }
+
+    let vault_key = ValueKey::property(
+        id,
+        Collection::Principal,
+        0,
+        PrincipalField::ZeroAccessVault,
+    );
+    let store = test.server.store();
+    let vault = store
+        .get_value::<RawValue>(vault_key.clone())
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let mut rows = Vec::new();
+    for document in message_ids(test, id).await {
+        let row_key = metadata_key(id, document);
+        let bytes = store
+            .get_value::<RawValue>(row_key.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        rows.push((row_key, bytes));
+    }
+    assert_eq!(rows.len(), 7);
+    let before_hashes = principal_hashes(test, id).await;
+    assert!(!before_hashes.is_empty());
+    reindex_account(test, admin, &key).await;
+
+    assert!(
+        manifest_bytes(test, id).await.is_none(),
+        "reindex must durably clear field 152 before keyed recovery"
+    );
+    assert!(principal_blob_links(test, id).await.is_empty());
+    assert!(
+        store
+            .get_value::<RawValue>(vault_key)
+            .await
+            .unwrap()
+            .is_some_and(|raw| raw.0 == vault),
+        "reindex changed the stored vault record"
+    );
+    assert_eq!(message_ids(test, id).await.len(), 7);
+    for (row_key, before) in rows {
+        assert!(
+            store
+                .get_value::<RawValue>(row_key)
+                .await
+                .unwrap()
+                .is_some_and(|raw| raw.0 == before),
+            "reindex changed a stored Email row"
+        );
+    }
+
+    // The resident view still exists. Only the ordinary keyed request can
+    // notice the missing durable generation and recover it.
+    let rebuilt_ids = get_recovery_ids(&key).await;
+    let mut rebuilt_docs = rebuilt_ids
+        .iter()
+        .map(|email| Id::from_str(email).unwrap().document_id())
+        .collect::<Vec<_>>();
+    rebuilt_docs.sort_unstable();
+    assert_eq!(rebuilt_docs, message_ids(test, id).await);
+    let after_get = index(test, id).await;
+    assert_ne!(after_get.epoch, before.epoch);
+    assert_eq!(
+        queried(&recovery_query(&key, Some("reindexneedle")).await),
+        rebuilt_ids
+    );
+    let rebuilt = index(test, id).await;
+    assert_manifest_links(test, id, &rebuilt).await;
+    let mut hashes = before_hashes;
+    hashes.extend(principal_hashes(test, id).await);
+    admin.destroy_account(key).await;
+    assert_destroyed_index(test, admin, id, &hashes).await;
+}
+
+async fn case_reindex_without_email_rows(test: &TestServer, admin: &Account) {
+    println!("case_reindex_without_email_rows");
+    let key = destroy_fixture(admin, "search-reindex-empty@example.com").await;
+    let id = account_id(&key);
+    assert!(message_ids(test, id).await.is_empty());
+    let before = index(test, id).await;
+    assert!(before.thread_blobs.is_empty() && before.content.is_none());
+    assert_manifest_links(test, id, &before).await;
+
+    reindex_account(test, admin, &key).await;
+    assert!(
+        manifest_bytes(test, id).await.is_none(),
+        "reindex skipped the empty key account"
+    );
+    assert!(principal_blob_links(test, id).await.is_empty());
+    assert!(get_recovery_ids(&key).await.is_empty());
+    let after = index(test, id).await;
+    assert_ne!(after.epoch, before.epoch);
+    assert_manifest_links(test, id, &after).await;
+
+    admin.destroy_account(key).await;
+    assert_destroyed_index(test, admin, id, &[]).await;
+}
+
+async fn case_blob_recode_recodes_the_index(test: &mut TestServer, admin: &Account) {
+    println!("case_blob_recode_recodes_the_index");
+    let key = destroy_fixture(admin, "keymail62@example.com").await;
+    let id = account_id(&key);
+    for number in 1..=3 {
+        deliver_one(test, &key, &format!("recodeneedle fixture {number}")).await;
+    }
+    let expected_ids = get_recovery_ids(&key).await;
+    assert_eq!(expected_ids.len(), 3);
+    let manifest = index(test, id).await;
+    assert!(!manifest.thread_blobs.is_empty() && manifest.content.is_some());
+    assert_manifest_links(test, id, &manifest).await;
+    let hashes = principal_hashes(test, id).await;
+    let mut expected_bytes = Vec::new();
+    for hash in &hashes {
+        expected_bytes.push(stored_blob(test, hash).await);
+    }
+
+    let codec_key = create_blob_codec_key(admin).await;
+    admin.reload_settings().await;
+    test.reload_core();
+    recode_blobs(
+        test,
+        admin,
+        TaskBlobRecodeCompression::Zstd,
+        TaskBlobRecodeEncryption::Encrypt(TaskBlobRecodeKey { key_id: codec_key }),
+    )
+    .await;
+    for (hash, bytes) in hashes.iter().zip(&expected_bytes) {
+        let raw = test
+            .server
+            .blob_store()
+            .get_raw_blob(hash.as_slice())
+            .await
+            .unwrap()
+            .unwrap();
+        let format = BlobFormat::of(&raw).unwrap();
+        assert_eq!(
+            format.key_id,
+            Some(codec_key.document_id()),
+            "Principal index blob {hash:?} missed the codec sweep"
+        );
+        // Zstd may leave sealed payloads uncompressed when compression does
+        // not reduce their size. Compute that choice from the original bytes.
+        let compressed = BlobOpts::compressed(CompressionAlgo::Zstd)
+            .encode(hash.as_slice(), bytes)
+            .unwrap();
+        assert_eq!(
+            format.compression,
+            BlobFormat::of(&compressed).unwrap().compression
+        );
+        assert_eq!(&stored_blob(test, hash).await, bytes);
+    }
+    simulate_restart(test, id).await;
+    assert_eq!(get_recovery_ids(&key).await, expected_ids);
+    assert_eq!(
+        queried(&recovery_query(&key, Some("recodeneedle")).await),
+        expected_ids
+    );
+    assert_eq!(index(test, id).await, manifest);
+
+    // The recode task swept the whole store. Remove the outer encryption
+    // before retiring the key, including from the other fixtures' blobs.
+    recode_blobs(
+        test,
+        admin,
+        TaskBlobRecodeCompression::Lz4,
+        TaskBlobRecodeEncryption::Disable,
+    )
+    .await;
+    admin.destroy_account(key).await;
+    assert_destroyed_index(test, admin, id, &hashes).await;
+    retire_blob_codec_key(test, admin, codec_key, None).await;
+}
+
 async fn destroy_cases(test: &TestServer, admin: &Account) {
     case_stale_permanent_destroy_creates_no_marker(test, admin).await;
     case_double_absence_removes_only_exact_orphan_links(test, admin).await;
     case_double_absence_scan_refuses_new_state(test, admin, false).await;
     case_double_absence_scan_refuses_new_state(test, admin, true).await;
     case_r7_interrupted_transitions_leave_nothing(test, admin).await;
-    case_r7_middle_node_break(test, admin).await;
+    case_r7_middle_node_break(test, admin, false).await;
+    case_r7_middle_node_break(test, admin, true).await;
     case_f23_unparseable_manifest(test, admin, false).await;
     case_f23_pre_release_account_without_a_manifest(test, admin).await;
     case_r19_paused_pass_loses_to_the_marker(test, admin).await;
@@ -2011,6 +2298,7 @@ async fn destroy_cases(test: &TestServer, admin: &Account) {
     case_reset_cannot_clear_after_registry_deletion(test, admin).await;
     case_reset_after_destroy_creates_no_marker(test, admin).await;
     case_stale_reset_scan_keeps_new_links(test, admin).await;
+    case_stale_reset_loses_to_reindex_rebuild(test, admin).await;
 }
 
 async fn destroy_fixture(admin: &Account, name: &'static str) -> Account {
@@ -2049,30 +2337,36 @@ async fn assert_destroyed_index(test: &TestServer, admin: &Account, id: u32, has
     }
 }
 
-async fn case_r7_middle_node_break(test: &TestServer, admin: &Account) {
-    let key = destroy_fixture(admin, "search-destroy-2@example.com").await;
+async fn case_r7_middle_node_break(test: &TestServer, admin: &Account, recover: bool) {
+    println!("case_r7_middle_node_break recover={recover}");
+    let name = if recover {
+        "search-destroy-2-recovery@example.com"
+    } else {
+        "search-destroy-2@example.com"
+    };
+    let key = destroy_fixture(admin, name).await;
     let id = account_id(&key);
-    set_search_config_override(Some(ZaSearchConfig {
-        segments: 8,
-        ..ZaSearchConfig::from_env().unwrap()
-    }));
+    let _config = search_config_guard!(test, segments: 8, absent_retry_secs: 0);
     for number in 1..=6 {
-        deliver_one(test, &key, &format!("Broken chain fixture {number}")).await;
+        deliver_one(test, &key, &format!("brokenchainneedle fixture {number}")).await;
         advanced(test, &key, true).await;
     }
-    set_search_config_override(None);
 
+    let mapped = if recover {
+        let reply = recovery_get(&key).await;
+        assert_eq!(reply.name_at(0), "Email/get", "{:?}", reply.0);
+        assert_eq!(reply.list().len(), 6);
+        Some(reply)
+    } else {
+        None
+    };
     let manifest = index(test, id).await;
     assert_manifest_links(test, id, &manifest).await;
-    let head = manifest.content.unwrap();
-    assert_eq!(head.length, 6);
-    let mut middle = head.hash;
-    for _ in 0..2 {
-        let bytes = stored_blob(test, &middle).await;
-        middle = BlobHeader::decode(&bytes).unwrap().0.predecessor.unwrap().0;
-    }
-    let hashes = principal_hashes(test, id).await;
-    assert!(hashes.len() > 6 && hashes.contains(&middle));
+    let old_content = content_hashes(test, &manifest).await;
+    assert_eq!(old_content.len(), 6);
+    let middle = &old_content[2];
+    let mut hashes = principal_hashes(test, id).await;
+    assert!(hashes.len() > 6 && hashes.contains(middle));
     assert!(
         test.server
             .blob_store()
@@ -2081,6 +2375,58 @@ async fn case_r7_middle_node_break(test: &TestServer, admin: &Account) {
             .unwrap()
     );
     simulate_restart(test, id).await;
+
+    if let Some(mapped) = mapped {
+        let mut expected = mapped
+            .list()
+            .iter()
+            .map(|email| email["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+        assert_eq!(
+            queried(&recovery_query(&key, Some("brokenchainneedle")).await),
+            expected
+        );
+        let after = index(test, id).await;
+        assert_eq!(after.epoch, manifest.epoch);
+        assert_eq!(after.thread_blobs, manifest.thread_blobs);
+        assert!(after.content_to.cursor.is_none());
+        let current = principal_hashes(test, id).await;
+        assert!(
+            old_content.iter().all(|hash| !current.contains(hash)),
+            "content recovery left old content links before destroy"
+        );
+        assert_manifest_links(test, id, &after).await;
+        let after_get = recovery_get(&key).await;
+        assert_eq!(after_get.name_at(0), "Email/get", "{:?}", after_get.0);
+        assert_eq!(after_get.list().len(), mapped.list().len());
+        assert!(
+            mapped
+                .list()
+                .iter()
+                .all(|email| after_get.list().contains(email))
+        );
+        let events = traces.finish().await;
+        let scanned = events.iter().any(|event| {
+            rebuild_trace(event, id, "content")
+                && event.keys.iter().any(|(key, value)| {
+                    *key == Key::Source
+                        && matches!(value, TraceValue::String(source) if source.as_str() == "scan")
+                })
+        });
+        assert!(
+            scanned,
+            "content recovery did not use the exact Principal link scan"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| rebuild_trace(event, id, "rebuild"))
+        );
+        hashes.extend(current);
+    }
+
     admin.destroy_account(key).await;
     assert_destroyed_index(test, admin, id, &hashes).await;
 }
@@ -2116,9 +2462,7 @@ async fn park_destroy(admin: &Account, key: &Account) -> HookParked<()> {
 async fn park_reset(test: &TestServer, id: u32) -> HookParked<trc::Result<()>> {
     let server = test.server.clone();
     HookParked::start(id, set_search_destroy_pause, async move {
-        // Reindex's admission gate will be wired in Task 16b.
-        assert!(server.za_is_key_account(id).await.unwrap());
-        server.za_search_destroy(id, true).await
+        server.za_search_reset(id).await
     })
     .await
 }
@@ -2390,7 +2734,8 @@ async fn case_reset_clears_a_live_account(test: &TestServer, admin: &Account) {
     let id = account_id(&key);
     let document = deliver_one(test, &key, "Live account reset").await;
     advanced(test, &key, true).await;
-    let hashes = principal_hashes(test, id).await;
+    let before = index(test, id).await;
+    let mut hashes = principal_hashes(test, id).await;
     assert_eq!(hashes.len(), 2);
     let vault_cas = test.server.za_vault_record(id).await.unwrap().unwrap().cas;
 
@@ -2403,6 +2748,13 @@ async fn case_reset_clears_a_live_account(test: &TestServer, admin: &Account) {
     );
     assert_eq!(message_ids(test, id).await, vec![document]);
 
+    let mapped = get_recovery_ids(&key).await;
+    assert_eq!(mapped.len(), 1);
+    assert_eq!(Id::from_str(&mapped[0]).unwrap().document_id(), document);
+    let after = index(test, id).await;
+    assert_ne!(after.epoch, before.epoch);
+    assert_manifest_links(test, id, &after).await;
+    hashes.extend(principal_hashes(test, id).await);
     admin.destroy_account(key).await;
     assert_destroyed_index(test, admin, id, &hashes).await;
 }
@@ -2464,6 +2816,55 @@ async fn case_stale_reset_scan_keeps_new_links(test: &TestServer, admin: &Accoun
         principal_blob_links(test, id).await,
         links,
         "the stale scan must leave new links intact"
+    );
+
+    let hashes = links.into_iter().map(|(hash, _)| hash).collect::<Vec<_>>();
+    admin.destroy_account(key).await;
+    assert_destroyed_index(test, admin, id, &hashes).await;
+}
+
+async fn case_stale_reset_loses_to_reindex_rebuild(test: &TestServer, admin: &Account) {
+    println!("case_stale_reset_loses_to_reindex_rebuild");
+    let key = destroy_fixture(admin, "search-reset-reindex-overlap@example.com").await;
+    let id = account_id(&key);
+    deliver_one(test, &key, "overlapneedle fixture").await;
+    write_manifest_bytes(test, id, None).await;
+    assert!(principal_blob_links(test, id).await.is_empty());
+
+    // The single task manager serializes AccountMaintenance. Model a stale
+    // execution after lease loss by running A's real reset helper directly.
+    // B is an actual queued Reindex and can finish while A stays parked.
+    let reset = park_reset(test, id).await;
+    assert_eq!(
+        read_manifest(test, id).await,
+        Some(ManifestValue::Destroying(Inventory::default()))
+    );
+    reindex_account(test, admin, &key).await;
+    assert!(
+        manifest_bytes(test, id).await.is_none(),
+        "queued reindex did not clear A's empty marker"
+    );
+    assert!(principal_blob_links(test, id).await.is_empty());
+
+    let mapped = get_recovery_ids(&key).await;
+    assert_eq!(mapped.len(), 1);
+    let rebuilt = index(test, id).await;
+    assert_manifest_links(test, id, &rebuilt).await;
+    let committed = manifest_bytes(test, id).await.unwrap();
+    let links = principal_blob_links(test, id).await;
+    assert!(!links.is_empty());
+
+    let result = reset.finish().await;
+    assert_eq!(
+        principal_blob_links(test, id).await,
+        links,
+        "A's stale scan unlinked B's rebuilt index"
+    );
+    assert!(result.as_ref().is_err_and(|err| err.is_assertion_failure()));
+    assert_eq!(manifest_bytes(test, id).await, Some(committed));
+    assert_eq!(
+        queried(&recovery_query(&key, Some("overlapneedle")).await),
+        mapped
     );
 
     let hashes = links.into_iter().map(|(hash, _)| hash).collect::<Vec<_>>();
