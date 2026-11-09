@@ -11,7 +11,7 @@ mod tests;
 use super::FormatError;
 use crate::search::{
     IndexDocument, MAX_STORED_DOCUMENT_SIZE, SearchFilter,
-    codec::{Reader, read_document},
+    codec::{Reader, document_scratch_size, read_document},
     leaf::{Leaf, LeafPlan},
     term::{AccountIndexer, deserialize_term_fields, matches_phrase},
 };
@@ -19,6 +19,7 @@ use ahash::AHashMap;
 use roaring::RoaringBitmap;
 use std::{collections::BTreeMap, ops::Range, str};
 use utils::cheeky_hash::CheekyHash;
+use zeroize::Zeroizing;
 
 const HAS_ATTACHMENT: u8 = 1;
 const HAS_SENT_AT: u8 = 2;
@@ -114,6 +115,32 @@ impl ContentRecord {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let frame = ContentFrame::parse(bytes)?;
+        frame.validate_terms(&mut Vec::new())?;
+        Ok(Self {
+            document_id: frame.document_id,
+            sent_at: frame.sent_at,
+            has_attachment: frame.has_attachment,
+            sort_keys: SortKeys {
+                from: frame.sort[0].to_owned(),
+                to: frame.sort[1].to_owned(),
+                subject: frame.sort[2].to_owned(),
+            },
+            terms: frame.terms.to_vec(),
+        })
+    }
+}
+
+pub(crate) struct ContentFrame<'a> {
+    document_id: u32,
+    sent_at: Option<i64>,
+    has_attachment: bool,
+    sort: [&'a str; 3],
+    terms: &'a [u8],
+}
+
+impl<'a> ContentFrame<'a> {
+    pub(crate) fn parse(bytes: &'a [u8]) -> Result<Self, FormatError> {
         let mut reader = Reader::new(bytes);
         let document_id = u32::from_le_bytes(read_array(&mut reader)?);
         let flags = reader.u8().ok_or(FormatError::Truncated)?;
@@ -125,26 +152,47 @@ impl ContentRecord {
             return Err(FormatError::Count);
         }
 
-        let sort_keys = SortKeys {
-            from: read_sort_key(&mut reader)?,
-            to: read_sort_key(&mut reader)?,
-            subject: read_sort_key(&mut reader)?,
-        };
+        let sort = [
+            read_sort_key(&mut reader)?,
+            read_sort_key(&mut reader)?,
+            read_sort_key(&mut reader)?,
+        ];
         let term_len = u32::from_le_bytes(read_array(&mut reader)?) as usize;
         let terms = reader.slice(term_len).ok_or(FormatError::Truncated)?;
         if term_len > MAX_STORED_DOCUMENT_SIZE || reader.u8().is_some() {
             return Err(FormatError::Count);
         }
-        // Only validated term tables reach the infallible posting updates.
-        deserialize_term_fields(terms, &mut Vec::new(), |_, _| {}).ok_or(FormatError::Count)?;
-
         Ok(Self {
             document_id,
             sent_at: (flags & HAS_SENT_AT != 0).then_some(sent_at),
             has_attachment: flags & HAS_ATTACHMENT != 0,
-            sort_keys,
-            terms: terms.to_vec(),
+            sort,
+            terms,
         })
+    }
+
+    pub(crate) fn scratch_size(&self) -> Result<usize, FormatError> {
+        document_scratch_size(self.terms).ok_or(FormatError::Count)
+    }
+
+    pub(crate) fn validate_terms(&self, scratch: &mut Vec<u8>) -> Result<(), FormatError> {
+        deserialize_term_fields(self.terms, scratch, |_, _| {}).ok_or(FormatError::Count)
+    }
+}
+
+pub struct OwnedContentFrame(pub(crate) Zeroizing<Box<[u8]>>);
+
+impl OwnedContentFrame {
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn document_id(&self) -> u32 {
+        u32::from_le_bytes(self.0[..4].try_into().expect("validated frame"))
+    }
+
+    pub fn from_record(record: &ContentRecord) -> Self {
+        Self(Zeroizing::new(record.encode().into_boxed_slice()))
     }
 }
 
@@ -156,23 +204,30 @@ fn read_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[u8; N], Format
         .map_err(|_| FormatError::Truncated)
 }
 
-fn read_sort_key(reader: &mut Reader<'_>) -> Result<String, FormatError> {
+fn read_sort_key<'a>(reader: &mut Reader<'a>) -> Result<&'a str, FormatError> {
     let len = reader.u8().ok_or(FormatError::Truncated)? as usize;
     let bytes = reader.slice(len).ok_or(FormatError::Truncated)?;
-    str::from_utf8(bytes)
-        .map(str::to_owned)
-        .map_err(|_| FormatError::Count)
+    str::from_utf8(bytes).map_err(|_| FormatError::Count)
 }
 
 struct Stored {
-    encoded: Box<[u8]>,
+    encoded: Zeroizing<Box<[u8]>>,
     term_range: Range<usize>,
     sent_at: Option<i64>,
     has_attachment: bool,
     sort: [Box<str>; 3],
 }
 
+// Account for the stored document key and value and per-entry hash bucket slack.
+const STORED_DOCUMENT_BYTES: usize = size_of::<(u32, Stored)>() + 8;
+
 impl Stored {
+    fn estimated_bytes(&self) -> usize {
+        STORED_DOCUMENT_BYTES
+            + self.encoded.len()
+            + self.sort.iter().map(|key| key.len()).sum::<usize>()
+    }
+
     fn terms(&self) -> &[u8] {
         &self.encoded[self.term_range.clone()]
     }
@@ -184,6 +239,8 @@ pub struct ContentPart {
     document_ids: RoaringBitmap,
     postings: AHashMap<(u8, CheekyHash), RoaringBitmap>,
     verbatim: AHashMap<u8, BTreeMap<Vec<u8>, RoaringBitmap>>,
+    documents_bytes: usize,
+    postings_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -203,25 +260,9 @@ pub enum LeafKind {
 impl ContentPart {
     pub fn insert(&mut self, record: ContentRecord) {
         let document_id = record.document_id();
-        self.remove(document_id);
-        for_each_posting(&record.terms, |field, term| {
-            self.postings
-                .entry((field, term))
-                .or_default()
-                .insert(document_id);
-            if let Some(key) = verbatim_key(&term) {
-                let terms = self.verbatim.entry(field).or_default();
-                if let Some(posting) = terms.get_mut(key) {
-                    posting.insert(document_id);
-                } else {
-                    terms.insert(key.to_vec(), RoaringBitmap::from([document_id]));
-                }
-            }
-        });
-
-        let encoded = record.encode().into_boxed_slice();
+        let encoded = Zeroizing::new(record.encode().into_boxed_slice());
         let term_range = encoded.len() - record.terms.len()..encoded.len();
-        self.documents.insert(
+        self.insert_stored(
             document_id,
             Stored {
                 encoded,
@@ -234,19 +275,109 @@ impl ContentPart {
                     record.sort_keys.subject.into_boxed_str(),
                 ],
             },
+            &mut Zeroizing::new(Vec::new()),
         );
+    }
+
+    /// Move an already charged frame into the part. Reserve the additional
+    /// resident estimate and term expansion before allocating either.
+    pub fn insert_frame(
+        &mut self,
+        owned: OwnedContentFrame,
+        mut reserve: impl FnMut(usize) -> bool,
+    ) -> bool {
+        let frame = ContentFrame::parse(owned.bytes()).expect("validated frame");
+        let document_id = frame.document_id;
+        let old_scratch = self.removal_scratch(document_id);
+        let scratch_size = frame
+            .scratch_size()
+            .expect("validated terms")
+            .max(old_scratch);
+        if !reserve(scratch_size) {
+            return false;
+        }
+        let mut scratch = Zeroizing::new(Vec::with_capacity(scratch_size));
+        let mut growth =
+            STORED_DOCUMENT_BYTES + frame.sort.iter().map(|key| key.len()).sum::<usize>();
+        growth +=
+            posting_insert_cost((!self.document_ids.is_empty()).then_some(&self.document_ids));
+        for_each_posting(frame.terms, &mut scratch, |field, term| {
+            growth = growth.saturating_add(posting_insert_cost(self.postings.get(&(field, term))));
+            if let Some(key) = verbatim_key(&term) {
+                growth = growth.saturating_add(posting_insert_cost(
+                    self.verbatim.get(&field).and_then(|keys| keys.get(key)),
+                ));
+            }
+        });
+        if !reserve(scratch_size.saturating_add(growth)) {
+            return false;
+        }
+        let term_range = owned.bytes().len() - frame.terms.len()..owned.bytes().len();
+        let sent_at = frame.sent_at;
+        let has_attachment = frame.has_attachment;
+        let sort = frame.sort.map(Box::<str>::from);
+        self.insert_stored(
+            document_id,
+            Stored {
+                encoded: owned.0,
+                term_range,
+                sent_at,
+                has_attachment,
+                sort,
+            },
+            &mut scratch,
+        );
+        true
+    }
+
+    fn insert_stored(&mut self, document_id: u32, record: Stored, scratch: &mut Vec<u8>) {
+        self.remove_with_scratch(document_id, scratch);
+        for_each_posting(record.terms(), scratch, |field, term| {
+            let posting = self.postings.entry((field, term)).or_default();
+            let before = posting_bytes(posting);
+            posting.insert(document_id);
+            self.postings_bytes = self.postings_bytes - before + posting_bytes(posting);
+            if let Some(key) = verbatim_key(&term) {
+                let terms = self.verbatim.entry(field).or_default();
+                if let Some(posting) = terms.get_mut(key) {
+                    let before = posting_bytes(posting);
+                    posting.insert(document_id);
+                    self.postings_bytes = self.postings_bytes - before + posting_bytes(posting);
+                } else {
+                    let posting = RoaringBitmap::from([document_id]);
+                    self.postings_bytes += posting_bytes(&posting);
+                    terms.insert(key.to_vec(), posting);
+                }
+            }
+        });
+
+        self.documents_bytes += record.estimated_bytes();
+        self.documents.insert(document_id, record);
         self.document_ids.insert(document_id);
     }
 
+    pub fn removal_scratch(&self, document_id: u32) -> usize {
+        self.documents.get(&document_id).map_or(0, |record| {
+            document_scratch_size(record.terms()).expect("validated terms")
+        })
+    }
+
     pub fn remove(&mut self, document_id: u32) -> bool {
+        self.remove_with_scratch(document_id, &mut Zeroizing::new(Vec::new()))
+    }
+
+    pub fn remove_with_scratch(&mut self, document_id: u32, scratch: &mut Vec<u8>) -> bool {
         let Some(record) = self.documents.remove(&document_id) else {
             return false;
         };
-        for_each_posting(record.terms(), |field, term| {
+        self.documents_bytes -= record.estimated_bytes();
+        for_each_posting(record.terms(), scratch, |field, term| {
             if let std::collections::hash_map::Entry::Occupied(mut entry) =
                 self.postings.entry((field, term))
             {
+                let before = posting_bytes(entry.get());
                 entry.get_mut().remove(document_id);
+                self.postings_bytes = self.postings_bytes - before + posting_bytes(entry.get());
                 if entry.get().is_empty() {
                     entry.remove();
                 }
@@ -255,7 +386,9 @@ impl ContentPart {
                 && let Some(terms) = self.verbatim.get_mut(&field)
             {
                 if let Some(posting) = terms.get_mut(key) {
+                    let before = posting_bytes(posting);
                     posting.remove(document_id);
+                    self.postings_bytes = self.postings_bytes - before + posting_bytes(posting);
                     if posting.is_empty() {
                         terms.remove(key);
                     }
@@ -294,7 +427,7 @@ impl ContentPart {
     pub fn record_bytes(&self, document_id: u32) -> Option<&[u8]> {
         self.documents
             .get(&document_id)
-            .map(|record| record.encoded.as_ref())
+            .map(|record| &record.encoded[..])
     }
 
     pub fn resolve(&self, filters: &[SearchFilter]) -> Result<Vec<SearchFilter>, ResolveError> {
@@ -443,21 +576,29 @@ impl ContentPart {
     }
 
     pub fn loaded_bytes(&self) -> usize {
-        self.documents
-            .values()
-            .map(|record| record.encoded.len())
-            .sum::<usize>()
-            + self
-                .postings
-                .values()
-                .chain(self.verbatim.values().flat_map(BTreeMap::values))
-                .map(|posting| 16 + posting.serialized_size())
-                .sum::<usize>()
+        self.documents_bytes + self.postings_bytes + posting_bytes(&self.document_ids)
     }
 }
 
-fn for_each_posting(terms: &[u8], mut visit: impl FnMut(u8, CheekyHash)) {
-    deserialize_term_fields(terms, &mut Vec::new(), |term, mut mask| {
+fn posting_bytes(bitmap: &RoaringBitmap) -> usize {
+    if bitmap.is_empty() {
+        0
+    } else {
+        16 + bitmap.serialized_size()
+    }
+}
+
+// A new high-word container contributes its serialized header and the ID;
+// ordinary growth in an existing array only adds the low-word ID.
+const POSTING_INSERT_BYTES: usize = 10;
+const NEW_POSTING_BYTES: usize = 16 + 8 + 8 + 2;
+
+fn posting_insert_cost(posting: Option<&RoaringBitmap>) -> usize {
+    posting.map_or(NEW_POSTING_BYTES, |_| POSTING_INSERT_BYTES)
+}
+
+fn for_each_posting(terms: &[u8], scratch: &mut Vec<u8>, mut visit: impl FnMut(u8, CheekyHash)) {
+    deserialize_term_fields(terms, scratch, |term, mut mask| {
         while mask != 0 {
             let field = mask.trailing_zeros();
             mask &= mask - 1;

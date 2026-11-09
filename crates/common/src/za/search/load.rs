@@ -11,7 +11,7 @@ use super::{
     },
     config::ZaSearchConfig,
     error::{LoadFailure, LossClass, NoMapReason, TransientClass},
-    seal::{parse_content_blob, parse_thread_blob, za_search_key},
+    seal::{open_content_blob, parse_thread_blob, za_search_key},
     trace::ZA_SEARCH_OVER_BUDGET,
 };
 use crate::{Server, auth::vault::RawValue, za_search_trace};
@@ -22,8 +22,8 @@ use store::{
     write::now,
     za_search::{
         BlobHeader, BlobKind, SegmentId, ZaSearchKey,
-        blob::{HiddenSection, PublicSection},
-        content::{ContentPart, ContentRecord},
+        blob::{ContentFramesError, HiddenSection, PublicSection, decode_content_frames},
+        content::{ContentPart, OwnedContentFrame},
         manifest::{
             ContentHead, Manifest, ManifestError, ManifestValue, ThreadBlobEntry, manifest_hash,
         },
@@ -32,7 +32,7 @@ use store::{
 };
 use trc::{EventType, Key, StoreEvent};
 use types::{blob_hash::BlobHash, collection::Collection, field::PrincipalField};
-use vault::{keys::Secret, session::SessionKeys};
+use vault::{Zeroizing, keys::Secret, session::SessionKeys};
 
 #[cfg(test)]
 #[path = "load_tests.rs"]
@@ -319,12 +319,184 @@ pub async fn load_thread_part<S: BlobSource>(
     Ok(loaded)
 }
 
+/// The verified prefix of the exact committed content chain a pass is replacing.
+/// The cursor starts at the manifest's authenticated head and advances only
+/// through authenticated predecessor pointers.
+pub struct ContentChainReader<'a> {
+    base: &'a LoadedIndex,
+    next: Option<(BlobHash, SegmentId)>,
+    remaining_len: u32,
+    remaining_size: u64,
+    visited: AHashSet<SegmentId>,
+}
+
+pub struct VerifiedContentNode {
+    hash: BlobHash,
+    header: BlobHeader,
+    size: u64,
+    base_hash: [u8; 32],
+    account_id: u32,
+}
+
+impl VerifiedContentNode {
+    pub fn hash(&self) -> &BlobHash {
+        &self.hash
+    }
+
+    pub fn header(&self) -> &BlobHeader {
+        &self.header
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl<'a> ContentChainReader<'a> {
+    pub fn new(base: &'a LoadedIndex) -> Option<Self> {
+        let head = base.manifest.content.as_ref()?;
+        Some(Self {
+            base,
+            next: Some((head.hash.clone(), head.segment)),
+            remaining_len: head.length,
+            remaining_size: head.size,
+            visited: AHashSet::new(),
+        })
+    }
+
+    pub fn next_input(&self) -> Option<(&BlobHash, u64)> {
+        self.next
+            .as_ref()
+            .map(|(hash, _)| (hash, self.remaining_size))
+    }
+
+    pub async fn next<S: BlobSource>(
+        &mut self,
+        source: &S,
+        entry: &IndexEntry,
+        window_secs: u64,
+    ) -> Result<Option<VerifiedContentNode>, ObservedLoadError> {
+        let Some((hash, segment)) = self.next.take() else {
+            return Ok(None);
+        };
+        self.read(source, entry, window_secs, hash, segment)
+            .await
+            .map(Some)
+            .map_err(|failure| self.observed(failure))
+    }
+
+    async fn read<S: BlobSource>(
+        &mut self,
+        source: &S,
+        entry: &IndexEntry,
+        window_secs: u64,
+        hash: BlobHash,
+        segment: SegmentId,
+    ) -> Result<VerifiedContentNode, LoadFailure> {
+        let invalid = LoadFailure::Loss(LossClass::Parse);
+        if !self.visited.insert(segment) {
+            return Err(invalid);
+        }
+        let bytes = fetch_verified(source, entry, &hash, window_secs, now()).await?;
+        let size = bytes.len() as u64;
+        self.remaining_size = self.remaining_size.checked_sub(size).ok_or(invalid)?;
+        self.remaining_len = self.remaining_len.checked_sub(1).ok_or(invalid)?;
+        // The expected digest covers the header. Authenticate the AEAD and
+        // decode the frames later, only for selected inputs.
+        let (header, _) = BlobHeader::decode(&bytes).map_err(|_| invalid)?;
+        if header.kind != BlobKind::Content
+            || header.segment != segment
+            || header.predecessor.is_none() != (self.remaining_len == 0)
+            || header.predecessor.is_none() != (self.remaining_size == 0)
+        {
+            return Err(invalid);
+        }
+        self.next = header.predecessor.clone();
+        Ok(VerifiedContentNode {
+            hash,
+            header,
+            size,
+            base_hash: self.base.manifest_bytes_hash,
+            account_id: entry.account_id,
+        })
+    }
+
+    pub async fn records<S: BlobSource>(
+        &self,
+        source: &S,
+        entry: &IndexEntry,
+        key: &Secret,
+        window_secs: u64,
+        node: &VerifiedContentNode,
+        mut reserve: impl FnMut(u64) -> bool,
+    ) -> Result<Vec<OwnedContentFrame>, ObservedLoadError> {
+        if node.base_hash != self.base.manifest_bytes_hash || node.account_id != entry.account_id {
+            return Err(LoadFailure::Transient(TransientClass::Validation).into());
+        }
+        if !reserve(content_read_bytes(node.size)) {
+            return Err(LoadFailure::Transient(TransientClass::Budget).into());
+        }
+        let bytes = fetch_verified(source, entry, &node.hash, window_secs, now())
+            .await
+            .map_err(|failure| self.observed(failure))?;
+        open_frames(key, entry.account_id, node.header.segment, bytes, reserve)
+            .map(|(_, records)| records)
+            .map_err(|failure| self.observed(failure))
+    }
+
+    fn observed(&self, failure: LoadFailure) -> ObservedLoadError {
+        match failure {
+            LoadFailure::Loss(class) => ObservedLoadError::ContentLoss(ContentLoss {
+                class,
+                manifest_hash: self.base.manifest_bytes_hash,
+                epoch: self.base.manifest.epoch,
+                head: self.base.manifest.content.clone().expect("named chain"),
+            }),
+            other => ObservedLoadError::Other(other),
+        }
+    }
+}
+
+// Sealed bytes and the opened section coexist only while authenticating.
+fn content_read_bytes(sealed_size: u64) -> u64 {
+    sealed_size.saturating_mul(2).saturating_add(128)
+}
+
+fn open_frames(
+    key: &Secret,
+    account_id: u32,
+    segment: SegmentId,
+    bytes: Vec<u8>,
+    mut reserve: impl FnMut(u64) -> bool,
+) -> Result<(BlobHeader, Vec<OwnedContentFrame>), LoadFailure> {
+    let (header, plaintext) = open_content_blob(key, account_id, Some(segment), None, &bytes)
+        .map_err(LoadFailure::Loss)?;
+    drop(bytes);
+    let records = decode_content_frames(&plaintext, |additional| {
+        reserve((plaintext.capacity() as u64).saturating_add(additional as u64))
+    })
+    .map_err(|error| match error {
+        ContentFramesError::Format(_) => LoadFailure::Loss(LossClass::Parse),
+        ContentFramesError::Budget => LoadFailure::Transient(TransientClass::Budget),
+    })?;
+    Ok((header, records))
+}
+
+pub fn content_frame_bytes(records: &[OwnedContentFrame]) -> u64 {
+    records
+        .iter()
+        .map(|record| record.bytes().len() as u64)
+        .sum::<u64>()
+}
+
 struct ContentWalk {
-    nodes: Vec<(SegmentId, Vec<ContentRecord>)>,
+    nodes: Vec<(SegmentId, Vec<OwnedContentFrame>)>,
     joined: bool,
+    memory: u64,
 }
 
 impl ContentWalk {
+    #[allow(clippy::too_many_arguments)]
     async fn read<S: BlobSource>(
         source: &S,
         entry: &IndexEntry,
@@ -333,11 +505,24 @@ impl ContentWalk {
         stop_at: impl Fn(&BlobHash, SegmentId) -> bool,
         window_secs: u64,
         now: u64,
+        mut reserve: impl FnMut(u64) -> bool,
     ) -> Result<Self, LoadFailure> {
+        let budget = LoadFailure::Transient(TransientClass::Budget);
         let mut nodes = Vec::new();
         let mut visited = AHashSet::new();
         let mut next = head.map(|head| (head.hash.clone(), head.segment));
+        let mut remaining = head.map_or(0, |head| head.size);
+        let mut memory = 0u64;
         while let Some((hash, segment)) = next {
+            // Leave room for the node/segment containers and their growth.
+            memory = memory.saturating_add(
+                4 * (size_of::<(SegmentId, Vec<OwnedContentFrame>)>()
+                    + 3 * size_of::<SegmentId>()
+                    + 1) as u64,
+            );
+            if !reserve(memory) {
+                return Err(budget);
+            }
             if !visited.insert(segment) {
                 return Err(LoadFailure::Loss(LossClass::Parse));
             }
@@ -345,38 +530,70 @@ impl ContentWalk {
                 return Ok(Self {
                     nodes,
                     joined: true,
+                    memory,
                 });
             }
+            if !reserve(memory.saturating_add(content_read_bytes(remaining))) {
+                return Err(budget);
+            }
             let bytes = fetch_verified(source, entry, &hash, window_secs, now).await?;
-            let (header, records) =
-                parse_content_blob(key, entry.account_id, Some(segment), None, &bytes)
-                    .map_err(LoadFailure::Loss)?;
+            remaining = remaining
+                .checked_sub(bytes.len() as u64)
+                .ok_or(LoadFailure::Loss(LossClass::Parse))?;
+            let (header, records) = open_frames(key, entry.account_id, segment, bytes, |needed| {
+                reserve(memory.saturating_add(needed))
+            })?;
+            memory = memory
+                .saturating_add(content_frame_bytes(&records))
+                .saturating_add((records.capacity() * size_of::<OwnedContentFrame>()) as u64);
             nodes.push((segment, records));
             next = header.predecessor;
         }
         Ok(Self {
             nodes,
             joined: false,
+            memory,
         })
     }
 
-    fn apply(self, content: &mut LoadedContent) {
+    fn apply(
+        self,
+        content: &mut LoadedContent,
+        cache: &ZaSearchCache,
+        account_id: u32,
+    ) -> Result<(), LoadFailure> {
+        let budget = LoadFailure::Transient(TransientClass::Budget);
         if !self.joined {
             content.part = ContentPart::default();
             content.segments.clear();
         }
-        let mut segments = self
-            .nodes
-            .iter()
-            .map(|(segment, _)| *segment)
-            .collect::<Vec<_>>();
+        let mut segments = Vec::with_capacity(self.nodes.len() + content.segments.len());
+        segments.extend(self.nodes.iter().map(|(segment, _)| *segment));
         segments.append(&mut content.segments);
         content.segments = segments;
+        let mut memory = self.memory;
         // The chain is stored head first. Later records replace earlier ones.
         for (_, records) in self.nodes.into_iter().rev() {
-            content.part.extend(records);
+            let metadata = (records.capacity() * size_of::<OwnedContentFrame>()) as u64;
+            for record in records {
+                let frame_bytes = record.bytes().len() as u64;
+                let before = memory.saturating_add(content.part.loaded_bytes() as u64);
+                if !content.part.insert_frame(record, |extra| {
+                    cache.grow(
+                        &mut content.charge,
+                        PartKind::Content,
+                        before.saturating_add(extra as u64),
+                        account_id,
+                    )
+                }) {
+                    return Err(budget);
+                }
+                memory -= frame_bytes;
+            }
+            memory -= metadata;
         }
         content.bytes = content.part.loaded_bytes() as u64;
+        Ok(())
     }
 }
 
@@ -389,11 +606,40 @@ fn empty_content() -> LoadedContent {
     }
 }
 
-fn apply_tombstones(content: &mut LoadedContent, thread: &ThreadPart) {
-    for record in thread.records().filter(|record| record.deleted.is_some()) {
-        content.part.remove(record.document_id);
+fn apply_tombstones(
+    content: &mut LoadedContent,
+    thread: &ThreadPart,
+    cache: &ZaSearchCache,
+    account_id: u32,
+) -> Result<(), LoadFailure> {
+    let deletions = || thread.records().filter(|record| record.deleted.is_some());
+    let scratch_size = deletions()
+        .map(|record| content.part.removal_scratch(record.document_id))
+        .max()
+        .unwrap_or_default();
+    if !cache.grow(
+        &mut content.charge,
+        PartKind::Content,
+        (content.part.loaded_bytes() as u64).saturating_add(scratch_size as u64),
+        account_id,
+    ) {
+        return Err(LoadFailure::Transient(TransientClass::Budget));
     }
+    let mut scratch = Zeroizing::new(Vec::with_capacity(scratch_size));
+    for record in deletions() {
+        content
+            .part
+            .remove_with_scratch(record.document_id, &mut scratch);
+    }
+    drop(scratch);
     content.bytes = content.part.loaded_bytes() as u64;
+    cache.grow(
+        &mut content.charge,
+        PartKind::Content,
+        content.bytes,
+        account_id,
+    );
+    Ok(())
 }
 
 pub async fn load_content<S: BlobSource>(
@@ -405,6 +651,10 @@ pub async fn load_content<S: BlobSource>(
     window_secs: u64,
     now: u64,
 ) -> Result<LoadedContent, LoadFailure> {
+    let cache = entry
+        .cache()
+        .ok_or(LoadFailure::Transient(TransientClass::Validation))?;
+    let mut content = empty_content();
     let walk = ContentWalk::read(
         source,
         entry,
@@ -413,12 +663,26 @@ pub async fn load_content<S: BlobSource>(
         |_, segment| stop_at.is_some_and(|held| held.contains(&segment)),
         window_secs,
         now,
+        |bytes| {
+            cache.grow(
+                &mut content.charge,
+                PartKind::Content,
+                bytes,
+                entry.account_id,
+            )
+        },
     )
     .await?;
-    let mut content = empty_content();
-    walk.apply(&mut content);
+    walk.apply(&mut content, &cache, entry.account_id)?;
     if let Some(index) = entry.index.read().await.as_ref() {
-        apply_tombstones(&mut content, &index.thread);
+        apply_tombstones(&mut content, &index.thread, &cache, entry.account_id)?;
+    } else {
+        cache.grow(
+            &mut content.charge,
+            PartKind::Content,
+            content.bytes,
+            entry.account_id,
+        );
     }
     Ok(content)
 }
@@ -567,6 +831,7 @@ async fn load_current_content<S: BlobSource>(
                 return Err(budget);
             }
             let stop = staged_head.as_ref().map(|(_, head)| head);
+            let previous_bytes = staged.bytes;
             ContentWalk::read(
                 source,
                 entry,
@@ -575,9 +840,17 @@ async fn load_current_content<S: BlobSource>(
                 |hash, segment| matches_head(stop, hash, segment),
                 config.absent_retry_secs,
                 now(),
+                |bytes| {
+                    cache.grow(
+                        &mut staged.charge,
+                        PartKind::Content,
+                        previous_bytes.saturating_add(bytes.max(reserved)),
+                        entry.account_id,
+                    )
+                },
             )
             .await?
-            .apply(&mut staged);
+            .apply(&mut staged, &cache, entry.account_id)?;
             if !cache.grow(
                 &mut staged.charge,
                 PartKind::Content,
@@ -616,13 +889,7 @@ async fn load_current_content<S: BlobSource>(
             }),
             other => ObservedLoadError::Other(other),
         })?;
-        apply_tombstones(&mut staged, &index.thread);
-        cache.grow(
-            &mut staged.charge,
-            PartKind::Content,
-            staged.bytes,
-            entry.account_id,
-        );
+        apply_tombstones(&mut staged, &index.thread, &cache, entry.account_id)?;
         index.content = Some(staged);
         return Ok(());
     }
@@ -711,9 +978,9 @@ async fn apply_reload_locked<S: BlobSource>(
             None
         };
         let content = async {
-            let bytes = content_reservation(head, config)?;
-            let charge = cache
-                .admit(PartKind::Content, bytes, account_id)
+            let reserved = content_reservation(head, config)?;
+            let mut charge = cache
+                .admit(PartKind::Content, reserved, account_id)
                 .ok_or(LoadFailure::Transient(TransientClass::Budget))?;
             let walk = ContentWalk::read(
                 source,
@@ -723,6 +990,14 @@ async fn apply_reload_locked<S: BlobSource>(
                 |hash, segment| matches_head(stop, hash, segment),
                 window,
                 now,
+                |bytes| {
+                    cache.grow(
+                        &mut charge,
+                        PartKind::Content,
+                        bytes.max(reserved),
+                        account_id,
+                    )
+                },
             )
             .await?;
             Ok((walk, charge))
@@ -764,23 +1039,34 @@ async fn apply_reload_locked<S: BlobSource>(
         old.content = None;
     }
 
-    if let Some((walk, charge)) = new_content {
+    let applied = if let Some((walk, charge)) = new_content {
         if walk.joined {
             let content = old.content.as_mut().expect("joined resident suffix");
             content.charge.absorb(charge);
-            walk.apply(content);
-            apply_tombstones(content, &old.thread);
+            walk.apply(content, &cache, account_id)
+                .and_then(|()| apply_tombstones(content, &old.thread, &cache, account_id))
         } else {
             let mut content = empty_content();
             content.charge = charge;
-            walk.apply(&mut content);
-            apply_tombstones(&mut content, &old.thread);
-            old.content = Some(content);
+            let result = walk
+                .apply(&mut content, &cache, account_id)
+                .and_then(|()| apply_tombstones(&mut content, &old.thread, &cache, account_id));
+            if result.is_ok() {
+                old.content = Some(content);
+            }
+            result
         }
     } else if let Some(content) = old.content.as_mut() {
-        apply_tombstones(content, &old.thread);
+        apply_tombstones(content, &old.thread, &cache, account_id)
+    } else {
+        Ok(())
+    };
+    if applied.is_err() {
+        // The map is still usable. A partially applied optional content part
+        // is discarded on budget refusal.
+        old.content = None;
+        trace_eviction(account_id, EvictReason::Budget);
     }
-    cache.admit_content_growth(old, account_id);
     Ok(true)
 }
 

@@ -54,6 +54,24 @@ struct CacheState {
     admission: Mutex<()>,
     thread_used: Arc<AtomicU64>,
     content_used: Arc<AtomicU64>,
+    #[cfg(feature = "test_mode")]
+    test_content_budget: AtomicU64,
+}
+
+#[cfg(feature = "test_mode")]
+#[must_use = "dropping the guard restores the content budget"]
+pub struct SearchContentBudgetGuard {
+    cache: Arc<CacheState>,
+    previous: u64,
+}
+
+#[cfg(feature = "test_mode")]
+impl Drop for SearchContentBudgetGuard {
+    fn drop(&mut self) {
+        self.cache
+            .test_content_budget
+            .store(self.previous, Ordering::Relaxed);
+    }
 }
 
 impl ZaSearchCache {
@@ -70,6 +88,8 @@ impl ZaSearchCache {
                 admission: Mutex::default(),
                 thread_used: Arc::default(),
                 content_used: Arc::default(),
+                #[cfg(feature = "test_mode")]
+                test_content_budget: AtomicU64::default(),
             }),
         }
     }
@@ -173,9 +193,21 @@ impl ZaSearchCache {
     }
 
     pub fn admit_content_growth(&self, index: &mut LoadedIndex, account_id: u32) -> bool {
+        self.admit_content_growth_with_staged(index, account_id, None)
+    }
+
+    pub fn admit_content_growth_with_staged(
+        &self,
+        index: &mut LoadedIndex,
+        account_id: u32,
+        staged: Option<BudgetCharge>,
+    ) -> bool {
         let Some(content) = index.content.as_mut() else {
             return true;
         };
+        if let Some(staged) = staged {
+            content.charge.absorb(staged);
+        }
         let bytes = content.part.loaded_bytes() as u64;
         if self.grow(&mut content.charge, PartKind::Content, bytes, account_id) {
             content.bytes = bytes;
@@ -225,12 +257,34 @@ impl ZaSearchCache {
         }
     }
 
+    pub fn content_budget(&self) -> u64 {
+        #[cfg(feature = "test_mode")]
+        {
+            let bytes = self.inner.test_content_budget.load(Ordering::Relaxed);
+            if bytes != 0 {
+                return bytes;
+            }
+        }
+        self.config().mem_mb.saturating_mul(1 << 20)
+    }
+
+    #[cfg(feature = "test_mode")]
+    pub fn override_content_budget_for_test(&self, bytes: u64) -> SearchContentBudgetGuard {
+        assert!(bytes != 0);
+        SearchContentBudgetGuard {
+            cache: self.inner.clone(),
+            previous: self
+                .inner
+                .test_content_budget
+                .swap(bytes, Ordering::Relaxed),
+        }
+    }
+
     pub(super) fn budget(&self, part: PartKind) -> u64 {
-        let mb = match part {
-            PartKind::Thread => self.config().thread_mem_mb,
-            PartKind::Content => self.config().mem_mb,
-        };
-        mb.saturating_mul(1 << 20)
+        match part {
+            PartKind::Thread => self.config().thread_mem_mb.saturating_mul(1 << 20),
+            PartKind::Content => self.content_budget(),
+        }
     }
 
     // Called only under admission. Dropping a charge can decrease the counters at
@@ -361,6 +415,27 @@ impl IndexEntry {
         });
     }
 
+    /// The current pass owns pass_lock. Budget pressure may release its
+    /// content only after a successful preflight, with no reader or load in
+    /// flight and only while this exact base remains resident.
+    pub fn try_evict_content_for_compaction(&self, base_hash: [u8; 32]) -> bool {
+        let Ok(_load) = self.load_flight.try_lock() else {
+            return false;
+        };
+        let Ok(mut guard) = self.index.try_write() else {
+            return false;
+        };
+        if let Some(index) = guard.as_mut()
+            && index.manifest_bytes_hash == base_hash
+            && index.content.take().is_some()
+        {
+            trace_eviction(self.account_id, EvictReason::Budget);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn absent_since(&self, hash: &BlobHash, now: u64) -> u64 {
         *self
             .absent
@@ -471,6 +546,60 @@ impl Server {
 mod tests {
     use super::*;
     use crate::za::test_hooks::set_search_config_override;
+
+    #[test]
+    fn staged_content_charge_is_reconciled_with_resident_estimate() {
+        use store::{
+            search::IndexDocument,
+            write::SearchIndex,
+            za_search::content::{ContentRecord, SortKeys},
+        };
+
+        let cache = ZaSearchCache::new(Ok(ZaSearchConfig::default()));
+        let mut index = LoadedIndex::empty(Manifest::default());
+        let mut part = ContentPart::default();
+        part.insert(ContentRecord::new(
+            IndexDocument::new(SearchIndex::Email),
+            1,
+            SortKeys::default(),
+            None,
+            false,
+        ));
+        let estimate = part.loaded_bytes() as u64;
+        let staged = cache.admit(PartKind::Content, estimate + 10, 0).unwrap();
+        index.content = Some(LoadedContent {
+            part,
+            segments: Vec::new(),
+            bytes: 0,
+            charge: BudgetCharge::detached(),
+        });
+        assert!(cache.admit_content_growth_with_staged(&mut index, 0, Some(staged)));
+        assert_eq!(cache.content_used(), estimate);
+        assert_eq!(index.content.take().unwrap().bytes, estimate);
+        assert_eq!(cache.content_used(), 0);
+
+        let staged = cache.admit(PartKind::Content, estimate, 0).unwrap();
+        assert!(cache.admit_content_growth_with_staged(&mut index, 0, Some(staged)));
+        assert_eq!(cache.content_used(), 0);
+    }
+
+    #[test]
+    fn content_budget_override_is_scoped_to_one_instance_and_part() {
+        let boot = ZaSearchConfig::default();
+        let cache = ZaSearchCache::new(Ok(boot.clone()));
+        let separate = ZaSearchCache::new(Ok(boot));
+        let original = cache.content_budget();
+        let thread = cache.budget(PartKind::Thread);
+        {
+            let _guard = cache.override_content_budget_for_test(4096);
+            assert_eq!(cache.content_budget(), 4096);
+            assert_eq!(cache.budget(PartKind::Thread), thread);
+            assert_eq!(separate.content_budget(), original);
+            assert!(cache.admit(PartKind::Content, 4097, 0).is_none());
+            assert!(cache.admit(PartKind::Content, 4096, 0).is_some());
+        }
+        assert_eq!(cache.content_budget(), original);
+    }
 
     #[test]
     fn the_override_replaces_the_boot_value_in_test_mode() {

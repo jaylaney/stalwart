@@ -436,6 +436,21 @@ pub async fn run_search_pass(test: &TestServer, account_id: u32, password: &str)
     test.server.za_search_pass(account_id, &keys).await.unwrap()
 }
 
+pub async fn za_search_thread_part(
+    test: &TestServer,
+    account_id: u32,
+    password: &str,
+) -> store::za_search::thread::ThreadPart {
+    let keys = za_unlock(test, account_id, password).await;
+    let entry = test
+        .server
+        .za_search_entry(account_id, &keys)
+        .await
+        .unwrap();
+    let view = entry.read_loaded().await.unwrap();
+    view.thread.clone()
+}
+
 pub async fn manifest_bytes(test: &TestServer, account_id: u32) -> Option<Vec<u8>> {
     test.server
         .store()

@@ -9,7 +9,7 @@
 use super::{
     ALIAS_LEN, FormatError, K, PadTarget, RECORD_MAX, REVISION_ROW_LEN, TOMBSTONE_LEN,
     checked_compaction_allowance, checked_padded_len,
-    content::ContentRecord,
+    content::{ContentFrame, ContentRecord, OwnedContentFrame},
     read_array, take,
     thread::{Alias, RevisionRow, ThreadRecord, Tombstone},
 };
@@ -235,20 +235,81 @@ pub fn encode_content(records: &[&[u8]]) -> Vec<u8> {
     bytes
 }
 
-pub fn decode_content(mut bytes: &[u8]) -> Result<Vec<ContentRecord>, FormatError> {
+pub fn decode_content(bytes: &[u8]) -> Result<Vec<ContentRecord>, FormatError> {
+    let mut records = Vec::new();
+    visit_content_frames(bytes, |frame| {
+        records.push(ContentRecord::decode(frame)?);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+#[derive(Debug)]
+pub enum ContentFramesError {
+    Format(FormatError),
+    Budget,
+}
+
+impl From<FormatError> for ContentFramesError {
+    fn from(error: FormatError) -> Self {
+        Self::Format(error)
+    }
+}
+
+/// Reserve additional memory beyond the caller's authenticated plaintext.
+/// Scratch is disposed before owned output frames are allocated.
+pub fn decode_content_frames(
+    bytes: &[u8],
+    mut reserve: impl FnMut(usize) -> bool,
+) -> Result<Vec<OwnedContentFrame>, ContentFramesError> {
+    let mut scratch_size = 0;
+    let mut payload = 0usize;
+    let count = visit_content_frames(bytes, |bytes| {
+        let frame = ContentFrame::parse(bytes)?;
+        scratch_size = scratch_size.max(frame.scratch_size()?);
+        payload = payload.checked_add(bytes.len()).ok_or(FormatError::Count)?;
+        Ok(())
+    })?;
+    if !reserve(scratch_size) {
+        return Err(ContentFramesError::Budget);
+    }
+    let mut scratch = Zeroizing::new(Vec::with_capacity(scratch_size));
+    visit_content_frames(bytes, |bytes| {
+        ContentFrame::parse(bytes)?.validate_terms(&mut scratch)
+    })?;
+    drop(scratch);
+
+    let size = count
+        .checked_mul(size_of::<OwnedContentFrame>())
+        .and_then(|metadata| payload.checked_add(metadata))
+        .ok_or(FormatError::Count)?;
+    if !reserve(size) {
+        return Err(ContentFramesError::Budget);
+    }
+    let mut frames = Vec::with_capacity(count);
+    visit_content_frames(bytes, |bytes| {
+        frames.push(OwnedContentFrame(Zeroizing::new(bytes.into())));
+        Ok(())
+    })?;
+    Ok(frames)
+}
+
+fn visit_content_frames(
+    mut bytes: &[u8],
+    mut visit: impl FnMut(&[u8]) -> Result<(), FormatError>,
+) -> Result<usize, FormatError> {
     let count = read_len(&mut bytes)?;
     if count > bytes.len() / LENGTH_PREFIX {
         return Err(FormatError::Truncated);
     }
-    let mut records = Vec::new();
     for _ in 0..count {
         let len = read_len(&mut bytes)?;
-        records.push(ContentRecord::decode(take(&mut bytes, len)?)?);
+        visit(take(&mut bytes, len)?)?;
     }
     if !bytes.is_empty() {
         return Err(FormatError::Count);
     }
-    Ok(records)
+    Ok(count)
 }
 
 fn encoded_len(len: usize) -> [u8; LENGTH_PREFIX] {

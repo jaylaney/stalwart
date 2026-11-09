@@ -129,11 +129,23 @@ pub fn build_content_blob(
     header: &BlobHeader,
     records: &[&[u8]],
 ) -> Vec<u8> {
+    seal_content_blob(
+        key,
+        account_id,
+        header,
+        Zeroizing::new(encode_content(records)),
+    )
+}
+
+pub fn seal_content_blob(
+    key: &Secret,
+    account_id: u32,
+    header: &BlobHeader,
+    plaintext: Zeroizing<Vec<u8>>,
+) -> Vec<u8> {
     debug_assert_eq!(header.kind, BlobKind::Content);
-    let sealed = {
-        let plaintext = Zeroizing::new(encode_content(records));
-        seal_section(key, account_id, header, SectionKind::Content, &plaintext)
-    };
+    let sealed = seal_section(key, account_id, header, SectionKind::Content, &plaintext);
+    drop(plaintext);
     let mut blob = Vec::with_capacity(BlobHeader::LEN + sealed.len());
     blob.extend_from_slice(&header.encode());
     blob.extend_from_slice(&sealed);
@@ -147,6 +159,24 @@ pub fn parse_content_blob(
     expected_hash_of_predecessor: Option<&(BlobHash, SegmentId)>,
     bytes: &[u8],
 ) -> Result<(BlobHeader, Vec<ContentRecord>), LossClass> {
+    let (header, plaintext) = open_content_blob(
+        key,
+        account_id,
+        expected_segment,
+        expected_hash_of_predecessor,
+        bytes,
+    )?;
+    let records = decode_content(&plaintext).map_err(|_| LossClass::Parse)?;
+    Ok((header, records))
+}
+
+pub(super) fn open_content_blob(
+    key: &Secret,
+    account_id: u32,
+    expected_segment: Option<SegmentId>,
+    expected_hash_of_predecessor: Option<&(BlobHash, SegmentId)>,
+    bytes: &[u8],
+) -> Result<(BlobHeader, Zeroizing<Vec<u8>>), LossClass> {
     let (header, sealed) = BlobHeader::decode(bytes).map_err(|_| LossClass::Parse)?;
     if header.kind != BlobKind::Content
         || expected_segment.is_some_and(|segment| header.segment != segment)
@@ -158,8 +188,7 @@ pub fn parse_content_blob(
     }
 
     let plaintext = open_section(key, account_id, &header, SectionKind::Content, sealed)?;
-    let records = decode_content(&plaintext).map_err(|_| LossClass::Parse)?;
-    Ok((header, records))
+    Ok((header, plaintext))
 }
 
 pub fn za_search_key(secret: &Secret) -> ZaSearchKey {

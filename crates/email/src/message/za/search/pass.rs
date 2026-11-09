@@ -24,7 +24,7 @@ use common::{
     za::search::{
         cache::{IndexEntry, LoadedIndex, PartKind, scanned_seed},
         error::{LoadFailure, LossClass, NoMapReason, TransientClass},
-        load::{MapLoss, ObservedLoadError},
+        load::{ContentLoss, MapLoss, ObservedLoadError},
         seal::za_search_key,
         trace::{ZA_SEARCH_ABORTED, ZA_SEARCH_LOST, ZA_SEARCH_REBUILD, ZA_SEARCH_SKIPPED},
     },
@@ -59,6 +59,7 @@ pub enum PassOutcome {
     Aborted(TransientClass),
     Lost,
     NoMap(NoMapReason),
+    ContentLoss(ContentLoss),
     Recovery(RecoveryCause),
 }
 
@@ -163,6 +164,22 @@ pub(crate) struct Staging {
 }
 
 impl Staging {
+    pub(super) fn trace_skipped(&self, account_id: u32) {
+        for (document_id, class) in &self.skipped {
+            let reason = self
+                .transient_skips
+                .iter()
+                .find_map(|(id, transient)| (id == document_id).then(|| transient.as_str()))
+                .unwrap_or_else(|| class.as_str());
+            za_search_trace!(
+                ZA_SEARCH_SKIPPED,
+                AccountId = account_id,
+                DocumentId = *document_id,
+                Reason = reason
+            );
+        }
+    }
+
     fn new(base: &LoadedIndex, marker_bound: Option<u64>) -> Self {
         Self {
             revision: base.manifest.revision,
@@ -843,19 +860,6 @@ impl ZaSearchPass for Server {
         #[cfg(feature = "test_mode")]
         common::za::test_hooks::note_za_search_item_aliases(account_id, staging.max_item_aliases);
 
-        for (document_id, class) in &staging.skipped {
-            let reason = staging
-                .transient_skips
-                .iter()
-                .find_map(|(id, transient)| (id == document_id).then(|| transient.as_str()))
-                .unwrap_or_else(|| class.as_str());
-            za_search_trace!(
-                ZA_SEARCH_SKIPPED,
-                AccountId = account_id,
-                DocumentId = *document_id,
-                Reason = reason
-            );
-        }
         if let PassDecision::Abort { class, document_id } = staging.decision {
             debug_assert_eq!(
                 staging.failing.as_ref().map(|f| f.document_id),
@@ -889,17 +893,7 @@ impl ZaSearchPass for Server {
                 ),
             ];
             let epoch = base.manifest.epoch;
-            let outcome = write_pass(
-                self,
-                account_id,
-                keys,
-                &entry,
-                &bytes,
-                hash,
-                base.manifest,
-                staging,
-            )
-            .await?;
+            let outcome = write_pass(self, account_id, keys, &entry, &bytes, base, staging).await?;
             if matches!(outcome, PassOutcome::Advanced { .. }) {
                 for (done, kind) in finished {
                     if done {

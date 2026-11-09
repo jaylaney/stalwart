@@ -5,6 +5,7 @@
  */
 
 pub mod changes;
+mod compact;
 pub mod ensure;
 pub mod fields;
 pub mod open;

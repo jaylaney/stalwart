@@ -1120,3 +1120,45 @@ mod tests {
         assert!(!take_search_blob_fail(5));
     }
 }
+
+pub static SEARCH_COMPACTION_FORCE_ALLOWANCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub fn search_compaction_force_allowance(account_id: u32) -> bool {
+    *SEARCH_COMPACTION_FORCE_ALLOWANCE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        == Some(account_id)
+}
+
+/// Opt-in numeric accounting for the search compaction benchmark and fixtures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchContentWrite {
+    Original(u64),
+    StagedMemory(u64),
+    RetirementMemory(u64),
+    Encoded { tier: u8, bytes: u64 },
+    Uploaded { tier: u8, bytes: u64 },
+    Linked { tier: u8, bytes: u64 },
+}
+
+static SEARCH_CONTENT_WRITES: std::sync::Mutex<Option<(u32, Vec<SearchContentWrite>)>> =
+    std::sync::Mutex::new(None);
+
+pub fn set_search_content_writes(account_id: Option<u32>) {
+    *SEARCH_CONTENT_WRITES.lock().unwrap() = account_id.map(|id| (id, Vec::new()));
+}
+
+pub fn take_search_content_writes(account_id: u32) -> Vec<SearchContentWrite> {
+    let mut observer = SEARCH_CONTENT_WRITES.lock().unwrap();
+    observer
+        .as_mut()
+        .filter(|(id, _)| *id == account_id)
+        .map_or_else(Vec::new, |(_, events)| std::mem::take(events))
+}
+
+pub fn note_search_content_write(account_id: u32, event: SearchContentWrite) {
+    let mut observer = SEARCH_CONTENT_WRITES.lock().unwrap();
+    if let Some((_, events)) = observer.as_mut().filter(|(id, _)| *id == account_id) {
+        events.push(event);
+    }
+}

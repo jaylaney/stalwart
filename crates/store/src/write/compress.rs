@@ -213,6 +213,11 @@ fn frame_capacity(frame: &[u8], limit: usize) -> std::io::Result<usize> {
     }
 }
 
+pub(crate) fn decompression_capacity(frame: &[u8], limit: usize) -> std::io::Result<usize> {
+    decoder_slot(frame)?;
+    frame_capacity(frame, limit)
+}
+
 pub fn decompress(frame: &[u8]) -> std::io::Result<Vec<u8>> {
     let slot = decoder_slot(frame)?;
     let capacity = frame_capacity(frame, MAX_ARCHIVE_SIZE)?;

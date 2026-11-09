@@ -5,7 +5,7 @@
  */
 
 use super::*;
-use crate::za::search::seal::{build_content_blob, build_thread_blob};
+use crate::za::search::seal::{build_content_blob, build_thread_blob, parse_content_blob};
 use ahash::{AHashMap, AHashSet};
 use std::{
     pin::pin,
@@ -19,7 +19,7 @@ use store::{
     za_search::{
         PadTarget,
         blob::{HiddenSection, PublicSection},
-        content::SortKeys,
+        content::{ContentRecord, SortKeys},
         manifest::Inventory,
         thread::{RevisionRow, ThreadRecord, Tombstone},
     },
@@ -781,9 +781,10 @@ async fn pl11_an_evicted_generation_stays_charged_until_its_last_reader_drops() 
     assert_eq!(cache.content_used(), 0);
 }
 
-// Fill an exact number of accounted bytes, including a new posting key in every batch.
+// Grow by at least the requested estimate while exercising real records and
+// postings. Stored tuple and duplicated sort bytes make exact padding uneven.
 fn add_content_bytes(part: &mut ContentPart, next_id: &mut u32, bytes: u64) {
-    let previous = part.loaded_bytes();
+    let target = part.loaded_bytes() + bytes as usize;
     let mut with_posting = document(*next_id);
     with_posting.insert_key_value(
         EmailSearchField::Headers,
@@ -798,15 +799,9 @@ fn add_content_bytes(part: &mut ContentPart, next_id: &mut u32, bytes: u64) {
         false,
     ));
     *next_id += 1;
-
-    let base = record(0).encoded_len();
-    let mut remaining = bytes as usize - (part.loaded_bytes() - previous);
-    while remaining != 0 {
-        let mut len = remaining.min(base + 3 * 255);
-        if remaining - len < base && remaining != len {
-            len = remaining - base;
-        }
-        let mut padding = len - base;
+    while part.loaded_bytes() < target {
+        let remaining = target - part.loaded_bytes();
+        let mut padding = (remaining / 2).min(3 * 255);
         let mut key = || {
             let count = padding.min(255);
             padding -= count;
@@ -824,9 +819,8 @@ fn add_content_bytes(part: &mut ContentPart, next_id: &mut u32, bytes: u64) {
             false,
         ));
         *next_id += 1;
-        remaining -= len;
     }
-    assert_eq!(part.loaded_bytes() - previous, bytes as usize);
+    assert!(part.loaded_bytes() < target + 1024);
 }
 
 fn charged_content(
@@ -836,9 +830,10 @@ fn charged_content(
     next_id: &mut u32,
 ) -> LoadedIndex {
     let mut index = LoadedIndex::empty(Manifest::default());
-    let charge = cache.admit(PartKind::Content, bytes, account).unwrap();
     let mut part = ContentPart::default();
     add_content_bytes(&mut part, next_id, bytes);
+    let bytes = part.loaded_bytes() as u64;
+    let charge = cache.admit(PartKind::Content, bytes, account).unwrap();
     index.content = Some(LoadedContent {
         part,
         segments: vec![],
@@ -855,10 +850,11 @@ async fn pl11_growth_through_local_passes_is_charged() {
     let mut id = 1;
     let mut guard = entry.index.write().await;
     let index = guard.insert(charged_content(&cache, 1, 100 * KIB, &mut id));
-    for step in 1..=5 {
+    for _ in 1..=5 {
         add_content_bytes(&mut index.content.as_mut().unwrap().part, &mut id, 40 * KIB);
         assert!(cache.admit_content_growth(index, 1));
-        assert_eq!(cache.content_used(), (100 + step * 40) * KIB);
+        let bytes = index.content.as_ref().unwrap().part.loaded_bytes() as u64;
+        assert_eq!(cache.content_used(), bytes);
     }
     drop(guard);
     let charge = cache.admit(PartKind::Content, 800 * KIB, 2).unwrap();
@@ -871,8 +867,10 @@ async fn pl11_growth_through_local_passes_is_charged() {
 async fn pl11_growth_across_accounts_is_admitted_against_the_process_budget() {
     for pin_other_accounts in [false, true] {
         let cache = cache();
+        let mut original = Vec::new();
         for account in 1..=4 {
             let index = charged_content(&cache, account, 200 * KIB, &mut 1);
+            original.push(index.content.as_ref().unwrap().bytes);
             *cache.entry(account).index.write().await = Some(index);
         }
         let mut readers = Vec::new();
@@ -896,7 +894,7 @@ async fn pl11_growth_across_accounts_is_admitted_against_the_process_budget() {
         assert_eq!(cache.admit_content_growth(index, 1), !pin_other_accounts);
         if pin_other_accounts {
             assert!(index.content.is_none());
-            assert_eq!(cache.content_used(), 600 * KIB);
+            assert_eq!(cache.content_used(), original[1..].iter().sum::<u64>());
         } else {
             assert!(
                 cache
@@ -908,7 +906,11 @@ async fn pl11_growth_across_accounts_is_admitted_against_the_process_budget() {
                     .content
                     .is_none()
             );
-            assert_eq!(cache.content_used(), 900 * KIB);
+            let bytes = index.content.as_ref().unwrap().bytes;
+            assert_eq!(
+                cache.content_used(),
+                bytes + original[2..].iter().sum::<u64>()
+            );
         }
     }
 }
@@ -947,7 +949,13 @@ fn pl11_concurrent_growth_is_admitted_atomically() {
             assert_ne!(first_admitted, second_admitted);
             assert_eq!(first.content.is_some(), first_admitted);
             assert_eq!(second.content.is_some(), second_admitted);
-            assert_eq!(cache.content_used(), 550 * KIB);
+            let bytes = first
+                .content
+                .iter()
+                .chain(second.content.iter())
+                .map(|content| content.bytes)
+                .sum::<u64>();
+            assert_eq!(cache.content_used(), bytes);
         });
         assert_eq!(cache.content_used(), 0);
     }

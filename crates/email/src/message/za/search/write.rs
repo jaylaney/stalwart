@@ -4,14 +4,20 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::pass::{CursorStep, MarkerStep, PassDecision, PassOutcome, Staging};
+use super::{
+    compact::{CompactError, CompactedContent, CompactedThreads, compact_content, compact_threads},
+    pass::{CursorStep, MarkerStep, PassDecision, PassOutcome, Staging},
+};
 use crate::cache::MessageCacheFetch;
+#[cfg(feature = "test_mode")]
+use common::za::test_hooks::{SearchContentWrite, note_search_content_write};
 use common::{
     Server,
     storage::blob::BlobHold,
     za::search::{
-        cache::{IndexEntry, PartKind, scanned_seed},
-        error::TransientClass,
+        cache::{BudgetCharge, IndexEntry, LoadedIndex, PartKind, scanned_seed},
+        error::{LoadFailure, TransientClass},
+        load::ObservedLoadError,
         seal::{build_content_blob, build_thread_blob, za_search_key},
         trace::{ZA_SEARCH_ABORTED, ZA_SEARCH_LOST, ZA_SEARCH_PASS, ZA_SEARCH_SUSPENDED},
     },
@@ -241,50 +247,251 @@ fn seal_content_delta(
     Some((header, bytes))
 }
 
+#[derive(Default)]
+struct PreparedWrite {
+    blobs: Vec<StagedBlob>,
+    unlinked: Vec<BlobHash>,
+    threads: Option<CompactedThreads>,
+    content: Option<ContentSwap>,
+    staged_content_charge: Option<BudgetCharge>,
+    staged_content_bytes: u64,
+    content_written: u64,
+    content_merged: u64,
+    #[cfg(feature = "test_mode")]
+    content_tier: Option<u8>,
+}
+
+// Declaration order keeps the charge alive while the staged frames are dropped,
+// including cancellation before the guarded swap is entered.
+struct ChargedStaging {
+    staging: Staging,
+    content_charge: Option<BudgetCharge>,
+}
+
+struct ContentSwap {
+    replaced: usize,
+    full: bool,
+    removed_missing: bool,
+}
+
 async fn stage_blobs(
     server: &Server,
-    account_id: u32,
+    entry: &IndexEntry,
     keys: &SessionKeys,
-    base: &Manifest,
+    mut base: LoadedIndex,
     new: &mut Manifest,
     staging: &Staging,
-) -> Result<Vec<StagedBlob>, TransientClass> {
-    let mut blobs = Vec::new();
-    if let Some((header, bytes)) = seal_thread_delta(
-        keys.swk(),
-        account_id,
-        server.za_search_config().pad_min,
-        base.newest_row,
-        staging,
-    )? {
-        let blob = hold(server, account_id, bytes).await?;
+) -> Result<PreparedWrite, CompactError> {
+    let account_id = entry.account_id;
+    let config = server.za_search_config();
+    let cache = &server.inner.cache.za_search;
+    let mut prepared = PreparedWrite::default();
+    let thread_delta = matches!(
+        staging.decision,
+        PassDecision::Publishing | PassDecision::NonPublishing
+    );
+    let compact_thread = thread_delta && base.manifest.thread_blobs.len() + 1 >= config.segments;
+    let compact_content_due = !staging.content.is_empty()
+        && base
+            .manifest
+            .content
+            .as_ref()
+            .is_some_and(|head| u64::from(head.length) + 1 >= config.segments as u64);
+    if thread_delta && (compact_thread || compact_content_due) {
+        base.thread.extend(
+            staging.records.iter().cloned(),
+            staging.aliases.iter().copied(),
+            None,
+            staging.tombstones.iter().copied(),
+        );
+        cache.grow(
+            &mut base.thread_charge,
+            PartKind::Thread,
+            base.thread.loaded_bytes() as u64,
+            account_id,
+        );
+    }
+    let cursor_pending =
+        new.cursor.is_some() || new.content_to.cursor.is_some() || new.reconciliation.is_some();
+    let content = if compact_content_due {
+        compact_content(server, entry, keys, &base, staging, cursor_pending, &config).await?
+    } else {
+        None
+    };
+    let threads = if compact_thread {
+        compact_threads(server, account_id, keys, &base.thread, &config)
+            .await
+            .map_err(CompactError::Transient)?
+    } else {
+        None
+    };
+
+    let thread = if let Some((header, bytes, replacement)) = threads {
+        prepared.threads = Some(replacement);
+        prepared
+            .unlinked
+            .extend(new.thread_blobs.drain(..).map(|blob| blob.hash));
+        Some((header, bytes))
+    } else {
+        if thread_delta && new.thread_blobs.len() == usize::from(u8::MAX) {
+            return Err(CompactError::ThreadInventory);
+        }
+        seal_thread_delta(
+            keys.swk(),
+            account_id,
+            config.pad_min,
+            base.manifest.newest_row,
+            staging,
+        )
+        .map_err(CompactError::Transient)?
+    };
+    drop(base);
+
+    if let Some((header, bytes)) = thread {
+        let blob = hold(server, account_id, bytes)
+            .await
+            .map_err(CompactError::Transient)?;
         #[cfg(feature = "test_mode")]
         common::za::test_hooks::search_pass_pause_point(account_id).await;
         new.thread_blobs.push(ThreadBlobEntry {
             segment: header.segment,
             hash: blob.hash.clone(),
-            size: u32::try_from(blob.len).map_err(|_| TransientClass::Validation)?,
+            size: u32::try_from(blob.len)
+                .map_err(|_| CompactError::Transient(TransientClass::Validation))?,
         });
-        blobs.push(blob);
+        if let Some(threads) = &mut prepared.threads {
+            cache.grow(
+                &mut threads.charge,
+                PartKind::Thread,
+                threads.part.loaded_bytes() as u64,
+                account_id,
+            );
+        }
+        prepared.blobs.push(blob);
     }
 
-    if let Some((header, bytes)) =
-        seal_content_delta(keys.swk(), account_id, new.content.as_ref(), staging)
-    {
-        let blob = hold(server, account_id, bytes).await?;
-        let length = new
+    if let Some(mut compacted) = content {
+        let old_head = new
             .content
             .as_ref()
-            .map_or(Some(1), |h| h.length.checked_add(1));
+            .expect("compaction replaces a named chain");
+        let replaced_count = u32::try_from(compacted.replaced.len())
+            .map_err(|_| CompactError::Transient(TransientClass::Validation))?;
+        let length = old_head
+            .length
+            .checked_sub(replaced_count)
+            .and_then(|len| len.checked_add(1));
+        let size = old_head
+            .size
+            .checked_sub(compacted.replaced_size)
+            .and_then(|size| size.checked_add(compacted.bytes.len() as u64));
+        let (Some(length), Some(size)) = (length, size) else {
+            return Err(CompactError::Transient(TransientClass::Validation));
+        };
+        // Keep the retirement vector and its charge together during upload.
+        let blob = hold(server, account_id, std::mem::take(&mut compacted.bytes))
+            .await
+            .map_err(CompactError::Transient)?;
+        let CompactedContent {
+            header,
+            replaced,
+            rewritten,
+            full,
+            removed_missing,
+            mut charge,
+            staged_bytes,
+            retirement_bytes,
+            ..
+        } = compacted;
+        cache.grow(
+            &mut charge,
+            PartKind::Content,
+            staged_bytes.saturating_add(retirement_bytes),
+            account_id,
+        );
+        prepared.staged_content_charge = Some(charge);
+        prepared.staged_content_bytes = staged_bytes;
         new.content = Some(ContentHead {
             hash: blob.hash.clone(),
             segment: header.segment,
-            length: length.ok_or(TransientClass::Validation)?,
-            size: new.content.as_ref().map_or(0, |h| h.size) + blob.len as u64,
+            length,
+            size,
         });
-        blobs.push(blob);
+        prepared.unlinked.extend(replaced);
+        prepared.content = Some(ContentSwap {
+            replaced: replaced_count as usize,
+            full,
+            removed_missing,
+        });
+        prepared.content_written = blob.len as u64;
+        #[cfg(feature = "test_mode")]
+        {
+            note_search_content_write(account_id, SearchContentWrite::StagedMemory(staged_bytes));
+            note_search_content_write(
+                account_id,
+                SearchContentWrite::RetirementMemory(retirement_bytes),
+            );
+            note_search_content_write(
+                account_id,
+                SearchContentWrite::Uploaded {
+                    tier: header.tier,
+                    bytes: blob.len as u64,
+                },
+            );
+            prepared.content_tier = Some(header.tier);
+        }
+        prepared.content_merged = rewritten;
+        prepared.blobs.push(blob);
+    } else if let Some((header, bytes)) =
+        seal_content_delta(keys.swk(), account_id, new.content.as_ref(), staging)
+    {
+        let length = new
+            .content
+            .as_ref()
+            .map_or(Some(1), |head| head.length.checked_add(1));
+        let size = new
+            .content
+            .as_ref()
+            .map_or(0, |head| head.size)
+            .checked_add(bytes.len() as u64);
+        let (Some(length), Some(size)) = (length, size) else {
+            return Err(CompactError::Transient(TransientClass::Validation));
+        };
+        #[cfg(feature = "test_mode")]
+        {
+            note_search_content_write(account_id, SearchContentWrite::Original(bytes.len() as u64));
+            note_search_content_write(
+                account_id,
+                SearchContentWrite::Encoded {
+                    tier: header.tier,
+                    bytes: bytes.len() as u64,
+                },
+            );
+        }
+        let blob = hold(server, account_id, bytes)
+            .await
+            .map_err(CompactError::Transient)?;
+        prepared.content_written = blob.len as u64;
+        #[cfg(feature = "test_mode")]
+        {
+            note_search_content_write(
+                account_id,
+                SearchContentWrite::Uploaded {
+                    tier: header.tier,
+                    bytes: blob.len as u64,
+                },
+            );
+            prepared.content_tier = Some(header.tier);
+        }
+        new.content = Some(ContentHead {
+            hash: blob.hash.clone(),
+            segment: header.segment,
+            length,
+            size,
+        });
+        prepared.blobs.push(blob);
     }
-    Ok(blobs)
+    Ok(prepared)
 }
 
 fn build_batch(
@@ -293,6 +500,7 @@ fn build_batch(
     new: &Manifest,
     key: &ZaSearchKey,
     blobs: Vec<StagedBlob>,
+    unlinked: Vec<BlobHash>,
     witness: Option<u32>,
     mailboxes: impl IntoIterator<Item = u32>,
 ) -> BatchBuilder {
@@ -317,6 +525,12 @@ fn build_batch(
                 account_id,
             )),
         );
+    for hash in unlinked {
+        batch.clear(BlobOp::Link {
+            hash,
+            to: BlobLink::Document,
+        });
+    }
     for blob in blobs {
         blob.hold.release(&mut batch);
         batch
@@ -351,29 +565,34 @@ pub(crate) async fn write_pass(
     keys: &SessionKeys,
     entry: &IndexEntry,
     previous_bytes: &[u8],
-    base_hash: [u8; 32],
-    base_manifest: Manifest,
+    base: LoadedIndex,
     staging: Staging,
 ) -> trc::Result<PassOutcome> {
-    if base_manifest.thread_blobs.len() >= usize::from(u8::MAX)
-        && matches!(
-            staging.decision,
-            PassDecision::Publishing | PassDecision::NonPublishing
-        )
-    {
-        za_search_trace!(
-            ZA_SEARCH_ABORTED,
-            AccountId = account_id,
-            Reason = "segments"
-        );
-        return Ok(PassOutcome::Aborted(TransientClass::Validation));
-    }
-    let mut new = next_manifest(&base_manifest, &staging);
-    let blobs =
-        match stage_blobs(server, account_id, keys, &base_manifest, &mut new, &staging).await {
-            Ok(blobs) => blobs,
-            Err(class) => return Ok(trace_abort(account_id, class)),
-        };
+    let mut new = next_manifest(&base.manifest, &staging);
+    let base_hash = base.manifest_bytes_hash;
+    let base_manifest = base.manifest.clone();
+    let prepared = match stage_blobs(server, entry, keys, base, &mut new, &staging).await {
+        Ok(prepared) => prepared,
+        Err(CompactError::Read(error)) => {
+            return Ok(match error {
+                ObservedLoadError::ContentLoss(loss) => PassOutcome::ContentLoss(loss),
+                other => match other.classification() {
+                    LoadFailure::Transient(class) => trace_abort(account_id, class),
+                    _ => trace_abort(account_id, TransientClass::Validation),
+                },
+            });
+        }
+        Err(CompactError::Transient(class)) => return Ok(trace_abort(account_id, class)),
+        Err(error @ (CompactError::TierOverflow | CompactError::ThreadInventory)) => {
+            let reason = if matches!(error, CompactError::TierOverflow) {
+                "tier-overflow"
+            } else {
+                "segments"
+            };
+            za_search_trace!(ZA_SEARCH_ABORTED, AccountId = account_id, Reason = reason);
+            return Ok(PassOutcome::Aborted(TransientClass::Validation));
+        }
+    };
     commit_and_swap(
         server,
         account_id,
@@ -383,7 +602,7 @@ pub(crate) async fn write_pass(
         base_hash,
         &base_manifest,
         new,
-        blobs,
+        prepared,
         staging,
     )
     .await
@@ -399,9 +618,29 @@ async fn commit_and_swap(
     base_hash: [u8; 32],
     base: &Manifest,
     mut new: Manifest,
-    blobs: Vec<StagedBlob>,
+    prepared: PreparedWrite,
     staging: Staging,
 ) -> trc::Result<PassOutcome> {
+    // The retirement vector and batch locals drop before the charge,
+    // including cancellation during mailbox lookup and commit.
+    let mut charged = ChargedStaging {
+        staging,
+        content_charge: None,
+    };
+    let PreparedWrite {
+        blobs,
+        unlinked,
+        threads,
+        content,
+        staged_content_charge,
+        staged_content_bytes,
+        content_written,
+        content_merged,
+        #[cfg(feature = "test_mode")]
+        content_tier,
+    } = prepared;
+    charged.content_charge = staged_content_charge;
+    let staging = &charged.staging;
     let publishing = matches!(staging.decision, PassDecision::Publishing);
     let witness = publishing.then(|| staging.witness.expect("publishing indexed a message"));
     let mut mailboxes = Vec::new();
@@ -439,6 +678,7 @@ async fn commit_and_swap(
         &new,
         &key,
         blobs,
+        unlinked,
         witness,
         mailboxes,
     );
@@ -448,7 +688,17 @@ async fn commit_and_swap(
     if expires_by.is_some_and(|deadline| deadline <= now()) {
         return Ok(trace_abort(account_id, TransientClass::BlobStore));
     }
-    match server.commit_batch(batch).await {
+    let result = server.commit_batch(batch).await;
+    // Only now has the transaction disposed of the retirement operations.
+    if let Some(charge) = &mut charged.content_charge {
+        server.inner.cache.za_search.grow(
+            charge,
+            PartKind::Content,
+            staged_content_bytes,
+            account_id,
+        );
+    }
+    match result {
         Ok(assigned) => {
             if publishing {
                 new.newest_row.change_id = assigned
@@ -458,7 +708,8 @@ async fn commit_and_swap(
         }
         Err(err) if err.is_assertion_failure() => {
             za_search_trace!(ZA_SEARCH_LOST, AccountId = account_id);
-            drop(staging);
+            drop(charged);
+            drop(threads);
             if let Err(failure) = server.za_search_reload_if_moved(entry, keys).await {
                 za_search_trace!(
                     ZA_SEARCH_ABORTED,
@@ -470,6 +721,16 @@ async fn commit_and_swap(
         }
         Err(_) => return Ok(trace_abort(account_id, TransientClass::Store)),
     }
+    #[cfg(feature = "test_mode")]
+    if let Some(tier) = content_tier {
+        note_search_content_write(
+            account_id,
+            SearchContentWrite::Linked {
+                tier,
+                bytes: content_written,
+            },
+        );
+    }
     let new_hash = manifest_hash(&ManifestValue::Index(new.clone()).encode(&key));
     drop(key);
 
@@ -480,6 +741,7 @@ async fn commit_and_swap(
             indexed_to: new.indexed_to,
         },
     };
+    staging.trace_skipped(account_id);
     za_search_trace!(
         ZA_SEARCH_PASS,
         AccountId = account_id,
@@ -488,9 +750,9 @@ async fn commit_and_swap(
         Result = publishing,
         Version = new.revision,
         ChangeId = new.indexed_to.change_id,
-        Size = new.content.as_ref().map_or(0, |h| h.size)
-            - base.content.as_ref().map_or(0, |h| h.size),
-        Used = 0u64,
+        Size = content_written,
+        // Encoded work includes cascade outputs consumed before upload.
+        Used = content_merged,
     );
     if !base.content_to.suspended && new.content_to.suspended {
         za_search_trace!(
@@ -508,10 +770,14 @@ async fn commit_and_swap(
             return Ok(outcome);
         }
     }
-    swap(server, entry, base_hash, base, new, new_hash, staging).await;
+    swap(
+        server, entry, base_hash, base, new, new_hash, charged, threads, content,
+    )
+    .await;
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn swap(
     server: &Server,
     entry: &IndexEntry,
@@ -519,7 +785,9 @@ async fn swap(
     base: &Manifest,
     new: Manifest,
     new_hash: [u8; 32],
-    staging: Staging,
+    charged: ChargedStaging,
+    threads: Option<CompactedThreads>,
+    content_swap: Option<ContentSwap>,
 ) {
     let search_cache = &server.inner.cache.za_search;
     let account_id = entry.account_id;
@@ -536,6 +804,10 @@ async fn swap(
     else {
         return;
     };
+    let ChargedStaging {
+        staging,
+        content_charge,
+    } = charged;
     if matches!(
         staging.decision,
         PassDecision::Publishing | PassDecision::NonPublishing | PassDecision::ContentOnly
@@ -551,9 +823,15 @@ async fn swap(
             }
             let row =
                 matches!(staging.decision, PassDecision::Publishing).then_some(new.newest_row);
-            index
-                .thread
-                .extend(staging.records, staging.aliases, row, staging.tombstones);
+            if let Some(CompactedThreads { mut part, charge }) = threads {
+                part.extend([], [], row, []);
+                index.thread = part;
+                index.thread_charge = charge;
+            } else {
+                index
+                    .thread
+                    .extend(staging.records, staging.aliases, row, staging.tombstones);
+            }
             index.thread_segments = new.thread_blobs.iter().map(|e| e.segment).collect();
             index.thread_bytes = index.thread.loaded_bytes() as u64;
             search_cache.grow(
@@ -563,26 +841,45 @@ async fn swap(
                 account_id,
             );
         }
-        if index
-            .content
-            .as_ref()
-            .is_some_and(|c| c.segments.first() != base.content.as_ref().map(|b| &b.segment))
-        {
+        if index.content.as_ref().is_some_and(|c| {
+            c.segments.first() != base.content.as_ref().map(|b| &b.segment)
+                || content_swap.as_ref().is_some_and(|update| {
+                    update.replaced > c.segments.len() || (!update.full && update.removed_missing)
+                })
+        }) {
             index.content = None;
         }
+        let staged_content = staging.content;
         if let Some(content) = index.content.as_mut() {
-            for (_, record) in staging.content {
+            for (_, record) in staged_content {
                 if index.thread.is_present(record.document_id()) {
                     content.part.insert(record);
                 }
             }
-            if let Some(head) = &new.content
-                && content.segments.first() != Some(&head.segment)
-            {
-                content.segments.insert(0, head.segment);
+            if let Some(head) = &new.content {
+                if let Some(update) = content_swap {
+                    content.segments.splice(..update.replaced, [head.segment]);
+                    if update.full {
+                        let missing = content
+                            .part
+                            .document_ids()
+                            .iter()
+                            .filter(|id| !index.thread.is_present(*id))
+                            .collect::<Vec<_>>();
+                        for id in missing {
+                            content.part.remove(id);
+                        }
+                    }
+                } else if content.segments.first() != Some(&head.segment) {
+                    content.segments.insert(0, head.segment);
+                }
             }
+        } else {
+            drop(staged_content);
         }
-        search_cache.admit_content_growth(index, account_id);
+        // The separate staging allocation is gone. Transfer its charge to
+        // the resident part before reconciling its updated size.
+        search_cache.admit_content_growth_with_staged(index, account_id, content_charge);
     }
     if !matches!(staging.decision, PassDecision::Abort { .. }) {
         index.scanned_to = staging.scanned_to.max(scanned_seed(&new.indexed_to));

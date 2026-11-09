@@ -13,7 +13,7 @@ use common::{
     za::search::{
         cache::{IndexEntry, LoadedIndex},
         error::{LoadFailure, NoMapReason, TransientClass},
-        load::{MapLoss, ObservedLoadError},
+        load::{ContentLoss, MapLoss, ObservedLoadError},
         trace::{ZA_SEARCH_LOST, ZA_SEARCH_REBUILD, ZA_SEARCH_UNAVAILABLE},
     },
     za_search_trace,
@@ -89,6 +89,17 @@ impl ZaSearchEnsure for Server {
                 Ok(PassOutcome::Recovery(cause)) => {
                     trace_recovery_limit(account_id, &cause);
                     break;
+                }
+                Ok(PassOutcome::ContentLoss(loss)) if !reentered => {
+                    reentered = true;
+                    if let Err(reason) = recover_content(self, account_id, keys, loss, None).await {
+                        za_search_trace!(
+                            ZA_SEARCH_UNAVAILABLE,
+                            AccountId = account_id,
+                            Reason = reason.as_str()
+                        );
+                        break;
+                    }
                 }
                 Ok(PassOutcome::NoMap(reason)) => {
                     za_search_trace!(
@@ -219,6 +230,11 @@ impl ZaSearchEnsure for Server {
                         return Err(Unavailable::Transient(class));
                     }
                 }
+                Ok(PassOutcome::ContentLoss(loss)) if !recovered_content => {
+                    recovered_content = true;
+                    recover_content(self, account_id, keys, loss, Some(deadline)).await?;
+                }
+                Ok(PassOutcome::ContentLoss(_)) => return Err(Unavailable::Rebuilding),
                 Ok(PassOutcome::NoMap(reason)) => return Err(map_no_map(reason)),
                 Ok(PassOutcome::Recovery(cause)) if !reentered => {
                     reentered = true;
@@ -315,44 +331,53 @@ async fn load_content(
     deadline: tokio::time::Instant,
     recovered: &mut bool,
 ) -> Result<bool, Unavailable> {
-    let id = entry.account_id;
     match timeout_at(deadline, server.za_search_load_content(entry, keys))
         .await
         .map_err(|_| Unavailable::NotCurrent)?
     {
-        Ok(()) => return Ok(false),
+        Ok(()) => Ok(false),
         Err(ObservedLoadError::ContentLoss(loss)) if !*recovered => {
             *recovered = true;
-            recovery_pause(id, Some(deadline)).await?;
-            match server
-                .za_search_content_rebuild_start(
-                    id,
-                    keys,
-                    ContentRebuildReason::ContentLoss(loss),
-                    Some(deadline),
-                )
-                .await
-            {
-                Ok(()) => (),
-                Err(error) if error.is_assertion_failure() => {
-                    za_search_trace!(ZA_SEARCH_LOST, AccountId = id);
-                }
-                Err(error) if recovery_timed_out(&error) => return Err(Unavailable::NotCurrent),
-                Err(error) => {
-                    trc::error!(error.account_id(id));
-                    return Err(Unavailable::Transient(TransientClass::Store));
-                }
-            }
+            recover_content(server, entry.account_id, keys, loss, Some(deadline)).await?;
+            Ok(true)
         }
-        Err(error) => return Err(map_load(error.classification())),
+        Err(error) => Err(map_load(error.classification())),
     }
-    wait_for_recovery(
-        Some(deadline),
-        server.za_search_reload_if_moved(entry, keys),
-    )
-    .await?
-    .map_err(|error| map_load(error.classification()))?;
-    Ok(true)
+}
+
+async fn recover_content(
+    server: &Server,
+    account_id: u32,
+    keys: &SessionKeys,
+    loss: ContentLoss,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), Unavailable> {
+    recovery_pause(account_id, deadline).await?;
+    match server
+        .za_search_content_rebuild_start(
+            account_id,
+            keys,
+            ContentRebuildReason::ContentLoss(loss),
+            deadline,
+        )
+        .await
+    {
+        Ok(()) => (),
+        Err(error) if error.is_assertion_failure() => {
+            za_search_trace!(ZA_SEARCH_LOST, AccountId = account_id);
+        }
+        Err(error) if recovery_timed_out(&error) => return Err(Unavailable::NotCurrent),
+        Err(error) => {
+            trc::error!(error.account_id(account_id));
+            return Err(Unavailable::Transient(TransientClass::Store));
+        }
+    }
+    if let Some(entry) = server.inner.cache.za_search.get(account_id) {
+        wait_for_recovery(deadline, server.za_search_reload_if_moved(&entry, keys))
+            .await?
+            .map_err(|error| map_load(error.classification()))?;
+    }
+    Ok(())
 }
 
 async fn recovery_pause(

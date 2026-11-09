@@ -210,6 +210,7 @@ pub async fn test(test: &mut TestServer) {
     test.wait_for_tasks().await;
     destroy_cases(test, &admin).await;
     test_recovery(test).await;
+    test_compaction(test, &admin).await;
     println!("Zero-access mail index pass tests finished");
 }
 
@@ -3846,5 +3847,1195 @@ async fn case_stale_loss_keeps_successor(test: &TestServer, key: &Account, loss:
     assert_eq!(
         queried(&recovery_query(key, Some("recoveryneedle")).await),
         successor_ids
+    );
+}
+
+async fn test_compaction(test: &mut TestServer, admin: &Account) {
+    let bounded = key_mail_account(test, "keymail61@example.com", "Keymail-61!").await;
+    case_r8_thread_compaction_bounds_the_manifest(test, admin, &bounded).await;
+    test.destroy_all_mailboxes(&bounded).await;
+
+    let allowance = key_mail_account(
+        test,
+        "keymail-compact-allowance@example.com",
+        "Compaction-allowance!",
+    )
+    .await;
+    case_thread_allowance_fallback_checks_the_final_inventory(test, &allowance).await;
+    test.destroy_all_mailboxes(&allowance).await;
+
+    let saturated =
+        key_mail_account(test, "keymail-compact-full@example.com", "Compaction-full!").await;
+    case_full_merge_saturates_repeatedly(test, &saturated).await;
+    test.destroy_all_mailboxes(&saturated).await;
+
+    for (name, arm) in [
+        ("keymail-compact-map@example.com", PendingArm::Map),
+        ("keymail-compact-content@example.com", PendingArm::Content),
+        ("keymail-compact-marker@example.com", PendingArm::Marker),
+    ] {
+        let key = key_mail_account(test, name, "Compaction-pending!").await;
+        case_pending_merge_leaves_tier_255_root(test, &key, arm).await;
+        test.destroy_all_mailboxes(&key).await;
+    }
+
+    let overflow = key_mail_account(
+        test,
+        "keymail-compact-overflow@example.com",
+        "Compaction-overflow!",
+    )
+    .await;
+    case_tier_overflow_refuses_the_pass(test, &overflow).await;
+    test.destroy_all_mailboxes(&overflow).await;
+
+    let rebuild = key_mail_account(
+        test,
+        "keymail-compact-rebuild@example.com",
+        "Compaction-rebuild!",
+    )
+    .await;
+    case_g17_h7_r32_tiered_merges_during_a_rebuild(test, &rebuild).await;
+    test.destroy_all_mailboxes(&rebuild).await;
+
+    let budget = key_mail_account(
+        test,
+        "keymail-compact-budget@example.com",
+        "Compaction-budget!",
+    )
+    .await;
+    case_warm_content_compaction_releases_its_own_budget(test, &budget).await;
+    test.destroy_all_mailboxes(&budget).await;
+
+    for (name, compressed) in [
+        ("keymail-compact-small-frames@example.com", false),
+        ("keymail-compact-compressed-frames@example.com", true),
+    ] {
+        let key = key_mail_account(test, name, "Compaction-bounds!").await;
+        case_content_frame_budget(test, &key, compressed).await;
+        test.destroy_all_mailboxes(&key).await;
+    }
+
+    let loss = key_mail_account(test, "keymail-compact-loss@example.com", "Compaction-loss!").await;
+    case_compaction_hash_loss_keeps_the_map(test, &loss).await;
+    test.destroy_all_mailboxes(&loss).await;
+    test.wait_for_tasks().await;
+}
+
+async fn case_r8_thread_compaction_bounds_the_manifest(
+    test: &TestServer,
+    admin: &Account,
+    key: &Account,
+) {
+    let _config = search_config_guard!(test, segments: 4);
+    let id = account_id(key);
+    let mut previous_links = Vec::new();
+    let mut retired = Vec::new();
+    let mut previous_revision = index(test, id).await.revision;
+    for pass_no in 1..=12 {
+        deliver_one(test, key, &format!("Bounded pass {pass_no}")).await;
+        mailbox_get(key).await;
+        let manifest = index(test, id).await;
+        assert_eq!(manifest.revision, previous_revision + 1);
+        previous_revision = manifest.revision;
+        let count = if pass_no <= 3 {
+            pass_no
+        } else {
+            1 + (pass_no - 4) % 3
+        };
+        assert_eq!(manifest.thread_blobs.len(), count as usize);
+        let head = manifest.content.as_ref().unwrap();
+        assert_eq!(head.length, count);
+        if [4, 7, 10].contains(&pass_no) {
+            let header = content_header(test, &head.hash).await;
+            assert_eq!(header.tier, ((pass_no - 1) / 3) as u8);
+            assert!(header.predecessor.is_none());
+        }
+        assert!(loaded(test, id).await.content.is_none(), "thread-only node");
+        assert_manifest_links(test, id, &manifest).await;
+        let links = principal_hashes(test, id).await;
+        retired.extend(
+            previous_links
+                .into_iter()
+                .filter(|hash| !links.contains(hash)),
+        );
+        previous_links = links;
+    }
+    assert!(!retired.is_empty());
+    expire_and_purge_blobs(test, admin).await;
+    for hash in retired {
+        assert!(
+            test.server
+                .get_blob(hash.as_slice(), 0..1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_manifest_links(test, id, &index(test, id).await).await;
+}
+
+async fn content_header(test: &TestServer, hash: &BlobHash) -> BlobHeader {
+    let bytes = test
+        .server
+        .get_blob(hash.as_slice(), 0..BlobHeader::LEN)
+        .await
+        .unwrap()
+        .unwrap();
+    BlobHeader::decode(&bytes).unwrap().0
+}
+
+async fn seed_content_tiers(
+    test: &TestServer,
+    key: &Account,
+    mut manifest: Manifest,
+    tiers: &[u8],
+) -> (Manifest, Vec<BlobHash>) {
+    use common::za::search::seal::{build_content_blob, parse_content_blob};
+    use store::za_search::{BlobKind, SegmentId, manifest::ContentHead};
+    use types::field::PrincipalField;
+    use vault::Zeroizing;
+
+    let id = account_id(key);
+    let keys = za_unlock(test, id, key.secret()).await;
+    let old = manifest.content.as_ref().unwrap();
+    assert_eq!(old.length, 1, "the seeded root comes from a real pass");
+    let bytes = stored_blob(test, &old.hash).await;
+    let (_, records) = parse_content_blob(keys.swk(), id, Some(old.segment), None, &bytes).unwrap();
+    assert_eq!(records.len(), 1);
+    let frames = records
+        .iter()
+        .map(|record| Zeroizing::new(record.encode()))
+        .collect::<Vec<_>>();
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .clear(BlobOp::Link {
+            hash: old.hash.clone(),
+            to: BlobLink::Document,
+        });
+    let mut predecessor = None;
+    let mut size = 0u64;
+    let mut hashes = Vec::new();
+    for (pos, &tier) in tiers.iter().rev().enumerate() {
+        let header = BlobHeader {
+            kind: BlobKind::Content,
+            tier,
+            segment: SegmentId::random(),
+            predecessor,
+        };
+        let slices = if pos == 0 {
+            frames
+                .iter()
+                .map(|frame| frame.as_slice())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let bytes = build_content_blob(keys.swk(), id, &header, &slices);
+        let (hash, hold) = test
+            .server
+            .hold_blob(id, BlobHash::generate(&bytes), &bytes, 60, &BlobOpts::PLAIN)
+            .await
+            .unwrap();
+        hold.release(&mut batch).set(
+            BlobOp::Link {
+                hash: hash.clone(),
+                to: BlobLink::Document,
+            },
+            BlobLinkValue::new(bytes.len()),
+        );
+        size += bytes.len() as u64;
+        hashes.push(hash.clone());
+        predecessor = Some((hash, header.segment));
+    }
+    let (hash, segment) = predecessor.unwrap();
+    manifest.content = Some(ContentHead {
+        hash,
+        segment,
+        size,
+        length: tiers.len() as u32,
+    });
+    batch.set(
+        PrincipalField::ZeroAccessSearch,
+        ManifestValue::Index(manifest.clone()).encode(&za_search_key(keys.swk())),
+    );
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    simulate_restart(test, id).await;
+    assert_manifest_links(test, id, &manifest).await;
+    hashes.reverse();
+    (manifest, hashes)
+}
+
+async fn content_frames(
+    test: &TestServer,
+    key: &Account,
+) -> std::collections::BTreeMap<u32, Vec<u8>> {
+    let id = account_id(key);
+    let keys = za_unlock(test, id, key.secret()).await;
+    let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+    test.server
+        .za_search_load_content(&entry, &keys)
+        .await
+        .unwrap();
+    let view = entry.read_loaded().await.unwrap();
+    let content = view.content.as_ref().unwrap();
+    content
+        .part
+        .document_ids()
+        .iter()
+        .map(|id| (id, content.part.record_bytes(id).unwrap().to_vec()))
+        .collect()
+}
+
+async fn case_full_merge_saturates_repeatedly(test: &TestServer, key: &Account) {
+    let _config = search_config_guard!(test, segments: 2);
+    let id = account_id(key);
+    let first = deliver_one(test, key, "Saturating root terms").await;
+    advanced(test, key, true).await;
+    let (mut previous, _) = seed_content_tiers(test, key, index(test, id).await, &[254]).await;
+    let mut frames = content_frames(test, key).await;
+    assert!(frames.contains_key(&first));
+    for turn in 0..3 {
+        let document = deliver_one(test, key, &format!("Saturation terms {turn}")).await;
+        let progress = advanced(test, key, true).await;
+        let after = index(test, id).await;
+        let head = after.content.as_ref().unwrap();
+        let old = previous.content.as_ref().unwrap();
+        assert!(progress.change_id > previous.indexed_to.change_id);
+        assert_eq!(head.length, 1);
+        assert_ne!(head.hash, old.hash);
+        assert_ne!(head.segment, old.segment);
+        let header = content_header(test, &head.hash).await;
+        assert_eq!(header.tier, 255);
+        assert!(header.predecessor.is_none());
+        assert_manifest_links(test, id, &after).await;
+        assert!(!principal_hashes(test, id).await.contains(&old.hash));
+        {
+            let view = loaded(test, id).await;
+            let resident = view
+                .content
+                .as_ref()
+                .expect("compaction kept its warm part");
+            assert_eq!(resident.segments, [head.segment]);
+            assert_eq!(resident.bytes, resident.part.loaded_bytes() as u64);
+        }
+        let warm = content_frames(test, key).await;
+        assert_eq!(warm.len(), frames.len() + 1);
+        assert!(warm.contains_key(&document));
+        for (id, frame) in &frames {
+            assert_eq!(warm.get(id), Some(frame));
+        }
+        simulate_restart(test, id).await;
+        assert_eq!(content_frames(test, key).await, warm);
+        frames = warm;
+        previous = after;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PendingArm {
+    Map,
+    Content,
+    Marker,
+}
+
+async fn case_pending_merge_leaves_tier_255_root(
+    test: &TestServer,
+    key: &Account,
+    arm: PendingArm,
+) {
+    use store::za_search::manifest::{ContentCursor, RebuildCursor, ReconciliationMarker};
+
+    let _config = search_config_guard!(test, segments: 2, pass_cap: 1);
+    let id = account_id(key);
+    deliver_one(test, key, "Older root").await;
+    advanced(test, key, true).await;
+    let mut manifest = index(test, id).await;
+    let ids = append_recovery_messages(test, key, 2).await;
+    match arm {
+        PendingArm::Map => {
+            manifest.cursor = Some(RebuildCursor {
+                next: ids[0],
+                end: ids[1],
+            })
+        }
+        PendingArm::Content => {
+            manifest.content_to.cursor = Some(ContentCursor {
+                next_below: u32::MAX,
+            })
+        }
+        PendingArm::Marker => {
+            manifest.reconciliation = Some(ReconciliationMarker {
+                bound: 1,
+                gap_next: 0,
+            })
+        }
+    }
+    let (_, hashes) = seed_content_tiers(test, key, manifest, &[0, 255]).await;
+
+    advanced(test, key, true).await;
+    let after = index(test, id).await;
+    match arm {
+        PendingArm::Map => assert!(after.cursor.is_some()),
+        PendingArm::Content => assert!(after.content_to.cursor.is_some()),
+        PendingArm::Marker => assert!(after.reconciliation.is_some()),
+    }
+    let chain = content_hashes(test, &after).await;
+    assert_eq!(chain.len(), 2, "{arm:?}");
+    assert_eq!(chain[1], hashes[1]);
+    assert_eq!(content_header(test, &chain[0]).await.tier, 1);
+    assert_eq!(content_header(test, &chain[1]).await.tier, 255);
+    assert!(!principal_hashes(test, id).await.contains(&hashes[0]));
+    assert_manifest_links(test, id, &after).await;
+}
+
+struct ObserveContentWrites;
+
+impl ObserveContentWrites {
+    fn start(id: u32) -> Self {
+        common::za::test_hooks::set_search_content_writes(Some(id));
+        Self
+    }
+}
+
+impl Drop for ObserveContentWrites {
+    fn drop(&mut self) {
+        common::za::test_hooks::set_search_content_writes(None);
+    }
+}
+
+async fn case_tier_overflow_refuses_the_pass(test: &TestServer, key: &Account) {
+    use common::za::{
+        search::trace::ZA_SEARCH_ABORTED,
+        test_hooks::{SearchContentWrite, take_search_content_writes},
+    };
+    use store::za_search::manifest::RebuildCursor;
+
+    let _config = search_config_guard!(test, segments: 2, pass_cap: 1);
+    let id = account_id(key);
+    let original = deliver_one(test, key, "Overflow original terms").await;
+    advanced(test, key, true).await;
+    let mut manifest = index(test, id).await;
+    let ids = append_recovery_messages(test, key, 2).await;
+    manifest.cursor = Some(RebuildCursor {
+        next: ids[0],
+        end: ids[1],
+    });
+    manifest.failing = Some(FailingDocument {
+        document_id: ids[0],
+        attempts: 1,
+    });
+    let tiers = (0..=255).collect::<Vec<_>>();
+    let (before, hashes) = seed_content_tiers(test, key, manifest, &tiers).await;
+    let warm = content_frames(test, key).await;
+    let raw = manifest_bytes(test, id).await;
+    let links = principal_blob_links(test, id).await;
+    let holds = temporary_blob_hashes(test, id).await;
+    let email = log_records_since(test, id, SyncCollection::Email, 0).await;
+    let thread = log_records_since(test, id, SyncCollection::Thread, 0).await;
+    let _observer = ObserveContentWrites::start(id);
+    use common::za::search::cache::PartKind;
+    let cache = &test.server.inner.cache.za_search;
+    let resident_bytes = loaded(test, id).await.content.as_ref().unwrap().bytes;
+    // Room for the staged record and one input, but not for the entire
+    // descriptor plan. Preflight must neither evict its base nor encode.
+    {
+        let _budget = cache.override_content_budget_for_test(resident_bytes + 4096);
+        assert_eq!(cache.content_budget(), resident_bytes + 4096);
+        drop(
+            cache
+                .admit(PartKind::Content, 4096, id)
+                .expect("room for one input"),
+        );
+        assert_eq!(cache.content_used(), resident_bytes);
+        assert_eq!(
+            pass(test, key).await,
+            PassOutcome::Aborted(TransientClass::Budget)
+        );
+        assert_eq!(
+            cache.content_used(),
+            resident_bytes,
+            "preflight refusal released its charge"
+        );
+        assert_eq!(manifest_bytes(test, id).await, raw);
+        assert_eq!(principal_blob_links(test, id).await, links);
+        assert_eq!(temporary_blob_hashes(test, id).await, holds);
+        assert!(take_search_content_writes(id).is_empty());
+        assert_eq!(content_frames(test, key).await, warm);
+    }
+    let used = cache.content_used();
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    for _ in 0..2 {
+        assert_eq!(
+            pass(test, key).await,
+            PassOutcome::Aborted(TransientClass::Validation)
+        );
+        assert!(
+            take_search_content_writes(id).is_empty(),
+            "overflow encoded or uploaded output"
+        );
+        assert_eq!(
+            cache.content_used(),
+            used,
+            "tier overflow released all preflight charges"
+        );
+        assert_eq!(manifest_bytes(test, id).await, raw);
+        assert_eq!(principal_blob_links(test, id).await, links);
+        assert_eq!(temporary_blob_hashes(test, id).await, holds);
+        let view = loaded(test, id).await;
+        assert_eq!(view.manifest, before);
+        assert!(!view.thread.is_present(ids[0]));
+        assert_eq!(view.content.as_ref().unwrap().segments.len(), 256);
+        drop(view);
+        assert_eq!(content_frames(test, key).await, warm);
+    }
+    assert_eq!(
+        log_records_since(test, id, SyncCollection::Email, 0).await,
+        email
+    );
+    assert_eq!(
+        log_records_since(test, id, SyncCollection::Thread, 0).await,
+        thread
+    );
+    let events = traces.finish().await;
+    let own = events
+        .iter()
+        .filter(|event| event.account_id == Some(u64::from(id)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        own.iter()
+            .filter(|event| event.details == ZA_SEARCH_ABORTED && event.reason == "tier-overflow")
+            .count(),
+        2
+    );
+    assert!(
+        !own.iter()
+            .any(|event| event.details == ZA_SEARCH_PASS || event.details == ZA_SEARCH_REBUILD)
+    );
+
+    // The exact same inventory and first staged document become a full
+    // merge when staging consumes the final eligible rebuild document.
+    let mut companion = before;
+    companion.cursor.as_mut().unwrap().end = ids[0];
+    let keys = za_unlock(test, id, key.secret()).await;
+    write_manifest_bytes(
+        test,
+        id,
+        Some(ManifestValue::Index(companion).encode(&za_search_key(keys.swk()))),
+    )
+    .await;
+    simulate_restart(test, id).await;
+    let raw = manifest_bytes(test, id).await;
+    let links_before_commit = principal_blob_links(test, id).await;
+    let used_before_commit = cache.content_used();
+    for expire in [true, false] {
+        let _expiry = expire
+            .then(|| ScopedSearchAccountHook::set(&common::za::test_hooks::SEARCH_HOLD_EXPIRE, id));
+        let parked = park(test, key, set_search_commit_pause).await;
+        let writes = take_search_content_writes(id);
+        let stage = writes
+            .iter()
+            .find_map(|event| match event {
+                SearchContentWrite::StagedMemory(bytes) => Some(*bytes),
+                _ => None,
+            })
+            .unwrap();
+        let retirement = writes
+            .iter()
+            .find_map(|event| match event {
+                SearchContentWrite::RetirementMemory(bytes) => Some(*bytes),
+                _ => None,
+            })
+            .unwrap();
+        assert!(retirement >= (256 * size_of::<BlobHash>()) as u64);
+        assert_eq!(
+            cache.content_used(),
+            used_before_commit + stage + retirement
+        );
+        {
+            let _budget = cache.override_content_budget_for_test(stage + retirement);
+            assert!(
+                cache.admit(PartKind::Content, retirement, id + 1).is_none(),
+                "unrelated work cannot spend retirement memory still owned by the batch",
+            );
+        }
+        let outcome = parked.finish().await;
+        assert_eq!(cache.content_used(), used_before_commit);
+        if expire {
+            assert_eq!(outcome, PassOutcome::Aborted(TransientClass::BlobStore));
+            assert_eq!(manifest_bytes(test, id).await, raw);
+            assert_eq!(principal_blob_links(test, id).await, links_before_commit);
+        } else {
+            assert!(matches!(
+                outcome,
+                PassOutcome::Advanced {
+                    published: true,
+                    ..
+                }
+            ));
+        }
+        println!("Many-node commit retained {retirement} retirement bytes; expiry={expire}");
+    }
+    let after = index(test, id).await;
+    assert!(after.cursor.is_none());
+    assert!(after.failing.is_none());
+    let head = after.content.as_ref().unwrap();
+    assert_eq!(head.length, 1);
+    let header = content_header(test, &head.hash).await;
+    assert_eq!(header.tier, 255);
+    assert!(header.predecessor.is_none());
+    assert_manifest_links(test, id, &after).await;
+    let links = principal_hashes(test, id).await;
+    assert!(hashes.iter().all(|hash| !links.contains(hash)));
+    let frames = content_frames(test, key).await;
+    assert_eq!(frames.get(&original), warm.get(&original));
+    assert!(frames.contains_key(&ids[0]));
+    let writes = take_search_content_writes(id);
+    assert!(
+        writes
+            .iter()
+            .any(|event| matches!(event, SearchContentWrite::Linked { tier: 255, .. }))
+    );
+}
+
+async fn case_g17_h7_r32_tiered_merges_during_a_rebuild(test: &TestServer, key: &Account) {
+    use common::za::test_hooks::{SearchContentWrite, take_search_content_writes};
+    let _config = search_config_guard!(test, segments: 4, pass_cap: 8, absent_retry_secs: 0);
+    let id = account_id(key);
+    append_many(test, key, 200).await;
+    mailbox_get(key).await;
+    force_loss(test, id).await;
+    let _observer = ObserveContentWrites::start(id);
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let mut original = 0;
+    let mut rewritten = 0;
+    let mut measurements = Vec::new();
+    for pass_no in 1..=25 {
+        mailbox_get(key).await;
+        let manifest = index(test, id).await;
+        let head = manifest.content.as_ref().unwrap();
+        assert!(head.length <= 10, "pass {pass_no}: {}", head.length);
+        let writes = take_search_content_writes(id);
+        let input = writes
+            .iter()
+            .find_map(|event| match event {
+                SearchContentWrite::Original(bytes) => Some(*bytes),
+                _ => None,
+            })
+            .unwrap();
+        let outputs = writes
+            .iter()
+            .filter_map(|event| match event {
+                SearchContentWrite::Encoded { tier, bytes } => Some((*tier, *bytes)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let (tier, bytes) = *outputs.last().unwrap();
+        let work = if tier == 0 {
+            0
+        } else {
+            outputs.iter().map(|(_, bytes)| bytes).sum::<u64>()
+        };
+        measurements.push((bytes, work));
+        assert!(writes.contains(&SearchContentWrite::Uploaded { tier, bytes }));
+        assert!(writes.contains(&SearchContentWrite::Linked { tier, bytes }));
+        assert_eq!(outputs.len(), if pass_no == 16 { 2 } else { 1 });
+        if manifest.cursor.is_some() {
+            original += input;
+            rewritten += work;
+        } else {
+            assert_eq!(pass_no, 25);
+            assert_eq!(head.length, 1);
+        }
+    }
+    assert!(rewritten > 0);
+    assert!(rewritten <= 3 * original, "{rewritten} > 3 × {original}");
+    let events = traces.finish().await;
+    let passes = events
+        .iter()
+        .filter(|event| event.details == ZA_SEARCH_PASS && event.account_id == Some(u64::from(id)))
+        .collect::<Vec<_>>();
+    assert_eq!(passes.len(), 25);
+    for (event, (written, merged)) in passes.into_iter().zip(measurements) {
+        assert!(event.keys.contains(&(Key::Size, TraceValue::UInt(written))));
+        assert!(event.keys.contains(&(Key::Used, TraceValue::UInt(merged))));
+    }
+    println!("Tiered rebuild encoded {rewritten} bytes over {original} original input bytes");
+    assert_manifest_links(test, id, &index(test, id).await).await;
+}
+
+async fn case_compaction_hash_loss_keeps_the_map(test: &TestServer, key: &Account) {
+    use common::za::search::error::LossClass;
+    let _config = search_config_guard!(test, segments: 2);
+    let id = account_id(key);
+    let first = deliver_one(test, key, "Compaction old hash").await;
+    advanced(test, key, true).await;
+    let before = index(test, id).await;
+    let raw = manifest_bytes(test, id).await.unwrap();
+    let links = principal_blob_links(test, id).await;
+    let hash = &before.content.as_ref().unwrap().hash;
+    corrupt_blob(test, hash).await;
+    deliver_one(test, key, "Compaction discovers hash loss").await;
+    match pass(test, key).await {
+        PassOutcome::ContentLoss(loss) => {
+            assert_eq!(loss.class(), LossClass::Hash);
+            assert!(loss.matches(&raw, &before));
+        }
+        other => panic!("expected observed content hash loss, got {other:?}"),
+    }
+    assert_eq!(manifest_bytes(test, id).await.unwrap(), raw);
+    assert_eq!(principal_blob_links(test, id).await, links);
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    mailbox_get(key).await;
+    let events = traces.finish().await;
+    assert!(
+        events
+            .iter()
+            .any(|event| rebuild_trace(event, id, "content") && event.reason == "hash")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| rebuild_trace(event, id, "rebuild"))
+    );
+    let after = index(test, id).await;
+    assert_eq!(after.epoch, before.epoch);
+    assert_eq!(after.thread_blobs, before.thread_blobs);
+    assert_eq!(after.newest_row, before.newest_row);
+    assert!(loaded(test, id).await.thread.is_present(first));
+    assert!(!principal_hashes(test, id).await.contains(hash));
+    assert_manifest_links(test, id, &after).await;
+}
+
+async fn case_warm_content_compaction_releases_its_own_budget(test: &TestServer, key: &Account) {
+    use common::za::{
+        search::cache::PartKind,
+        test_hooks::{SEARCH_HOLD_EXPIRE, SearchContentWrite, take_search_content_writes},
+    };
+
+    let _small_cap = search_config_guard!(test, account_max_mb: 1, segments: 255);
+    let id = account_id(key);
+    let mut previous = None;
+    for _ in 0..14 {
+        // Keep the terms shared so postings fit in the warm budget while
+        // the repeated frames bring the sealed chain close to its cap.
+        deliver_large_recovery(test, key, 0).await;
+        advanced(test, key, true).await;
+        let manifest = index(test, id).await;
+        let head = manifest.content.as_ref().unwrap();
+        assert!(
+            head.size < 1 << 20,
+            "warm chain crossed its account cap: {}",
+            head.size
+        );
+        if head.size >= 750_000 {
+            previous = Some(manifest);
+            break;
+        }
+    }
+    let previous = previous.expect("fixture approached the account cap");
+    let head = previous.content.as_ref().unwrap();
+    let cache = &test.server.inner.cache.za_search;
+    let boot_budget = cache.content_budget();
+    let process_budget = 3 << 20;
+    let small_budget = cache.override_content_budget_for_test(process_budget);
+    assert_eq!(cache.content_budget(), process_budget);
+    let frames = content_frames(test, key).await;
+    let warm_bytes = loaded(test, id).await.content.as_ref().unwrap().bytes;
+    println!(
+        "Warm budget fixture sealed={} resident={} process={process_budget}",
+        head.size, warm_bytes
+    );
+    assert!(head.size * 3 + warm_bytes > process_budget);
+    assert!(head.size * 3 < process_budget, "cold reservation must fit");
+    assert!(
+        cache.admit(PartKind::Content, head.size * 3, id).is_none(),
+        "the original whole-head reservation must fail under real warm pressure",
+    );
+    assert_eq!(
+        loaded(test, id).await.content.as_ref().unwrap().bytes,
+        warm_bytes
+    );
+
+    let _compact = search_config_guard!(test, segments: 2);
+    let added = deliver_one(test, key, "Compaction under the warm budget").await;
+    let raw = manifest_bytes(test, id).await;
+    let links = principal_blob_links(test, id).await;
+    let _observer = ObserveContentWrites::start(id);
+
+    for expire in [true, false] {
+        let _expiry = expire.then(|| ScopedSearchAccountHook::set(&SEARCH_HOLD_EXPIRE, id));
+        let parked = park(test, key, set_search_commit_pause).await;
+        assert!(
+            loaded(test, id).await.content.is_none(),
+            "the pass releases only its warm content"
+        );
+        assert_eq!(manifest_bytes(test, id).await, raw);
+        assert_eq!(principal_blob_links(test, id).await, links);
+
+        let writes = take_search_content_writes(id);
+        let original = writes
+            .iter()
+            .find_map(|event| match event {
+                SearchContentWrite::Original(bytes) => Some(*bytes),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            writes
+                .iter()
+                .any(|event| matches!(event, SearchContentWrite::Uploaded { .. }))
+        );
+        let staged_bytes = writes
+            .iter()
+            .find_map(|event| match event {
+                SearchContentWrite::StagedMemory(bytes) => Some(*bytes),
+                _ => None,
+            })
+            .expect("estimated staged-frame charge");
+        assert!(
+            staged_bytes > original,
+            "charge includes frame-container metadata"
+        );
+        let retirement = writes
+            .iter()
+            .find_map(|event| match event {
+                SearchContentWrite::RetirementMemory(bytes) => Some(*bytes),
+                _ => None,
+            })
+            .unwrap();
+        let charged = cache.content_used();
+        assert!(
+            charged >= staged_bytes,
+            "staged frames remain charged after upload"
+        );
+        let outcome = parked.finish().await;
+        let after = cache.content_used();
+        assert_eq!(charged.checked_sub(after), Some(staged_bytes + retirement));
+        println!(
+            "Warm budget {} retained {staged_bytes} staged bytes through commit ({charged} to {after})",
+            if expire { "abort" } else { "success" }
+        );
+        if expire {
+            assert_eq!(outcome, PassOutcome::Aborted(TransientClass::BlobStore));
+            assert_eq!(manifest_bytes(test, id).await, raw);
+            assert_eq!(principal_blob_links(test, id).await, links);
+            assert_eq!(content_frames(test, key).await, frames);
+        } else {
+            assert!(
+                matches!(outcome, PassOutcome::Advanced { published: true, indexed_to }
+                if indexed_to.change_id > previous.indexed_to.change_id)
+            );
+        }
+    }
+
+    let merged = index(test, id).await;
+    assert_eq!(merged.content.as_ref().unwrap().length, 1);
+    assert!(loaded(test, id).await.content.is_none());
+    assert_manifest_links(test, id, &merged).await;
+    let reloaded = content_frames(test, key).await;
+    assert_eq!(reloaded.len(), frames.len() + 1);
+    assert!(reloaded.contains_key(&added));
+    for (document, frame) in frames {
+        assert_eq!(reloaded.get(&document), Some(&frame));
+    }
+    drop(small_budget);
+    assert_eq!(cache.content_budget(), boot_budget);
+}
+
+struct ScopedSearchAccountHook {
+    slot: &'static std::sync::Mutex<Option<u32>>,
+    prior: Option<u32>,
+}
+
+impl ScopedSearchAccountHook {
+    fn set(slot: &'static std::sync::Mutex<Option<u32>>, id: u32) -> Self {
+        let prior = slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(id);
+        Self { slot, prior }
+    }
+}
+
+impl Drop for ScopedSearchAccountHook {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = self.prior;
+    }
+}
+
+async fn case_thread_allowance_fallback_checks_the_final_inventory(
+    test: &TestServer,
+    key: &Account,
+) {
+    use common::za::{
+        search::{seal::build_thread_blob, trace::ZA_SEARCH_ABORTED},
+        test_hooks::SEARCH_COMPACTION_FORCE_ALLOWANCE,
+    };
+    use store::za_search::{
+        BlobKind, SegmentId,
+        blob::{PublicSection, SEAL_OVERHEAD},
+        manifest::ThreadBlobEntry,
+    };
+
+    const PAD: usize = 65_537;
+    let _config = search_config_guard!(test, segments: 255, pad_min: PAD);
+    let id = account_id(key);
+    let initial = deliver_one(test, key, "Allowance base").await;
+    advanced(test, key, true).await;
+    let mut seeded = index(test, id).await;
+    assert_eq!(seeded.thread_blobs.len(), 1);
+    let keys = za_unlock(test, id, key.secret()).await;
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Principal)
+        .with_document(0);
+    for _ in 1..254 {
+        let header = BlobHeader {
+            kind: BlobKind::Thread,
+            tier: 0,
+            segment: SegmentId::random(),
+            predecessor: None,
+        };
+        let bytes = build_thread_blob(
+            keys.swk(),
+            id,
+            &header,
+            None,
+            &PublicSection::default(),
+            PAD,
+        )
+        .unwrap();
+        let (hash, hold) = test
+            .server
+            .hold_blob(id, BlobHash::generate(&bytes), &bytes, 60, &BlobOpts::PLAIN)
+            .await
+            .unwrap();
+        hold.release(&mut batch).set(
+            BlobOp::Link {
+                hash: hash.clone(),
+                to: BlobLink::Document,
+            },
+            BlobLinkValue::new(bytes.len()),
+        );
+        seeded.thread_blobs.push(ThreadBlobEntry {
+            segment: header.segment,
+            hash,
+            size: u32::try_from(bytes.len()).unwrap(),
+        });
+    }
+    batch.set(
+        PrincipalField::ZeroAccessSearch,
+        ManifestValue::Index(seeded.clone()).encode(&za_search_key(keys.swk())),
+    );
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    simulate_restart(test, id).await;
+    assert_manifest_links(test, id, &seeded).await;
+
+    let allowance = ScopedSearchAccountHook::set(&SEARCH_COMPACTION_FORCE_ALLOWANCE, id);
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let fallback = deliver_one(test, key, "Valid fallback at the inventory limit").await;
+    assert!(advanced(test, key, true).await.change_id > seeded.indexed_to.change_id);
+    let at_limit = index(test, id).await;
+    assert_eq!(at_limit.thread_blobs.len(), 255);
+    assert_eq!(
+        &at_limit.thread_blobs[..254],
+        seeded.thread_blobs.as_slice()
+    );
+    assert_manifest_links(test, id, &at_limit).await;
+    let bytes = stored_blob(test, &at_limit.thread_blobs.last().unwrap().hash).await;
+    let (_, body) = BlobHeader::decode(&bytes).unwrap();
+    let hidden_size = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+    assert_eq!(
+        hidden_size,
+        PAD + SEAL_OVERHEAD,
+        "publishing fallback uses exactly M"
+    );
+
+    let pending = deliver_one(test, key, "Would overflow the thread inventory").await;
+    let raw = manifest_bytes(test, id).await;
+    let links = principal_blob_links(test, id).await;
+    let holds = temporary_blob_hashes(test, id).await;
+    let email = log_records_since(test, id, SyncCollection::Email, 0).await;
+    let thread = log_records_since(test, id, SyncCollection::Thread, 0).await;
+    let resident_frames = content_frames(test, key).await;
+    assert_eq!(
+        pass(test, key).await,
+        PassOutcome::Aborted(TransientClass::Validation)
+    );
+    assert_eq!(manifest_bytes(test, id).await, raw);
+    assert_eq!(principal_blob_links(test, id).await, links);
+    assert_eq!(temporary_blob_hashes(test, id).await, holds);
+    assert_eq!(
+        log_records_since(test, id, SyncCollection::Email, 0).await,
+        email
+    );
+    assert_eq!(
+        log_records_since(test, id, SyncCollection::Thread, 0).await,
+        thread
+    );
+    let resident = loaded(test, id).await;
+    assert_eq!(resident.manifest, at_limit);
+    assert!(resident.thread.is_present(initial) && resident.thread.is_present(fallback));
+    assert!(!resident.thread.is_present(pending));
+    drop(resident);
+    assert_eq!(content_frames(test, key).await, resident_frames);
+    let events = traces.finish().await;
+    let refusals = events
+        .iter()
+        .filter(|event| {
+            event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_ABORTED
+        })
+        .map(|event| event.reason.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(refusals, ["allowance", "allowance", "segments"]);
+
+    drop(allowance);
+    assert!(advanced(test, key, true).await.change_id > at_limit.indexed_to.change_id);
+    let compacted = index(test, id).await;
+    assert_eq!(compacted.thread_blobs.len(), 1);
+    assert_manifest_links(test, id, &compacted).await;
+    let installed = principal_hashes(test, id).await;
+    assert!(
+        at_limit
+            .thread_blobs
+            .iter()
+            .all(|blob| !installed.contains(&blob.hash))
+    );
+    simulate_restart(test, id).await;
+    let part = crate::utils::za::za_search_thread_part(test, id, key.secret()).await;
+    assert!(
+        [initial, fallback, pending]
+            .into_iter()
+            .all(|id| part.is_present(id))
+    );
+    println!("Thread allowance fallback accepted 254→255, refused 255→256, and compacted 255→1");
+}
+
+async fn case_content_frame_budget(test: &TestServer, key: &Account, compressed: bool) {
+    use common::za::search::seal::{build_content_blob, build_thread_blob};
+    use store::{
+        search::IndexDocument,
+        write::{Dictionary, SearchIndex, compress::compress},
+        za_search::{
+            BlobKind, PadTarget, SegmentId,
+            blob::{HiddenSection, PublicSection},
+            content::{ContentRecord, SortKeys},
+            manifest::{ContentHead, ThreadBlobEntry},
+            thread::ThreadRecord,
+        },
+    };
+    use utils::codec::leb128::Leb128Writer;
+
+    let _config = search_config_guard!(test, segments: 2);
+    let id = account_id(key);
+    let keys = za_unlock(test, id, key.secret()).await;
+    let original = index(test, id).await;
+    assert!(original.content.is_none() && original.thread_blobs.is_empty());
+    let count = if compressed { 1 } else { 1024 };
+    let ids = 10_000..10_000 + count;
+    let records = ids
+        .clone()
+        .map(|document_id| {
+            let mut frame = ContentRecord::new(
+                IndexDocument::new(SearchIndex::Email),
+                document_id,
+                SortKeys::default(),
+                None,
+                false,
+            )
+            .encode();
+            if compressed {
+                // One term, one positional field, and a valid highly compressible
+                // sequence of occurrences of ordinal zero.
+                let mut terms = vec![1, 1, b'x', 1, 1, 0];
+                terms.push_leb128(200_000usize);
+                terms.resize(terms.len() + 200_000, 0);
+                let mut stored = compress(Some(Dictionary::Term), &terms, 1).unwrap();
+                stored.push(1); // DOCUMENT_ZSTD
+                frame.truncate(16);
+                frame.extend_from_slice(&(stored.len() as u32).to_le_bytes());
+                frame.extend_from_slice(&stored);
+                assert!(ContentRecord::decode(&frame).is_ok());
+            }
+            frame
+        })
+        .collect::<Vec<_>>();
+    let frame_slices = records.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let hidden = HiddenSection {
+        records: ids
+            .clone()
+            .map(|document_id| ThreadRecord {
+                document_id,
+                thread_id: document_id,
+                revision: original.revision,
+                created: original.indexed_to.change_id,
+                deleted: None,
+                subject_hash: document_id.into(),
+                hashes: vec![],
+            })
+            .collect(),
+        aliases: Vec::new(),
+    };
+    let content_header = BlobHeader {
+        kind: BlobKind::Content,
+        tier: 0,
+        segment: SegmentId::random(),
+        predecessor: None,
+    };
+    let thread_header = BlobHeader {
+        kind: BlobKind::Thread,
+        tier: 0,
+        segment: SegmentId::random(),
+        predecessor: None,
+    };
+    let content_bytes = build_content_blob(keys.swk(), id, &content_header, &frame_slices);
+    if !compressed {
+        assert_eq!(content_bytes.len(), 27_759);
+    }
+    let thread_bytes = build_thread_blob(
+        keys.swk(),
+        id,
+        &thread_header,
+        Some((
+            &hidden,
+            PadTarget::Compaction {
+                n_records: count as usize,
+            },
+        )),
+        &PublicSection::default(),
+        test.server.za_search_config().pad_min,
+    )
+    .unwrap();
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Principal)
+        .with_document(0);
+    let mut hashes = Vec::new();
+    for bytes in [&content_bytes, &thread_bytes] {
+        let (hash, hold) = test
+            .server
+            .hold_blob(id, BlobHash::generate(bytes), bytes, 60, &BlobOpts::PLAIN)
+            .await
+            .unwrap();
+        hold.release(&mut batch).set(
+            BlobOp::Link {
+                hash: hash.clone(),
+                to: BlobLink::Document,
+            },
+            BlobLinkValue::new(bytes.len()),
+        );
+        hashes.push(hash);
+    }
+    let mut seeded = original;
+    seeded.content = Some(ContentHead {
+        hash: hashes[0].clone(),
+        segment: content_header.segment,
+        size: content_bytes.len() as u64,
+        length: 1,
+    });
+    seeded.thread_blobs.push(ThreadBlobEntry {
+        hash: hashes[1].clone(),
+        segment: thread_header.segment,
+        size: thread_bytes.len() as u32,
+    });
+    let raw = ManifestValue::Index(seeded.clone()).encode(&za_search_key(keys.swk()));
+    batch.set(PrincipalField::ZeroAccessSearch, raw.clone());
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    simulate_restart(test, id).await;
+    let document = deliver_one(test, key, "Frame budget delta").await;
+    let links = principal_blob_links(test, id).await;
+    let cache = &test.server.inner.cache.za_search;
+
+    let pressure = if compressed { 64 * 1024 } else { 128 * 1024 };
+    {
+        let _budget = cache.override_content_budget_for_test(pressure);
+        let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+        let load = test
+            .server
+            .za_search_load_content(&entry, &keys)
+            .await
+            .map_err(|error| error.classification());
+        drop(entry);
+        simulate_restart(test, id).await;
+        let merge = pass(test, key).await;
+        assert_eq!(
+            (load, merge),
+            (
+                Err(LoadFailure::Transient(TransientClass::Budget)),
+                PassOutcome::Aborted(TransientClass::Budget)
+            ),
+            "compressed={compressed}",
+        );
+        assert_eq!(
+            manifest_bytes(test, id).await.as_deref(),
+            Some(raw.as_slice())
+        );
+        assert_eq!(principal_blob_links(test, id).await, links);
+        assert!(loaded(test, id).await.content.is_none());
+    }
+    {
+        let budget = if compressed { 1024 * 1024 } else { 256 * 1024 };
+        let _budget = cache.override_content_budget_for_test(budget);
+        if !compressed {
+            let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+            test.server
+                .za_search_load_content(&entry, &keys)
+                .await
+                .unwrap();
+            let resident = entry
+                .read_loaded()
+                .await
+                .unwrap()
+                .content
+                .as_ref()
+                .unwrap()
+                .bytes;
+            println!(
+                "Warm frame budget cap={budget} resident={resident} sealed={}",
+                content_bytes.len()
+            );
+            assert!(
+                resident + 3 * content_bytes.len() as u64 + 4096 < budget,
+                "the initial seal reservation fits beside the warm part"
+            );
+        }
+        advanced(test, key, true).await;
+        if !compressed {
+            assert!(
+                loaded(test, id).await.content.is_none(),
+                "the larger assembly phase evicts the exact warm base when it fits cold"
+            );
+        }
+        let after = index(test, id).await;
+        assert_eq!(after.content.as_ref().unwrap().length, 1);
+        assert_manifest_links(test, id, &after).await;
+    }
+    simulate_restart(test, id).await;
+    {
+        let _budget = cache.override_content_budget_for_test(pressure);
+        let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+        assert_eq!(
+            test.server
+                .za_search_load_content(&entry, &keys)
+                .await
+                .map_err(|error| error.classification()),
+            Err(LoadFailure::Transient(TransientClass::Budget)),
+        );
+        assert!(entry.read_loaded().await.unwrap().content.is_none());
+    }
+    let _budget = cache.override_content_budget_for_test(1024 * 1024);
+    let reloaded = content_frames(test, key).await;
+    assert_eq!(reloaded.len(), records.len() + 1);
+    assert!(reloaded.contains_key(&document));
+    for (doc, frame) in ids.zip(records) {
+        assert_eq!(reloaded.get(&doc), Some(&frame));
+    }
+    println!(
+        "Frame budget merge and cold reload validated compressed={compressed} records={count}"
     );
 }

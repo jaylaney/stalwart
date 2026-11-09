@@ -67,6 +67,7 @@ pub async fn test(test: &mut TestServer) {
     }
     task12::test(test).await;
     task13::test(test).await;
+    test_compaction(test).await;
     test.blob_expire_all().await;
     wait_for_delivery(test).await;
 }
@@ -918,4 +919,352 @@ async fn case_initial_continuation_epoch_loss(
             assert_eq!(resumed, fresh);
         }
     }
+}
+
+async fn test_compaction(test: &mut TestServer) {
+    let admin = test.account("admin@example.com").clone();
+    let merged = key_mail_account(test, "keymail-task15-deleted-merged@example.com", STRONG).await;
+    case_r3_deleted_merged_message_after_compaction(test, &merged).await;
+    test.destroy_all_mailboxes(&merged).await;
+
+    let pruned = key_mail_account(test, "keymail-task15-pruned@example.com", STRONG).await;
+    case_r17_tombstone_gone_after_retention(test, &admin, &pruned).await;
+    test.destroy_all_mailboxes(&pruned).await;
+
+    let paged = key_mail_account(test, "keymail-task15-paged@example.com", STRONG).await;
+    case_initial_continuation_folded_alias(test, &admin, &paged).await;
+    test.destroy_all_mailboxes(&paged).await;
+
+    case_r21_amplified_merge_probe_class(test).await;
+}
+
+fn with_references(raw: String, parents: &[&str]) -> String {
+    let header = parents
+        .iter()
+        .map(|parent| format!("<{}>", parent_message_id(parent)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    raw.replacen("\r\n\r\n", &format!("\r\nReferences: {header}\r\n\r\n"), 1)
+}
+
+async fn compacted_thread(
+    test: &TestServer,
+    key: &Account,
+) -> store::za_search::thread::ThreadPart {
+    crate::utils::za::za_search_thread_part(test, key.id().document_id(), key.secret()).await
+}
+
+async fn case_r3_deleted_merged_message_after_compaction(test: &TestServer, key: &Account) {
+    let _config = search_config_guard!(test, segments: 3);
+    let id = key.id().document_id();
+    let subject = "Retained merged deletion";
+    let a = message_with(subject, "first root");
+    let b = message_with(subject, "other root");
+    let root = deliver_doc(test, key, &a).await;
+    let member = deliver_doc(test, key, &b).await;
+    deliver_doc(test, key, &reply_to(&a, subject, "child of the first root")).await;
+    trigger_recovery_pass(key).await;
+    let bridge = with_references(message_with(subject, "bridge"), &[&a, &b]);
+    deliver_doc(test, key, &bridge).await;
+    trigger_recovery_pass(key).await;
+    let before = recovery_manifest(test, key).await;
+    let part = compacted_thread(test, key).await;
+    assert_eq!(part.current_thread(member), root);
+    assert_eq!(part.record(member).unwrap().thread_id, member);
+    assert!(
+        part.aliases()
+            .any(|alias| alias.source == member && alias.target == root)
+    );
+    assert_eq!(before.thread_blobs.len(), 2);
+    pop3_delete(test, key, member).await;
+    trigger_recovery_pass(key).await;
+    let after = recovery_manifest(test, key).await;
+    assert_eq!(after.thread_blobs.len(), 1);
+    assert_eq!(after.newest_row, before.newest_row);
+    assert_eq!(after.content, before.content);
+    simulate_restart(test, id).await;
+    let reloaded = compacted_thread(test, key).await;
+    assert!(reloaded.record(member).unwrap().deleted.is_some());
+    assert!(reloaded.aliases().any(|alias| alias.source == member));
+    let reply = recovery_page(
+        key,
+        "Email/changes",
+        &State::Exact(before.newest_row.change_id),
+        20,
+    )
+    .await;
+    assert_eq!(
+        method(&reply, 0, "Email/changes")["destroyed"],
+        json!([mapped(root, member)])
+    );
+}
+
+async fn churn_retention(
+    test: &TestServer,
+    admin: &Account,
+    key: &Account,
+    live: u32,
+    expired_through: u64,
+) {
+    use email::message::za::search::changes::ZaRetainedBound;
+
+    // Keep the manifest current and generate enough publications for both
+    // groups to drop the old rows. Flags advance the Email group alone.
+    let _config = search_config_guard!(test, checkpoint: 1);
+    for turn in 0..10 {
+        let message = message_with(&format!("Retention publication {turn}"), "retained");
+        deliver_doc(test, key, &message).await;
+        trigger_recovery_pass(key).await;
+    }
+    let part = compacted_thread(test, key).await;
+    let email_id = mapped(part.current_thread(live), live);
+    for turn in 0..20 {
+        let reply = set(
+            key,
+            json!({
+                "update": { (&email_id): {"keywords/$flagged": turn % 2 == 0} },
+            }),
+        )
+        .await;
+        assert!(
+            method(&reply, 0, "Email/set")["updated"]
+                .as_object()
+                .unwrap()
+                .contains_key(&email_id)
+        );
+        trigger_recovery_pass(key).await;
+    }
+    lower_changes_history(admin, Some(8)).await;
+    purge_account(test, admin, key).await;
+    lower_changes_history(admin, None).await;
+    let id = key.id().document_id();
+    assert!(test.server.za_retained_bound(id).await.unwrap() > expired_through);
+    for collection in [SyncCollection::Email, SyncCollection::Thread] {
+        let marker = test
+            .server
+            .store()
+            .za_log_first_retained(id, collection)
+            .await
+            .unwrap();
+        assert!(
+            marker.is_some_and(|change| change > expired_through),
+            "{collection:?}: {marker:?}"
+        );
+    }
+}
+
+async fn case_r17_tombstone_gone_after_retention(
+    test: &TestServer,
+    admin: &Account,
+    key: &Account,
+) {
+    use crate::utils::za::{HookParked, za_unlock};
+    use common::za::test_hooks::set_search_sweep_pause;
+    use email::message::za::search::pass::ZaSearchPass;
+
+    let _no_compaction_yet = search_config_guard!(test, segments: 255);
+    let id = key.id().document_id();
+    let deleted = deliver_doc(test, key, &message_with("Old tombstone", "old content")).await;
+    let live = deliver_doc(test, key, &message_with("Live survivor", "live content")).await;
+    trigger_recovery_pass(key).await;
+    let before = recovery_manifest(test, key).await;
+    deliver_doc(
+        test,
+        key,
+        &message_with("Park before log read", "parked pass"),
+    )
+    .await;
+    let server = test.server.clone();
+    let keys = za_unlock(test, id, key.secret()).await;
+    let parked = HookParked::start(id, set_search_sweep_pause, async move {
+        server.za_search_pass(id, &keys).await.unwrap()
+    })
+    .await;
+    pop3_delete(test, key, deleted).await;
+    assert!(matches!(
+        parked.finish().await,
+        PassOutcome::Advanced { .. }
+    ));
+    simulate_restart(test, id).await;
+    let part = compacted_thread(test, key).await;
+    let stamp = part
+        .record(deleted)
+        .unwrap()
+        .deleted
+        .expect("persisted tombstone");
+    let assignment = part
+        .revision_change_id(part.record(deleted).unwrap().revision)
+        .unwrap();
+    assert_eq!(assignment, before.newest_row.change_id);
+    churn_retention(test, admin, key, live, stamp.max(assignment)).await;
+    assert!(compacted_thread(test, key).await.record(deleted).is_some());
+
+    let _compact = search_config_guard!(test, segments: 2);
+    deliver_doc(
+        test,
+        key,
+        &message_with("After retention", "compact both parts"),
+    )
+    .await;
+    trigger_recovery_pass(key).await;
+    let compacted = recovery_manifest(test, key).await;
+    assert_eq!(compacted.thread_blobs.len(), 1);
+    assert_eq!(compacted.content.as_ref().unwrap().length, 1);
+    simulate_restart(test, id).await;
+    assert!(compacted_thread(test, key).await.record(deleted).is_none());
+    let keys = za_unlock(test, id, key.secret()).await;
+    let head = compacted.content.unwrap();
+    let bytes = super::stored_blob(test, &head.hash).await;
+    let (_, records) = common::za::search::seal::parse_content_blob(
+        keys.swk(),
+        id,
+        Some(head.segment),
+        None,
+        &bytes,
+    )
+    .unwrap();
+    assert!(records.iter().any(|record| record.document_id() == live));
+    assert!(records.iter().all(|record| record.document_id() != deleted));
+}
+
+async fn case_initial_continuation_folded_alias(test: &TestServer, admin: &Account, key: &Account) {
+    let _no_compaction_yet = search_config_guard!(test, segments: 255);
+    let id = key.id().document_id();
+    let subject = "Continuation across a fold";
+    let a = message_with(subject, "first root");
+    let b = message_with(subject, "losing root");
+    let root = deliver_doc(test, key, &a).await;
+    let member = deliver_doc(test, key, &b).await;
+    deliver_doc(test, key, &reply_to(&a, subject, "third item")).await;
+    trigger_recovery_pass(key).await;
+    let first = recovery_page(key, "Email/changes", &State::Initial, 2).await;
+    let page = method(&first, 0, "Email/changes");
+    assert_eq!(page["hasMoreChanges"], true);
+    assert!(
+        page["created"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(singleton(member)))
+    );
+    let token = State::parse(page["newState"].as_str().unwrap()).unwrap();
+    let State::Intermediate(pinned) = &token else {
+        panic!("expected an initial continuation")
+    };
+    deliver_doc(
+        test,
+        key,
+        &with_references(message_with(subject, "bridge"), &[&a, &b]),
+    )
+    .await;
+    trigger_recovery_pass(key).await;
+    let merged = recovery_manifest(test, key).await;
+    assert!(merged.newest_row.change_id > pinned.to_id);
+    let part = compacted_thread(test, key).await;
+    assert!(
+        part.aliases()
+            .any(|alias| alias.source == member && alias.target == root)
+    );
+    assert_eq!(part.record(member).unwrap().thread_id, member);
+    churn_retention(test, admin, key, root, merged.newest_row.change_id).await;
+
+    let _compact = search_config_guard!(test, segments: 2);
+    deliver_doc(
+        test,
+        key,
+        &message_with("Force alias fold", "after retention"),
+    )
+    .await;
+    trigger_recovery_pass(key).await;
+    assert_eq!(recovery_manifest(test, key).await.thread_blobs.len(), 1);
+    simulate_restart(test, id).await;
+    let part = compacted_thread(test, key).await;
+    assert_eq!(part.record(member).unwrap().thread_id, root);
+    assert!(!part.aliases().any(|alias| alias.source == member));
+    let stale = recovery_page(key, "Email/changes", &token, 2).await;
+    assert_eq!(stale.error_type_at(0), Some("cannotCalculateChanges"));
+    let fresh = recovery_page(key, "Email/changes", &State::Initial, 30).await;
+    let created = method(&fresh, 0, "Email/changes")["created"]
+        .as_array()
+        .unwrap();
+    assert!(created.contains(&json!(mapped(root, member))));
+}
+
+async fn append_probe_messages(test: &TestServer, key: &Account, messages: &[String]) {
+    use crate::utils::imap::{ImapConnection, Type};
+    use imap_proto::ResponseType;
+
+    let entry = test
+        .server
+        .inner
+        .cache
+        .za_search
+        .entry(key.id().document_id());
+    let pass = entry.pass_lock.lock().await;
+    let mut imap = ImapConnection::connect(b"_compactprobe ").await;
+    imap.authenticate(key.name(), key.secret()).await;
+    imap.send_ok("SELECT INBOX").await;
+    for message in messages {
+        imap.send(&format!("APPEND INBOX {{{}}}", message.len()))
+            .await;
+        imap.assert_read(Type::Continuation, ResponseType::Ok).await;
+        imap.send_untagged(message).await;
+        imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    }
+    drop(imap);
+    drop(pass);
+    test.wait_for_tasks().await;
+}
+
+async fn case_r21_amplified_merge_probe_class(test: &mut TestServer) {
+    use store::za_search::{BlobHeader, blob::SEAL_OVERHEAD};
+
+    let _config = search_config_guard!(test, segments: 255);
+    let subject = "Amplified compaction probe";
+    let a = message_with(subject, "first anchor");
+    let a2 = reply_to(&a, subject, "second anchor");
+    let b = message_with(subject, "third anchor");
+    let b2 = reply_to(&b, subject, "fourth anchor");
+    let bridge = || with_references(message_with(subject, "join the anchors"), &[&a, &b]);
+    let mut sizes = Vec::new();
+    for (name, already_joined) in [
+        ("keymail-task15-probe-join@example.com", false),
+        ("keymail-task15-probe-control@example.com", true),
+    ] {
+        let key = key_mail_account(test, name, STRONG).await;
+        let mut messages = vec![a.clone(), a2.clone(), b.clone(), b2.clone()];
+        if already_joined {
+            messages.push(bridge());
+        }
+        for turn in 0..40 {
+            messages.push(with_references(
+                message_with(subject, &format!("left {turn}")),
+                &[&a, &a2],
+            ));
+            messages.push(with_references(
+                message_with(subject, &format!("right {turn}")),
+                &[&b, &b2],
+            ));
+        }
+        append_probe_messages(test, &key, &messages).await;
+        trigger_recovery_pass(&key).await;
+        trigger_recovery_pass(&key).await;
+        let before = compacted_thread(test, &key).await;
+        assert_eq!(before.records().count(), messages.len());
+        assert_eq!(before.aliases().count(), usize::from(already_joined));
+        deliver_doc(test, &key, &bridge()).await;
+        trigger_recovery_pass(&key).await;
+        let after = compacted_thread(test, &key).await;
+        assert_eq!(
+            after.aliases().count() - before.aliases().count(),
+            usize::from(!already_joined)
+        );
+        let manifest = recovery_manifest(test, &key).await;
+        let bytes = super::stored_blob(test, &manifest.thread_blobs.last().unwrap().hash).await;
+        let (_, body) = BlobHeader::decode(&bytes).unwrap();
+        let hidden = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+        assert_eq!(hidden, 65536 + SEAL_OVERHEAD);
+        sizes.push(bytes.len());
+        test.destroy_all_mailboxes(&key).await;
+    }
+    assert_eq!(sizes[0], sizes[1]);
 }

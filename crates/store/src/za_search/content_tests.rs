@@ -452,3 +452,52 @@ fn s42_document_cap_is_upstreams() {
     );
     assert!(record.encoded_len() <= MAX_STORED_DOCUMENT_SIZE + 256);
 }
+
+#[test]
+fn bounded_frames_validate_term_scratch_and_keep_exact_bytes() {
+    use crate::{
+        write::{Dictionary, compress::compress},
+        za_search::blob::{ContentFramesError, decode_content_frames, encode_content},
+    };
+    use utils::codec::leb128::Leb128Writer;
+
+    let mut terms = vec![1, 1, b'x', 1, 1, 0];
+    terms.push_leb128(4096usize);
+    terms.resize(terms.len() + 4096, 0);
+    let mut stored = compress(Some(Dictionary::Term), &terms, 1).unwrap();
+    stored.push(1);
+    let mut frame = record(1, |_| {}).encode();
+    frame.truncate(16);
+    frame.extend_from_slice(&(stored.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&stored);
+    let blob = encode_content(&[&frame]);
+
+    let mut requested = Vec::new();
+    assert!(matches!(
+        decode_content_frames(&blob, |bytes| {
+            requested.push(bytes);
+            false
+        }),
+        Err(ContentFramesError::Budget)
+    ));
+    assert_eq!(requested, [terms.len()]);
+
+    let mut requested = Vec::new();
+    let mut frames = decode_content_frames(&blob, |bytes| {
+        requested.push(bytes);
+        true
+    })
+    .unwrap();
+    assert_eq!(
+        requested,
+        [
+            terms.len(),
+            frame.len() + size_of::<super::OwnedContentFrame>()
+        ]
+    );
+    assert_eq!(frames[0].bytes(), frame);
+    let mut part = ContentPart::default();
+    assert!(part.insert_frame(frames.pop().unwrap(), |_| true));
+    assert_eq!(part.record_bytes(1), Some(frame.as_slice()));
+    assert!(part.loaded_bytes() > frame.len());
+}
