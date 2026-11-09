@@ -62,8 +62,11 @@ const MIB: u64 = 1 << 20;
 const SMALL: usize = 2_000;
 const DESIGN: usize = 30_000;
 const SEED: u64 = 1;
-const WIRE_TIMEOUT: Duration = Duration::from_secs(60);
+// Client measurement headroom for owned compaction. Product deadlines are separate.
+const WIRE_TIMEOUT: Duration = Duration::from_secs(600);
+const MILESTONE_LOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(14_400);
+const SYSTEM_TIMEOUT: Duration = Duration::from_secs(43_200);
 const GROWTH: [usize; 7] = [2_000, 5_000, 10_000, 15_000, 20_000, 25_000, DESIGN];
 
 struct Wire<'a> {
@@ -779,7 +782,7 @@ async fn drain(
                 let keys = za_unlock(test, id, wire.account.secret()).await;
                 let entry = test.server.inner.cache.za_search.get(id).unwrap();
                 let loaded = timeout(
-                    WIRE_TIMEOUT,
+                    MILESTONE_LOAD_TIMEOUT,
                     test.server.za_search_load_content(&entry, &keys),
                 )
                 .await;
@@ -1554,7 +1557,7 @@ async fn natural_cap(test: &TestServer, wire: &Wire<'_>, original: &Progress) ->
 }
 
 pub(super) async fn run() {
-    timeout(Duration::from_secs(43_200), run_system())
+    timeout(SYSTEM_TIMEOUT, run_system())
         .await
         .expect("system benchmark watchdog expired");
 }
@@ -1573,6 +1576,9 @@ async fn run_system() {
         "Benchmark PID {}, CPU architecture {}, boot/effective search config {config:?}",
         std::process::id(),
         std::env::consts::ARCH
+    );
+    println!(
+        "Benchmark watchdogs: client wire {WIRE_TIMEOUT:?}, milestone loader {MILESTONE_LOAD_TIMEOUT:?}, phase {PHASE_TIMEOUT:?}, whole test {SYSTEM_TIMEOUT:?}"
     );
     let mut rows = Vec::new();
     let mut row = |(name, value): (&'static str, String)| {
