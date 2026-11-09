@@ -476,6 +476,10 @@ impl ZaSearchRebuild for Server {
             Total = cursor_size,
             Source = source
         );
+        #[cfg(feature = "test_mode")]
+        if loss.raw().is_none() {
+            common::za::test_hooks::search_rebuild_create_pause_point(account_id).await;
+        }
         match self.commit_batch(batch).await {
             Ok(ids) => {
                 let epoch = ids

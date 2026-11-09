@@ -182,11 +182,18 @@ pub async fn fetch_verified<S: BlobSource>(
     #[cfg(feature = "test_mode")]
     source.count_fetch(entry.account_id);
 
-    let Some(bytes) = source
-        .fetch(hash)
-        .await
-        .map_err(|err| classify_blob_error(&err))?
-    else {
+    let fetched = source.fetch(hash).await;
+    #[cfg(feature = "test_mode")]
+    let fetched = if crate::za::test_hooks::take_search_blob_timeout(entry.account_id, hash) {
+        // Match the S3 adapter's mapping of an exhausted HTTP RequestTimeout.
+        Err(StoreEvent::S3Error
+            .reason("S3 returned status 408 RequestTimeout")
+            .ctx(Key::Code, 408u16))
+    } else {
+        fetched
+    };
+
+    let Some(bytes) = fetched.map_err(|err| classify_blob_error(&err))? else {
         return Err(absence_class(
             entry.absent_since(hash, now),
             now,

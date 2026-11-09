@@ -241,6 +241,9 @@ impl Server {
                 .caused_by(trc::location!())?;
         }
 
+        #[cfg(feature = "test_mode")]
+        crate::za::test_hooks::search_post_unlink_pause_point(account_id).await;
+
         if let Some(account) = live_account {
             // Permanent destruction starts after the registry Item is removed.
             // A reset admitted earlier must leave the marker for that task.

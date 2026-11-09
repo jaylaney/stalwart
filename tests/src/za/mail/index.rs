@@ -21,8 +21,8 @@ use crate::{
             HookParked, expire_and_purge_blobs, force_loss, index_holds, log_records_since,
             lower_changes_history, manifest_bytes, pop3_delete, principal_blob_links,
             purge_account, read_manifest, run_search_pass, search_config_guard, simulate_restart,
-            temporary_blob_hashes, wait_for_delivery, write_manifest_bytes, za_setup_token,
-            za_unlock,
+            temporary_blob_hashes, wait_for_delivery, write_manifest_bytes, za_search_thread_part,
+            za_setup_token, za_unlock,
         },
     },
     za::{
@@ -36,9 +36,9 @@ use common::za::{
     search::{
         ZaSearchConfig,
         cache::EvictReason,
-        error::{LoadFailure, NoMapReason, TransientClass},
-        load::entry_outcome,
-        seal::za_search_key,
+        error::{LoadFailure, LossClass, NoMapReason, TransientClass},
+        load::{ObservedLoadError, entry_outcome},
+        seal::{parse_thread_blob, za_search_key},
         setup::za_setup_manifest,
         trace::{
             ZA_SEARCH_EVENT_TYPE, ZA_SEARCH_LOST, ZA_SEARCH_PASS, ZA_SEARCH_REBUILD,
@@ -46,10 +46,11 @@ use common::za::{
         },
     },
     test_hooks::{
-        reset_za_search_counters, set_search_blob_fail_once, set_search_blob_slow,
-        set_search_commit_pause, set_search_config_override, set_search_destroy_fail_once,
-        set_search_destroy_pause, set_search_hold_expire, set_search_open_fail_all,
-        set_search_pass_pause, set_search_recovery_pause, set_search_snapshot_pause,
+        SearchBlobTimeoutOnce, reset_za_search_counters, set_search_blob_fail_once,
+        set_search_blob_slow, set_search_commit_pause, set_search_config_override,
+        set_search_destroy_fail_once, set_search_destroy_pause, set_search_hold_expire,
+        set_search_open_fail_all, set_search_pass_pause, set_search_post_unlink_pause,
+        set_search_rebuild_create_pause, set_search_recovery_pause, set_search_snapshot_pause,
         set_search_swap_pause, set_search_swap_skip, za_search_blob_reads, za_search_message_opens,
     },
 };
@@ -61,6 +62,7 @@ use email::{
         changes::ZaRetainedBound,
         ensure::{Unavailable, ZaSearchEnsure, is_current},
         pass::{PassOutcome, ZaSearchPass},
+        rebuild::{RebuildStarted, ZaSearchRebuild},
     },
 };
 use imap_proto::ResponseType;
@@ -90,7 +92,7 @@ use store::{
         blob_codec::{BlobFormat, BlobOpts},
     },
     za_search::{
-        BlobHeader, Checkpoint,
+        BlobHeader, BlobKind, Checkpoint,
         manifest::{FailingDocument, Inventory, Manifest, ManifestValue, manifest_hash},
     },
 };
@@ -1852,6 +1854,13 @@ async fn case_lost_assertion(test: &TestServer, key: &Account) {
     let keys = za_unlock(test, id, key.secret()).await;
     let bytes = ManifestValue::Index(competing).encode(&za_search_key(keys.swk()));
     let parked = park(test, key, set_search_commit_pause).await;
+    {
+        let resident = loaded(test, id).await;
+        assert!(
+            resident.thread.record(document).is_none(),
+            "the staged thread record became resident before commit"
+        );
+    }
     let mut batch = BatchBuilder::new();
     batch
         .with_account_id(id)
@@ -2292,6 +2301,8 @@ async fn destroy_cases(test: &TestServer, admin: &Account) {
     case_f23_unparseable_manifest(test, admin, false).await;
     case_f23_pre_release_account_without_a_manifest(test, admin).await;
     case_r19_paused_pass_loses_to_the_marker(test, admin).await;
+    case_r19_no_publication_after_unlink(test, admin).await;
+    case_r19_absent_manifest_creator_loses_after_destroy(test, admin).await;
     case_g12_destroy_dies_after_the_marker(test, admin).await;
     case_empty_marker_retry_scans(test, admin).await;
     case_reset_clears_a_live_account(test, admin).await;
@@ -2627,6 +2638,102 @@ async fn case_r19_paused_pass_loses_to_the_marker(test: &TestServer, admin: &Acc
     destroy.finish().await;
     let hashes = committed.into_iter().chain(staged).collect::<Vec<_>>();
     assert_destroyed_index(test, admin, id, &hashes).await;
+}
+
+async fn case_r19_no_publication_after_unlink(test: &TestServer, admin: &Account) {
+    println!("case_r19_no_publication_after_unlink");
+    let key = destroy_fixture(admin, "search-destroy-post-unlink@example.com").await;
+    let id = account_id(&key);
+    deliver_one(test, &key, "Committed before unlink").await;
+    advanced(test, &key, true).await;
+    let committed = principal_hashes(test, id).await;
+    assert_eq!(committed.len(), 2);
+
+    deliver_one(test, &key, "Staged across unlink").await;
+    let holds = temporary_blob_hashes(test, id).await;
+    let server = test.server.clone();
+    let keys = za_unlock(test, id, key.secret()).await;
+    let pass = HookParked::start(id, set_search_commit_pause, async move {
+        server.za_search_pass(id, &keys).await
+    })
+    .await;
+    let staged = staged_hashes(test, id, &holds).await;
+
+    let admin_request = admin.clone();
+    let destroy = HookParked::start(id, set_search_post_unlink_pause, async move {
+        admin_request.destroy_account(key).await;
+    })
+    .await;
+    let after_unlink = principal_hashes(test, id).await;
+    let holds = temporary_blob_hashes(test, id).await;
+    // No expiry or purge until the prepared pass has tried its commit.
+    let outcome = pass.finish().await;
+    destroy.finish().await;
+
+    // Inspect terminal state before checking the writer result. A successful
+    // writer could leave fresh links that were outside the unlink inventory.
+    let hashes = committed
+        .into_iter()
+        .chain(staged.iter().cloned())
+        .collect::<Vec<_>>();
+    assert_destroyed_index(test, admin, id, &hashes).await;
+    assert!(
+        after_unlink.is_empty(),
+        "destroy had not unlinked its inventory"
+    );
+    assert!(staged.iter().all(|hash| holds.contains(hash)));
+    assert_eq!(outcome.unwrap(), PassOutcome::Lost);
+}
+
+async fn case_r19_absent_manifest_creator_loses_after_destroy(test: &TestServer, admin: &Account) {
+    println!("case_r19_absent_manifest_creator_loses_after_destroy");
+    let key = destroy_fixture(admin, "search-destroy-absent-create@example.com").await;
+    let id = account_id(&key);
+    deliver_one(test, &key, "Present for absent-manifest creation").await;
+    advanced(test, &key, true).await;
+    let committed = principal_hashes(test, id).await;
+    assert_eq!(committed.len(), 2);
+    write_manifest_bytes(test, id, None).await;
+    simulate_restart(test, id).await;
+
+    let keys = za_unlock(test, id, key.secret()).await;
+    let loss = match test.server.za_search_entry(id, &keys).await {
+        Err(ObservedLoadError::MapLoss(loss)) => loss,
+        _ => panic!("the cold loader did not observe missing manifest loss"),
+    };
+    assert_eq!(loss.class(), LossClass::ManifestMissing);
+    assert!(loss.raw().is_none());
+
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let server = test.server.clone();
+    let creator = HookParked::start(id, set_search_rebuild_create_pause, async move {
+        server.za_search_rebuild_start(id, &keys, loss, None).await
+    })
+    .await;
+    assert!(test.server.za_vault_record(id).await.unwrap().is_some());
+    assert!(manifest_bytes(test, id).await.is_none());
+    admin.destroy_account(key).await;
+    assert_destroyed_index(test, admin, id, &committed).await;
+    assert!(test.server.za_vault_record(id).await.unwrap().is_none());
+
+    let outcome = creator.finish().await;
+    assert!(
+        manifest_bytes(test, id).await.is_none(),
+        "the prepared creator resurrected field 152"
+    );
+    assert!(test.server.za_vault_record(id).await.unwrap().is_none());
+    assert!(principal_blob_links(test, id).await.is_empty());
+    for collection in [SyncCollection::Email, SyncCollection::Thread] {
+        assert!(log_records_since(test, id, collection, 0).await.is_empty());
+    }
+    let events = traces.finish().await;
+    assert!(
+        events.iter().any(|event| {
+            event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_LOST
+        }),
+        "{events:?}"
+    );
+    assert_eq!(outcome.unwrap(), RebuildStarted::LostToAnotherNode);
 }
 
 async fn case_g12_destroy_dies_after_the_marker(test: &TestServer, admin: &Account) {
@@ -3073,6 +3180,15 @@ pub(crate) async fn test_recovery(test: &mut TestServer) {
     let key = key_mail_account(test, "keymail58@example.com", "Keymail-58!").await;
     let content = key_mail_account(test, "keymail59@example.com", "Keymail-59!").await;
     let gap = key_mail_account(test, "keymail60@example.com", "Keymail-60!").await;
+    let timeout = key_mail_account(
+        test,
+        "keymail-thread-timeout@example.com",
+        "Thread-timeout!",
+    )
+    .await;
+    case_f3_thread_blob_timeout_keeps_index(test, &timeout).await;
+    test.destroy_all_mailboxes(&timeout).await;
+
     case_zero_row_epoch(test, &key, "fresh").await;
     mailbox_get(&key).await;
     assert!(!mailbox_archives(test, account_id(&key)).await.is_empty());
@@ -3353,6 +3469,81 @@ async fn append_recovery_messages(test: &TestServer, key: &Account, count: usize
         .collect();
     assert_eq!(ids.len(), count);
     ids
+}
+
+async fn case_f3_thread_blob_timeout_keeps_index(test: &TestServer, key: &Account) {
+    println!("case_f3_thread_blob_timeout_keeps_index");
+    let id = account_id(key);
+    let first = deliver_one(test, key, "Thread load before the timed-out segment").await;
+    advanced(test, key, true).await;
+    let second = deliver_one(test, key, "Thread load with a timed-out segment").await;
+    advanced(test, key, true).await;
+    let before = index(test, id).await;
+    assert_eq!(before.thread_blobs.len(), 2);
+    let hash = &before.thread_blobs[1].hash;
+    assert_ne!(hash, &before.thread_blobs[0].hash);
+    assert_manifest_links(test, id, &before).await;
+    assert_eq!(&BlobHash::generate(&stored_blob(test, hash).await), hash);
+    let raw = manifest_bytes(test, id).await;
+    let links = principal_blob_links(test, id).await;
+
+    simulate_restart(test, id).await;
+    assert!(test.server.inner.cache.za_search.get(id).is_none());
+    reset_za_search_counters(id);
+    let timeout = SearchBlobTimeoutOnce::new(id, hash.clone());
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+
+    // Mailbox/query takes the real request pre-pass, including map recovery
+    // on loss. The handler reads the mailbox cache without loading the map.
+    let query = async || {
+        let reply = key
+            .jmap_method_call("Mailbox/query", json!({ "accountId": key.id_string() }))
+            .await;
+        assert_eq!(
+            reply.0["methodResponses"][0][0], "Mailbox/query",
+            "{:?}",
+            reply.0
+        );
+    };
+    query().await;
+    assert_eq!(
+        manifest_bytes(test, id).await,
+        raw,
+        "the timeout changed the index manifest"
+    );
+    assert_eq!(principal_blob_links(test, id).await, links);
+    assert!(
+        timeout.was_consumed(),
+        "the selected thread blob was not read"
+    );
+    assert_eq!(
+        za_search_blob_reads(id),
+        2,
+        "both thread segments were fetched"
+    );
+    let entry = test.server.inner.cache.za_search.get(id).unwrap();
+    assert!(
+        entry.read_loaded().await.is_none(),
+        "a partial map was installed"
+    );
+    let events = traces.finish().await;
+    assert!(
+        !events.iter().any(|event| {
+            event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_REBUILD
+        }),
+        "{events:?}"
+    );
+
+    query().await;
+    assert_eq!(
+        za_search_blob_reads(id),
+        4,
+        "the retry fetched both segments again"
+    );
+    assert!(index_holds(test, id, first).await);
+    assert!(index_holds(test, id, second).await);
+    assert_eq!(manifest_bytes(test, id).await, raw);
+    assert_eq!(principal_blob_links(test, id).await, links);
 }
 
 async fn case_r3_rebuild_moves_the_epoch(test: &TestServer, key: &Account) {
@@ -4256,6 +4447,15 @@ async fn test_compaction(test: &mut TestServer, admin: &Account) {
     case_r8_thread_compaction_bounds_the_manifest(test, admin, &bounded).await;
     test.destroy_all_mailboxes(&bounded).await;
 
+    let retained = key_mail_account(
+        test,
+        "keymail-compact-shorter-thread@example.com",
+        "Compaction-retained!",
+    )
+    .await;
+    case_compaction_uses_shorter_thread_log(test, &retained).await;
+    test.destroy_all_mailboxes(&retained).await;
+
     let allowance = key_mail_account(
         test,
         "keymail-compact-allowance@example.com",
@@ -4375,6 +4575,131 @@ async fn case_r8_thread_compaction_bounds_the_manifest(
         );
     }
     assert_manifest_links(test, id, &index(test, id).await).await;
+}
+
+async fn case_compaction_uses_shorter_thread_log(test: &TestServer, key: &Account) {
+    println!("case_compaction_uses_shorter_thread_log");
+    let _setup = search_config_guard!(test, segments: 255, checkpoint: 1);
+    let id = account_id(key);
+
+    let older = deliver_one(test, key, "Older retention control").await;
+    advanced(test, key, true).await;
+    set_flag(key, older, true).await;
+    let older_checkpoint = advanced(test, key, false).await;
+    let email_bound = test
+        .server
+        .truncate_change_log(id, SyncCollection::Email.into(), 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(email_bound, older_checkpoint.change_id);
+
+    let expired = deliver_one(test, key, "Deleted singleton inside the retention gap").await;
+    advanced(test, key, true).await;
+    let assignment = index(test, id).await.newest_row;
+    pop3_delete(test, key, expired).await;
+    let deletion = change_id(test, id).await;
+    advanced(test, key, false).await;
+
+    let newer = deliver_one(test, key, "Newer thread retention control").await;
+    advanced(test, key, true).await;
+    let thread_bound = test
+        .server
+        .truncate_change_log(id, SyncCollection::Thread.into(), 0)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = test.server.store();
+    assert_eq!(
+        store
+            .za_log_first_retained(id, SyncCollection::Email)
+            .await
+            .unwrap(),
+        Some(email_bound)
+    );
+    assert_eq!(
+        store
+            .za_log_first_retained(id, SyncCollection::Thread)
+            .await
+            .unwrap(),
+        Some(thread_bound)
+    );
+    assert!(thread_bound > email_bound);
+    assert!(
+        email_bound <= assignment.change_id
+            && assignment.change_id < deletion
+            && deletion < thread_bound,
+        "expected Email bound <= assignment < deletion < Thread bound, got {email_bound}, {}, {deletion}, {thread_bound}",
+        assignment.change_id
+    );
+
+    // Put the durable checkpoint beyond both markers without a thread delta.
+    set_flag(key, newer, true).await;
+    advanced(test, key, false).await;
+    let before = index(test, id).await;
+    assert!(before.indexed_to.complete && before.indexed_to.change_id > thread_bound);
+    assert!(before.reconciliation.is_none());
+    assert!(before.thread_blobs.len() > 1);
+    {
+        let view = loaded(test, id).await;
+        let record = view
+            .thread
+            .record(expired)
+            .expect("the deleted singleton's retained record");
+        assert_eq!(record.thread_id, expired);
+        assert_eq!(record.revision, assignment.revision);
+        assert_eq!(
+            view.thread.revision_change_id(record.revision),
+            Some(assignment.change_id)
+        );
+        assert_eq!(
+            view.thread.members_of(expired, assignment.change_id),
+            [expired]
+        );
+        assert_eq!(record.deleted, Some(deletion));
+    }
+
+    let _compact = search_config_guard!(test, segments: before.thread_blobs.len() + 1);
+    let newest = deliver_one(test, key, "Real delta triggers retention compaction").await;
+    advanced(test, key, true).await;
+    let after = index(test, id).await;
+    assert_eq!(after.epoch, before.epoch);
+    assert_eq!(after.revision, before.revision + 1);
+    assert_eq!(after.thread_blobs.len(), 1);
+    let compacted = &after.thread_blobs[0];
+    assert!(
+        !before
+            .thread_blobs
+            .iter()
+            .any(|blob| blob.hash == compacted.hash)
+    );
+    assert_manifest_links(test, id, &after).await;
+
+    simulate_restart(test, id).await;
+    assert!(test.server.inner.cache.za_search.get(id).is_none());
+    let part = za_search_thread_part(test, id, key.secret()).await;
+    assert!(
+        part.record(expired).is_none(),
+        "compaction retained the expired singleton"
+    );
+    for live in [older, newer, newest] {
+        assert!(part.is_present(live));
+    }
+    let bytes = stored_blob(test, &compacted.hash).await;
+    let keys = za_unlock(test, id, key.secret()).await;
+    let header = BlobHeader {
+        kind: BlobKind::Thread,
+        tier: 0,
+        segment: compacted.segment,
+        predecessor: None,
+    };
+    let (_, public) = parse_thread_blob(keys.swk(), id, &header, &bytes).unwrap();
+    assert!(
+        public
+            .tombstones
+            .iter()
+            .all(|tombstone| tombstone.document_id != expired)
+    );
 }
 
 async fn content_header(test: &TestServer, hash: &BlobHash) -> BlobHeader {

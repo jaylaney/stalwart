@@ -142,6 +142,7 @@ use std::{
 pub use store::za_test::{
     FORCE_COMMIT_SPLIT, Pause, set_index_chunk_pause, set_second_chunk_fail_once,
 };
+use types::blob_hash::BlobHash;
 
 /// Sets `FORCE_COMMIT_SPLIT` to `account_id` for the guard's lifetime; the
 /// drop clears it, also when the test panics.
@@ -864,6 +865,9 @@ pub static SEARCH_SWEEP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 static SEARCH_RECOVERY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_PASS_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_DESTROY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+static SEARCH_POST_UNLINK_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+static SEARCH_REBUILD_CREATE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+static SEARCH_BLOB_TIMEOUT_ONCE: Mutex<Option<BlobTimeout>> = Mutex::new(None);
 pub static SEARCH_HOLD_EXPIRE: Mutex<Option<u32>> = Mutex::new(None);
 pub static SEARCH_CACHE_HOLD: Mutex<Option<u32>> = Mutex::new(None);
 pub static SEARCH_SWAP_SKIP: Mutex<Option<u32>> = Mutex::new(None);
@@ -949,6 +953,80 @@ pub fn set_search_destroy_pause(pause: Option<Arc<Pause>>) {
 
 pub async fn search_destroy_pause_point(account_id: u32) {
     wait(take_for(&SEARCH_DESTROY_PAUSE, account_id)).await;
+}
+
+/// Park destruction after it has unlinked its selected inventory.
+pub fn set_search_post_unlink_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_POST_UNLINK_PAUSE, pause);
+}
+
+pub(super) async fn search_post_unlink_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_POST_UNLINK_PAUSE, account_id)).await;
+}
+
+/// Park a missing-manifest creator after preparing its batch and before CAS.
+pub fn set_search_rebuild_create_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_REBUILD_CREATE_PAUSE, pause);
+}
+
+pub async fn search_rebuild_create_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_REBUILD_CREATE_PAUSE, account_id)).await;
+}
+
+struct BlobTimeout {
+    account_id: u32,
+    hash: BlobHash,
+    consumed: bool,
+}
+
+/// Replace one matching index-blob fetch result with an S3 request timeout.
+#[must_use = "dropping the guard disarms the timeout"]
+pub struct SearchBlobTimeoutOnce(());
+
+impl SearchBlobTimeoutOnce {
+    pub fn new(account_id: u32, hash: BlobHash) -> Self {
+        let mut slot = SEARCH_BLOB_TIMEOUT_ONCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(slot.is_none(), "an index-blob timeout is already armed");
+        *slot = Some(BlobTimeout {
+            account_id,
+            hash,
+            consumed: false,
+        });
+        Self(())
+    }
+
+    pub fn was_consumed(&self) -> bool {
+        SEARCH_BLOB_TIMEOUT_ONCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|timeout| timeout.consumed)
+    }
+}
+
+impl Drop for SearchBlobTimeoutOnce {
+    fn drop(&mut self) {
+        *SEARCH_BLOB_TIMEOUT_ONCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+pub(super) fn take_search_blob_timeout(account_id: u32, hash: &BlobHash) -> bool {
+    let mut slot = SEARCH_BLOB_TIMEOUT_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(timeout) = slot.as_mut()
+        && timeout.account_id == account_id
+        && &timeout.hash == hash
+        && !timeout.consumed
+    {
+        timeout.consumed = true;
+        return true;
+    }
+    false
 }
 
 pub fn set_search_hold_expire(account_id: Option<u32>) {

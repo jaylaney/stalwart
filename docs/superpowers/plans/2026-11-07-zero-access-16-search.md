@@ -2,6 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Plan revision 27** (2026-11-09) aligns Task 19's mutation catchers with the
+implemented paths. The residual-resolution unit directly tests M9; the metadata
+wire refusal remains a separate control. M27 injects a raw index-blob timeout
+before classification. M45 distinguishes the Thread-shorter compaction bound.
+M47 races the prepared absent-manifest creator against completed destruction.
+M18 observes resident state before commit, and M26 adds the post-unlink race.
+The existing actual-map-order companion supplies Task 3's traversal witness.
+These are qualification corrections; the production design and defaults stay fixed.
+
 **Plan revision 26** (2026-11-09) clarifies Task 18's comparison history
 (spec revision 33). Await committed paired delivery and resulting ordinary thread
 work before submitting the next message. Preserve all 3,258 raw MIME instances:
@@ -3953,6 +3962,25 @@ Measurements by the given method, mechanical mutation runs, and the specified do
 - Consumes: everything above; Task 1's corpus generator (`search_bench::corpus(seed: u64, count: usize) -> Vec<Generated>`, `Generated { raw, attachment_bytes, references }`; the no-attachment run keeps the items with `attachment_bytes == 0`) and its delivery loop; `read_manifest`, `principal_blob_links`, `za_index_current`; the trace constants `ZA_SEARCH_PASS`, `ZA_SEARCH_REBUILD` on their event with `Traced` (`tests/src/za/mail/mod.rs`, `Traced::start`); `Server::za_search_pass` through the keyed requests; `search_config_guard!`.
 - Produces: the outcome note later plans read; the `CLAUDE.md` text every later session reads.
 
+- [ ] **Step 0: Make the named mutation catchers discriminating.** Before the
+benchmark candidate, add the bounded fixtures described by M18, M26, M27, M45
+and M47 below. Preserve existing tests and assertions. Any new pause/error
+interception is account-scoped, restoring and `test_mode`-only; no hook mutex or
+reader lock spans an await. The timeout enters the real classifier as a raw
+backend error and targets the intended existing thread blob. The creator reaches
+its real prepared transaction and CAS after completed destruction. The compaction
+case verifies both log bounds, the record's lifecycle positions, actual publication
+and cold reload. The lost-assertion case drops its resident read guard before
+proceeding. The post-unlink race captures the writer outcome, finishes cleanup and
+checks final links before an outcome assertion can mask that observation. No
+hand-built survivor, fabricated committed row or weakened oracle is permitted.
+Focused validation and independent Astra review precede the primary's intermediate
+fixture commit. Use Sol high for this concurrency/error-path fixture phase; use
+the listed Sol medium route for the subsequent benchmark. The fresh committed-head
+mutation campaign still follows the reviewed benchmark commit. Test hooks may
+require narrow edits to `common::za::test_hooks`, search load/destroy and the
+rebuild commit seam; no shipped behavior or stored layout changes.
+
 - [ ] **Step 1: The system benchmark (9.6, second half)**
 
 `za::search_bench::system`, its own `TestServerBuilder::new("search_bench")`, the account `search-bench@example.com` (Task 1's; the two benchmarks never run in one process), run by name: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::search_bench::system -- --ignored --nocapture`. It prints one table, copied into the outcome note under "## Benchmarks", and the implementer records the machine (CPU, RAM, disk) beside it. Each row's method:
@@ -3983,7 +4011,7 @@ Procedure, plan 15's (its outcome note, "Mutation runs (plan 15)"): against the 
 | M6 | the manifest-hash comparison (Task 6) | compare `(epoch, revision)` instead of the hash | Task 6's unit `r18_a_deletion_only_change_moves_the_hash_and_reloads` |
 | M7 | the history lookup's direction (Task 3 `revision_at`) | newest row at or above `X` | `mail::threads` R5 states before/at/between/after |
 | M8 | the range end of the stream (Task 13) | `now` in place of `E` | `mail::threads` R12 paging with a merge and a deletion between pages |
-| M9 | the exhaustive leaf resolution (Task 10) | an unresolved leaf is dropped instead of refusing | `mail::search`: a search mixing a served and an unresolvable key widens instead of refusing |
+| M9 | the exhaustive leaf resolution (Task 10) | an unresolved leaf is dropped instead of refusing | JMAP unit `unresolved_leaf_refuses_the_entire_tree` exercises the production resolver; retain `mail::search` mixed-metadata wire refusal as a separate front-door control |
 | M10 | the prefix check on supplied ids (Task 11) | accept any prefix | `mail::threads` G20: a stale prefix is served on `Email/get` |
 | M11 | the key gates of 6.2's table (Task 11) | `Mailbox/get` keyless | `mail::gates` F8: the keyless token is served |
 | M12 | the witness rule (Task 8) | the witness is the lowest reassigned id | `leak_search` membership case: the log names a losing member |
@@ -3992,7 +4020,7 @@ Procedure, plan 15's (its outcome note, "Mutation runs (plan 15)"): against the 
 | M15 | the epoch's fresh change id (Task 14) | `epoch` = the change id current at the loss | `mail::index` R3: the latest pre-loss state is served |
 | M16 | the cursor's precedence over the shortcut (Task 8 step 0) | the shortcut applies with a cursor pending | `mail::index` R10 rebuild of several passes over an idle mailbox |
 | M17 | the chain header's segment id (Task 5) | a content blob's header omits its predecessor's segment id | unit: the chain reloads from the head with the descriptor alone (R11) |
-| M18 | the staging swap after commit (Task 8) | swap before the batch | `mail::index` lost-assertion case: a mapped id in memory after a failed batch |
+| M18 | the staging swap after commit (Task 8) | swap before the batch | `mail::index` lost-assertion case: the staged document is absent from resident thread state while parked before commit, and remains absent after failed CAS; observe early exposure even if reload repairs the final state |
 | M19 | the links in the manifest's batch (Task 8) | `BlobOp::Link` written before the batch | `mail::index` R7 interrupted transitions: a permanent link survives |
 | M20 | the scan on an incomplete traversal (Task 16) | skip the scan when the chain breaks | `mail::index` R7 middle-node case: an older blob survives destroy and purge |
 | M21 | the existence rule (Task 13) | classify by the entry that made the document a candidate | `mail::threads` R14 created-and-deleted in range |
@@ -4000,8 +4028,8 @@ Procedure, plan 15's (its outcome note, "Mutation runs (plan 15)"): against the 
 | M23 | the strict order (Task 8) | apply a record's deletions before its inserts | `mail::threads` R16 ordering case |
 | M24 | the cursor evidence (Task 8) | drop a tombstone's fields with a cursor pending (apply a log deletion before the cursor is exhausted) | `mail::threads` R16/R20 rebuild form |
 | M25 | the unconditional tombstone (Task 8) | skip a deletion the cache still shows | `mail::index::case_r17_tombstone_gone_after_retention` |
-| M26 | the destroying marker (Task 16) | inventory and unlinks before the marker | `mail::index` R19 paused pass losing to destroy: a link survives |
-| M27 | the error classes (Tasks 6, 7) | a store timeout is loss | `mail::index` F3: `SEARCH_BLOB_FAIL_ONCE` rebuilds |
+| M26 | the destroying marker (Task 16) | inventory and unlinks before the marker | `mail::index` R19 post-unlink companion: release the staged writer after the selected links were unlinked, then complete destruction and check final Principal links/purge; retain the original marker race |
+| M27 | the error classes (Tasks 6, 7) | an index-blob timeout is loss | `mail::index` F3 companion injects a raw backend timeout for a valid cold thread segment before `classify_blob_error`: transient leaves epoch/revision/inventory unchanged and retry loads; the mutant starts rebuild. The separate already-classified opener hook tests abort policy only |
 | M28 | the empty-staging rule (Task 8) | write a blob for an update-only delta; separately, move the cursor without a checkpoint | `mail::index` F4 hundred flag changes (blob count); R22 vanished cursor |
 | M29 | the record bound, the hidden budget and `M` (Tasks 4, 5, 8) | unbounded references; tombstones in the padded section; `M` under the inequality | `leak_search` F1; `leak_search` G1; unit: the configuration refusal |
 | M30 | the reservation charge (Task 8) | charge actual alias bytes | Task 8's unit `equal_public_inputs_stop_at_the_same_checkpoint_whatever_the_probe_merged`; `mail::threads::case_r21_amplified_merge_probe_class` |
@@ -4019,9 +4047,9 @@ Procedure, plan 15's (its outcome note, "Mutation runs (plan 15)"): against the 
 | M42 | the thread blob's padding (Task 5) | unpadded; separately, rounded to a 256-byte multiple | unit R15 byte-class checks |
 | M43 | the alias resolution (Tasks 3, 15) | a member rewritten at merge; separately, an alias dropped without folding | `mail::threads` R25 pinned page |
 | M44 | the reconciliation's attribution (Task 14) | stamp without reading the retained records | `mail::index::case_r24_g2_retained_deletion_rendered_once` (rendered twice) |
-| M45 | the shorter log's bound (Task 15) | prune by the Email log alone | `mail::threads` G4 `Thread/changes` refusal |
+| M45 | the shorter log's bound (Task 15) | prune by the Email log alone at compaction | a real compaction with verified `B_thread > B_email` removes a deleted singleton whose assignment and deletion lie between the bounds, checked after cold reload; retain G4's Email-shorter admission refusal separately |
 | M46 | the counter comparison (Task 11) | compare the item state | `mail::threads` G3 empty account refused |
-| M47 | the vault assertion on creation (Task 14) | the creating batch asserts `None` alone | `mail::index` R19 second form: the manifest recreated after destroy |
+| M47 | the vault assertion on creation (Task 14) | the creating batch asserts `None` alone | `mail::index` R19 creator companion parks the actual absent-manifest builder after vault read and preparation, completes permanent destruction through field150/152 removal, then releases commit: the manifest must not be recreated |
 | M48 | the skip of an already-held insert (Task 8) | re-index a held document | `mail::index` repeated-delta case: the record count or the blob count moves |
 | M49 | the destroy step's chain walk and scan (Task 16) | unlink the head only | `mail::index` R7 destroy and purge: an older content blob survives |
 | M50 | the bridge rule (Task 15) | prune a deleted record when its deletion alone is below the bound | unit: the chain fixture's resolution fails (R35) |
