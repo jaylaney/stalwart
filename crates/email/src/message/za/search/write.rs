@@ -15,11 +15,17 @@ use common::{
     Server,
     storage::blob::BlobHold,
     za::search::{
-        cache::{BudgetCharge, IndexEntry, LoadedIndex, PartKind, scanned_seed},
+        cache::{
+            BudgetCharge, EvictReason, IndexEntry, LoadedContent, LoadedIndex, PartKind,
+            ZaSearchCache, scanned_seed,
+        },
         error::{LoadFailure, TransientClass},
         load::ObservedLoadError,
         seal::{build_content_blob, build_thread_blob, za_search_key},
-        trace::{ZA_SEARCH_ABORTED, ZA_SEARCH_LOST, ZA_SEARCH_PASS, ZA_SEARCH_SUSPENDED},
+        trace::{
+            ZA_SEARCH_ABORTED, ZA_SEARCH_EVICTED, ZA_SEARCH_LOST, ZA_SEARCH_PASS,
+            ZA_SEARCH_SUSPENDED,
+        },
     },
     za_search_trace,
 };
@@ -33,11 +39,12 @@ use store::{
     za_search::{
         BlobHeader, BlobKind, PadTarget, SegmentId, ZaSearchKey,
         blob::{HiddenSection, PublicSection},
+        content::{ContentPart, ContentRecord, OwnedContentFrame},
         manifest::{
             ContentCursor, ContentHead, Manifest, ManifestFill, ManifestValue, ManifestWrite,
             ThreadBlobEntry, manifest_assertion, manifest_hash,
         },
-        thread::RevisionRow,
+        thread::{RevisionRow, ThreadPart},
     },
 };
 use types::{
@@ -804,23 +811,65 @@ async fn swap(
     else {
         return;
     };
-    let ChargedStaging {
-        staging,
-        content_charge,
-    } = charged;
+    let mut charged = charged;
+    let staged_charge = charged.content_charge.take();
+    let staging = charged.staging;
     if matches!(
         staging.decision,
         PassDecision::Publishing | PassDecision::NonPublishing | PassDecision::ContentOnly
     ) {
-        if matches!(
+        if index.content.as_ref().is_some_and(|c| {
+            c.segments.first() != base.content.as_ref().map(|b| &b.segment)
+                || content_swap.as_ref().is_some_and(|update| {
+                    update.replaced > c.segments.len() || (!update.full && update.removed_missing)
+                })
+        }) {
+            index.content = None;
+        }
+
+        let thread_delta = matches!(
             staging.decision,
             PassDecision::Publishing | PassDecision::NonPublishing
-        ) {
-            for tombstone in &staging.tombstones {
-                if let Some(content) = index.content.as_mut() {
-                    content.part.remove(tombstone.document_id);
-                }
+        );
+        let staged_bytes = staging.content_owned_bytes();
+        let mut staged_charge = staged_charge.unwrap_or_else(BudgetCharge::detached);
+        // The Vec (or its iterator) must drop before its reservation.
+        let staged_content = staging.content;
+        if let Some(content) = index.content.as_mut() {
+            let staged_admitted = search_cache.grow(
+                &mut staged_charge,
+                PartKind::Content,
+                staged_bytes,
+                account_id,
+            );
+            let keep_content = if staged_admitted && thread_delta && !staging.tombstones.is_empty()
+            {
+                let scratch_size = staging
+                    .tombstones
+                    .iter()
+                    .map(|tombstone| content.part.removal_scratch(tombstone.document_id))
+                    .max()
+                    .unwrap_or_default();
+                remove_warm_content(
+                    search_cache,
+                    account_id,
+                    content,
+                    scratch_size,
+                    |part, scratch| {
+                        for tombstone in &staging.tombstones {
+                            part.remove_with_scratch(tombstone.document_id, scratch);
+                        }
+                    },
+                )
+            } else {
+                staged_admitted
+            };
+            if !keep_content {
+                evict_warm_content(index, account_id);
             }
+        }
+
+        if thread_delta {
             let row =
                 matches!(staging.decision, PassDecision::Publishing).then_some(new.newest_row);
             if let Some(CompactedThreads { mut part, charge }) = threads {
@@ -841,45 +890,33 @@ async fn swap(
                 account_id,
             );
         }
-        if index.content.as_ref().is_some_and(|c| {
-            c.segments.first() != base.content.as_ref().map(|b| &b.segment)
-                || content_swap.as_ref().is_some_and(|update| {
-                    update.replaced > c.segments.len() || (!update.full && update.removed_missing)
-                })
-        }) {
-            index.content = None;
-        }
-        let staged_content = staging.content;
+
         if let Some(content) = index.content.as_mut() {
-            for (_, record) in staged_content {
-                if index.thread.is_present(record.document_id()) {
-                    content.part.insert(record);
-                }
-            }
-            if let Some(head) = &new.content {
-                if let Some(update) = content_swap {
-                    content.segments.splice(..update.replaced, [head.segment]);
-                    if update.full {
-                        let missing = content
-                            .part
-                            .document_ids()
-                            .iter()
-                            .filter(|id| !index.thread.is_present(*id))
-                            .collect::<Vec<_>>();
-                        for id in missing {
-                            content.part.remove(id);
-                        }
-                    }
-                } else if content.segments.first() != Some(&head.segment) {
-                    content.segments.insert(0, head.segment);
-                }
+            let inserted = insert_warm_records(
+                search_cache,
+                account_id,
+                content,
+                &index.thread,
+                staged_content,
+                &mut staged_charge,
+                staged_bytes,
+            );
+            drop(staged_charge);
+            if !inserted
+                || !advance_warm_content(
+                    search_cache,
+                    account_id,
+                    content,
+                    &index.thread,
+                    new.content.as_ref(),
+                    content_swap,
+                )
+            {
+                evict_warm_content(index, account_id);
             }
         } else {
             drop(staged_content);
         }
-        // The separate staging allocation is gone. Transfer its charge to
-        // the resident part before reconciling its updated size.
-        search_cache.admit_content_growth_with_staged(index, account_id, content_charge);
     }
     if !matches!(staging.decision, PassDecision::Abort { .. }) {
         index.scanned_to = staging.scanned_to.max(scanned_seed(&new.indexed_to));
@@ -887,6 +924,143 @@ async fn swap(
     }
     index.manifest = new;
     index.manifest_bytes_hash = new_hash;
+}
+
+fn insert_warm_records(
+    cache: &ZaSearchCache,
+    account_id: u32,
+    content: &mut LoadedContent,
+    thread: &ThreadPart,
+    records: Vec<(u32, ContentRecord)>,
+    staged_charge: &mut BudgetCharge,
+    mut staged_bytes: u64,
+) -> bool {
+    for (_, record) in records {
+        let owned = record.owned_buffer_bytes() as u64;
+        staged_bytes -= owned;
+        if !thread.is_present(record.document_id()) {
+            drop(record);
+            cache.grow(staged_charge, PartKind::Content, staged_bytes, account_id);
+            continue;
+        }
+
+        let with_frame = content.bytes.saturating_add(record.encoded_len() as u64);
+        if !cache.grow(
+            &mut content.charge,
+            PartKind::Content,
+            with_frame,
+            account_id,
+        ) {
+            return false;
+        }
+        let frame = OwnedContentFrame::from_record(&record);
+        drop(record);
+        // Reuse the released buffer's reservation for scratch without giving
+        // another admission a chance to consume the credit between phases.
+        staged_charge.transfer_to(&mut content.charge, owned);
+        if !content.part.insert_frame(frame, |extra| {
+            cache.grow(
+                &mut content.charge,
+                PartKind::Content,
+                with_frame.saturating_add(extra as u64),
+                account_id,
+            )
+        }) || !reconcile_warm_content(cache, account_id, content)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn advance_warm_content(
+    cache: &ZaSearchCache,
+    account_id: u32,
+    content: &mut LoadedContent,
+    thread: &ThreadPart,
+    head: Option<&ContentHead>,
+    update: Option<ContentSwap>,
+) -> bool {
+    let Some(head) = head else {
+        return true;
+    };
+    if let Some(update) = update {
+        if update.full
+            && let Some(scratch_size) = content
+                .part
+                .document_ids()
+                .iter()
+                .filter(|id| !thread.is_present(*id))
+                .map(|id| content.part.removal_scratch(id))
+                .max()
+        {
+            let removed =
+                remove_warm_content(cache, account_id, content, scratch_size, |part, scratch| {
+                    let mut next = 0;
+                    while let Some(id) = part
+                        .document_ids()
+                        .range(next..)
+                        .find(|id| !thread.is_present(*id))
+                    {
+                        part.remove_with_scratch(id, scratch);
+                        let Some(after) = id.checked_add(1) else {
+                            break;
+                        };
+                        next = after;
+                    }
+                });
+            if !removed {
+                return false;
+            }
+        }
+        content.segments.splice(..update.replaced, [head.segment]);
+    } else if content.segments.first() != Some(&head.segment) {
+        content.segments.insert(0, head.segment);
+    }
+    true
+}
+
+fn remove_warm_content(
+    cache: &ZaSearchCache,
+    account_id: u32,
+    content: &mut LoadedContent,
+    scratch_size: usize,
+    remove: impl FnOnce(&mut ContentPart, &mut Vec<u8>),
+) -> bool {
+    if !cache.grow(
+        &mut content.charge,
+        PartKind::Content,
+        content.bytes.saturating_add(scratch_size as u64),
+        account_id,
+    ) {
+        return false;
+    }
+    let mut scratch = Zeroizing::new(Vec::with_capacity(scratch_size));
+    remove(&mut content.part, &mut scratch);
+    drop(scratch);
+    reconcile_warm_content(cache, account_id, content)
+}
+
+fn reconcile_warm_content(
+    cache: &ZaSearchCache,
+    account_id: u32,
+    content: &mut LoadedContent,
+) -> bool {
+    let bytes = content.part.loaded_bytes() as u64;
+    if !cache.grow(&mut content.charge, PartKind::Content, bytes, account_id) {
+        return false;
+    }
+    content.bytes = bytes;
+    true
+}
+
+fn evict_warm_content(index: &mut LoadedIndex, account_id: u32) {
+    index.content = None;
+    za_search_trace!(
+        ZA_SEARCH_EVICTED,
+        AccountId = account_id,
+        Reason = EvictReason::Budget.as_str()
+    );
 }
 
 fn trace_abort(account_id: u32, class: TransientClass) -> PassOutcome {

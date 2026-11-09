@@ -4316,6 +4316,8 @@ async fn test_compaction(test: &mut TestServer, admin: &Account) {
         test.destroy_all_mailboxes(&key).await;
     }
 
+    test_warm_content_admission(test).await;
+
     let loss = key_mail_account(test, "keymail-compact-loss@example.com", "Compaction-loss!").await;
     case_compaction_hash_loss_keeps_the_map(test, &loss).await;
     test.destroy_all_mailboxes(&loss).await;
@@ -4388,8 +4390,18 @@ async fn content_header(test: &TestServer, hash: &BlobHash) -> BlobHeader {
 async fn seed_content_tiers(
     test: &TestServer,
     key: &Account,
+    manifest: Manifest,
+    tiers: &[u8],
+) -> (Manifest, Vec<BlobHash>) {
+    seed_content_tiers_with_frame(test, key, manifest, tiers, None).await
+}
+
+async fn seed_content_tiers_with_frame(
+    test: &TestServer,
+    key: &Account,
     mut manifest: Manifest,
     tiers: &[u8],
+    extra_frame: Option<&[u8]>,
 ) -> (Manifest, Vec<BlobHash>) {
     use common::za::search::seal::{build_content_blob, parse_content_blob};
     use store::za_search::{BlobKind, SegmentId, manifest::ContentHead};
@@ -4430,6 +4442,7 @@ async fn seed_content_tiers(
             frames
                 .iter()
                 .map(|frame| frame.as_slice())
+                .chain(extra_frame)
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -5439,4 +5452,365 @@ async fn case_content_frame_budget(test: &TestServer, key: &Account, compressed:
     println!(
         "Frame budget merge and cold reload validated compressed={compressed} records={count}"
     );
+}
+
+async fn test_warm_content_admission(test: &mut TestServer) {
+    for (name, cap) in [
+        ("keymail-warm-reuse@example.com", 192 * 1024),
+        ("keymail-warm-room@example.com", 1024 * 1024),
+    ] {
+        let key = key_mail_account(test, name, "Warm-admission!").await;
+        case_warm_staged_insertion(test, &key, cap).await;
+        test.destroy_all_mailboxes(&key).await;
+    }
+
+    let key = key_mail_account(
+        test,
+        "keymail-warm-tombstone@example.com",
+        "Warm-admission!",
+    )
+    .await;
+    case_warm_tombstone_budget(test, &key).await;
+    test.destroy_all_mailboxes(&key).await;
+
+    for (name, pressure) in [
+        ("keymail-warm-missing@example.com", true),
+        ("keymail-warm-prune@example.com", false),
+    ] {
+        let key = key_mail_account(test, name, "Warm-admission!").await;
+        case_warm_full_merge_missing_budget(test, &key, pressure).await;
+        test.destroy_all_mailboxes(&key).await;
+    }
+}
+
+const WARM_NEEDLE: &str = "zawarmneedle";
+const WARM_POSITIONS: usize = 120_000;
+const WARM_REMOVE_CAP: u64 = 64 * 1024;
+
+fn repeated_warm_body() -> String {
+    let line = format!(
+        "{}{}\r\n",
+        format!("{WARM_NEEDLE} ").repeat(31),
+        WARM_NEEDLE
+    );
+    line.repeat(WARM_POSITIONS / 32)
+}
+
+async fn deliver_repeated_warm(test: &TestServer, key: &Account) -> u32 {
+    let id = account_id(key);
+    let before = message_ids(test, id).await;
+    let message = message_with("Warm admission", &repeated_warm_body());
+    let (headers, body) = message.split_once("\r\n\r\n").unwrap();
+    let mime = format!(
+        "{headers}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Language: en\r\n\r\n{body}"
+    );
+    deliver(test, SENDER, key.name(), &mime).await;
+    super::new_message(test, id, &before).await
+}
+
+async fn read_warm_root_frames(
+    test: &TestServer,
+    key: &Account,
+    manifest: &Manifest,
+    reserve: impl FnMut(usize) -> bool,
+) -> Result<
+    Vec<store::za_search::content::OwnedContentFrame>,
+    store::za_search::blob::ContentFramesError,
+> {
+    use common::za::search::seal::open_section;
+    use store::za_search::{BlobKind, SectionKind, blob::decode_content_frames};
+
+    let id = account_id(key);
+    let keys = za_unlock(test, id, key.secret()).await;
+    let head = manifest.content.as_ref().unwrap();
+    assert_eq!(head.length, 1);
+    let bytes = stored_blob(test, &head.hash).await;
+    assert_eq!(BlobHash::generate(&bytes), head.hash);
+    assert_eq!(bytes.len() as u64, head.size);
+    let (header, sealed) = BlobHeader::decode(&bytes).unwrap();
+    assert_eq!(header.kind, BlobKind::Content);
+    assert_eq!(header.segment, head.segment);
+    assert!(header.predecessor.is_none());
+    let plaintext = open_section(keys.swk(), id, &header, SectionKind::Content, sealed).unwrap();
+    decode_content_frames(&plaintext, reserve)
+}
+
+async fn case_warm_staged_insertion(test: &TestServer, key: &Account, cap: u64) {
+    use common::za::test_hooks::{SearchContentWrite, take_search_content_writes};
+    use store::za_search::blob::ContentFramesError;
+
+    let _config = search_config_guard!(test, segments: 2);
+    let id = account_id(key);
+    let cache = &test.server.inner.cache.za_search;
+    let first = deliver_one(test, key, "Warm admission first").await;
+    advanced(test, key, true).await;
+    let original_frames = content_frames(test, key).await;
+    let original = index(test, id).await;
+    assert!(original.cursor.is_none());
+    assert!(original.content_to.cursor.is_none());
+    assert!(original.reconciliation.is_none());
+
+    let added = deliver_repeated_warm(test, key).await;
+    let budget = cache.override_content_budget_for_test(cap);
+    let _observer = ObserveContentWrites::start(id);
+    let parked = park(test, key, set_search_swap_pause).await;
+    let (old_bytes, old_scratch) = {
+        let view = loaded(test, id).await;
+        let warm = view.content.as_ref().expect("merge kept its warm base");
+        assert_eq!(warm.segments, [original.content.as_ref().unwrap().segment]);
+        assert_eq!(
+            warm.part.record_bytes(first),
+            Some(original_frames[&first].as_slice()),
+        );
+        (warm.bytes, warm.part.removal_scratch(first))
+    };
+    let committed = index(test, id).await;
+    let raw = manifest_bytes(test, id).await.unwrap();
+    let links = principal_blob_links(test, id).await;
+    assert_ne!(committed.content, original.content);
+    let mut declared = 0;
+    assert!(matches!(
+        read_warm_root_frames(test, key, &committed, |bytes| {
+            declared = bytes;
+            false
+        })
+        .await,
+        Err(ContentFramesError::Budget)
+    ));
+    assert!(declared >= WARM_POSITIONS && declared > old_scratch);
+    assert!(committed.content.as_ref().unwrap().size < 4096);
+    if cap == 192 * 1024 {
+        assert!(old_bytes + 2 * declared as u64 > cap);
+    }
+    let writes = take_search_content_writes(id);
+    let estimate = |find: fn(&SearchContentWrite) -> Option<u64>| {
+        writes.iter().find_map(find).expect("compaction accounting")
+    };
+    let staged = estimate(|event| match event {
+        SearchContentWrite::StagedMemory(bytes) => Some(*bytes),
+        _ => None,
+    });
+    let original_size = estimate(|event| match event {
+        SearchContentWrite::Original(bytes) => Some(*bytes),
+        _ => None,
+    });
+    assert!(
+        writes
+            .iter()
+            .any(|event| matches!(event, SearchContentWrite::Linked { .. }))
+    );
+    let paused_usage = cache.content_used();
+    assert_eq!(
+        parked.finish().await,
+        PassOutcome::Advanced {
+            published: true,
+            indexed_to: committed.indexed_to,
+        }
+    );
+    assert!(
+        staged >= declared as u64,
+        "retained staging charge {staged} must cover the {declared}-byte term buffer",
+    );
+    assert!(staged > original_size + declared as u64 / 2);
+    assert!(old_bytes + staged <= paused_usage && paused_usage <= cap);
+    let frames = read_warm_root_frames(test, key, &committed, |_| true)
+        .await
+        .unwrap();
+    assert_eq!(frames.len(), 2);
+    {
+        let view = loaded(test, id).await;
+        let content = view
+            .content
+            .as_ref()
+            .expect("staging capacity was reusable");
+        assert_eq!(
+            content.segments,
+            [committed.content.as_ref().unwrap().segment]
+        );
+        assert_eq!(content.bytes, content.part.loaded_bytes() as u64);
+        assert_eq!(view.manifest_bytes_hash, manifest_hash(&raw));
+        assert!(view.thread.is_present(added));
+        for frame in &frames {
+            assert_eq!(
+                content.part.record_bytes(frame.document_id()),
+                Some(frame.bytes())
+            );
+        }
+    }
+    assert_eq!(
+        manifest_bytes(test, id).await.as_deref(),
+        Some(raw.as_slice())
+    );
+    assert_eq!(principal_blob_links(test, id).await, links);
+    assert_manifest_links(test, id, &committed).await;
+
+    drop(budget);
+    let _budget = cache.override_content_budget_for_test(1024 * 1024);
+    simulate_restart(test, id).await;
+    let reloaded = content_frames(test, key).await;
+    assert_eq!(reloaded.len(), frames.len());
+    for frame in frames {
+        assert_eq!(reloaded[&frame.document_id()], frame.bytes());
+    }
+    assert_eq!(reloaded[&first], original_frames[&first]);
+    let ids = queried(&recovery_query(key, Some(WARM_NEEDLE)).await);
+    assert_eq!(ids.len(), 1);
+    assert_eq!(Id::from_str(&ids[0]).unwrap().document_id(), added);
+    assert_eq!(pass(test, key).await, PassOutcome::Current);
+    println!(
+        "Warm insertion reused stage at cap={cap}: stage={staged}, scratch={declared}, paused={paused_usage}"
+    );
+}
+
+async fn case_warm_tombstone_budget(test: &TestServer, key: &Account) {
+    let id = account_id(key);
+    let cache = &test.server.inner.cache.za_search;
+    let survivor = deliver_one(test, key, "Warm tombstone survivor").await;
+    let removed = deliver_repeated_warm(test, key).await;
+    advanced(test, key, true).await;
+    let original = index(test, id).await;
+    let frames = content_frames(test, key).await;
+    pop3_delete(test, key, removed).await;
+
+    let budget = cache.override_content_budget_for_test(WARM_REMOVE_CAP);
+    let parked = park(test, key, set_search_swap_pause).await;
+    let scratch = {
+        let view = loaded(test, id).await;
+        let warm = view.content.as_ref().expect("warm before tombstone");
+        assert!(warm.bytes < WARM_REMOVE_CAP);
+        assert_eq!(
+            warm.part.record_bytes(removed),
+            Some(frames[&removed].as_slice())
+        );
+        warm.part.removal_scratch(removed)
+    };
+    assert!(scratch >= WARM_POSITIONS);
+    assert!(scratch as u64 > WARM_REMOVE_CAP);
+    let committed = index(test, id).await;
+    let raw = manifest_bytes(test, id).await.unwrap();
+    assert_eq!(committed.content, original.content);
+    assert_eq!(committed.revision, original.revision);
+    assert!(committed.indexed_to.change_id > original.indexed_to.change_id);
+    assert_eq!(
+        parked.finish().await,
+        PassOutcome::Advanced {
+            published: false,
+            indexed_to: committed.indexed_to,
+        }
+    );
+    {
+        let view = loaded(test, id).await;
+        assert!(
+            view.content.is_none(),
+            "warm tombstone scratch must be admitted"
+        );
+        assert_eq!(view.manifest_bytes_hash, manifest_hash(&raw));
+        assert_eq!(view.thread.exists_at(removed, u64::MAX), Some(false));
+    }
+    assert_eq!(
+        manifest_bytes(test, id).await.as_deref(),
+        Some(raw.as_slice())
+    );
+    assert_manifest_links(test, id, &committed).await;
+
+    drop(budget);
+    let _budget = cache.override_content_budget_for_test(1024 * 1024);
+    simulate_restart(test, id).await;
+    let reloaded = content_frames(test, key).await;
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[&survivor], frames[&survivor]);
+    assert!(queried(&recovery_query(key, Some(WARM_NEEDLE)).await).is_empty());
+    assert_eq!(pass(test, key).await, PassOutcome::Current);
+    println!("Warm tombstone evicted only content before scratch={scratch}");
+}
+
+async fn case_warm_full_merge_missing_budget(test: &TestServer, key: &Account, pressure: bool) {
+    use nlp::language::Language;
+    use store::{
+        search::{EmailSearchField, IndexDocument},
+        write::SearchIndex,
+        za_search::content::{ContentRecord, SortKeys},
+    };
+
+    let _config = search_config_guard!(test, segments: 2);
+    let id = account_id(key);
+    let cache = &test.server.inner.cache.za_search;
+    let _room = cache.override_content_budget_for_test(1024 * 1024);
+    let first = deliver_one(test, key, "Warm missing survivor").await;
+    advanced(test, key, true).await;
+
+    // The authenticated old root has an extra content frame with no thread row.
+    let missing = u32::MAX;
+    let mut document = IndexDocument::new(SearchIndex::Email);
+    document.index_text(
+        EmailSearchField::Body,
+        &repeated_warm_body(),
+        Language::English,
+    );
+    let extra = ContentRecord::new(document, missing, SortKeys::default(), None, false).encode();
+    let (original, _) =
+        seed_content_tiers_with_frame(test, key, index(test, id).await, &[0], Some(&extra)).await;
+    let frames = content_frames(test, key).await;
+    assert_eq!(frames[&missing], extra);
+    let added = deliver_one(test, key, "Warm missing addition").await;
+
+    let parked = park(test, key, set_search_swap_pause).await;
+    let scratch = {
+        let view = loaded(test, id).await;
+        let warm = view.content.as_ref().expect("warm before missing prune");
+        assert_eq!(warm.segments, [original.content.as_ref().unwrap().segment]);
+        assert!(warm.bytes < WARM_REMOVE_CAP);
+        assert!(warm.part.contains(missing));
+        assert!(view.thread.record(missing).is_none());
+        warm.part.removal_scratch(missing)
+    };
+    assert!(scratch >= WARM_POSITIONS && scratch as u64 > WARM_REMOVE_CAP);
+    let committed = index(test, id).await;
+    let raw = manifest_bytes(test, id).await.unwrap();
+    let merged = read_warm_root_frames(test, key, &committed, |_| true)
+        .await
+        .unwrap();
+    assert_eq!(merged.len(), 2);
+    assert!(merged.iter().any(|frame| frame.document_id() == added));
+    assert!(merged.iter().all(|frame| frame.document_id() != missing));
+    let budget = pressure.then(|| cache.override_content_budget_for_test(WARM_REMOVE_CAP));
+    assert_eq!(
+        parked.finish().await,
+        PassOutcome::Advanced {
+            published: true,
+            indexed_to: committed.indexed_to,
+        }
+    );
+    {
+        let view = loaded(test, id).await;
+        assert_eq!(view.manifest_bytes_hash, manifest_hash(&raw));
+        assert!(view.thread.is_present(added));
+        if pressure {
+            assert!(
+                view.content.is_none(),
+                "warm missing-ID scratch must be admitted"
+            );
+        } else {
+            let warm = view.content.as_ref().expect("warm pruning fits");
+            assert!(warm.part.contains(first) && warm.part.contains(added));
+            assert!(!warm.part.contains(missing));
+        }
+    }
+    assert_eq!(
+        manifest_bytes(test, id).await.as_deref(),
+        Some(raw.as_slice())
+    );
+    assert_manifest_links(test, id, &committed).await;
+
+    drop(budget);
+    simulate_restart(test, id).await;
+    let reloaded = content_frames(test, key).await;
+    assert_eq!(reloaded.len(), 2);
+    assert_eq!(reloaded[&first], frames[&first]);
+    for frame in merged {
+        assert_eq!(reloaded[&frame.document_id()], frame.bytes());
+    }
+    assert_eq!(pass(test, key).await, PassOutcome::Current);
+    println!("Warm missing-ID pruning at pressure={pressure}: scratch={scratch}");
 }

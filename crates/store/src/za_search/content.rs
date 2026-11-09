@@ -85,6 +85,15 @@ impl ContentRecord {
         self.document_id
     }
 
+    /// Heap buffers retained by a staged record, excluding its inline value.
+    pub fn owned_buffer_bytes(&self) -> usize {
+        self.terms
+            .capacity()
+            .saturating_add(self.sort_keys.from.capacity())
+            .saturating_add(self.sort_keys.to.capacity())
+            .saturating_add(self.sort_keys.subject.capacity())
+    }
+
     pub fn encoded_len(&self) -> usize {
         RECORD_OVERHEAD
             + self.sort_keys.from.len()

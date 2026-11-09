@@ -501,3 +501,48 @@ fn bounded_frames_validate_term_scratch_and_keep_exact_bytes() {
     assert_eq!(part.record_bytes(1), Some(frame.as_slice()));
     assert!(part.loaded_bytes() > frame.len());
 }
+
+#[test]
+fn bounded_insert_refuses_scratch_and_growth_before_replacing_resident_bytes() {
+    let original = record(1, body(&"oldterm ".repeat(8192)));
+    let replacement = record(1, body("newterm"));
+    let original_bytes = original.encode();
+    let replacement_scratch = super::document_scratch_size(&replacement.terms).unwrap();
+    let mut part = part([original]);
+    let resident_bytes = part.loaded_bytes();
+    let scratch = part.removal_scratch(1);
+    assert!(scratch >= 8192 && scratch > replacement_scratch);
+
+    let mut requests = Vec::new();
+    assert!(!part.insert_frame(
+        super::OwnedContentFrame::from_record(&replacement),
+        |bytes| {
+            requests.push(bytes);
+            false
+        }
+    ));
+    assert_eq!(requests, [scratch]);
+    assert_eq!(part.record_bytes(1), Some(original_bytes.as_slice()));
+    assert_eq!(part.loaded_bytes(), resident_bytes);
+
+    requests.clear();
+    assert!(!part.insert_frame(
+        super::OwnedContentFrame::from_record(&replacement),
+        |bytes| {
+            requests.push(bytes);
+            bytes <= scratch
+        }
+    ));
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], scratch);
+    assert!(requests[1] > scratch);
+    assert_eq!(part.record_bytes(1), Some(original_bytes.as_slice()));
+    assert_eq!(part.loaded_bytes(), resident_bytes);
+    assert!(
+        resolve_one(
+            &part,
+            SearchFilter::text_eq(EmailSearchField::Body, "oldterm")
+        )
+        .contains(1)
+    );
+}

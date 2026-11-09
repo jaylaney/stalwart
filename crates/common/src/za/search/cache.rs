@@ -508,6 +508,20 @@ impl BudgetCharge {
         }
     }
 
+    /// Move part of this reservation without changing the shared usage counter.
+    pub fn transfer_to(&mut self, target: &mut Self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        assert!(bytes <= self.bytes);
+        assert!(target.bytes == 0 || Arc::ptr_eq(&self.counter, &target.counter));
+        self.bytes -= bytes;
+        target.absorb(Self {
+            counter: self.counter.clone(),
+            bytes,
+        });
+    }
+
     pub fn detached() -> Self {
         Self {
             counter: Arc::default(),
@@ -581,6 +595,43 @@ mod tests {
         let staged = cache.admit(PartKind::Content, estimate, 0).unwrap();
         assert!(cache.admit_content_growth_with_staged(&mut index, 0, Some(staged)));
         assert_eq!(cache.content_used(), 0);
+    }
+
+    #[test]
+    fn partial_transfer_keeps_remaining_staging_and_resident_credit_separate() {
+        let cache = ZaSearchCache::new(Ok(ZaSearchConfig::default()));
+        let _budget = cache.override_content_budget_for_test(120);
+        let mut staged = cache.admit(PartKind::Content, 100, 0).unwrap();
+        let mut resident = BudgetCharge::detached();
+        let existing = cache.admit(PartKind::Content, 20, 0).unwrap();
+
+        staged.transfer_to(&mut resident, 60);
+        staged.transfer_to(&mut resident, 20);
+        assert_eq!(cache.content_used(), 120);
+        assert!(cache.admit(PartKind::Content, 1, 1).is_none());
+        assert!(cache.grow(&mut resident, PartKind::Content, 75, 0));
+        assert_eq!(cache.content_used(), 115);
+        drop(resident);
+        assert_eq!(cache.content_used(), 40);
+        drop(staged);
+        assert_eq!(cache.content_used(), 20);
+        drop(existing);
+        assert_eq!(cache.content_used(), 0);
+    }
+
+    #[test]
+    fn partial_transfer_rejects_different_nonempty_pools() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let cache = ZaSearchCache::new(Ok(ZaSearchConfig::default()));
+        let mut staged = cache.admit(PartKind::Content, 10, 0).unwrap();
+        let mut thread = cache.admit(PartKind::Thread, 20, 0).unwrap();
+        assert!(catch_unwind(AssertUnwindSafe(|| staged.transfer_to(&mut thread, 5))).is_err());
+        assert_eq!(cache.content_used(), 10);
+        assert_eq!(cache.thread_used(), 20);
+        drop(staged);
+        drop(thread);
+        assert_eq!((cache.content_used(), cache.thread_used()), (0, 0));
     }
 
     #[test]

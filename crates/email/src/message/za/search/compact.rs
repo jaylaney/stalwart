@@ -24,7 +24,7 @@ use store::{
         BlobHeader, BlobKind, FormatError, PadTarget, SegmentId,
         blob::{HiddenSection, PublicSection, SEAL_OVERHEAD, encode_content},
         compaction_allowance,
-        content::{ContentRecord, OwnedContentFrame},
+        content::OwnedContentFrame,
         thread::{ThreadPart, Tombstone},
     },
 };
@@ -238,14 +238,8 @@ pub(super) async fn compact_content(
         .map(|(_, record)| (size_of::<u32>() + record.encoded_len()) as u64)
         .sum::<u64>()
         .saturating_add((BlobHeader::LEN + SEAL_OVERHEAD + size_of::<u32>()) as u64);
-    // Encoded length estimates the owned term and sort-key buffers. The
-    // allocation of record tuples survives even after the output is uploaded.
-    let staged_bytes = staged_size.saturating_add(
-        staging
-            .content
-            .capacity()
-            .saturating_mul(size_of::<(u32, ContentRecord)>()) as u64,
-    );
+    // Compressed terms can retain much more capacity than their encoded length.
+    let staged_bytes = staging.content_owned_bytes();
     let mut charge = cache
         .admit(PartKind::Content, staged_bytes, account_id)
         .ok_or(CompactError::Transient(TransientClass::Budget))?;
@@ -487,7 +481,10 @@ mod tests {
     use store::{
         search::IndexDocument,
         write::SearchIndex,
-        za_search::{ThreadFieldsK, content::SortKeys},
+        za_search::{
+            ThreadFieldsK,
+            content::{ContentRecord, SortKeys},
+        },
     };
 
     #[test]

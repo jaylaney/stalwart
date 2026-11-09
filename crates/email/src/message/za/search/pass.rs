@@ -164,6 +164,18 @@ pub(crate) struct Staging {
 }
 
 impl Staging {
+    pub(super) fn content_owned_bytes(&self) -> u64 {
+        let slots = self
+            .content
+            .capacity()
+            .saturating_mul(size_of::<(u32, ContentRecord)>());
+        self.content
+            .iter()
+            .fold(slots as u64, |bytes, (_, record)| {
+                bytes.saturating_add(record.owned_buffer_bytes() as u64)
+            })
+    }
+
     pub(super) fn trace_skipped(&self, account_id: u32) {
         for (document_id, class) in &self.skipped {
             let reason = self
