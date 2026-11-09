@@ -613,12 +613,26 @@ async fn case_grouping_after_deleting_a_reference(
     let next = reply_to(&middle, subject, "N");
     let plain_a = import(plain, root.clone(), RECEIVED).await;
     let plain_d = import(plain, middle.clone(), RECEIVED).await;
-    pop3_delete(test, plain, plain_d.document_id()).await;
+    // D must still be present when the ordinary ingest assigns N's thread.
     let plain_n = import(plain, next.clone(), RECEIVED).await;
     test.wait_for_tasks().await;
+    pop3_delete(test, plain, plain_d.document_id()).await;
+    test.wait_for_tasks().await;
     let (_, plain_rows) = query(plain, false).await;
+    let mut expected_docs = [plain_a.document_id(), plain_n.document_id()];
+    expected_docs.sort_unstable();
+    let mut actual_docs = plain_rows
+        .iter()
+        .map(|id| id.document_id())
+        .collect::<Vec<_>>();
+    actual_docs.sort_unstable();
+    assert_eq!(actual_docs, expected_docs);
     let same_thread = by_document(&plain_rows, plain_a).prefix_id()
         == by_document(&plain_rows, plain_n).prefix_id();
+    assert!(
+        same_thread,
+        "ordinary N must stay in A's thread after deleting D"
+    );
 
     let a = import(key, root, RECEIVED).await;
     let d = import(key, middle, RECEIVED).await;

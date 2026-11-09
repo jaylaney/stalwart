@@ -1,6 +1,12 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 32 (2026-11-08), execution clarification.
+Date: 2026-11-04. Status: revision 33 (2026-11-09), execution clarification.
+Revision 33 makes the ordinary-thread parity precondition explicit: delivery,
+thread-merge work and deletion cleanup settle between thread-affecting operations.
+Keyed assignment follows the committed history; it does not reproduce candidate
+visibility from overlapping ordinary operations. Sections 5.1, 6.1, 7.5 and 9.5
+state that boundary. The threading algorithm and existing deviations are unchanged.
+
 Revision 32 corrects the expected partition in the rebuild's missing-evidence
 fixture. With D absent before its cursor turn, N and N2 can still match each
 other through their shared reference to D, but remain separate from A. The
@@ -1063,9 +1069,11 @@ the records it reads (R17). A response, by contrast, takes one cache
 snapshot and uses it for both the state it returns and the set of
 messages it treats as present (6.2).
 
-**Order.** Strictly chronological, which is upstream's own order (R16,
-R20). A pending rebuild cursor is worked first, oldest document id
-first, and no post-epoch log record is applied until the cursor is
+**Order.** Strictly chronological in the committed history (R16, R20).
+This is the reference order for ordinary-thread comparison under the settled
+history precondition of 7.5, not a claim about pre-commit lookup visibility
+when ordinary operations overlap. A pending rebuild cursor is worked first,
+oldest document id first, and no post-epoch log record is applied until the cursor is
 exhausted: every message the cursor holds predates every record the
 rebuild's log holds, since document ids are a monotonic counter (4.1)
 and the cursor is the set present at the epoch. Then records are
@@ -1075,8 +1083,8 @@ before the batch that carried both committed. A record may be left
 part-way through at an insert boundary (R1's second option, R20): the
 checkpoint then names the record and the last document id indexed in
 it, and the record's deletions are applied when it completes. This
-order is what makes an insert see exactly the messages that existed
-when it was logged: every message deleted later is still in the index,
+order makes an insert see the messages present at its point of replay:
+every message deleted later is still in the index,
 every message deleted earlier is a tombstone, and no message newer than
 the insert has been indexed before it. That last clause is what bounds
 a merge: within a subject bucket, every present message whose kept
@@ -1097,9 +1105,9 @@ ids, a bounded, single-step disorder, not a fan-in.
 
 **What is discarded, and when.** A message's threading fields go when it
 is tombstoned: under the chronological order every insert that could
-have used them has already been processed, as upstream threaded it with
-the message still present, and a rebuild's cursor is exhausted before
-any deletion record is applied, so no tombstone exists while a cursor
+have used them in that replay order has already been processed; ordinary
+comparison additionally requires 7.5's settled history. A rebuild's cursor is
+exhausted before any deletion record is applied, so no tombstone exists while a cursor
 is pending (R16, both forms, by construction rather than by a retention
 rule). A message's identity (its
 assignment, its creation and deletion change ids) stays until its
@@ -1894,12 +1902,16 @@ the index can only use what it was given a chance to read.
 The pass threads a message as upstream's ingest does for an ordinary
 account (`find_thread_id`, `crates/email/src/message/ingest.rs:1098-1197`,
 and `ThreadMerge::merge`, `:1487-1512`), against the index instead of the
-`Threading` key class:
+`Threading` key class. Assignment uses the committed order defined by 5.1:
+change-id order, inserts in document-id order before deletions within a record,
+and the specified cursor order during rebuild or reconciliation. Its candidates
+are the records present at that point of replay. This is the reference order
+for comparison under 7.5; it does not reproduce the pre-commit visibility of
+overlapping ordinary operations:
 
 - Candidates are the messages the index holds as present at the point
   of the insert in the log's order (5.1: every message deleted later is
-  still present, every message deleted earlier is a tombstone, which is
-  what upstream's ingest saw when it threaded the message) with the same
+  still present, every message deleted earlier is a tombstone) with the same
   subject thread-name hash whose kept reference hashes intersect the
   new message's. Under that order each kept hash names at most one
   present message, so an item joins or retires at most `K − 1` threads
@@ -2536,6 +2548,16 @@ never wait for the content part.
 
 ### 7.5 Parity
 
+Thread-partition parity and thread-derived responses assume the same ordered
+mail history on both accounts, with each delivery committed and its ordinary
+thread-merge work settled before the next thread-affecting operation. Deletions
+and their threading-row cleanup must also settle before a later ingest.
+Comparisons follow completion of pending ordinary thread work and the required
+keyed indexing. Overlapping ingestion, deletion/cleanup or thread-merge work can
+make ordinary lookups observe a different candidate set or an earlier thread
+assignment, producing schedule-dependent partitions that keyed replay need not
+reproduce. This precondition does not remove the recorded differences below.
+
 The contract is the one release 5 made for scheduling (its section
 3.1): what a key account's client observes from a search, a sort, a
 snippet, a thread or a changes call is what an ordinary account's client
@@ -3008,6 +3030,18 @@ without the bridge rule must fail the chain fixture's resolution, and a
 fold to the end of the chain must fail the pre-merge rendering, R35).
 
 ### 9.5 Differential test
+
+Before submitting the next corpus message, await committed delivery to both
+accounts and completion of resulting ordinary thread work; LMTP queue acceptance
+alone is not that boundary. After preparation, complete the required keyed
+indexing and ordinary queued work before collecting inventories. Compare every
+message and every partition, preserving exactly the prescribed K1 exception.
+This fixture qualifies the ordered history, not overlapping delivery or mutation.
+Pair the server-assigned arrival times as well as the MIME bytes: give both
+LMTP ingests one explicit receive second in the test-only fixture and verify
+the stored values before comparing receivedAt and secondary sorts. Ordinary
+delivery can sample the clock separately for each recipient; different comparator
+inputs do not establish a search difference. Shipping timestamp behavior is unchanged.
 
 A corpus of a few hundred messages (threads, replies, forwards, attachments
 with text, non-ASCII subjects, phrases, messages with more than `K`

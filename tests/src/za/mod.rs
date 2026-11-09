@@ -31,6 +31,7 @@ pub mod imip;
 pub mod inbox;
 pub mod index_task;
 pub mod leak;
+pub mod leak_search;
 pub mod mail;
 pub mod pairs;
 pub mod password;
@@ -202,6 +203,7 @@ pub async fn za_tests() {
     leak::test_drain(&mut test).await;
     leak::test_pins(&mut test).await;
     leak::test_mail(&mut test).await;
+    leak_search::test(&mut test).await;
     leak::test_imip(&mut test).await;
     leak::test_codec(&mut test).await;
     leak::test(&mut test).await;
@@ -224,14 +226,47 @@ pub async fn za_tests() {
     mail::search::test(&mut test).await;
     mail::threads::test(&mut test).await;
     mail::index::test(&mut test).await;
+    mail::differential::test(&mut test).await;
     mail::traces::test(&mut test).await;
     mail::gateway::test(&mut test).await;
     // Last: part 6a expects this case to reproduce a recorded residual (the
     // destroy window), and a failure here loses no other module.
     index_task::test_mid_pass_deletion(&mut test).await;
 
+    let mut search_inventories = Vec::new();
+    for account in test
+        .accounts
+        .values()
+        .filter(|account| account.recovery_key.is_some())
+    {
+        let id = account.id().document_id();
+        let links = crate::utils::za::principal_blob_links(&test, id).await;
+        if !links.is_empty() {
+            assert!(crate::utils::za::manifest_bytes(&test, id).await.is_some());
+            search_inventories.push((id, links));
+        }
+    }
+    assert!(!search_inventories.is_empty());
     destroy_key_accounts(&test).await;
     crate::utils::za::expire_and_purge_blobs(&test, test.account("admin@example.com")).await;
+    leak::purge_blobs(&test).await;
+    for (id, links) in search_inventories {
+        assert!(crate::utils::za::manifest_bytes(&test, id).await.is_none());
+        assert!(
+            crate::utils::za::principal_blob_links(&test, id)
+                .await
+                .is_empty()
+        );
+        for (hash, _) in links {
+            assert!(
+                test.server
+                    .get_blob(hash.as_slice(), 0..usize::MAX)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
     test.assert_is_empty().await;
     test_hooks::clear_drain_skip(test_hooks::DRAIN_SKIP_ALL);
 

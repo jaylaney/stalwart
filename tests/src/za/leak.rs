@@ -83,13 +83,15 @@ use crate::{
         smtp_sink::sink,
         webdav::DummyWebDavClient,
         za::{
-            Conn, IDS_ONLY_DOCUMENT, InboxItem, PlantedItem, copy_href, destroy_inbox_item,
-            envelope_wrap, expire_and_purge_blobs, hold_index_partition, hold_task_consumer,
-            inbox_ids, inbox_items, internal_search, itip_tasks_for, mail_borne_items,
+            Conn, IDS_ONLY_DOCUMENT, InboxItem, PlantedItem, assert_search_publication, copy_href,
+            current_mailbox_ids, destroy_inbox_item, email_log_tip, envelope_wrap,
+            expire_and_purge_blobs, hold_index_partition, hold_task_consumer, inbox_ids,
+            inbox_items, internal_search, itip_tasks_for, mail_borne_items, manifest_bytes,
             new_inbox_items, open_pending_item_as, pending_ids, pin_record, plain_dav_container,
             plant_container, plant_event, plant_inbox_item, plant_plain_message,
             plant_sealed_event, queued_recipients, release_index_partition, substitute_public_key,
-            trigger_drain, wait_for_delivery, wait_for_index_queue, wait_for_queue, za_unlock,
+            trigger_drain, wait_for_delivery, wait_for_index_queue, wait_for_queue,
+            write_manifest_bytes, za_unlock,
         },
     },
     za::drain::{DrainOn, body, set_partstat},
@@ -142,20 +144,22 @@ use store::{
     BlobStore, Deserialize as _, IterateParams, Serialize as _, Subspace, U32_LEN, U64_LEN,
     ValueKey, ZA_UID_LEASE_PREFIX,
     write::{
-        AnyKey, Archive, ArchiveBytes, Archiver, BatchBuilder, IndexPropertyClass, QueueDocumentId,
-        SearchIndex, SearchIndexClass, ValueClass,
+        AnyKey, Archive, ArchiveBytes, Archiver, BatchBuilder, BlobLink, BlobOp,
+        IndexPropertyClass, QueueDocumentId, SearchIndex, SearchIndexClass, ValueClass,
+        blob::BlobLinkValue,
         blob_codec::BlobFormat,
         metadata::{MetadataClass, ViewerState},
         serialize::RawValue,
     },
+    za_search::{BlobKind, SEARCH_FORMAT_V1, manifest::ManifestValue},
 };
 use trc::EventType;
 use types::{
-    blob_hash::BLOB_HASH_LEN,
+    blob_hash::{BLOB_HASH_LEN, BlobHash},
     collection::{Collection, SyncCollection},
     field::{
         CalendarEventField, CalendarNotificationField, EmailField, EmailSubmissionField, Field,
-        MailboxField, SieveField,
+        MailboxField, PrincipalField, SieveField,
     },
     id::Id,
 };
@@ -342,6 +346,8 @@ pub struct Scan {
     pub records: usize,
     pub archives: usize,
     pub blobs: usize,
+    pub index_blobs: usize,
+    pub manifests: usize,
     /// Records of the internal search store's `SearchTerm` and
     /// `SearchDocument` subspaces, and those of the account.
     pub search_records: usize,
@@ -383,6 +389,10 @@ fn all_canaries() -> Vec<&'static str> {
 }
 
 fn find_canaries(bytes: &[u8], what: &str, how: &str, scan: &mut Scan) {
+    check_canaries(bytes, what, how, false, scan);
+}
+
+fn check_canaries(bytes: &[u8], what: &str, how: &str, private: bool, scan: &mut Scan) {
     let text = String::from_utf8_lossy(bytes);
     for canary in all_canaries() {
         if text.contains(canary) {
@@ -392,7 +402,12 @@ fn find_canaries(bytes: &[u8], what: &str, how: &str, scan: &mut Scan) {
     }
     for canary in VISIBLE_CANARIES {
         if text.contains(canary) {
-            scan.found.push(format!("{what}: {how} contains {canary}"));
+            let hits = if private {
+                &mut scan.violations
+            } else {
+                &mut scan.found
+            };
+            hits.push(format!("{what}: {how} contains {canary}"));
         }
     }
 }
@@ -1261,6 +1276,13 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
     let item_content_field = u8::from(CalendarNotificationField::Content);
     let mut scan = Scan::default();
     let mut blob_hashes: Vec<Vec<u8>> = Vec::new();
+    let mut principal_links = BTreeSet::new();
+    let principal_suffix = [
+        account_id.to_be_bytes().as_slice(),
+        &[Collection::Principal as u8],
+        &0u32.to_be_bytes(),
+    ]
+    .concat();
     // Build the complete owner/calendar/header map before validating any event.
     let mut calendar_records = Vec::new();
     store
@@ -1335,8 +1357,36 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
             scan.records += 1;
             let what = format!("subspace {:?} key {:?}", subspace_char(subspace), key);
             find_canaries(&key, &what, "key", &mut scan);
-            find_canaries(&value, &what, "raw value", &mut scan);
             let of_account = key.get(..U32_LEN) == Some(account_id.to_be_bytes().as_slice());
+            if subspace == Subspace::Property
+                && of_account
+                && key.len() == U32_LEN + 2 + U32_LEN
+                && key[U32_LEN] == Collection::Principal as u8
+                && key[U32_LEN + 1] == PrincipalField::ZeroAccessSearch as u8
+            {
+                scan.manifests += 1;
+                if key[U32_LEN + 2..] != 0u32.to_be_bytes() {
+                    scan.violations
+                        .push(format!("{what}: field 152 is outside principal document 0"));
+                }
+                if let Err(err) = ManifestValue::decode_unverified(&value) {
+                    scan.violations.push(format!(
+                        "{what}: field 152 does not parse as a manifest: {err:?}"
+                    ));
+                }
+                check_canaries(&value, &what, "manifest", true, &mut scan);
+                continue;
+            }
+            // The link subspace precedes raw blobs in Subspace::ALL.
+            // Even a clear canary in the outer representation of a scoped
+            // index blob is forbidden. The decoded scan checks it again.
+            check_canaries(
+                &value,
+                &what,
+                "raw value",
+                subspace == Subspace::Blobs && principal_links.contains(&key),
+                &mut scan,
+            );
 
             match subspace {
                 // Blob contents are decoded after the walk, through the
@@ -1345,7 +1395,11 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                 // link records name (a link key starts with the blob hash).
                 Subspace::Blobs => blob_hashes.push(key.clone()),
                 Subspace::BlobLink if key.len() >= BLOB_HASH_LEN => {
-                    blob_hashes.push(key[..BLOB_HASH_LEN].to_vec());
+                    let hash = &key[..BLOB_HASH_LEN];
+                    blob_hashes.push(hash.to_vec());
+                    if key[BLOB_HASH_LEN..] == principal_suffix {
+                        principal_links.insert(hash.to_vec());
+                    }
                     // Mail spec 11: once delivery completes the account
                     // holds no temporary link (hash | account id | until):
                     // no staged blob and no training sample's hold.
@@ -1527,7 +1581,26 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
         match test.server.get_blob(&hash, 0..usize::MAX).await {
             Ok(Some(blob)) => {
                 scan.blobs += 1;
-                find_canaries(&blob, &what, "decoded blob", &mut scan);
+                if principal_links.contains(&hash)
+                    && blob.first() == Some(&SEARCH_FORMAT_V1)
+                    && blob
+                        .get(1)
+                        .is_some_and(|kind| BlobKind::try_from(*kind).is_ok())
+                {
+                    scan.index_blobs += 1;
+                    check_canaries(&blob, &what, "index blob", true, &mut scan);
+                } else {
+                    if principal_links.contains(&hash) {
+                        scan.violations.push(format!(
+                            "{what}: principal-linked blob is not a sealed index blob"
+                        ));
+                    }
+                    find_canaries(&blob, &what, "decoded blob", &mut scan);
+                }
+            }
+            Ok(None) if principal_links.contains(&hash) => {
+                scan.violations
+                    .push(format!("{what}: principal-linked index blob is missing"));
             }
             Ok(None) => {}
             Err(err) => scan
@@ -1943,7 +2016,7 @@ async fn sink_and_purge_held(test: &TestServer) {
 /// Deletes every unlinked blob, as the purge does: a delivered message's
 /// queue blob is unlinked once delivery completes (mail spec 11, "no queue
 /// blob linked after delivery") and stays in the blob store until then.
-async fn purge_blobs(test: &TestServer) {
+pub(super) async fn purge_blobs(test: &TestServer) {
     test.server
         .store()
         .purge_blobs_all_shards(test.server.blob_store().clone())
@@ -2306,7 +2379,29 @@ pub async fn test_mail(test: &mut TestServer) {
     let id = key.id().document_id();
     let recipient_id = recipient.id().document_id();
 
-    // Delivered over LMTP to a sub-address, and appended over IMAP.
+    // Create the visible mailbox before the publication so its property
+    // change must be included alongside all default mailboxes.
+    let mailbox = key
+        .jmap_method_call(
+            "Mailbox/set",
+            json!({
+                "accountId": key.id_string(),
+                "create": {"m": {"name": "mailbox-canary"}}
+            }),
+        )
+        .await;
+    assert!(
+        mailbox
+            .pointer("/methodResponses/0/1/created/m/id")
+            .is_some()
+    );
+    let mailboxes = current_mailbox_ids(&key).await;
+
+    // Keep the real pass slot busy during APPEND so its opportunistic
+    // hooks cannot split delivery and APPEND into two publications.
+    let entry = test.server.inner.cache.za_search.entry(id);
+    let pass = entry.pass_lock.lock().await;
+    let before = manifest_bytes(test, id).await;
     SmtpConnection::connect()
         .await
         .ingest("sender@example.org", &[MAIL_RCPT], &mail_canary_message(1))
@@ -2315,36 +2410,33 @@ pub async fn test_mail(test: &mut TestServer) {
     let mut imap = ImapConnection::connect(b"_l ").await;
     imap.authenticate(MAIL_KEY, STRONG).await;
     imap.append("INBOX", &mail_canary_message(2)).await;
-    imap.send("LOGOUT").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap.send_ok("LOGOUT").await;
     let documents = message_ids(test, id).await;
     assert_eq!(documents.len(), 2, "the delivery and the APPEND");
+    let since = email_log_tip(test, &key).await;
+    assert_eq!(manifest_bytes(test, id).await, before);
+    drop(pass);
 
-    // The positive controls: a keyword and a mailbox name (spec 5.6).
-    let email_ids = key
-        .jmap_method_call("Email/query", json!({ "accountId": key.id_string() }))
-        .await
-        .ids()
-        .map(String::from)
-        .collect::<Vec<_>>();
+    let query = key
+        .jmap_method_call("Email/query", json!({"accountId": key.id_string()}))
+        .await;
+    assert_eq!(query.name_at(0), "Email/query");
+    let email_ids = query.ids().collect::<Vec<_>>();
+    assert_eq!(email_ids.len(), 2);
+    assert_search_publication(test, &key, since, documents[0], &mailboxes).await;
     let reply = key
-        .jmap_method_calls(json!([
-            ["Mailbox/set", {
+        .jmap_method_call(
+            "Email/set",
+            json!({
                 "accountId": key.id_string(),
-                "create": { "m": { "name": "mailbox-canary" } }
-            }, "m"],
-            ["Email/set", {
-                "accountId": key.id_string(),
-                "update": { (email_ids[0].as_str()): { "keywords/$mailkw-canary": true } }
-            }, "e"],
-        ]))
+                "update": {(email_ids[0]): {"keywords/$mailkw-canary": true}}
+            }),
+        )
         .await;
     assert!(
-        reply.pointer("/methodResponses/0/1/created/m/id").is_some()
-            && reply
-                .pointer(&format!("/methodResponses/1/1/updated/{}", email_ids[0]))
-                .is_some(),
-        "{reply:?}"
+        reply
+            .pointer(&format!("/methodResponses/0/1/updated/{}", email_ids[0]))
+            .is_some()
     );
 
     // A session that FETCHes, RETRs and submits the message, its IMAP, POP3
@@ -2428,10 +2520,12 @@ pub async fn test_mail(test: &mut TestServer) {
     purge_blobs(test).await;
     let result = scan(test, id).await;
     println!(
-        "Mail leak scan: {} records, {} archives, {} blobs, {} search index records ({} of the account), {} emails, {} stubs, {} visible hits",
+        "Mail leak scan: {} records, {} archives, {} blobs ({} linked search blobs), {} manifests, {} search index records ({} of the account), {} emails, {} stubs, {} visible hits",
         result.records,
         result.archives,
         result.blobs,
+        result.index_blobs,
+        result.manifests,
         result.search_records,
         result.search_account_records,
         result.emails,
@@ -2451,6 +2545,8 @@ pub async fn test_mail(test: &mut TestServer) {
     );
     assert_eq!(result.stubs, 2, "{result:?}");
     assert_eq!(result.emails, 2, "{result:?}");
+    assert_eq!(result.manifests, 1);
+    assert!(result.index_blobs >= 1, "{result:?}");
     assert!(
         result.search_account_records > 0,
         "no search entry of the account: {result:?}"
@@ -2551,6 +2647,8 @@ pub async fn test_mail(test: &mut TestServer) {
     assert!(restored.violations.is_empty(), "{:?}", restored.violations);
     assert_eq!(restored.stubs, 2);
 
+    test_search_storage_controls(test).await;
+
     // Positive control: an ordinary account's message, delivered and
     // indexed by 1.0's ordinary paths, is flagged by every mail rule.
     let plain = test
@@ -2574,6 +2672,7 @@ pub async fn test_mail(test: &mut TestServer) {
         .await;
     wait_for_delivery(test).await;
     let ordinary = scan(test, plain_id).await;
+    assert_eq!((ordinary.manifests, ordinary.index_blobs), (0, 0));
     let report = ordinary.violations.join("\n");
     for rule in [
         "plaintext metadata row",
@@ -2603,6 +2702,151 @@ pub async fn test_mail(test: &mut TestServer) {
         .await;
     test.wait_for_tasks().await;
     purge_blobs(test).await;
+}
+
+async fn test_search_storage_controls(test: &TestServer) {
+    println!("Mail leak scan: search storage negative controls");
+    let admin = test.account("admin@example.com");
+    let plain = admin
+        .create_user_account(
+            "plainmail59@example.com",
+            STRONG,
+            "Search leak control",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let id = plain.id().document_id();
+    let baseline = scan(test, id).await;
+    assert_eq!((baseline.manifests, baseline.index_blobs), (0, 0));
+    assert!(baseline.violations.is_empty(), "{:?}", baseline.violations);
+
+    for (bytes, expected_index, expected_violations) in [
+        (
+            b"mailbody-canary".as_slice(),
+            0,
+            &[
+                "principal-linked blob is not a sealed index blob",
+                "decoded blob contains mailbody-canary",
+            ][..],
+        ),
+        (
+            b"\x01\x01mailbox-canary".as_slice(),
+            1,
+            &["index blob contains mailbox-canary"][..],
+        ),
+    ] {
+        let server = &test.server;
+        let (hash, hold) = server
+            .hold_blob(
+                id,
+                BlobHash::generate(bytes),
+                bytes,
+                60,
+                &server.core.blob.email,
+            )
+            .await
+            .unwrap();
+        let link = || BlobOp::Link {
+            hash: hash.clone(),
+            to: BlobLink::Document,
+        };
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(id)
+            .with_collection(Collection::Principal)
+            .with_document(0)
+            .set(link(), BlobLinkValue::new(bytes.len()));
+        hold.release(&mut batch);
+        server.commit_batch(batch).await.unwrap();
+        let found = scan(test, id).await;
+        assert_eq!(found.index_blobs, expected_index);
+        let label = format!("blob {:?}", hash.as_slice());
+        for expected in expected_violations {
+            assert!(
+                found.violations.contains(&format!("{label}: {expected}")),
+                "{found:?}"
+            );
+        }
+        assert!(
+            !found.found.iter().any(|hit| hit.starts_with(&label)),
+            "{found:?}"
+        );
+
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(id)
+            .with_collection(Collection::Principal)
+            .with_document(0)
+            .clear(ValueClass::Blob(link()));
+        if expected_index == 1 {
+            // The same payload behind an adjacent document link is still
+            // scanned generically, with no scoped count or index violation.
+            batch
+                .with_document(1)
+                .set(link(), BlobLinkValue::new(bytes.len()));
+        }
+        server.commit_batch(batch).await.unwrap();
+        if expected_index == 1 {
+            let adjacent = scan(test, id).await;
+            assert_eq!(adjacent.index_blobs, 0);
+            assert_eq!(adjacent.violations, baseline.violations);
+            assert!(
+                adjacent
+                    .found
+                    .contains(&format!("{label}: decoded blob contains mailbox-canary"))
+            );
+            let mut batch = BatchBuilder::new();
+            batch
+                .with_account_id(id)
+                .with_collection(Collection::Principal)
+                .with_document(1)
+                .clear(ValueClass::Blob(link()));
+            server.commit_batch(batch).await.unwrap();
+        }
+        purge_blobs(test).await;
+        assert!(
+            server
+                .get_blob(hash.as_slice(), 0..usize::MAX)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    let original = manifest_bytes(test, id).await;
+    assert!(original.is_none());
+    write_manifest_bytes(test, id, Some(b"mailbox-canary".to_vec())).await;
+    let found = scan(test, id).await;
+    let key = document_key(
+        id,
+        Collection::Principal,
+        PrincipalField::ZeroAccessSearch as u8,
+        0,
+    );
+    let label = format!(
+        "subspace {:?} key {key:?}",
+        subspace_char(Subspace::Property)
+    );
+    assert_eq!(found.manifests, 1);
+    assert!(
+        found
+            .violations
+            .iter()
+            .any(|v| v.starts_with(&format!("{label}: field 152 does not parse as a manifest:")))
+    );
+    assert!(
+        found
+            .violations
+            .contains(&format!("{label}: manifest contains mailbox-canary"))
+    );
+    assert!(!found.found.iter().any(|hit| hit.starts_with(&label)));
+    write_manifest_bytes(test, id, original).await;
+    let restored = scan(test, id).await;
+    assert_eq!((restored.manifests, restored.index_blobs), (0, 0));
+    assert_eq!(restored.violations, baseline.violations);
+    admin.destroy_account(plain).await;
+    test.wait_for_tasks().await;
 }
 
 /// Release 5, iMIP spec 8.4: `test_imip`'s two key accounts. The first

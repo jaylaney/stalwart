@@ -71,9 +71,12 @@ use http::auth::authenticate::za_test::{self, Pause};
 use hyper::{Method, StatusCode};
 use mail_parser::MessageParser;
 use registry::schema::{
-    enums::{TaskAccountMaintenanceType, TaskStoreMaintenanceType},
-    prelude::Property,
-    structs::{DataRetention, Task, TaskAccountMaintenance, TaskStatus, TaskStoreMaintenance},
+    enums::{MtaInboundThrottleKey, TaskAccountMaintenanceType, TaskStoreMaintenanceType},
+    prelude::{ObjectType, Property},
+    structs::{
+        DataRetention, MtaInboundThrottle, Task, TaskAccountMaintenance, TaskStatus,
+        TaskStoreMaintenance,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -105,6 +108,7 @@ use tokio_rustls::{
 use types::blob_hash::{BLOB_HASH_LEN, BlobHash};
 use types::collection::{Collection, SyncCollection};
 use types::field::{CalendarEventField, CalendarNotificationField, EmailField, PrincipalField};
+use types::id::Id;
 use vault::{
     keys::{
         AAD_PRIVATE_KEY, AAD_PRIVATE_KEY_PINNED, Secret, aad, generate_keypair, unwrap_key,
@@ -666,6 +670,95 @@ pub async fn log_records_since(
         .await
         .unwrap()
         .records
+}
+
+pub async fn email_log_tip(test: &TestServer, account: &Account) -> u64 {
+    test.server
+        .store()
+        .get_last_change_id(account.id().document_id(), SyncCollection::Email.into())
+        .await
+        .unwrap()
+        .unwrap_or_default()
+}
+
+pub async fn search_pass_request(account: &Account) {
+    let reply = account
+        .jmap_method_call(
+            "Email/get",
+            json!({"accountId": account.id_string(), "ids": []}),
+        )
+        .await;
+    assert_eq!(reply.name_at(0), "Email/get");
+    assert_eq!(reply.method_response()["list"], json!([]));
+}
+
+pub async fn search_manifest(
+    test: &TestServer,
+    account_id: u32,
+) -> store::za_search::manifest::Manifest {
+    match read_manifest(test, account_id).await {
+        Some(ManifestValue::Index(manifest)) => manifest,
+        _ => panic!("account {account_id} lacks a live search manifest"),
+    }
+}
+
+pub async fn assert_search_publication(
+    test: &TestServer,
+    account: &Account,
+    since: u64,
+    witness: u32,
+    mailboxes: &[u64],
+) {
+    use store::query::log::PartialChange;
+    let id = account.id().document_id();
+    let revision_id = search_manifest(test, id).await.newest_row.change_id;
+    let email = log_records_since(test, id, SyncCollection::Email, since).await;
+    let [(change_id, rows)] = email.as_slice() else {
+        panic!("expected one Email publication after {since}, got {email:?}");
+    };
+    assert_eq!(*change_id, revision_id);
+    let mut remainder = rows.clone();
+    for expected in std::iter::once(Change::UpdateItem(Id::from_parts(witness, witness).id()))
+        .chain(
+            mailboxes
+                .iter()
+                .map(|id| Change::UpdateContainerPartial(*id, PartialChange::PROPERTIES)),
+        )
+    {
+        let position = remainder
+            .iter()
+            .position(|row| *row == expected)
+            .unwrap_or_else(|| panic!("missing {expected:?} from {rows:?}"));
+        remainder.swap_remove(position);
+    }
+    assert!(
+        remainder.is_empty(),
+        "unexpected Email publication rows {remainder:?}"
+    );
+    assert_eq!(
+        log_records_since(test, id, SyncCollection::Thread, since).await,
+        [(
+            revision_id,
+            vec![Change::UpdateContainerPartial(
+                u64::from(witness),
+                PartialChange::PROPERTIES
+            )]
+        )],
+    );
+}
+
+pub async fn current_mailbox_ids(account: &Account) -> Vec<u64> {
+    let reply = account
+        .jmap_get("Mailbox", ["id"], Vec::<String>::new())
+        .await;
+    assert_eq!(reply.name_at(0), "Mailbox/get");
+    let ids = reply
+        .list()
+        .iter()
+        .map(|mailbox| mailbox["id"].as_str().unwrap().parse::<Id>().unwrap().id())
+        .collect::<Vec<_>>();
+    assert!(!ids.is_empty());
+    ids
 }
 
 /// Writes `ical` into the store as the event `name` in the account's
@@ -2356,6 +2449,63 @@ pub async fn za_revoke_grant(server: &common::Server, grant_id: u64) {
             .unwrap()
     );
     server.invalidate_caches(invalidator).await.unwrap();
+}
+
+/// Give a bulk LMTP fixture room under the two default inbound rates.
+pub async fn raise_bulk_lmtp_rates(test: &mut TestServer) -> Vec<(Id, MtaInboundThrottle)> {
+    use MtaInboundThrottleKey::{Rcpt, RemoteIp, SenderDomain};
+    let admin = test.account("admin@example.com").clone();
+    let records = admin.registry_get_all::<MtaInboundThrottle>().await;
+    let mut saved = Vec::new();
+    for (description, keys) in [
+        ("Sender IP throttle", &[RemoteIp][..]),
+        (
+            "Sender address to recipient throttle",
+            &[SenderDomain, Rcpt][..],
+        ),
+    ] {
+        let mut matches = records
+            .iter()
+            .filter(|(_, throttle)| throttle.description == description);
+        let (id, throttle) = matches.next().expect("default inbound throttle");
+        assert!(matches.next().is_none());
+        assert!(throttle.enable);
+        assert_eq!(throttle.key.iter().count(), keys.len());
+        assert!(
+            keys.iter()
+                .all(|key| throttle.key.iter().any(|actual| actual == key))
+        );
+        let mut raised = throttle.clone();
+        raised.rate.count = raised.rate.count.max(20_000);
+        admin
+            .registry_update_object(
+                ObjectType::MtaInboundThrottle,
+                *id,
+                json!({"rate": raised.rate}),
+            )
+            .await;
+        assert_eq!(admin.registry_get::<MtaInboundThrottle>(*id).await, raised);
+        saved.push((*id, throttle.clone()));
+    }
+    admin.reload_settings().await;
+    test.reload_core();
+    saved
+}
+
+pub async fn restore_bulk_lmtp_rates(test: &mut TestServer, saved: Vec<(Id, MtaInboundThrottle)>) {
+    let admin = test.account("admin@example.com").clone();
+    for (id, throttle) in saved {
+        admin
+            .registry_update_object(
+                ObjectType::MtaInboundThrottle,
+                id,
+                json!({"rate": throttle.rate}),
+            )
+            .await;
+        assert_eq!(admin.registry_get::<MtaInboundThrottle>(id).await, throttle);
+    }
+    admin.reload_settings().await;
+    test.reload_core();
 }
 
 /// Bring a finished bulk-delivery fixture to its durable Email log boundary.

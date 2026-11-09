@@ -123,8 +123,19 @@ impl SmtpConnection {
     }
 
     pub async fn bdat_last(&mut self, chunk: &str, num_responses: usize, code: u8) -> Vec<String> {
-        self.send_raw(&format!("BDAT {} LAST\r\n{}", chunk.len(), chunk))
+        self.bdat_last_bytes(chunk.as_bytes(), num_responses, code)
+            .await
+    }
+
+    pub async fn bdat_last_bytes(
+        &mut self,
+        chunk: &[u8],
+        num_responses: usize,
+        code: u8,
+    ) -> Vec<String> {
+        self.send_raw(&format!("BDAT {} LAST\r\n", chunk.len()))
             .await;
+        self.writer.write_all(chunk).await.unwrap();
         self.read(num_responses, code).await
     }
 

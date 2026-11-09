@@ -48,6 +48,7 @@ use types::{blob::BlobId, blob_hash::BlobHash, collection::Collection, field::Em
 use utils::hash128::Hash128;
 
 pub mod delivery;
+pub mod differential;
 pub mod fence;
 pub mod gates;
 pub mod gateway;
