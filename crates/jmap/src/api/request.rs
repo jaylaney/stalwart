@@ -549,7 +549,9 @@ impl RequestHandler for Server {
                     access_token.assert_is_member(req.account_id)?;
                     za_assert_mail_keys(self, access_token, req.account_id).await?;
 
-                    self.email_submission_query(*req).await?.into()
+                    self.email_submission_query(*req, access_token)
+                        .await?
+                        .into()
                 }
                 QueryRequestMethod::Sieve(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;

@@ -485,8 +485,8 @@ async fn imap_served_keys(key: &Fixture, plain: &Fixture) {
     assert_eq!(no_ops[0], no_ops[1], "RECENT, NEW and OLD");
 }
 
-/// Release 7 spec 7.2. Check result IDs, including the whole mixed expression,
-/// against the ordinary control. Thread grouping itself is wired in Task 12.
+/// Release 7 spec 7.2. Compare result IDs and THREAD groups with the
+/// ordinary control, including mixed content and metadata expressions.
 async fn imap_served_content_keys(key: &Fixture, plain: &Fixture) {
     println!("imap_served_content_keys");
     const TERM: &str = "search-term-canary";
@@ -539,14 +539,7 @@ async fn imap_served_content_keys(key: &Fixture, plain: &Fixture) {
     let mut thread_results = Vec::new();
     for session in [&mut keyed, &mut control] {
         let answer = served(session, "THREAD REFERENCES UTF-8 BODY flying", "* THREAD").await;
-        let mut uids = answer
-            .trim_start_matches("* THREAD")
-            .split(|ch: char| ch.is_ascii_whitespace() || ch == '(' || ch == ')')
-            .filter(|item| !item.is_empty())
-            .map(|item| item.parse::<u32>().unwrap())
-            .collect::<Vec<_>>();
-        uids.sort_unstable();
-        thread_results.push(uids);
+        thread_results.push(answer);
 
         session.send("SORT (CC) UTF-8 ALL").await;
         let lines = session.assert_read(Type::Tagged, ResponseType::No).await;
@@ -557,7 +550,7 @@ async fn imap_served_content_keys(key: &Fixture, plain: &Fixture) {
         );
         session.send_ok("NOOP").await;
     }
-    assert_eq!(thread_results, [vec![1, 2, 3], vec![1, 2, 3]]);
+    assert_eq!(thread_results, ["* THREAD (1)(2)(3)", "* THREAD (1)(2)(3)"]);
     assert_eq!(
         served(&mut keyed, &format!("SEARCH SUBJECT {TERM}"), "* SEARCH").await,
         "* SEARCH"

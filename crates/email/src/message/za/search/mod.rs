@@ -10,5 +10,6 @@ pub mod open;
 pub mod pass;
 pub mod query;
 pub mod snapshot;
+pub mod threads;
 pub mod view;
 pub(crate) mod write;

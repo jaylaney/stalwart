@@ -6,7 +6,10 @@
 
 use common::{Server, auth::AccessToken, sharing::EffectiveAcl};
 use email::cache::{MessageCacheFetch, email::MessageCacheAccess, mailbox::MailboxCacheAccess};
-use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
+use email::message::za::search::{
+    snapshot::{ZaSnapshotFetch, za_no_map_error},
+    threads::za_mailbox_counters,
+};
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, all_ids},
     object::mailbox::{Mailbox, MailboxProperty, MailboxValue},
@@ -143,15 +146,16 @@ impl MailboxGet for Server {
                     MailboxProperty::TotalEmails | MailboxProperty::UnreadEmails
                 )
             }) {
-            cache.mailbox_counters(
-                ids.iter().map(Id::document_id).filter(|document_id| {
-                    cache.mailbox_by_id(document_id).is_some()
-                        && shared_ids
-                            .as_ref()
-                            .is_none_or(|ids| ids.contains(*document_id))
-                }),
-                count_threads,
-            )
+            let mailbox_ids = ids.iter().map(Id::document_id).filter(|document_id| {
+                cache.mailbox_by_id(document_id).is_some()
+                    && shared_ids
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(*document_id))
+            });
+            match &snapshot {
+                Some(snapshot) => za_mailbox_counters(snapshot, mailbox_ids, count_threads),
+                None => cache.mailbox_counters(mailbox_ids, count_threads),
+            }
         } else {
             AHashMap::new()
         };

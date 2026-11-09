@@ -43,9 +43,9 @@ enum Rule {
     RegistryIndex,
     /// Registry primary keys and references, kept for the same types.
     RegistryPrimaryKey,
-    /// Counters: the document-id and change-id counters are deleted, the
-    /// registry id counters kept (as at 0.16), and any other counter that the
-    /// store purge did not remove (it removes zero counters) is a leftover.
+    /// Counters: reset document and change allocators except those used by
+    /// a retained search manifest. Keep registry id counters (as at 0.16).
+    /// Any other counter the store purge did not remove is a leftover.
     Counters,
     /// Properties: zero-access vault, pin and search-manifest records are
     /// reported to the caller, which checks that their accounts still exist.
@@ -58,7 +58,8 @@ enum Rule {
     /// except on PostgreSQL and MySQL, which keep the search index in tables
     /// of their own and create no such subspace (`Subspace::is_internal_fts`).
     InternalSearch,
-    /// The change logs, deleted after the check as at 0.16. 1.0 also keeps
+    /// The change logs, reset after the check except for shared Email and
+    /// Thread history used by a retained search manifest. 1.0 also keeps
     /// share notifications here, as log entries of
     /// `SyncCollection::ShareNotification`: an account's own state, written on
     /// every grant, change and revoke, and deleted with the logs. Their
@@ -264,28 +265,42 @@ pub async fn store_assert_is_empty(store: &Store, blob_store: BlobStore, include
         "Found share notifications of accounts {:?}",
         account_state.share_notification_accounts
     );
+    account_state.reset(store).await;
 }
 
-/// The keys that live exactly as long as their account, which the emptiness
-/// check leaves to its caller: the caller checks that each account still
-/// exists.
-#[derive(Debug, Default)]
-pub struct AccountState {
+/// The planned fixture reset and the account state whose owners must still exist.
+#[derive(Debug)]
+pub struct StoreCleanup {
     /// Accounts holding zero-access vault, pin or search state (kept).
     pub vault_accounts: Vec<u32>,
     /// Accounts that held share notifications (deleted with the logs).
     pub share_notification_accounts: Vec<u32>,
+    delete_batch: BatchBuilder,
+    clear_all_logs: bool,
 }
 
-/// Like `store_assert_is_empty`, but returns the accounts holding zero-access
-/// state or share notifications instead of reporting them. The caller must check that each account still exists.
+impl StoreCleanup {
+    /// Apply the fixture reset after the caller has checked account liveness.
+    pub async fn reset(mut self, store: &Store) {
+        if self.clear_all_logs {
+            let (from_key, to_key) = subspace_range(Subspace::Logs);
+            store.delete_range(from_key, to_key).await.unwrap();
+        }
+        if !self.delete_batch.is_empty() {
+            store.write_batch(&mut self.delete_batch).await.unwrap();
+        }
+    }
+}
+
+/// Like `store_assert_is_empty`, but defers the counter and log reset until
+/// the caller has checked the owners of the reported account state.
 #[allow(unused_variables)]
 #[must_use]
 pub async fn store_assert_is_empty_except_account_state(
     store: &Store,
     blob_store: BlobStore,
     include_registry: bool,
-) -> AccountState {
+) -> StoreCleanup {
     // 0.16 also expired the in-memory keys kept in the data store here
     // (`store_lookup_expire_all`). 1.0 keeps no in-memory values in the data
     // store: `InMemoryStore` has no data-store variant, so that step has no
@@ -307,6 +322,7 @@ pub async fn store_assert_is_empty_except_account_state(
     let mut failed = false;
     let mut delete_batch = BatchBuilder::new();
     let mut vault_accounts = Vec::new();
+    let mut search_manifest_accounts = HashSet::new();
     let mut share_notification_accounts = Vec::new();
     let mut search_blob_hashes = HashSet::<[u8; BLOB_HASH_LEN]>::new();
 
@@ -327,7 +343,14 @@ pub async fn store_assert_is_empty_except_account_state(
         .await
         .unwrap();
 
-    for subspace in Subspace::ALL.iter().copied() {
+    // Classify manifests before staging any log or allocator reset.
+    let subspaces = std::iter::once(Subspace::Property).chain(
+        Subspace::ALL
+            .iter()
+            .copied()
+            .filter(|&subspace| subspace != Subspace::Property),
+    );
+    for subspace in subspaces {
         let rule = subspace_rule(subspace);
         let with_values = match rule {
             Rule::InternalSearch if store.is_pg_or_mysql() => continue,
@@ -353,7 +376,20 @@ pub async fn store_assert_is_empty_except_account_state(
                             if kind == CounterKind::DocumentId.byte()
                                 || kind == CounterKind::ChangeId.byte()
                             {
-                                // Document-id and change-id counters
+                                // A retained search generation still uses the Email document
+                                // namespace and the shared Email/Thread change allocator.
+                                let email_namespace = if kind == CounterKind::DocumentId.byte() {
+                                    Collection::Email as u8
+                                } else {
+                                    SyncCollection::Email.change_group().to_u8()
+                                };
+                                if key.len() == 1 + U32_LEN + 1
+                                    && key[1 + U32_LEN] == email_namespace
+                                    && search_manifest_accounts
+                                        .contains(&key.deserialize_be_u32(1).unwrap())
+                                {
+                                    return Ok(true);
+                                }
                                 delete_batch.clear(ValueClass::Any(AnyClass {
                                     subspace,
                                     key: key.to_vec(),
@@ -422,14 +458,26 @@ pub async fn store_assert_is_empty_except_account_state(
                             );
                         }
                         Rule::Logs => {
-                            // Change-log entries and share notifications, deleted below
-                            if key.len() == U32_LEN + 1 + U64_LEN
-                                && key[U32_LEN] == u8::from(SyncCollection::ShareNotification)
-                            {
+                            if key.len() == U32_LEN + 1 + U64_LEN {
                                 let account_id = key.deserialize_be_u32(0).unwrap();
-                                if !share_notification_accounts.contains(&account_id) {
+                                let collection = key[U32_LEN];
+                                if collection == u8::from(SyncCollection::ShareNotification)
+                                    && !share_notification_accounts.contains(&account_id)
+                                {
                                     share_notification_accounts.push(account_id);
                                 }
+                                if (collection == u8::from(SyncCollection::Email)
+                                    || collection == u8::from(SyncCollection::Thread))
+                                    && search_manifest_accounts.contains(&account_id)
+                                {
+                                    return Ok(true);
+                                }
+                            }
+                            if !search_manifest_accounts.is_empty() {
+                                delete_batch.clear(ValueClass::Any(AnyClass {
+                                    subspace,
+                                    key: key.to_vec(),
+                                }));
                             }
                             return Ok(true);
                         }
@@ -444,7 +492,13 @@ pub async fn store_assert_is_empty_except_account_state(
                         {
                             // Vault, pin and search-manifest records persist for the life
                             // of the account. The caller checks that the account exists.
-                            vault_accounts.push(key.deserialize_be_u32(0).unwrap());
+                            let account_id = key.deserialize_be_u32(0).unwrap();
+                            vault_accounts.push(account_id);
+                            if key[U32_LEN + 1] == PrincipalField::ZeroAccessSearch as u8
+                                && key.ends_with(&0u32.to_be_bytes())
+                            {
+                                search_manifest_accounts.insert(account_id);
+                            }
                             return Ok(true);
                         }
                         Rule::System
@@ -507,21 +561,13 @@ pub async fn store_assert_is_empty_except_account_state(
             .unwrap();
     }
 
-    // Delete logs and counters
-    let (from_key, to_key) = subspace_range(Subspace::Logs);
-    store.delete_range(from_key, to_key).await.unwrap();
+    assert!(!failed, "Store is not empty.");
 
-    if !delete_batch.is_empty() {
-        store.write_batch(&mut delete_batch).await.unwrap();
-    }
-
-    if failed {
-        panic!("Store is not empty.");
-    }
-
-    AccountState {
+    StoreCleanup {
         vault_accounts,
         share_notification_accounts,
+        delete_batch,
+        clear_all_logs: search_manifest_accounts.is_empty(),
     }
 }
 
@@ -563,13 +609,16 @@ mod tests {
         schema::structs::{Account, SystemSettings, UserAccount},
         types::id::ObjectId,
     };
+    use common::za::search::setup::za_setup_manifest;
     use futures::FutureExt;
+    use jmap::registry::mapping::principal::schedule_account_destruction;
     use std::panic::AssertUnwindSafe;
     use store::{
         registry::write::RegistryWrite,
         write::blob_codec::{BlobKeyring, BlobOpts},
     };
-    use types::id::Id;
+    use types::{collection::VanishedCollection, id::Id};
+    use vault::keys::Secret;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn cleanup_retains_only_search_blobs_of_live_accounts() {
@@ -582,7 +631,6 @@ mod tests {
 
         let test = TestServerBuilder::new("cleanup-search-blobs")
             .await
-            .disable_services()
             .build()
             .await;
         let registry = test.server.registry();
@@ -684,6 +732,8 @@ mod tests {
                 .unwrap()
         );
 
+        assert_search_namespace_reset(&test, account_id, domain_id).await;
+
         // Remove just the registry object to simulate a destroyed account
         // whose principal link leaked. The caller must reject the account ID.
         registry
@@ -715,6 +765,142 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    async fn assert_search_namespace_reset(
+        test: &crate::utils::server::TestServer,
+        plain_id: u32,
+        domain_id: Id,
+    ) {
+        let account = Account::User(UserAccount {
+            name: "cleanup-search-namespace".into(),
+            domain_id,
+            ..Default::default()
+        });
+        let registry = test.server.registry();
+        let id = registry
+            .write(RegistryWrite::insert(&account.clone().into()))
+            .await
+            .unwrap()
+            .unwrap_id(trc::location!());
+        let indexed_id = id.document_id();
+        let store = test.server.store();
+        let manifest_key = ValueKey::property(
+            indexed_id,
+            Collection::Principal,
+            0,
+            PrincipalField::ZeroAccessSearch,
+        );
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(indexed_id)
+            .with_collection(Collection::Principal)
+            .with_document(0)
+            .set(
+                PrincipalField::ZeroAccessSearch,
+                za_setup_manifest(&Secret::random(), 0),
+            );
+
+        let mut keys = Vec::new();
+        for account_id in [plain_id, indexed_id] {
+            batch.with_account_id(account_id);
+            for (collection, class, keep) in [
+                (Collection::Email, ValueClass::DocumentId, true),
+                (Collection::Mailbox, ValueClass::DocumentId, false),
+                (
+                    Collection::Email,
+                    ValueClass::ChangeId(SyncCollection::Email.into()),
+                    true,
+                ),
+                (
+                    Collection::Calendar,
+                    ValueClass::ChangeId(SyncCollection::Calendar.into()),
+                    false,
+                ),
+            ] {
+                batch.with_collection(collection).add(class.clone(), 7);
+                keys.push((
+                    AnyKey {
+                        subspace: Subspace::Counter,
+                        key: ValueKey {
+                            account_id,
+                            collection: collection as u8,
+                            document_id: 0,
+                            class,
+                        }
+                        .serialize(0),
+                    },
+                    keep && account_id == indexed_id,
+                ));
+            }
+            for (collection, change_id, data, keep) in [
+                (SyncCollection::Email.into(), 5, vec![], true), // retention marker
+                (SyncCollection::Email.into(), 6, vec![0], true),
+                (SyncCollection::Thread.into(), 6, vec![0], true),
+                (SyncCollection::Calendar.into(), 6, vec![0], false),
+                (VanishedCollection::Email.into(), 6, vec![0], false),
+                (
+                    LogCollection::Private {
+                        collection: SyncCollection::Email,
+                        viewer: plain_id,
+                    },
+                    6,
+                    vec![0],
+                    false,
+                ),
+            ] {
+                let key = collection.log_key(account_id, change_id).serialize(0);
+                batch.set(
+                    ValueClass::Any(AnyClass {
+                        subspace: Subspace::Logs,
+                        key: key.clone(),
+                    }),
+                    data,
+                );
+                keys.push((
+                    AnyKey {
+                        subspace: Subspace::Logs,
+                        key,
+                    },
+                    keep && account_id == indexed_id,
+                ));
+            }
+        }
+        store.write_batch(&mut batch).await.unwrap();
+        for (key, _) in &keys {
+            assert!(store.key_exists(key.clone()).await.unwrap(), "{key:?}");
+        }
+
+        test.assert_is_empty().await;
+        assert!(store.key_exists(manifest_key.clone()).await.unwrap());
+        for (key, keep) in &keys {
+            assert_eq!(
+                store.key_exists(key.clone()).await.unwrap(),
+                *keep,
+                "{key:?}"
+            );
+        }
+
+        // Run the production destroy task and inspect the raw state before a
+        // subsequent fixture cleanup could erase a leaked counter or log.
+        registry
+            .write(RegistryWrite::delete(ObjectId::new(
+                ObjectType::Account,
+                id,
+            )))
+            .await
+            .unwrap()
+            .unwrap_id(trc::location!());
+        schedule_account_destruction(&test.server, id, &account)
+            .await
+            .unwrap();
+        test.wait_for_tasks().await;
+        assert!(!store.key_exists(manifest_key).await.unwrap());
+        for (key, keep) in keys {
+            if keep {
+                assert!(!store.key_exists(key.clone()).await.unwrap(), "{key:?}");
+            }
+        }
     }
 
     async fn assert_cleanup_panics(test: &crate::utils::server::TestServer, expected: &str) {

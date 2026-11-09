@@ -374,6 +374,7 @@ pub async fn assert_is_empty(server: &Server, include_registry: bool) {
             );
         }
     }
+    account_state.reset(server.store()).await;
     search_store_destroy(server.search_store()).await;
 
     // Clean caches

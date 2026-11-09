@@ -8,6 +8,7 @@ use super::za::{attachment_keyword, first_refused_filter, first_refused_sort};
 use common::{
     MessageStoreCache, Server,
     auth::AccessToken,
+    cache::email::MessageRef,
     za::{
         ZA_MAIL_SEARCH_REFUSED, ZA_MAIL_SEARCH_UNAVAILABLE,
         search::trace::{ZA_SEARCH_UNAVAILABLE, za_search_trace},
@@ -111,6 +112,7 @@ pub fn za_resolve_condition(
     content: &ContentPart,
     cache: &MessageStoreCache,
     access: &MessageAccess,
+    thread_of: impl Fn(&MessageRef<'_>) -> u32,
 ) -> Option<RoaringBitmap> {
     let documents = content.document_ids();
     let attachment = |wanted| {
@@ -149,9 +151,9 @@ pub fn za_resolve_condition(
                     .iter()
                     .filter(|message| access.allows(*message))
             };
-            let threads = attachment_threads(content, wanted, all, visible());
+            let threads = attachment_threads(content, wanted, all, visible(), &thread_of);
             visible()
-                .filter(|message| threads.contains(message.thread_id()) != none)
+                .filter(|message| threads.contains(thread_of(message)) != none)
                 .map(|message| message.document_id())
                 .collect()
         }
@@ -165,6 +167,7 @@ pub fn za_sort_comparator(
     content: &ContentPart,
     cache: &MessageStoreCache,
     documents: &RoaringBitmap,
+    thread_of: impl Fn(&MessageRef<'_>) -> u32,
 ) -> Option<MessageComparator> {
     let field = match property {
         EmailComparator::From => SortField::From,
@@ -191,9 +194,9 @@ pub fn za_sort_comparator(
                     .iter()
                     .filter(|message| documents.contains(message.document_id()))
             };
-            let threads = attachment_threads(content, wanted, all, visible());
+            let threads = attachment_threads(content, wanted, all, visible(), &thread_of);
             let set = visible()
-                .filter(|message| threads.contains(message.thread_id()))
+                .filter(|message| threads.contains(thread_of(message)))
                 .map(|message| message.document_id())
                 .collect();
             return Some(MessageComparator::Search(SearchComparator::set(
@@ -208,21 +211,21 @@ pub fn za_sort_comparator(
     )))
 }
 
-// Task 12 switches these stored thread ids to the validated map.
 fn attachment_threads<'a>(
     content: &ContentPart,
     wanted: bool,
     all: bool,
-    visible: impl Iterator<Item = common::cache::email::MessageRef<'a>>,
+    visible: impl Iterator<Item = MessageRef<'a>>,
+    thread_of: impl Fn(&MessageRef<'_>) -> u32,
 ) -> RoaringBitmap {
     let mut tagged = RoaringBitmap::new();
     let mut untagged = RoaringBitmap::new();
     for message in visible {
         let id = message.document_id();
         if content.contains(id) && content.has_attachment(id) == wanted {
-            tagged.insert(message.thread_id());
+            tagged.insert(thread_of(&message));
         } else if all {
-            untagged.insert(message.thread_id());
+            untagged.insert(thread_of(&message));
         }
     }
     tagged - untagged
@@ -364,10 +367,16 @@ mod tests {
             (EmailFilter::NotKeyword(Keyword::HasNoAttachment), vec![2]),
         ] {
             assert_eq!(
-                za_resolve_condition(&condition, &content, &cache, &MessageAccess::All)
-                    .unwrap()
-                    .iter()
-                    .collect::<Vec<_>>(),
+                za_resolve_condition(
+                    &condition,
+                    &content,
+                    &cache,
+                    &MessageAccess::All,
+                    |message| message.thread_id()
+                )
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
                 expected
             );
         }
@@ -376,7 +385,8 @@ mod tests {
                 &EmailFilter::InMailbox(Id::from(1u32)),
                 &content,
                 &cache,
-                &MessageAccess::All
+                &MessageAccess::All,
+                |message| message.thread_id(),
             )
             .is_none()
         );
@@ -394,6 +404,7 @@ mod tests {
                 &content,
                 &cache,
                 &documents,
+                |message| message.thread_id(),
             )
         else {
             panic!("missing subject ranks");

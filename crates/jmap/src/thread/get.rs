@@ -6,8 +6,15 @@
 
 use crate::changes::state::StateManager;
 use common::{Server, auth::AccessToken};
-use email::cache::{MessageCacheFetch, email::MessageAccess, mailbox::MailboxCacheAccess};
-use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
+use email::cache::{
+    MessageCacheFetch,
+    email::{MessageAccess, MessageCacheAccess},
+    mailbox::MailboxCacheAccess,
+};
+use email::message::za::search::{
+    snapshot::{ZaSnapshotFetch, za_no_map_error},
+    threads::za_group_by_thread,
+};
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, all_ids},
     object::thread::{Thread, ThreadProperty, ThreadValue},
@@ -58,7 +65,34 @@ impl ThreadGet for Server {
 
         let (ids, not_found_ids) = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let mut thread_map: AHashMap<u32, Vec<u32>>;
-        let ids = if let Some(ids) = ids {
+        let ids = if let Some(snapshot) = &snapshot {
+            if let Some(ids) = ids {
+                thread_map = ids
+                    .iter()
+                    .map(|id| {
+                        let thread_id = id.document_id();
+                        let mut members = snapshot.thread_members(thread_id);
+                        members.retain(|id| {
+                            cache
+                                .email_by_id(id)
+                                .is_some_and(|item| access.allows(item))
+                        });
+                        members.sort_unstable();
+                        (thread_id, members)
+                    })
+                    .collect();
+                ids
+            } else {
+                thread_map = za_group_by_thread(
+                    snapshot,
+                    cache.emails.iter().filter(|item| access.allows(*item)),
+                );
+                all_ids(
+                    thread_map.keys().copied().map(Into::into),
+                    self.core.jmap.get_max_objects,
+                )?
+            }
+        } else if let Some(ids) = ids {
             thread_map = ids
                 .iter()
                 .map(|id| (id.document_id(), Vec::new()))

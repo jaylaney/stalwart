@@ -79,7 +79,7 @@ impl<T: SessionStream> SessionData<T> {
         let snapshot = if is_content {
             content_view
         } else {
-            za_imap_map_guard(self, &mailbox, &arguments.filter, &mut saved_search, false).await?
+            za_imap_map_guard(self, &mailbox, &arguments.filter, &mut saved_search, true).await?
         };
         let cache = match &snapshot {
             Some(view) => view.cache.clone(),
@@ -125,7 +125,10 @@ impl<T: SessionStream> SessionData<T> {
                     && let Some(resolved) = view.map_result(document_id)
                 {
                     threads
-                        .entry(item.thread_id())
+                        .entry(snapshot.as_ref().map_or_else(
+                            || item.thread_id(),
+                            |snapshot| snapshot.thread_of(document_id),
+                        ))
                         .or_default()
                         .push(resolved.imap_id(is_uid));
                 }

@@ -181,7 +181,7 @@ impl<T: SessionStream> SessionData<T> {
                 &mailbox,
                 &arguments.filter,
                 &mut prev_saved_search,
-                true,
+                false,
             )
             .await?
         };

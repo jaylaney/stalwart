@@ -1532,6 +1532,7 @@ async fn owner_stale_keyless_session(test: &mut TestServer, admin: &Account) -> 
         format!("UID SEARCH OR EMAILID {mapped} NOT THREADID {thread}"),
         format!("UID SORT (ARRIVAL) UTF-8 THREADID {thread}"),
         format!("UID THREAD REFERENCES UTF-8 EMAILID {mapped}"),
+        "UID THREAD REFERENCES UTF-8 ALL".to_string(),
     ] {
         imap.send(&command).await;
         let lines = imap

@@ -194,7 +194,9 @@ impl QueryChanges for Server {
                 }
 
                 up_to_id = request.up_to_id;
-                results = self.email_submission_query((*request).into()).await?;
+                results = self
+                    .email_submission_query((*request).into(), access_token)
+                    .await?;
             }
             QueryChangesRequestMethod::ContactCard(mut request) => {
                 // Query changes

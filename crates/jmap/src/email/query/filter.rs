@@ -8,7 +8,10 @@ use super::text::{push_text, strip_subject_prefix};
 use crate::email::za_search::za_resolve_condition;
 use common::{MessageStoreCache, cache::email::MessageRef};
 use compact_str::ToCompactString;
-use email::cache::email::{MessageAccess, MessageCacheAccess, SearchOperator, thread_keywords};
+use email::{
+    cache::email::{MessageAccess, MessageCacheAccess, SearchOperator, thread_keywords},
+    message::za::search::{snapshot::ZaSnapshot, threads::za_thread_keywords},
+};
 use jmap_proto::{
     method::query::Filter,
     object::email::{EmailFilter, EmailQueryFilter},
@@ -217,6 +220,7 @@ impl QueryFilter {
         access: MessageAccess,
         mut metadata_matches: impl Iterator<Item = RoaringBitmap>,
         default_language: Language,
+        snapshot: Option<&ZaSnapshot>,
         content: Option<&ContentPart>,
     ) -> trc::Result<Option<Self>> {
         let mut row = RowFilter::new(access);
@@ -234,9 +238,20 @@ impl QueryFilter {
                     SearchFilter::is_in_set(metadata_matches.next().unwrap_or_default()),
                 ),
                 Filter::Property(EmailQueryFilter::Email(condition)) => {
-                    if let Some(set) = content
-                        .and_then(|part| za_resolve_condition(&condition, part, cache, &row.access))
+                    if let Some(snapshot) = snapshot
+                        && let EmailFilter::InThread(id) = &condition
                     {
+                        residual.push(SearchFilter::is_in_set(
+                            snapshot
+                                .thread_members(id.document_id())
+                                .into_iter()
+                                .collect(),
+                        ));
+                    } else if let Some(set) = content.zip(snapshot).and_then(|(part, snapshot)| {
+                        za_resolve_condition(&condition, part, cache, &row.access, |message| {
+                            snapshot.thread_of(message.document_id())
+                        })
+                    }) {
                         residual.push(SearchFilter::is_in_set(set));
                     } else if top_level {
                         match row.absorb(condition) {
@@ -249,6 +264,7 @@ impl QueryFilter {
                                 &row.access,
                                 &mut visible,
                                 default_language,
+                                snapshot,
                             )?,
                             Err(condition) => push_condition(
                                 &mut residual,
@@ -257,6 +273,7 @@ impl QueryFilter {
                                 &row.access,
                                 &mut visible,
                                 default_language,
+                                snapshot,
                             )?,
                         }
                     } else {
@@ -267,6 +284,7 @@ impl QueryFilter {
                             &row.access,
                             &mut visible,
                             default_language,
+                            snapshot,
                         )?;
                     }
                 }
@@ -477,6 +495,7 @@ pub(super) fn push_condition(
     access: &MessageAccess,
     visible: &mut Option<RoaringBitmap>,
     default_language: Language,
+    snapshot: Option<&ZaSnapshot>,
 ) -> trc::Result<()> {
     match condition {
         EmailFilter::Text(text) => {
@@ -628,34 +647,23 @@ pub(super) fn push_condition(
                     .map(|m| m.document_id()),
             )))
         }
-        EmailFilter::AllInThreadHaveKeyword(keyword) => {
-            filters.push(SearchFilter::is_in_set(thread_keywords(
-                cache,
-                &keyword,
-                true,
-                None,
-                visible_ids(cache, access, visible),
-            )))
-        }
-        EmailFilter::SomeInThreadHaveKeyword(keyword) => {
-            filters.push(SearchFilter::is_in_set(thread_keywords(
-                cache,
-                &keyword,
-                false,
-                None,
-                visible_ids(cache, access, visible),
-            )))
-        }
-        EmailFilter::NoneInThreadHaveKeyword(keyword) => {
-            filters.push(SearchFilter::Not);
-            filters.push(SearchFilter::is_in_set(thread_keywords(
-                cache,
-                &keyword,
-                false,
-                None,
-                visible_ids(cache, access, visible),
-            )));
-            filters.push(SearchFilter::End);
+        EmailFilter::AllInThreadHaveKeyword(ref keyword)
+        | EmailFilter::SomeInThreadHaveKeyword(ref keyword)
+        | EmailFilter::NoneInThreadHaveKeyword(ref keyword) => {
+            let all = matches!(condition, EmailFilter::AllInThreadHaveKeyword(_));
+            let none = matches!(condition, EmailFilter::NoneInThreadHaveKeyword(_));
+            let visible = visible_ids(cache, access, visible);
+            let documents = match snapshot {
+                Some(snapshot) => za_thread_keywords(snapshot, keyword, all, None, visible),
+                None => thread_keywords(cache, keyword, all, None, visible),
+            };
+            if none {
+                filters.push(SearchFilter::Not);
+            }
+            filters.push(SearchFilter::is_in_set(documents));
+            if none {
+                filters.push(SearchFilter::End);
+            }
         }
         EmailFilter::HasKeyword(keyword) => filters.push(SearchFilter::is_in_set(
             RoaringBitmap::from_iter(cache.with_keyword(&keyword).map(|item| item.document_id())),

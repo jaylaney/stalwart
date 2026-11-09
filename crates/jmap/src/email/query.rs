@@ -28,7 +28,10 @@ use common::{
     MessageStoreCache, MessagesCache, Server, auth::AccessToken, cache::email::MessageRef,
 };
 use compact_str::ToCompactString;
-use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
+use email::message::za::search::{
+    snapshot::{ZaSnapshotFetch, za_no_map_error},
+    threads::za_thread_keywords,
+};
 use email::{
     cache::{
         MessageCacheFetch,
@@ -54,7 +57,6 @@ use store::{
     roaring::RoaringBitmap,
     search::{SearchComparator, SearchQuery},
     write::SearchIndex,
-    za_search::content::ContentPart,
 };
 use trc::AddContext;
 use types::acl::Acl;
@@ -203,6 +205,7 @@ pub(crate) async fn email_query_with_view(
         access,
         metadata_matches.into_iter(),
         server.core.email.default_language,
+        view,
         content,
     )?;
     let sort = request.sort.take();
@@ -217,12 +220,7 @@ pub(crate) async fn email_query_with_view(
                 .map(|filter| filter.readable(&cache))
                 .unwrap_or_default()
         });
-    let mut comparators = sort_comparators(
-        sort,
-        content
-            .zip(documents.as_ref())
-            .map(|(part, documents)| (part, &*cache, documents)),
-    )?;
+    let mut comparators = sort_comparators(sort, view.zip(documents.as_ref()))?;
     let query_state = if view.is_some() {
         cache.get_state(false)
     } else {
@@ -234,7 +232,7 @@ pub(crate) async fn email_query_with_view(
         return Page::new(&request, max_results, query_state, view).finish();
     };
 
-    restrict_thread_keywords(&mut comparators, &cache, &mut filter);
+    restrict_thread_keywords(&mut comparators, &cache, &mut filter, view);
     let windowed = if view.is_none() && server.search_store().supports_windowed_walk() {
         let resolve_rows = server
             .search_store()
@@ -413,15 +411,22 @@ fn restrict_thread_keywords(
     comparators: &mut [MessageComparator],
     cache: &MessageStoreCache,
     filter: &mut QueryFilter,
+    snapshot: Option<&ZaView>,
 ) {
     for comparator in comparators {
         if let MessageComparator::Cache {
             field: MessageCacheField::ThreadKeyword { keyword, match_all },
             ascending,
         } = comparator
-            && let Some(visible) = filter.visible(cache)
         {
-            let documents = thread_keywords(cache, keyword, *match_all, None, Some(visible));
+            let visible = filter.visible(cache);
+            let documents = if let Some(snapshot) = snapshot {
+                za_thread_keywords(snapshot, keyword, *match_all, None, visible)
+            } else if let Some(visible) = visible {
+                thread_keywords(cache, keyword, *match_all, None, Some(visible))
+            } else {
+                continue;
+            };
             *comparator = MessageComparator::Search(SearchComparator::set(documents, *ascending));
         }
     }
@@ -751,15 +756,21 @@ impl<'a> Page<'a> {
 
 fn sort_comparators(
     sort: Option<Vec<Comparator<EmailComparator>>>,
-    content_sort: Option<(&ContentPart, &MessageStoreCache, &RoaringBitmap)>,
+    content_sort: Option<(&ZaView, &RoaringBitmap)>,
 ) -> trc::Result<Vec<MessageComparator>> {
     let sort = sort.filter(|sort| !sort.is_empty()).unwrap_or_default();
     let mut comparators = Vec::with_capacity(sort.len());
     for comparator in sort {
         let ascending = comparator.is_ascending;
-        if let Some((content, cache, documents)) = content_sort
-            && let Some(comparator) =
-                za_sort_comparator(&comparator.property, ascending, content, cache, documents)
+        if let Some((view, documents)) = content_sort
+            && let Some(comparator) = za_sort_comparator(
+                &comparator.property,
+                ascending,
+                view.content(),
+                &view.cache,
+                documents,
+                |message| view.thread_of(message.document_id()),
+            )
         {
             comparators.push(comparator);
             continue;

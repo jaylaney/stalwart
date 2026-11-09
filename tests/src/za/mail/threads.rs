@@ -23,6 +23,7 @@ use types::{collection::SyncCollection, id::Id};
 
 mod protocol;
 mod races;
+mod task12;
 
 const SENDER: &str = "sender@example.org";
 const KEY: &str = "keymail50@example.com";
@@ -59,6 +60,7 @@ pub async fn test(test: &mut TestServer) {
     for account in [&key, &race_key, &plain] {
         test.destroy_all_mailboxes(account).await;
     }
+    task12::test(test).await;
     test.blob_expire_all().await;
     wait_for_delivery(test).await;
 }

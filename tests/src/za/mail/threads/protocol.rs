@@ -134,14 +134,22 @@ async fn case_blob_lookup(key: &Account, thread: u32, doc: u32) {
 }
 
 async fn case_submission_same_snapshot(test: &TestServer, key: &Account, root: &str, root_id: u32) {
+    let independent = email_create(key, "Independent submission control", None);
+    let created = set(key, json!({ "create": { "independent": independent } })).await;
+    let independent_id =
+        email_id(&method(&created, 0, "Email/set")["created"]["independent"]["id"]);
+    assert_eq!(independent_id.prefix_id(), independent_id.document_id());
+
     let draft = email_create(key, "Re: Task 11 mapped id", Some(root));
     let created = set(key, json!({ "create": { "submission-draft": draft } })).await;
     let draft = &method(&created, 0, "Email/set")["created"]["submission-draft"];
     let draft_id = email_id(&draft["id"]);
     assert_eq!(draft_id.prefix_id(), root_id);
     let doc = draft_id.document_id();
-    assert_ne!(doc, root_id);
+    // The raw order is independent, reply. The map puts the reply first.
+    assert!(root_id < independent_id.document_id() && independent_id.document_id() < doc);
     let current = draft_id.to_string();
+    let independent = independent_id.to_string();
 
     let identities = key
         .jmap_method_call(
@@ -216,6 +224,52 @@ async fn case_submission_same_snapshot(test: &TestServer, key: &Account, root: &
     assert_eq!(u32::from(stored.email_id), doc);
     assert_eq!(u32::from(stored.thread_id), doc);
 
+    let independent_submitted = key
+        .jmap_method_call("EmailSubmission/set", submit(&independent))
+        .await;
+    let outcome = &method(&independent_submitted, 0, "EmailSubmission/set")["created"]["s"];
+    let control = outcome["id"].as_str().expect("control submission ID");
+    assert_eq!(outcome["undoStatus"], "pending");
+    assert_email_updated(&independent_submitted, &independent);
+
+    for (thread, expected) in [
+        (root_id, vec![submission]),
+        (independent_id.document_id(), vec![control]),
+        (doc, vec![]),
+    ] {
+        let response = key
+            .jmap_method_call(
+                "EmailSubmission/query",
+                json!({
+                    "accountId": key.id_string(),
+                    "filter": { "threadIds": [Id::from(thread).to_string()] },
+                }),
+            )
+            .await;
+        assert_eq!(
+            method(&response, 0, "EmailSubmission/query")["ids"],
+            json!(expected)
+        );
+    }
+    for (ascending, expected) in [
+        (true, [submission, control]),
+        (false, [control, submission]),
+    ] {
+        let response = key
+            .jmap_method_call(
+                "EmailSubmission/query",
+                json!({
+                    "accountId": key.id_string(),
+                    "sort": [{ "property": "threadId", "isAscending": ascending }],
+                }),
+            )
+            .await;
+        assert_eq!(
+            method(&response, 0, "EmailSubmission/query")["ids"],
+            json!(expected)
+        );
+    }
+
     let after_create = get(key, json!([&current])).await;
     assert_eq!(
         method(&after_create, 0, "Email/get")["list"][0]["keywords"]["$flagged"],
@@ -227,7 +281,10 @@ async fn case_submission_same_snapshot(test: &TestServer, key: &Account, root: &
             "EmailSubmission/set",
             json!({
                 "accountId": key.id_string(),
-                "update": { (submission): { "undoStatus": "canceled" } },
+                "update": {
+                    (submission): { "undoStatus": "canceled" },
+                    (control): { "undoStatus": "canceled" },
+                },
                 "onSuccessUpdateEmail": { (submission): { "keywords/$seen": true } }
             }),
         )
@@ -235,6 +292,11 @@ async fn case_submission_same_snapshot(test: &TestServer, key: &Account, root: &
     assert!(
         method(&canceled, 0, "EmailSubmission/set")["updated"]
             .get(submission)
+            .is_some()
+    );
+    assert!(
+        method(&canceled, 0, "EmailSubmission/set")["updated"]
+            .get(control)
             .is_some()
     );
     assert_email_updated(&canceled, &current);
@@ -249,23 +311,23 @@ async fn case_submission_same_snapshot(test: &TestServer, key: &Account, root: &
             "EmailSubmission/set",
             json!({
                 "accountId": key.id_string(),
-                "destroy": [submission],
-                "onSuccessDestroyEmail": [submission]
+                "destroy": [submission, control],
+                "onSuccessDestroyEmail": [submission, control]
             }),
         )
         .await;
     assert_eq!(
         method(&deleted, 0, "EmailSubmission/set")["destroyed"],
-        json!([submission])
+        json!([submission, control])
     );
     assert_eq!(
         method(&deleted, 1, "Email/set")["destroyed"],
-        json!([&current])
+        json!([&current, &independent])
     );
-    let readback = get(key, json!([&current])).await;
+    let readback = get(key, json!([&current, &independent])).await;
     assert_eq!(
         method(&readback, 0, "Email/get")["notFound"],
-        json!([&current])
+        json!([&current, &independent])
     );
 }
 

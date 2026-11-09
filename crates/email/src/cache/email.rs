@@ -283,61 +283,109 @@ pub fn thread_keywords(
     documents: Option<&RoaringBitmap>,
     visible: Option<&RoaringBitmap>,
 ) -> RoaringBitmap {
+    thread_keywords_by(cache, keyword, match_all, documents, visible, |message| {
+        message.thread_id()
+    })
+}
+
+pub(crate) fn thread_keywords_by(
+    cache: &MessageStoreCache,
+    keyword: &Keyword,
+    match_all: bool,
+    documents: Option<&RoaringBitmap>,
+    visible: Option<&RoaringBitmap>,
+    thread_of: impl Fn(&MessageRef<'_>) -> u32,
+) -> RoaringBitmap {
     let is_visible = |document_id: u32| visible.is_none_or(|visible| visible.contains(document_id));
     let mut tagged = RoaringBitmap::new();
     let mut untagged = RoaringBitmap::new();
     let mut tally = |item: MessageRef<'_>| {
         if cache.has_keyword(item, keyword) {
-            tagged.insert(item.thread_id());
+            tagged.insert(thread_of(&item));
         } else if match_all {
-            untagged.insert(item.thread_id());
+            untagged.insert(thread_of(&item));
         }
     };
-    let members = match documents {
-        Some(documents) => {
-            let members = documents
-                .iter()
-                .filter_map(|document_id| {
-                    cache
-                        .email_by_id(&document_id)
-                        .map(|item| (document_id, item.thread_id()))
-                })
-                .collect::<Vec<_>>();
-            let threads = members
-                .iter()
-                .map(|(_, thread_id)| *thread_id)
-                .collect::<AHashSet<_>>();
-            for item in cache.emails.iter().filter(|item| {
-                is_visible(item.document_id()) && threads.contains(&item.thread_id())
-            }) {
-                tally(item);
+    let members =
+        match documents {
+            Some(documents) => {
+                let members = documents
+                    .iter()
+                    .filter_map(|document_id| {
+                        cache
+                            .email_by_id(&document_id)
+                            .map(|item| (document_id, thread_of(&item)))
+                    })
+                    .collect::<Vec<_>>();
+                let threads = members
+                    .iter()
+                    .map(|(_, thread_id)| *thread_id)
+                    .collect::<AHashSet<_>>();
+                for item in cache.emails.iter().filter(|item| {
+                    is_visible(item.document_id()) && threads.contains(&thread_of(item))
+                }) {
+                    tally(item);
+                }
+                members
             }
-            members
-        }
-        None => {
-            let capacity = visible
-                .map_or(cache.emails.len(), |visible| {
-                    usize::try_from(visible.len()).unwrap_or(usize::MAX)
-                })
-                .min(cache.emails.len());
-            let mut members = Vec::with_capacity(capacity);
-            for item in cache
-                .emails
-                .iter()
-                .filter(|item| is_visible(item.document_id()))
-            {
-                members.push((item.document_id(), item.thread_id()));
-                tally(item);
+            None => {
+                let capacity = visible
+                    .map_or(cache.emails.len(), |visible| {
+                        usize::try_from(visible.len()).unwrap_or(usize::MAX)
+                    })
+                    .min(cache.emails.len());
+                let mut members = Vec::with_capacity(capacity);
+                for item in cache
+                    .emails
+                    .iter()
+                    .filter(|item| is_visible(item.document_id()))
+                {
+                    members.push((item.document_id(), thread_of(&item)));
+                    tally(item);
+                }
+                members
             }
-            members
-        }
-    };
+        };
     tagged -= untagged;
     members
         .into_iter()
         .filter(|(_, thread_id)| tagged.contains(*thread_id))
         .map(|(document_id, _)| document_id)
         .collect()
+}
+
+pub(crate) fn mailbox_counters_by(
+    cache: &MessageStoreCache,
+    mailbox_ids: impl IntoIterator<Item = u32>,
+    count_threads: bool,
+    thread_of: impl Fn(&MessageRef<'_>) -> u32,
+) -> AHashMap<u32, MailboxCounters> {
+    let mut counters = mailbox_ids
+        .into_iter()
+        .map(|mailbox_id| (mailbox_id, MailboxCounters::default()))
+        .collect::<AHashMap<_, _>>();
+    if counters.is_empty() {
+        return counters;
+    }
+
+    for message in cache.emails.iter() {
+        let mailboxes = message.mailboxes();
+        let mut is_unread = None;
+        for (pos, uid) in mailboxes.iter().enumerate() {
+            if let Some(counter) = counters.get_mut(&uid.mailbox_id)
+                && !mailboxes
+                    .iter()
+                    .take(pos)
+                    .any(|prev| prev.mailbox_id == uid.mailbox_id)
+            {
+                let is_unread =
+                    *is_unread.get_or_insert_with(|| message.keywords() & READ_KEYWORDS == 0);
+                counter.add(thread_of(&message), is_unread, count_threads);
+            }
+        }
+    }
+
+    counters
 }
 
 pub enum SearchOperator {
@@ -585,32 +633,9 @@ impl MessageCacheAccess for MessageStoreCache {
         mailbox_ids: impl IntoIterator<Item = u32>,
         count_threads: bool,
     ) -> AHashMap<u32, MailboxCounters> {
-        let mut counters = mailbox_ids
-            .into_iter()
-            .map(|mailbox_id| (mailbox_id, MailboxCounters::default()))
-            .collect::<AHashMap<_, _>>();
-        if counters.is_empty() {
-            return counters;
-        }
-
-        for message in self.emails.iter() {
-            let mailboxes = message.mailboxes();
-            let mut is_unread = None;
-            for (pos, uid) in mailboxes.iter().enumerate() {
-                if let Some(counter) = counters.get_mut(&uid.mailbox_id)
-                    && !mailboxes
-                        .iter()
-                        .take(pos)
-                        .any(|prev| prev.mailbox_id == uid.mailbox_id)
-                {
-                    let is_unread =
-                        *is_unread.get_or_insert_with(|| message.keywords() & READ_KEYWORDS == 0);
-                    counter.add(message.thread_id(), is_unread, count_threads);
-                }
-            }
-        }
-
-        counters
+        mailbox_counters_by(self, mailbox_ids, count_threads, |message| {
+            message.thread_id()
+        })
     }
 
     fn email_by_id(&self, id: &u32) -> Option<MessageRef<'_>> {
