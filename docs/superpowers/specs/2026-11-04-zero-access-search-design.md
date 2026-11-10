@@ -222,7 +222,7 @@ group's counter, setup writes epoch 0, and a no-message rebuild still
 allocates a boundary (5.4, 6.2, G3); retention bounds are the shorter
 of the Email and Thread logs (5.5, 6.3, G4); a reconciliation attributes
 by the retained log before stamping (5.4, R24, G2); thread parts have
-their own memory budget, loads are single-flight, and the account cap
+their own memory budget, loads are single-flight per part, and the account cap
 fits the load's transient (4.3, 4.4, G6); cursor progress is durable
 even when every item was skipped, and update-only runs checkpoint
 (5.1, R22, G19); `content_to` and a suspended flag, and a content-only
@@ -930,12 +930,15 @@ structure with its own rules:
   loaded on the first content request (7.1), or for a content compaction
   (5.5). Both are loads of the same entry.
 - **Reload incrementally** (F20). Thread blobs and the content chain are
-  append-only between compactions, so a node whose loaded index is behind
-  the manifest loads only what the manifest added: the thread blobs it
-  does not hold, and the chain from the new head back to a segment id it
-  holds; a compaction, which names blobs it does not hold and drops
-  ones it does, is loaded whole. Either way the loaded index ends as a
-  fresh load of the current manifest would.
+  append-only between compactions. A validated Map reload fetches only
+  the required new Thread blobs. When the Content head moves or new
+  Thread tombstones make the warm Content part stale, the loader can
+  keep the charged allocation as a verified suffix for an explicit
+  Content request. It is unavailable for queries until refreshed.
+  A Content request walks the current chain back to the exact hash and
+  segment it already holds, or loads the whole chain when it cannot join
+  that suffix. A whole Map reload discards the old optional part.
+  Refreshing the needed part gives the same result as a fresh load.
 - **Serve** from memory: every resolution of section 7 reads the loaded
   index; no query reads a blob.
 - **Never ahead of the store.** A pass builds its additions in a staging
@@ -944,19 +947,20 @@ structure with its own rules:
   response therefore never maps an id with a revision the store does not
   hold; 6.2's validated snapshot ensures the converse, that it never
   maps with a revision older than the state it returns.
-- **Locks** (F5, G21). The index entry has a read lock for every reader
-  and the staging swap, and a separate pass lock for the pass itself. A
-  thread-valued read never waits for a pass's I/O: it takes the read
-  lock, which a pass holds only for the swap. A request that finds a
-  pass running does not wait for it (5.1). Eviction takes the write
-  lock (F18), so it never races a reader or a swap. A validated
-  snapshot's reload (6.2) also takes the write lock and may run while a
-  pass is staging on the same node; the pass is unharmed, because its
-  batch asserts the manifest hash it read at step 0, and a reload means
-  that hash moved, so the pass loses its assertion and discards.
-  **Loads are single-flight per account** (G6): a second request that
-  needs a load the first is making waits for it rather than paying a
-  second transient.
+- **Locks** (F5, G21). The index entry has a read lock for every reader,
+  a write lock for publication and eviction, and a separate pass lock.
+  A thread-valued read never waits for a running pass's I/O. It can
+  contend with the committed swap. A validated snapshot's required
+  manifest and Thread reload (6.2) also takes the write lock. If a pass
+  is staging and the manifest moves, its previous-manifest assertion
+  makes it discard that staging. Optional Content blob reads, posting
+  construction and tombstone pruning take place outside the index
+  guard. The Content loader snapshots the needed tombstone IDs under
+  a read guard and checks the exact manifest hash, epoch and Content
+  head again before swapping in the prepared part.
+  **Loads are single-flight per account and part** (G6). Duplicate
+  requests share the relevant Thread or Content load, while a Map
+  reload is independent of a Content load in flight.
 - **Evict** after `ZA_SEARCH_IDLE_SECS` (default 900) without use, when
   the process budget `ZA_SEARCH_MEM_MB` (default 1536) needs room (least
   recently used first, content parts before thread parts), and on every
@@ -1028,8 +1032,8 @@ after eviction is the load cost of 4.3. The knobs:
 | `ZA_SEARCH_WAIT_SECS` | 30 | how long a content request completes passes before refusing |
 | `ZA_SEARCH_SEGMENTS` | 16 | thread-blob count, and content-chain length, that trigger compaction |
 | `ZA_SEARCH_CHECKPOINT` | 1000 | update-only records after which a pass writes a manifest-only checkpoint (G19) |
-| `ZA_SEARCH_SKIP_AFTER` | 8 | aborted passes on one document after which it is skipped as loss (H5) |
-| `ZA_SEARCH_ABSENT_RETRY_SECS` | 10 | how long a blob a committed manifest names may be reported absent before that is loss (H6) |
+| `ZA_SEARCH_SKIP_AFTER` | 8 | non-absent transient attempts on one document after which it is skipped as loss (H5) |
+| `ZA_SEARCH_ABSENT_RETRY_SECS` | 10 | retry window for an absent message or index blob before absence is loss (H6) |
 | `ZA_SEARCH_PAD_MIN` | 65536 | exact publishing target and minimum compaction class in bytes (`M`) |
 
 `K = 16` is a constant of the format, not a knob (4.2, H22). The
@@ -1168,18 +1172,20 @@ queue skips a message whose blob is missing); a transient error aborts
 the pass with no index write, no blob, no checkpoint, `indexed_to`
 unchanged, and the next pass retries; the one write an aborted pass
 makes is a manifest-only checkpoint (above) carrying the id of the
-document whose open failed and its count of aborted attempts, public
-facts (R34: held in memory alone the count would not survive an
-eviction or a restart and the bound would never be reached), and a
-document whose count reaches `ZA_SEARCH_SKIP_AFTER` is then skipped as
-loss with `ZA_SEARCH_SKIPPED` carrying
-the persistent class (H5: a single object answering a persistent
-non-absent error, an S3 403 on one key or a backend fault, must not
-wedge the account's index and every later message's threading for
-ever). In a load, loss of a thread blob is loss of the index (a
-rebuild, 5.4), loss of a content blob is loss of the content part only
-(a content-only rebuild, 5.4, H23); a transient error is "no map" for
-this request (6.2) and nothing more. Nothing is ever skipped for good,
+document whose open failed and its count of non-absent transient
+attempts. This public count survives eviction and restart (R34).
+In-window absence always aborts without consuming the document or
+advancing the checkpoint, a cursor or Content coverage. It preserves
+the matching count, which is zero if the document has no prior count.
+The first absence timestamp is entry-local and may be forgotten on
+eviction. Existing counts carry no fault class and still count against
+a later non-absent attempt. Only a current non-absent transient can
+reach `ZA_SEARCH_SKIP_AFTER` and skip as loss, with `ZA_SEARCH_SKIPPED`
+carrying that fault's class (H5). In a load, loss of a Thread blob is
+loss of the Map (a rebuild, 5.4), and loss of a Content blob triggers
+only Content recovery (5.4, H23). A required Thread transient can
+refuse Map (6.2). An optional Content transient affects only the
+Content request (7.4). Nothing is ever skipped for good,
 or rebuilt, because the blob store was slow. A blob store that answers
 "not found" for every key is not slow (I6: a wrong bucket or prefix, a
 restore to another path): past the window every admitted message is
@@ -1857,7 +1863,7 @@ of 4.2, as one model rather than one patch each:
 | The time cap making the checkpoint a function of processing cost (R30, H4) | recorded as the one remaining channel; invariants 48 and 50 narrowed to the byte and count charges | duration is observable anyway |
 | A deletion committed between a pass's log read and its commit, a phantom `created` (H2) | existence at `E` from the cache's present set, or from the log outside the range for a pinned `E`, before the record | a lagging record never decides presence at `E` |
 | A reconciliation tombstoning before it inserts (H3, I1) | gap inserts oldest first, then the gap deletions, then the retained records | a gap insert finds what the gap deleted; a retained insert, which came after every gap deletion, does not, as upstream |
-| One persistently failing object wedging the index (H5) | a per-document attempt count in the manifest; skipped as loss after `ZA_SEARCH_SKIP_AFTER` | a persistent fault is bounded; a transient one still retries |
+| One persistently failing object wedging the index (H5) | a per-document non-absent attempt count in the manifest; skipped as loss after `ZA_SEARCH_SKIP_AFTER` | a persistent non-absent fault is bounded and in-window absence always retries |
 | A lagging blob store read as loss (H6) | absence is loss only past `ZA_SEARCH_ABSENT_RETRY_SECS` | a committed manifest's blob exists |
 | A thread-part load refused for budget, failing every mail method (H8) | thread loads evict idle parts and overrun the soft budget with a trace, never refuse | mail degrades after search |
 | An unauthenticated manifest rewritten from authentic blobs (H9) | the keyed tag; a bad tag is loss | every manifest writer holds keys |
@@ -2747,8 +2753,10 @@ read races another node's publication returns a state at or past the
 row (I5); upstream's per-account reindex task on a key account writes
 the marker and the next keyed request rebuilds, after a blob store
 that answered "not found" for every key had skipped the backlog (I6);
-transient failures of one document across an eviction and a restart
-reach `ZA_SEARCH_SKIP_AFTER` through the checkpointed count (R34); a logged
+non-absent transient failures of one document across an eviction and
+a restart reach `ZA_SEARCH_SKIP_AFTER` through the checkpointed count
+(R34). At least that many in-window absent reads leave the document
+pending until it can be indexed without reindexing (H6); a logged
 deletion is applied whatever a presence snapshot says (R17); the error
 classes map a store timeout to abort and an absent stub to skip (F3);
 paging the stream with a small `maxChanges` reproduces every item
@@ -3834,7 +3842,7 @@ the thread records on every pass, which section 12 rejects on cost.
 22. Content records are compressed one by one with a static dictionary;
     nothing is compressed across records (G5).
 23. Thread parts have a memory budget of their own, loads are
-    single-flight per account, and the account cap is at most a third of
+    single-flight per account and part, and the account cap is at most a third of
     the content budget (G6).
 24. The validated snapshot compares the Email group's counter; setup
     writes epoch 0; a no-message rebuild still allocates a fresh
@@ -3852,8 +3860,9 @@ the thread records on every pass, which section 12 rejects on cost.
     tag (H9); the merge survivor is the thread with the most matching
     candidates (H10); a missing manifest is loss on any key account
     (H11), a lost content blob a content-only rebuild (H23); absence of
-    a blob is loss only past a retry window and a persistently failing
-    document is skipped after `ZA_SEARCH_SKIP_AFTER` passes (H5, H6);
+    a blob is loss only once its retry window elapses and a document
+    with a persistent non-absent fault is skipped after
+    `ZA_SEARCH_SKIP_AFTER` attempts (H5, H6);
     a thread-part load is never refused for budget (H8); content
     compaction is tiered while a cursor is pending, by tier so that each
     byte is rewritten once per tier (H7, R32); a reconciliation applies

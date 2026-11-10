@@ -295,20 +295,21 @@ impl Planner<'_> {
             }
             Err(OpenFailure::Loss(class)) => self.staging.skipped.push((document_id, class)),
             Err(OpenFailure::Transient(class)) => {
-                let attempts = self
+                let previous = self
                     .base
                     .manifest
                     .failing
                     .as_ref()
                     .filter(|f| f.document_id == document_id)
-                    .map_or(1, |f| f.attempts.saturating_add(1));
-                if attempts >= self.limits.skip_after {
-                    let loss = if class == TransientClass::AbsentWithinWindow {
-                        LossClass::BlobAbsent
-                    } else {
-                        LossClass::Parse
-                    };
-                    self.staging.skipped.push((document_id, loss));
+                    .map_or(0, |f| f.attempts);
+                let absent = class == TransientClass::AbsentWithinWindow;
+                let attempts = if absent {
+                    previous
+                } else {
+                    previous.saturating_add(1)
+                };
+                if !absent && attempts >= self.limits.skip_after {
+                    self.staging.skipped.push((document_id, LossClass::Parse));
                     self.staging.transient_skips.push((document_id, class));
                 } else {
                     let mut aborted = Staging::new(self.base, self.staging.marker_bound);
@@ -753,17 +754,14 @@ impl ZaSearchPass for Server {
             let thread_charge = search_cache
                 .admit(PartKind::Thread, index.thread_bytes, account_id)
                 .expect("a thread part is always admitted");
-            LoadedIndex {
-                manifest_bytes_hash: hash,
-                manifest,
-                thread: index.thread.clone(),
-                thread_segments: Vec::new(),
-                content: None,
-                scanned_to: index.scanned_to,
-                update_records: index.update_records,
-                thread_bytes: index.thread_bytes,
-                thread_charge,
-            }
+            let mut base = LoadedIndex::empty(manifest);
+            base.manifest_bytes_hash = hash;
+            base.thread = index.thread.clone();
+            base.scanned_to = index.scanned_to;
+            base.update_records = index.update_records;
+            base.thread_bytes = index.thread_bytes;
+            base.thread_charge = thread_charge;
+            base
         };
         let records = if let Some(marker) = &base.manifest.reconciliation {
             let Some(present) = observe_present(self, account_id).await? else {
@@ -1340,8 +1338,73 @@ mod tests {
         });
         let last = plan(&base, &records, &limits(), &mut fixture()).await;
         assert_eq!(last.skipped, [(2, LossClass::Parse)]);
+        assert_eq!(last.transient_skips, [(2, TransientClass::BlobStore)]);
         assert_eq!(ids(&last), [1, 3]);
         assert_eq!(last.failing, None);
+    }
+
+    #[tokio::test]
+    async fn in_window_absence_discards_staging_after_the_attempt_cap() {
+        let records = records(vec![(11, inserts([1, 2, 3]))]);
+        let limits = limits();
+        for sources in [
+            PassSources::default(),
+            PassSources {
+                cursor: vec![1, 2, 3],
+                ..Default::default()
+            },
+            PassSources {
+                content: vec![3, 2, 1],
+                content_runnable: true,
+                ..Default::default()
+            },
+        ] {
+            let mut base = LoadedIndex::empty(manifest_at(partial(11, 0)));
+            if !sources.cursor.is_empty() {
+                base.manifest.cursor = Some(RebuildCursor { next: 1, end: 3 });
+            }
+            if sources.content_runnable {
+                base.manifest.content_to.cursor = Some(ContentCursor { next_below: 4 });
+            }
+            let failing = FailingDocument {
+                document_id: 2,
+                attempts: limits.skip_after,
+            };
+            base.manifest.failing = Some(failing.clone());
+            let mut opener = content_opener([1, 3]);
+            opener.0.insert(
+                2,
+                Err(OpenFailure::Transient(TransientClass::AbsentWithinWindow)),
+            );
+            let staging = plan_pass(
+                &base,
+                sources,
+                &records,
+                &limits,
+                Instant::now(),
+                &mut opener,
+            )
+            .await;
+
+            assert!(matches!(
+                staging.decision,
+                PassDecision::Abort {
+                    class: TransientClass::AbsentWithinWindow,
+                    document_id: 2,
+                }
+            ));
+            assert_eq!(staging.failing, Some(failing));
+            assert_eq!(staging.checkpoint, base.manifest.indexed_to);
+            assert_eq!(staging.scanned_to, base.scanned_to);
+            assert_eq!(staging.revision, base.manifest.revision);
+            assert!(matches!(staging.cursor, CursorStep::None));
+            assert!(matches!(staging.content_cursor, CursorStep::None));
+            assert!(matches!(staging.marker, MarkerStep::Untouched));
+            assert!(staging.records.is_empty() && staging.aliases.is_empty());
+            assert!(staging.content.is_empty() && staging.tombstones.is_empty());
+            assert!(staging.skipped.is_empty() && staging.transient_skips.is_empty());
+            assert!(staging.witness.is_none() && !staging.bookkeeping);
+        }
     }
 
     #[tokio::test]

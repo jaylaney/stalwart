@@ -9,7 +9,10 @@ use crate::za::search::seal::{build_content_blob, build_thread_blob, parse_conte
 use ahash::{AHashMap, AHashSet};
 use std::{
     pin::pin,
-    sync::{Arc, Barrier, Mutex, atomic::Ordering},
+    sync::{
+        Arc, Barrier, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use store::za_search::Checkpoint;
@@ -528,10 +531,12 @@ async fn f20_incremental_reload_equals_a_fresh_load() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        source.reads(),
-        [new_thread.hash, v2.content.as_ref().unwrap().hash.clone()]
-    );
+    assert_eq!(source.reads(), [new_thread.hash]);
+    assert!(old.read_loaded().await.unwrap().content.is_none());
+    load_current_content(&source, &old, &key, cache1.config())
+        .await
+        .unwrap();
+    assert_eq!(source.reads(), [v2.content.as_ref().unwrap().hash.clone()]);
     let cache2 = cache();
     let fresh = loaded(&source, &cache2, &key, &v2_bytes, v2, true).await;
     assert_same_index(
@@ -571,8 +576,9 @@ async fn f20_compaction_reloads_whole() {
     drop(guard);
 
     let v3_bytes = encode(&key, &v3);
+    let source = counting(map);
     apply_reload(
-        &map,
+        &source,
         &old,
         &key,
         cache1.config(),
@@ -582,8 +588,14 @@ async fn f20_compaction_reloads_whole() {
     )
     .await
     .unwrap();
+    assert_eq!(source.reads(), [v3.thread_blobs[0].hash.clone()]);
+    assert!(old.read_loaded().await.unwrap().content.is_none());
+    load_current_content(&source, &old, &key, cache1.config())
+        .await
+        .unwrap();
+    assert_eq!(source.reads(), [v3.content.as_ref().unwrap().hash.clone()]);
     let cache2 = cache();
-    let fresh = loaded(&map, &cache2, &key, &v3_bytes, v3, true).await;
+    let fresh = loaded(&source, &cache2, &key, &v3_bytes, v3, true).await;
     let guard = old.read_loaded().await.unwrap();
     assert_eq!(guard.thread_segments, [segment(50)]);
     assert_same_index(&guard, &*fresh.read_loaded().await.unwrap());
@@ -617,12 +629,26 @@ async fn r18_a_deletion_only_change_moves_the_hash_and_reloads() {
     ));
     drop(old);
 
-    apply_reload(&map, &entry, &key, cache.config(), &moved, manifest, 100)
+    let delta_hash = manifest.thread_blobs.last().unwrap().hash.clone();
+    let source = counting(map);
+    apply_reload(&source, &entry, &key, cache.config(), &moved, manifest, 100)
         .await
         .unwrap();
+    assert_eq!(source.reads(), [delta_hash]);
+    {
+        let index = entry.read_loaded().await.unwrap();
+        assert_eq!(index.manifest_bytes_hash, manifest_hash(&moved));
+        assert!(!index.thread.is_present(3));
+        assert!(index.content.is_none());
+    }
+    load_current_content(&source, &entry, &key, cache.config())
+        .await
+        .unwrap();
+    assert!(source.reads().is_empty());
     let index = entry.read_loaded().await.unwrap();
-    assert!(!index.thread.is_present(3));
-    assert!(!index.content.as_ref().unwrap().part.contains(3));
+    let content = index.content.as_ref().unwrap();
+    assert!(!content.part.contains(3));
+    assert!(content.part.contains(4));
 }
 
 #[test]
@@ -1008,32 +1034,113 @@ async fn content_failure_during_reload_does_not_turn_into_thread_loss() {
     assert!(index.content.is_none());
     let current = index.manifest.clone();
     drop(index);
-    assert_eq!(cache.content_used(), 0);
     let Err(ObservedLoadError::ContentLoss(loss)) =
         load_current_content(&map, &entry, &key, cache.config()).await
     else {
         panic!("the failed content walk must carry content loss evidence");
     };
+    assert_eq!(cache.content_used(), 0);
     assert_eq!(loss.class(), LossClass::Hash);
     assert!(loss.matches(&v2_bytes, &current));
     assert!(!loss.matches(&bytes, &current));
     assert!(!loss.matches(&v2_bytes, &v1));
 }
 
-struct GatedSource<'a> {
-    map: &'a AHashMap<BlobHash, Vec<u8>>,
+struct GatedSource<'a, S> {
+    map: &'a S,
     gated: AHashSet<BlobHash>,
     fetching: mpsc::UnboundedSender<BlobHash>,
     release: Semaphore,
 }
 
-impl BlobSource for GatedSource<'_> {
+impl<S: BlobSource> BlobSource for GatedSource<'_, S> {
     async fn fetch(&self, hash: &BlobHash) -> trc::Result<Option<Vec<u8>>> {
         if self.gated.contains(hash) {
             self.fetching.send(hash.clone()).unwrap();
             self.release.acquire().await.unwrap().forget();
         }
         self.map.fetch(hash).await
+    }
+}
+
+#[tokio::test]
+async fn map_reload_does_not_wait_for_a_gated_content_load() {
+    let (key, _, mut map, bytes, v1) = fixture();
+    let v2 = append(&key, &mut map, &v1, 5);
+    let v3 = append(&key, &mut map, &v2, 6);
+    let v2_bytes = encode(&key, &v2);
+    let v3_bytes = encode(&key, &v3);
+    let gated_head = v2.content.as_ref().unwrap().hash.clone();
+
+    for warm in [false, true] {
+        let cache = cache();
+        let entry = loaded(&map, &cache, &key, &bytes, v1.clone(), warm).await;
+        let (fetching, mut fetches) = mpsc::unbounded_channel();
+        let source = GatedSource {
+            map: &map,
+            gated: [gated_head.clone()].into_iter().collect(),
+            fetching,
+            release: Semaphore::new(0),
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        timeout_at(
+            deadline,
+            apply_reload(
+                &source,
+                &entry,
+                &key,
+                cache.config(),
+                &v2_bytes,
+                v2.clone(),
+                100,
+            ),
+        )
+        .await
+        .expect("Map read the gated Content head")
+        .unwrap();
+        assert!(entry.read_loaded().await.unwrap().thread.is_present(5));
+
+        let mut load = pin!(timeout_at(
+            deadline,
+            load_current_content(&source, &entry, &key, cache.config())
+        ));
+        tokio::select! {
+            result = &mut load => panic!("Content load did not wait at the gate: {result:?}"),
+            hash = fetches.recv() => assert_eq!(hash.as_ref(), Some(&gated_head)),
+        }
+        timeout_at(
+            deadline,
+            apply_reload(
+                &source,
+                &entry,
+                &key,
+                cache.config(),
+                &v3_bytes,
+                v3.clone(),
+                100,
+            ),
+        )
+        .await
+        .expect("Map reload waited for the in-flight Content load")
+        .unwrap();
+        {
+            let index = entry.read_loaded().await.unwrap();
+            assert_eq!(index.manifest_bytes_hash, manifest_hash(&v3_bytes));
+            assert!(index.thread.is_present(6));
+            assert!(index.content.is_none());
+        }
+        source.release.add_permits(1);
+        load.await.expect("Content load did not finish").unwrap();
+
+        let index = entry.read_loaded().await.unwrap();
+        let content = index.content.as_ref().unwrap();
+        assert_eq!(
+            content.segments,
+            [segment(16), segment(15), segment(12), segment(11)]
+        );
+        assert!(content.part.contains(5) && content.part.contains(6));
+        assert!(!content.part.contains(2));
+        assert_eq!(cache.content_used(), content.bytes);
     }
 }
 
@@ -1116,7 +1223,7 @@ async fn fx3_repeated_head_moves_respect_the_callers_single_deadline() {
     }
     assert!(load.await.is_err());
     assert_eq!(cache.content_used(), 0);
-    assert!(entry.load_flight.try_lock().is_ok());
+    assert!(entry.content_load_flight.try_lock().is_ok());
     let index = entry.index.try_read().unwrap();
     let index = index.as_ref().unwrap();
     assert!(index.content.is_none());
@@ -1214,6 +1321,7 @@ struct FaultSource<'a> {
     map: &'a AHashMap<BlobHash, Vec<u8>>,
     hash: &'a BlobHash,
     error: Option<trc::StoreEvent>,
+    fault_reads: AtomicUsize,
 }
 
 impl BlobSource for FaultSource<'_> {
@@ -1221,6 +1329,7 @@ impl BlobSource for FaultSource<'_> {
         if hash != self.hash {
             return self.map.fetch(hash).await;
         }
+        self.fault_reads.fetch_add(1, Ordering::Relaxed);
         match self.error {
             Some(trc::StoreEvent::DecryptError) => Err(trc::StoreEvent::DecryptError
                 .into_err()
@@ -1232,10 +1341,12 @@ impl BlobSource for FaultSource<'_> {
 }
 
 #[tokio::test]
-async fn content_transient_during_append_preserves_the_installed_index() {
+async fn content_transient_during_append_does_not_reject_the_map() {
     let (key, _, mut map, bytes, v1) = fixture();
     let v2 = append(&key, &mut map, &v1, 5);
     let v2_bytes = encode(&key, &v2);
+    let head = &v2.content.as_ref().unwrap().hash;
+    let clean = counting(map);
     for (error, expected) in [
         (
             Some(trc::StoreEvent::DecryptError),
@@ -1245,12 +1356,13 @@ async fn content_transient_during_append_preserves_the_installed_index() {
         (None, TransientClass::AbsentWithinWindow),
     ] {
         let cache = cache();
-        let entry = loaded(&map, &cache, &key, &bytes, v1.clone(), true).await;
-        let before = (cache.thread_used(), cache.content_used());
+        let entry = loaded(&clean.map, &cache, &key, &bytes, v1.clone(), true).await;
+        let content_before = cache.content_used();
         let source = FaultSource {
-            map: &map,
-            hash: &v2.content.as_ref().unwrap().hash,
+            map: &clean.map,
+            hash: head,
             error,
+            fault_reads: AtomicUsize::new(0),
         };
         assert_eq!(
             apply_reload(
@@ -1263,18 +1375,359 @@ async fn content_transient_during_append_preserves_the_installed_index() {
                 100
             )
             .await,
-            Err(LoadFailure::Transient(expected))
+            Ok(())
         );
-        assert_eq!((cache.thread_used(), cache.content_used()), before);
-        let index = entry.read_loaded().await.unwrap();
-        assert_eq!(index.manifest, v1);
-        assert_eq!(index.manifest_bytes_hash, manifest_hash(&bytes));
-        assert!(!index.thread.is_present(5));
+        assert_eq!(source.fault_reads.load(Ordering::Relaxed), 0);
+        {
+            let index = entry.read_loaded().await.unwrap();
+            assert_eq!(index.manifest, v2);
+            assert_eq!(index.manifest_bytes_hash, manifest_hash(&v2_bytes));
+            assert!(index.thread.is_present(5));
+            assert!(index.content.is_none());
+        }
+        assert_eq!(cache.content_used(), content_before);
         assert_eq!(
-            index.content.as_ref().unwrap().segments,
-            [segment(12), segment(11)]
+            load_current_content(&source, &entry, &key, cache.config()).await,
+            Err(ObservedLoadError::Other(LoadFailure::Transient(expected)))
         );
+        assert_eq!(source.fault_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.content_used(), content_before);
+        assert_eq!(
+            entry.read_loaded().await.unwrap().manifest_bytes_hash,
+            manifest_hash(&v2_bytes)
+        );
+
+        load_current_content(&clean, &entry, &key, cache.config())
+            .await
+            .unwrap();
+        assert_eq!(clean.reads(), [head.clone()]);
+        let index = entry.read_loaded().await.unwrap();
+        let content = index.content.as_ref().unwrap();
+        assert!(content.part.contains(5));
+        assert_eq!(cache.content_used(), content.bytes);
     }
+}
+
+#[tokio::test]
+async fn moved_content_head_retries_a_transient_without_restoring_its_suffix() {
+    let (key, _, mut map, bytes, v1) = fixture();
+    let cache = cache();
+    let entry = loaded(&map, &cache, &key, &bytes, v1.clone(), true).await;
+    let v2 = append(&key, &mut map, &v1, 5);
+    let v2_bytes = encode(&key, &v2);
+    let failed_head = &v2.content.as_ref().unwrap().hash;
+    let mut v3 = append(&key, &mut map, &v2, 6);
+    v3.content = Some(content_blob(
+        &key,
+        &mut map,
+        segment(26),
+        v1.content.as_ref(),
+        &[5, 6],
+    ));
+    let v3_bytes = encode(&key, &v3);
+    apply_reload(
+        &map,
+        &entry,
+        &key,
+        cache.config(),
+        &v2_bytes,
+        v2.clone(),
+        100,
+    )
+    .await
+    .unwrap();
+    assert!(
+        entry
+            .read_loaded()
+            .await
+            .unwrap()
+            .deferred_content
+            .is_some()
+    );
+
+    let fault = FaultSource {
+        map: &map,
+        hash: failed_head,
+        error: Some(trc::StoreEvent::NotFound),
+        fault_reads: AtomicUsize::new(0),
+    };
+    let (fetching, mut fetches) = mpsc::unbounded_channel();
+    let source = GatedSource {
+        map: &fault,
+        gated: [failed_head.clone()].into_iter().collect(),
+        fetching,
+        release: Semaphore::new(0),
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut load = pin!(timeout_at(
+        deadline,
+        load_current_content(&source, &entry, &key, cache.config())
+    ));
+    tokio::select! {
+        result = &mut load => panic!("Content load did not wait at the gate: {result:?}"),
+        hash = fetches.recv() => assert_eq!(hash.as_ref(), Some(failed_head)),
+    }
+
+    timeout_at(
+        deadline,
+        apply_reload(&map, &entry, &key, cache.config(), &v3_bytes, v3, 100),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        entry.read_loaded().await.unwrap().manifest_bytes_hash,
+        manifest_hash(&v3_bytes)
+    );
+    source.release.add_permits(1);
+    load.await.unwrap().unwrap();
+
+    let index = entry.read_loaded().await.unwrap();
+    assert!(index.deferred_content.is_none());
+    let content = index.content.as_ref().unwrap();
+    assert_eq!(content.segments.first(), Some(&segment(26)));
+    assert!(content.part.contains(5) && content.part.contains(6));
+    assert_eq!(fault.fault_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(cache.content_used(), content.bytes);
+}
+
+#[tokio::test]
+async fn deletion_only_generation_wins_over_prepared_content() {
+    let (key, _, mut map, bytes, v1) = fixture();
+    let cache = cache();
+    let entry = loaded(&map, &cache, &key, &bytes, v1.clone(), false).await;
+    let mut staged = load_content(&map, &entry, &key, &v1, None, 10, 100)
+        .await
+        .unwrap();
+    let old =
+        snapshot_content_tombstones(&entry, &cache, v1.epoch, v1.content.as_ref(), &staged.part)
+            .await
+            .unwrap()
+            .unwrap();
+    apply_tombstones(&mut staged, || old.ids.iter().copied(), &cache, ACCOUNT).unwrap();
+
+    let mut v2 = v1.clone();
+    v2.thread_blobs.push(thread_blob(
+        &key,
+        &mut map,
+        segment(5),
+        vec![],
+        PublicSection {
+            tombstones: vec![Tombstone {
+                document_id: 3,
+                deleted: 250,
+            }],
+            rows: vec![],
+        },
+    ));
+    let v2_bytes = encode(&key, &v2);
+    apply_reload(
+        &map,
+        &entry,
+        &key,
+        cache.config(),
+        &v2_bytes,
+        v2.clone(),
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v1.identity_version(), v2.identity_version());
+    assert_eq!(v1.content, v2.content);
+    assert!(
+        !install_content(
+            &entry,
+            old.version,
+            v2.epoch,
+            v2.content.as_ref(),
+            &mut staged,
+            Ok(())
+        )
+        .await
+        .unwrap()
+    );
+    assert!(staged.part.contains(3));
+    assert!(entry.read_loaded().await.unwrap().content.is_none());
+    drop(old);
+
+    let new =
+        snapshot_content_tombstones(&entry, &cache, v2.epoch, v2.content.as_ref(), &staged.part)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(new.ids, [3]);
+    let prepared = apply_tombstones(&mut staged, || new.ids.iter().copied(), &cache, ACCOUNT);
+    let version = new.version;
+    drop(new);
+    assert!(
+        install_content(
+            &entry,
+            version,
+            v2.epoch,
+            v2.content.as_ref(),
+            &mut staged,
+            prepared
+        )
+        .await
+        .unwrap()
+    );
+    let index = entry.read_loaded().await.unwrap();
+    assert_eq!(index.manifest_bytes_hash, manifest_hash(&v2_bytes));
+    let content = index.content.as_ref().unwrap();
+    assert!(!content.part.contains(3));
+    assert_eq!(cache.content_used(), content.bytes);
+}
+
+#[tokio::test]
+async fn deferred_content_is_evictable_without_losing_the_map() {
+    let (key, _, mut map, bytes, v1) = fixture();
+    let cache = cache();
+    let entry = loaded(&map, &cache, &key, &bytes, v1.clone(), true).await;
+    let before = cache.content_used();
+    let v2 = append(&key, &mut map, &v1, 5);
+    let v2_bytes = encode(&key, &v2);
+    apply_reload(&map, &entry, &key, cache.config(), &v2_bytes, v2, 100)
+        .await
+        .unwrap();
+
+    let reader = entry.read_loaded().await.unwrap();
+    assert!(reader.content.is_none());
+    assert!(reader.deferred_content.is_some());
+    assert!(before > 0);
+    cache.drop_content(ACCOUNT, EvictReason::Budget);
+    assert_eq!(cache.content_used(), before);
+    drop(reader);
+
+    cache.drop_content(ACCOUNT, EvictReason::Budget);
+    assert_eq!(cache.content_used(), 0);
+    let index = entry.read_loaded().await.unwrap();
+    assert!(index.deferred_content.is_none());
+    assert!(index.thread.is_present(5));
+    assert_eq!(index.manifest_bytes_hash, manifest_hash(&v2_bytes));
+}
+
+#[tokio::test]
+async fn cancelled_deferred_refresh_releases_its_suffix_and_reservation() {
+    let (key, _, mut map, bytes, v1) = fixture();
+    let cache = cache();
+    let entry = loaded(&map, &cache, &key, &bytes, v1.clone(), true).await;
+    let before = cache.content_used();
+    let v2 = append(&key, &mut map, &v1, 5);
+    let v2_bytes = encode(&key, &v2);
+    let head = v2.content.as_ref().unwrap().hash.clone();
+    apply_reload(&map, &entry, &key, cache.config(), &v2_bytes, v2, 100)
+        .await
+        .unwrap();
+
+    let (fetching, mut fetches) = mpsc::unbounded_channel();
+    let source = GatedSource {
+        map: &map,
+        gated: [head.clone()].into_iter().collect(),
+        fetching,
+        release: Semaphore::new(0),
+    };
+    let mut loading = Box::pin(load_current_content(&source, &entry, &key, cache.config()));
+    tokio::select! {
+        result = &mut loading => panic!("Content load did not reach the gate: {result:?}"),
+        hash = timeout_at(Instant::now() + Duration::from_secs(2), fetches.recv()) => {
+            assert_eq!(hash.unwrap(), Some(head));
+        }
+    }
+    assert!(cache.content_used() > before);
+    drop(loading);
+    assert_eq!(cache.content_used(), 0);
+    assert!(entry.content_load_flight.try_lock().is_ok());
+    {
+        let index = entry.read_loaded().await.unwrap();
+        assert!(index.content.is_none() && index.deferred_content.is_none());
+        assert_eq!(index.manifest_bytes_hash, manifest_hash(&v2_bytes));
+    }
+    load_current_content(&map, &entry, &key, cache.config())
+        .await
+        .unwrap();
+    assert!(
+        entry
+            .read_loaded()
+            .await
+            .unwrap()
+            .content
+            .as_ref()
+            .unwrap()
+            .part
+            .contains(5)
+    );
+}
+
+#[cfg(feature = "test_mode")]
+#[tokio::test]
+async fn a_cold_refresh_can_fit_after_releasing_the_suffix() {
+    let (key, _, mut map, bytes, v1) = fixture();
+    let cache = cache();
+    let entry = loaded(&map, &cache, &key, &bytes, v1.clone(), true).await;
+    let before = cache.content_used();
+    let mut v2 = append(&key, &mut map, &v1, 5);
+    let ids = 5..=36;
+    let thread = thread_blob(
+        &key,
+        &mut map,
+        segment(5),
+        ids.clone()
+            .map(|id| thread_record(id, v2.revision, v2.newest_row.change_id))
+            .collect(),
+        PublicSection {
+            tombstones: vec![],
+            rows: vec![v1.newest_row],
+        },
+    );
+    let new_thread = thread.hash.clone();
+    *v2.thread_blobs.last_mut().unwrap() = thread;
+
+    let old_head = v1.content.as_ref().unwrap();
+    let old_tail = predecessor_of_head(&map, &v1);
+    let head = v2.content.as_mut().unwrap();
+    let header = BlobHeader {
+        kind: BlobKind::Content,
+        tier: 0,
+        segment: head.segment,
+        predecessor: Some((old_head.hash.clone(), old_head.segment)),
+    };
+    let sort_keys = SortKeys {
+        from: "f".repeat(255),
+        to: "t".repeat(255),
+        subject: "s".repeat(255),
+    };
+    let records = ids
+        .map(|id| ContentRecord::new(document(id), id, sort_keys.clone(), None, false).encode())
+        .collect::<Vec<_>>();
+    let records = records.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let sealed = build_content_blob(&key, ACCOUNT, &header, &records);
+    head.size = old_head.size + sealed.len() as u64;
+    head.hash = BlobHash::generate(&sealed);
+    let new_head = head.hash.clone();
+    map.insert(new_head.clone(), sealed);
+    let budget = content_reservation(head, cache.config()).unwrap();
+
+    let v2_bytes = encode(&key, &v2);
+    let source = counting(map);
+    apply_reload(&source, &entry, &key, cache.config(), &v2_bytes, v2, 100)
+        .await
+        .unwrap();
+    assert_eq!(source.reads(), [new_thread]);
+    assert_eq!(cache.content_used(), before);
+    assert!(before > 0);
+
+    // The new transient's minimum fits, while adding the retained suffix does not.
+    let _budget = cache.override_content_budget_for_test(budget);
+    load_current_content(&source, &entry, &key, cache.config())
+        .await
+        .unwrap();
+    assert_eq!(source.reads(), [new_head, old_head.hash.clone(), old_tail]);
+    let index = entry.read_loaded().await.unwrap();
+    let content = index.content.as_ref().unwrap();
+    assert!(content.part.contains(1) && content.part.contains(36));
+    assert!(!content.part.contains(2));
+    assert_eq!(cache.content_used(), content.bytes);
+    assert!(content.bytes <= budget);
 }
 
 #[tokio::test]

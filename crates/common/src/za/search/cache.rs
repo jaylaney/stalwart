@@ -14,7 +14,10 @@ use std::sync::{
 use store::{
     write::now,
     za_search::{
-        Checkpoint, SegmentId, content::ContentPart, manifest::Manifest, thread::ThreadPart,
+        Checkpoint, SegmentId,
+        content::ContentPart,
+        manifest::{ContentHead, Manifest},
+        thread::ThreadPart,
     },
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedRwLockReadGuard, RwLock};
@@ -120,6 +123,7 @@ impl ZaSearchCache {
                     index: Arc::default(),
                     pass_lock: AsyncMutex::default(),
                     load_flight: AsyncMutex::default(),
+                    content_load_flight: AsyncMutex::default(),
                     last_used: AtomicU64::new(now()),
                     absent: Mutex::default(),
                     cache: Arc::downgrade(&self.inner),
@@ -329,10 +333,9 @@ impl ZaSearchCache {
                     for &(_, account_id) in &candidates {
                         if let Some(entry) = entries.get(&account_id).cloned() {
                             entry.try_eviction(|index| {
-                                if index
-                                    .as_ref()
-                                    .is_some_and(|index| index.content.is_some() == has_content)
-                                {
+                                if index.as_ref().is_some_and(|index| {
+                                    index.has_optional_content() == has_content
+                                }) {
                                     entries.remove(&account_id);
                                     trace_eviction(account_id, EvictReason::Budget);
                                 }
@@ -354,7 +357,7 @@ impl ZaSearchCache {
         let entry = self.entry(account_id);
         let mut guard = entry.index.try_write().expect("test index has no readers");
         let index = guard.get_or_insert_with(|| LoadedIndex::empty(Manifest::default()));
-        index.content = None;
+        drop(index.take_optional_content());
         index.content = self
             .admit(PartKind::Content, bytes, account_id)
             .map(|charge| LoadedContent {
@@ -370,7 +373,10 @@ pub struct IndexEntry {
     pub account_id: u32,
     pub index: Arc<RwLock<Option<LoadedIndex>>>,
     pub pass_lock: AsyncMutex<()>,
+    /// Required Thread loading and validated Map reloads.
     pub load_flight: AsyncMutex<()>,
+    /// Optional Content fetch and detached preparation.
+    pub content_load_flight: AsyncMutex<()>,
     pub(super) last_used: AtomicU64,
     absent: Mutex<AHashMap<BlobHash, u64>>,
     cache: Weak<CacheState>,
@@ -401,34 +407,41 @@ impl IndexEntry {
     fn try_eviction<T>(&self, evict: impl FnOnce(&mut Option<LoadedIndex>) -> T) -> Option<T> {
         let _pass = self.pass_lock.try_lock().ok()?;
         let _load = self.load_flight.try_lock().ok()?;
+        let _content = self.content_load_flight.try_lock().ok()?;
         let mut index = self.index.try_write().ok()?;
         Some(evict(&mut index))
     }
 
     fn try_drop_content(&self, reason: EvictReason) {
-        self.try_eviction(|index| {
-            if let Some(index) = index.as_mut()
-                && index.content.take().is_some()
-            {
-                trace_eviction(self.account_id, reason);
-            }
-        });
+        let retired = self
+            .try_eviction(|index| index.as_mut().and_then(LoadedIndex::take_optional_content))
+            .flatten();
+        if retired.is_some() {
+            trace_eviction(self.account_id, reason);
+        }
     }
 
     /// The current pass owns pass_lock. Budget pressure may release its
     /// content only after a successful preflight, with no reader or load in
     /// flight and only while this exact base remains resident.
     pub fn try_evict_content_for_compaction(&self, base_hash: [u8; 32]) -> bool {
-        let Ok(_load) = self.load_flight.try_lock() else {
+        let Ok(load) = self.load_flight.try_lock() else {
+            return false;
+        };
+        let Ok(content_load) = self.content_load_flight.try_lock() else {
             return false;
         };
         let Ok(mut guard) = self.index.try_write() else {
             return false;
         };
-        if let Some(index) = guard.as_mut()
-            && index.manifest_bytes_hash == base_hash
-            && index.content.take().is_some()
-        {
+        let retired = guard
+            .as_mut()
+            .filter(|index| index.manifest_bytes_hash == base_hash)
+            .and_then(LoadedIndex::take_optional_content);
+        drop(guard);
+        drop(content_load);
+        drop(load);
+        if retired.is_some() {
             trace_eviction(self.account_id, EvictReason::Budget);
             true
         } else {
@@ -456,6 +469,8 @@ pub struct LoadedIndex {
     pub thread: ThreadPart,
     pub thread_segments: Vec<SegmentId>,
     pub content: Option<LoadedContent>,
+    // One previously verified suffix, never served as the current Content.
+    pub(super) deferred_content: Option<(ContentHead, LoadedContent)>,
     pub scanned_to: u64,
     pub update_records: usize,
     pub thread_bytes: u64,
@@ -463,6 +478,17 @@ pub struct LoadedIndex {
 }
 
 impl LoadedIndex {
+    fn has_optional_content(&self) -> bool {
+        self.content.is_some() || self.deferred_content.is_some()
+    }
+
+    pub(super) fn take_optional_content(&mut self) -> Option<LoadedContent> {
+        debug_assert!(self.content.is_none() || self.deferred_content.is_none());
+        self.content
+            .take()
+            .or_else(|| self.deferred_content.take().map(|(_, content)| content))
+    }
+
     pub fn identity_version(&self) -> (u64, u32) {
         self.manifest.identity_version()
     }
@@ -475,6 +501,7 @@ impl LoadedIndex {
             thread: ThreadPart::default(),
             thread_segments: Vec::new(),
             content: None,
+            deferred_content: None,
             update_records: 0,
             thread_bytes: 0,
             thread_charge: BudgetCharge::detached(),

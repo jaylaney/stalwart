@@ -232,7 +232,7 @@ fn attachment_threads<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageAccess, za_content_current, za_resolve_condition, za_sort_comparator};
+    use super::{za_content_current, za_resolve_condition, za_sort_comparator};
     use common::{
         MailboxesCache, MessageStoreCache, MessagesCache, za::search::cache::LoadedIndex,
     };
@@ -370,7 +370,7 @@ mod tests {
                     &condition,
                     &content,
                     &cache,
-                    &MessageAccess::All,
+                    |_| true,
                     |message| message.thread_id()
                 )
                 .unwrap()
@@ -384,7 +384,7 @@ mod tests {
                 &EmailFilter::InMailbox(Id::from(1u32)),
                 &content,
                 &cache,
-                &MessageAccess::All,
+                |_| true,
                 |message| message.thread_id(),
             )
             .is_none()

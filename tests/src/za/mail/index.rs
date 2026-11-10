@@ -204,6 +204,12 @@ pub async fn test(test: &mut TestServer) {
     clean_messages(test, &key).await;
     case_transient_blob_error_aborts_then_indexes(test, &key).await;
     clean_messages(test, &key).await;
+    let search_fix =
+        key_mail_account(test, "searchfix-fixture@example.com", "Searchfix-Fixture!").await;
+    case_in_window_absence_does_not_consume_an_insert(test, &search_fix).await;
+    clean_messages(test, &search_fix).await;
+    case_warm_content_transient_does_not_block_a_served_map(test, &search_fix).await;
+    clean_messages(test, &search_fix).await;
     case_lost_assertion(test, &key).await;
     clean_messages(test, &key).await;
     case_invalidation_between_commit_and_swap(test, &key).await;
@@ -217,7 +223,15 @@ pub async fn test(test: &mut TestServer) {
     case_repeated_delta_changes_nothing(test, &key).await;
     clean_messages(test, &key).await;
 
-    for account in [&key, &split, &plain, &triggers, &waits, &plain_triggers] {
+    for account in [
+        &key,
+        &split,
+        &plain,
+        &triggers,
+        &waits,
+        &plain_triggers,
+        &search_fix,
+    ] {
         test.destroy_all_mailboxes(account).await;
     }
     case_blob_hook_does_not_create_mailboxes(test, &triggers, false).await;
@@ -802,7 +816,7 @@ async fn case_content_loader_uses_original_deadline(test: &TestServer, key: &Acc
 
     // The thread entry is resident and current, so the pass needs no load
     // flight. Only the actual content load waits on this lock.
-    let load_flight = entry.load_flight.lock().await;
+    let load_flight = entry.content_load_flight.lock().await;
     let budget = test.server.inner.cache.za_search.content_used();
     let start = Instant::now();
     let result = tokio::time::timeout(
@@ -1826,6 +1840,196 @@ async fn case_transient_blob_error_aborts_then_indexes(test: &TestServer, key: &
         }),
         "{events:?}"
     );
+}
+
+async fn case_in_window_absence_does_not_consume_an_insert(test: &TestServer, key: &Account) {
+    println!("case_in_window_absence_does_not_consume_an_insert");
+    let _config = search_config_guard!(test, skip_after: 2, absent_retry_secs: 60, segments: 255);
+    let id = account_id(key);
+    let needle = "absencerecoveryfixture";
+    let document = deliver_one(test, key, needle).await;
+    let keys = za_unlock(test, id, key.secret()).await;
+    let hash = stored_hash(test, id, document).await;
+    let saved = stored_blob(test, &hash).await;
+    let before = index(test, id).await;
+    let links = principal_blob_links(test, id).await;
+    let limit = test.server.za_search_config().skip_after;
+
+    let blob_store = test.server.blob_store();
+    assert!(blob_store.delete_blob(hash.as_slice()).await.unwrap());
+    let start = Instant::now();
+    let mut attempts = Vec::new();
+    for _ in 0..=limit {
+        let outcome = test.server.za_search_pass(id, &keys).await;
+        let manifest = read_manifest(test, id).await;
+        let links = principal_blob_links(test, id).await;
+        attempts.push((outcome, manifest, links));
+    }
+    let elapsed = start.elapsed();
+    blob_store
+        .put_blob(hash.as_slice(), &saved, &test.server.core.blob.email)
+        .await
+        .unwrap();
+
+    assert!(elapsed < Duration::from_secs(59), "{elapsed:?}");
+    for (outcome, manifest, after_links) in attempts {
+        assert_eq!(
+            outcome.unwrap(),
+            PassOutcome::Aborted(TransientClass::AbsentWithinWindow)
+        );
+        let Some(ManifestValue::Index(manifest)) = manifest else {
+            panic!("aborted pass did not retain the manifest: {manifest:?}");
+        };
+        assert_eq!(manifest.indexed_to, before.indexed_to);
+        assert_eq!(manifest.content_to, before.content_to);
+        assert_eq!(manifest.cursor, before.cursor);
+        assert_eq!(manifest.reconciliation, before.reconciliation);
+        assert_eq!(after_links, links);
+        assert_eq!(
+            manifest.failing,
+            Some(FailingDocument {
+                document_id: document,
+                attempts: 0,
+            })
+        );
+    }
+
+    advanced(test, key, true).await;
+    let after = index(test, id).await;
+    assert_eq!(after.epoch, before.epoch);
+    assert!(after.failing.is_none());
+    assert!(index_holds(test, id, document).await);
+    assert_eq!(
+        queried(&recovery_query(key, Some(needle)).await),
+        [email_id(document)]
+    );
+
+    let _expired = search_config_guard!(test, absent_retry_secs: 0);
+    let expired = deliver_one(test, key, "Already expired absence fixture").await;
+    let hash = stored_hash(test, id, expired).await;
+    let saved = stored_blob(test, &hash).await;
+    let latest = change_id(test, id).await;
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    assert!(blob_store.delete_blob(hash.as_slice()).await.unwrap());
+    let outcome = test.server.za_search_pass(id, &keys).await;
+    blob_store
+        .put_blob(hash.as_slice(), &saved, &test.server.core.blob.email)
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome.unwrap(),
+        PassOutcome::Advanced {
+            published: false,
+            indexed_to,
+        } if indexed_to.complete && indexed_to.change_id == latest
+    ));
+    let after = index(test, id).await;
+    assert_eq!(after.epoch, before.epoch);
+    assert_eq!(after.content_to.checkpoint, after.indexed_to);
+    assert!(!index_holds(test, id, expired).await);
+    let events = traces.finish().await;
+    assert!(events.iter().any(|event| {
+        event.account_id == Some(u64::from(id))
+            && event.details == ZA_SEARCH_SKIPPED
+            && event.reason == LossClass::BlobAbsent.as_str()
+            && event
+                .keys
+                .contains(&(Key::DocumentId, TraceValue::UInt(u64::from(expired))))
+    }));
+}
+
+async fn case_warm_content_transient_does_not_block_a_served_map(test: &TestServer, key: &Account) {
+    println!("case_warm_content_transient_does_not_block_a_served_map");
+    let _config = search_config_guard!(test, segments: 255);
+    let id = account_id(key);
+    let root = message_with("Map refresh fixture", "maprefreshrootfixture");
+    let reference = root
+        .lines()
+        .find_map(|line| line.strip_prefix("Message-ID: "))
+        .unwrap();
+    deliver(test, SENDER, key.name(), &root).await;
+    let root_id = super::new_message(test, id, &[]).await;
+    advanced(test, key, true).await;
+    assert_eq!(
+        queried(&recovery_query(key, Some("maprefreshrootfixture")).await),
+        [email_id(root_id)]
+    );
+    let old_hash = {
+        let view = loaded(test, id).await;
+        assert!(view.content.is_some());
+        view.manifest_bytes_hash
+    };
+
+    let needle = "maprefreshreplyfixture";
+    let reply = message_with("Re: Map refresh fixture", needle).replacen(
+        "\r\n\r\n",
+        &format!("\r\nIn-Reply-To: {reference}\r\n\r\n"),
+        1,
+    );
+    deliver(test, SENDER, key.name(), &reply).await;
+    let reply_id = super::new_message(test, id, &[root_id]).await;
+    let keys = za_unlock(test, id, key.secret()).await;
+    set_search_swap_skip(Some(id));
+    let outcome = test.server.za_search_pass(id, &keys).await;
+    set_search_swap_skip(None);
+    assert!(matches!(
+        outcome.unwrap(),
+        PassOutcome::Advanced {
+            published: true,
+            ..
+        }
+    ));
+    let manifest = index(test, id).await;
+    let raw = manifest_bytes(test, id).await.unwrap();
+    let committed_hash = manifest_hash(&raw);
+    assert_ne!(committed_hash, old_hash);
+    let links = principal_blob_links(test, id).await;
+    {
+        let view = loaded(test, id).await;
+        assert_eq!(view.manifest_bytes_hash, old_hash);
+        assert!(view.content.is_some());
+    }
+    let thread_hash = &manifest.thread_blobs.last().unwrap().hash;
+    assert_eq!(
+        &BlobHash::generate(&stored_blob(test, thread_hash).await),
+        thread_hash
+    );
+
+    let timeout = SearchBlobTimeoutOnce::new(id, manifest.content.as_ref().unwrap().hash.clone());
+    let mapped_reply = Id::from_parts(root_id, reply_id).to_string();
+    assert_ne!(mapped_reply, email_id(reply_id));
+    reset_za_search_counters(id);
+    let answer = recovery_get(key).await;
+    assert!(
+        !timeout.was_consumed(),
+        "the keyed Map path read optional Content: {:?}",
+        answer.0
+    );
+    assert_eq!(answer.name_at(0), "Email/get", "{:?}", answer.0);
+    let thread_id = Id::from(root_id).to_string();
+    let emails = answer.method_response()["list"].as_array().unwrap();
+    assert!(
+        emails.iter().any(|email| {
+            email["id"].as_str() == Some(mapped_reply.as_str())
+                && email["threadId"].as_str() == Some(thread_id.as_str())
+        }),
+        "{:?}",
+        answer.0
+    );
+    assert_eq!(loaded(test, id).await.manifest_bytes_hash, committed_hash);
+    assert_eq!(za_search_blob_reads(id), 1);
+
+    assert_search_unavailable(&recovery_query(key, Some(needle)).await);
+    assert!(timeout.was_consumed());
+    drop(timeout);
+    reset_za_search_counters(id);
+    assert_eq!(
+        queried(&recovery_query(key, Some(needle)).await),
+        [mapped_reply]
+    );
+    assert_eq!(za_search_blob_reads(id), 1);
+    assert_eq!(manifest_bytes(test, id).await.unwrap(), raw);
+    assert_eq!(principal_blob_links(test, id).await, links);
 }
 
 async fn park(

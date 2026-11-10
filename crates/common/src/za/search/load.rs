@@ -289,6 +289,15 @@ impl ThreadDelta {
         Ok(Self { blobs })
     }
 
+    fn has_deletions(&self) -> bool {
+        self.blobs.iter().any(|(_, hidden, public)| {
+            !public.tombstones.is_empty()
+                || hidden.as_ref().is_some_and(|hidden| {
+                    hidden.records.iter().any(|record| record.deleted.is_some())
+                })
+        })
+    }
+
     fn apply(self, loaded: &mut LoadedIndex, row: RevisionRow) {
         for (segment, hidden, public) in self.blobs {
             let hidden = hidden.unwrap_or_default();
@@ -613,15 +622,14 @@ fn empty_content() -> LoadedContent {
     }
 }
 
-fn apply_tombstones(
+fn apply_tombstones<I: Iterator<Item = u32>>(
     content: &mut LoadedContent,
-    thread: &ThreadPart,
+    deletions: impl Fn() -> I,
     cache: &ZaSearchCache,
     account_id: u32,
 ) -> Result<(), LoadFailure> {
-    let deletions = || thread.records().filter(|record| record.deleted.is_some());
     let scratch_size = deletions()
-        .map(|record| content.part.removal_scratch(record.document_id))
+        .map(|document_id| content.part.removal_scratch(document_id))
         .max()
         .unwrap_or_default();
     if !cache.grow(
@@ -633,10 +641,8 @@ fn apply_tombstones(
         return Err(LoadFailure::Transient(TransientClass::Budget));
     }
     let mut scratch = Zeroizing::new(Vec::with_capacity(scratch_size));
-    for record in deletions() {
-        content
-            .part
-            .remove_with_scratch(record.document_id, &mut scratch);
+    for document_id in deletions() {
+        content.part.remove_with_scratch(document_id, &mut scratch);
     }
     drop(scratch);
     content.bytes = content.part.loaded_bytes() as u64;
@@ -682,7 +688,17 @@ pub async fn load_content<S: BlobSource>(
     .await?;
     walk.apply(&mut content, &cache, entry.account_id)?;
     if let Some(index) = entry.index.read().await.as_ref() {
-        apply_tombstones(&mut content, &index.thread, &cache, entry.account_id)?;
+        apply_tombstones(
+            &mut content,
+            || {
+                index
+                    .thread
+                    .records()
+                    .filter_map(|record| record.deleted.map(|_| record.document_id))
+            },
+            &cache,
+            entry.account_id,
+        )?;
     } else {
         cache.grow(
             &mut content.charge,
@@ -779,13 +795,104 @@ fn matches_head(head: Option<&ContentHead>, hash: &BlobHash, segment: SegmentId)
     head.is_some_and(|head| head.segment == segment && head.hash == *hash)
 }
 
+fn same_content_target(index: &LoadedIndex, epoch: u64, head: Option<&ContentHead>) -> bool {
+    index.manifest.epoch == epoch && index.manifest.content.as_ref() == head
+}
+
+struct ContentTombstones {
+    version: [u8; 32],
+    ids: Vec<u32>,
+    _charge: Option<BudgetCharge>,
+}
+
+fn matching_tombstones<'a>(
+    thread: &'a ThreadPart,
+    content: &'a ContentPart,
+) -> impl Iterator<Item = u32> + 'a {
+    thread
+        .records()
+        .filter(|record| record.deleted.is_some() && content.contains(record.document_id))
+        .map(|record| record.document_id)
+}
+
+async fn snapshot_content_tombstones(
+    entry: &IndexEntry,
+    cache: &ZaSearchCache,
+    epoch: u64,
+    head: Option<&ContentHead>,
+    content: &ContentPart,
+) -> Result<Option<ContentTombstones>, LoadFailure> {
+    let invalid = LoadFailure::Transient(TransientClass::Validation);
+    let (version, count) = {
+        let guard = entry.index.read().await;
+        let index = guard.as_ref().ok_or(invalid)?;
+        if !same_content_target(index, epoch, head) {
+            return Ok(None);
+        }
+        (
+            index.manifest_bytes_hash,
+            matching_tombstones(&index.thread, content).count(),
+        )
+    };
+    if count == 0 {
+        return Ok(Some(ContentTombstones {
+            version,
+            ids: Vec::new(),
+            _charge: None,
+        }));
+    }
+
+    let charge = cache.admit(
+        PartKind::Content,
+        (count as u64).saturating_mul(size_of::<u32>() as u64),
+        entry.account_id,
+    );
+    let guard = entry.index.read().await;
+    let index = guard.as_ref().ok_or(invalid)?;
+    if index.manifest_bytes_hash != version || !same_content_target(index, epoch, head) {
+        return Ok(None);
+    }
+    let charge = charge.ok_or(LoadFailure::Transient(TransientClass::Budget))?;
+    let mut ids = Vec::with_capacity(count);
+    ids.extend(matching_tombstones(&index.thread, content));
+    Ok(Some(ContentTombstones {
+        version,
+        ids,
+        _charge: Some(charge),
+    }))
+}
+
+async fn install_content(
+    entry: &IndexEntry,
+    version: [u8; 32],
+    epoch: u64,
+    head: Option<&ContentHead>,
+    staged: &mut LoadedContent,
+    prepared: Result<(), LoadFailure>,
+) -> Result<bool, LoadFailure> {
+    let mut guard = entry.index.write().await;
+    let index = guard
+        .as_mut()
+        .ok_or(LoadFailure::Transient(TransientClass::Validation))?;
+    if index.manifest_bytes_hash != version || !same_content_target(index, epoch, head) {
+        return Ok(false);
+    }
+    prepared?;
+    let retired = index
+        .content
+        .replace(std::mem::replace(staged, empty_content()));
+    drop(guard);
+    drop(retired);
+    Ok(true)
+}
+
 async fn load_current_content<S: BlobSource>(
     source: &S,
     entry: &IndexEntry,
     key: &Secret,
     config: &ZaSearchConfig,
 ) -> Result<(), ObservedLoadError> {
-    let _flight = entry.load_flight.lock().await;
+    let _flight = entry.content_load_flight.lock().await;
     let cache = entry
         .cache()
         .ok_or(LoadFailure::Transient(TransientClass::Validation))?;
@@ -795,7 +902,7 @@ async fn load_current_content<S: BlobSource>(
     let mut staged_head: Option<(u64, ContentHead)> = None;
 
     loop {
-        let (version, epoch, head) = {
+        let (version, epoch, head, has_deferred) = {
             let guard = entry.index.read().await;
             let index = guard.as_ref().ok_or(invalid)?;
             if let Some(head) = &index.manifest.content {
@@ -808,9 +915,9 @@ async fn load_current_content<S: BlobSource>(
                 index.manifest_bytes_hash,
                 index.manifest.epoch,
                 index.manifest.content.clone(),
+                index.deferred_content.is_some(),
             )
         };
-
         if head.is_none()
             || staged_head
                 .as_ref()
@@ -820,12 +927,34 @@ async fn load_current_content<S: BlobSource>(
             staged_head = None;
         }
 
+        let mut untouched_deferred = false;
+        if head.is_some() && staged_head.is_none() && has_deferred {
+            let mut guard = entry.index.write().await;
+            let index = guard.as_mut().ok_or(invalid)?;
+            if index.manifest_bytes_hash != version {
+                drop(guard);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            if let Some((previous, content)) = index.deferred_content.take() {
+                staged = content;
+                staged_head = Some((epoch, previous));
+                untouched_deferred = true;
+            }
+        }
+
+        let had_suffix = staged_head.is_some();
         let result = async {
             let Some(head) = head.as_ref() else {
                 return Ok(());
             };
+            let stop = staged_head.as_ref().map(|(_, head)| head);
+            // An unchanged head with newer Thread tombstones needs only pruning.
+            if stop == Some(head) {
+                return Ok(());
+            }
             let reserved = content_reservation(head, config)?;
-            if staged_head.is_none() {
+            if !had_suffix {
                 staged.charge = cache
                     .admit(PartKind::Content, reserved, entry.account_id)
                     .ok_or(budget)?;
@@ -837,9 +966,8 @@ async fn load_current_content<S: BlobSource>(
             ) {
                 return Err(budget);
             }
-            let stop = staged_head.as_ref().map(|(_, head)| head);
             let previous_bytes = staged.bytes;
-            ContentWalk::read(
+            let walk = ContentWalk::read(
                 source,
                 entry,
                 key,
@@ -856,8 +984,9 @@ async fn load_current_content<S: BlobSource>(
                     )
                 },
             )
-            .await?
-            .apply(&mut staged, &cache, entry.account_id)?;
+            .await?;
+            untouched_deferred = false;
+            walk.apply(&mut staged, &cache, entry.account_id)?;
             if !cache.grow(
                 &mut staged.charge,
                 PartKind::Content,
@@ -869,36 +998,74 @@ async fn load_current_content<S: BlobSource>(
             Ok(())
         }
         .await;
-        if result.is_err() {
-            staged = empty_content();
+
+        if let Err(failure) = result {
+            if had_suffix && failure == budget {
+                // A fresh load may fit once the old suffix is released.
+                staged = empty_content();
+                staged_head = None;
+                trace_eviction(entry.account_id, EvictReason::Budget);
+                continue;
+            }
+
+            let restore = untouched_deferred && matches!(failure, LoadFailure::Transient(_));
+            if restore {
+                cache.grow(
+                    &mut staged.charge,
+                    PartKind::Content,
+                    staged.bytes,
+                    entry.account_id,
+                );
+            }
+            let mut guard = entry.index.write().await;
+            let index = guard.as_mut().ok_or(invalid)?;
+            if !same_content_target(index, epoch, head.as_ref()) {
+                drop(guard);
+                staged = empty_content();
+                staged_head = None;
+                tokio::task::yield_now().await;
+                continue;
+            }
+            if restore && index.manifest_bytes_hash == version {
+                let (_, previous) = staged_head.expect("deferred suffix head");
+                debug_assert!(index.deferred_content.is_none());
+                index.deferred_content = Some((previous, staged));
+            }
+            drop(guard);
+            return Err(match failure {
+                LoadFailure::Loss(class) => ObservedLoadError::ContentLoss(ContentLoss {
+                    class,
+                    manifest_hash: version,
+                    epoch,
+                    head: head.expect("content loss requires a named head"),
+                }),
+                other => ObservedLoadError::Other(other),
+            });
         }
 
-        let mut guard = entry.index.write().await;
-        let index = guard.as_mut().ok_or(invalid)?;
-        if index.manifest.epoch != epoch || index.manifest.content != head {
-            // A pass can advance the manifest while this load is reading blobs.
-            // Keep a verified suffix only for the same epoch and exact descriptor.
-            staged_head = if result.is_ok() {
-                head.map(|head| (epoch, head))
+        staged_head = head.clone().map(|head| (epoch, head));
+        if let Some(tombstones) =
+            snapshot_content_tombstones(entry, &cache, epoch, head.as_ref(), &staged.part).await?
+        {
+            let prepared = if tombstones.ids.is_empty() {
+                Ok(())
             } else {
-                None
+                apply_tombstones(
+                    &mut staged,
+                    || tombstones.ids.iter().copied(),
+                    &cache,
+                    entry.account_id,
+                )
             };
-            drop(guard);
-            tokio::task::yield_now().await;
-            continue;
+            let version = tombstones.version;
+            drop(tombstones);
+            if install_content(entry, version, epoch, head.as_ref(), &mut staged, prepared).await? {
+                return Ok(());
+            }
         }
-        result.map_err(|failure| match failure {
-            LoadFailure::Loss(class) => ObservedLoadError::ContentLoss(ContentLoss {
-                class,
-                manifest_hash: version,
-                epoch,
-                head: head.expect("content loss requires a named head"),
-            }),
-            other => ObservedLoadError::Other(other),
-        })?;
-        apply_tombstones(&mut staged, &index.thread, &cache, entry.account_id)?;
-        index.content = Some(staged);
-        return Ok(());
+        // A newer committed generation arrived during preparation. A same-head
+        // retry just refreshes tombstones. An append can use the verified stage.
+        tokio::task::yield_now().await;
     }
 }
 
@@ -911,9 +1078,9 @@ pub async fn apply_reload<S: BlobSource>(
     manifest: Manifest,
     now: u64,
 ) -> Result<(), LoadFailure> {
-    let _flight = entry.load_flight.lock().await;
+    let flight = entry.load_flight.lock().await;
     let mut guard = entry.index.write().await;
-    apply_reload_locked(
+    let result = apply_reload_locked(
         source,
         entry,
         &mut guard,
@@ -923,9 +1090,12 @@ pub async fn apply_reload<S: BlobSource>(
         manifest,
         now,
     )
-    .await
-    .map(|_| ())
-    .map_err(|failure| failure.classification())
+    .await;
+    drop(guard);
+    drop(flight);
+    result
+        .map(|_| ())
+        .map_err(|failure| failure.classification())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -938,7 +1108,7 @@ async fn apply_reload_locked<S: BlobSource>(
     manifest_bytes: &[u8],
     manifest: Manifest,
     now: u64,
-) -> Result<bool, ObservedLoadError> {
+) -> Result<(bool, Option<LoadedContent>), ObservedLoadError> {
     let cache = entry
         .cache()
         .ok_or(LoadFailure::Transient(TransientClass::Validation))?;
@@ -947,7 +1117,7 @@ async fn apply_reload_locked<S: BlobSource>(
         .ok_or(LoadFailure::Transient(TransientClass::Validation))?;
     let hash = manifest_hash(manifest_bytes);
     if old.manifest_bytes_hash == hash {
-        return Ok(false);
+        return Ok((false, None));
     }
 
     let account_id = entry.account_id;
@@ -972,56 +1142,27 @@ async fn apply_reload_locked<S: BlobSource>(
             ObservedLoadError::map_read(failure, || manifest_bytes.to_vec(), Some(hash))
         })?;
 
-    let mut new_content = None;
-    if let Some(head) = manifest.content.as_ref()
-        && old.content.is_some()
-        && (content_head_moved || !content_head_is_resident(old))
+    // Move optional state by ownership only. It cannot participate in the
+    // required reload or keep the previous Map installed.
+    let content_allowed = manifest
+        .content
+        .as_ref()
+        .is_some_and(|head| content_reservation(head, config).is_ok());
+    let retired = if whole || !content_allowed {
+        old.take_optional_content()
+    } else if (content_head_moved || delta.has_deletions())
+        && let Some(content) = old.content.take()
     {
-        let stop = if !whole && content_head_is_resident(old) {
-            old.manifest.content.as_ref()
-        } else {
-            // Free the previous part before the whole-chain reservation.
-            old.content = None;
+        if let Some(head) = old.manifest.content.clone() {
+            debug_assert!(old.deferred_content.is_none());
+            old.deferred_content = Some((head, content));
             None
-        };
-        let content = async {
-            let reserved = content_reservation(head, config)?;
-            let mut charge = cache
-                .admit(PartKind::Content, reserved, account_id)
-                .ok_or(LoadFailure::Transient(TransientClass::Budget))?;
-            let walk = ContentWalk::read(
-                source,
-                entry,
-                key,
-                Some(head),
-                |hash, segment| matches_head(stop, hash, segment),
-                window,
-                now,
-                |bytes| {
-                    cache.grow(
-                        &mut charge,
-                        PartKind::Content,
-                        bytes.max(reserved),
-                        account_id,
-                    )
-                },
-            )
-            .await?;
-            Ok((walk, charge))
+        } else {
+            Some(content)
         }
-        .await;
-        match content {
-            Ok(staged) => new_content = Some(staged),
-            Err(LoadFailure::Transient(TransientClass::Budget) | LoadFailure::OverCap) => {
-                old.content = None;
-                trace_eviction(account_id, EvictReason::Budget);
-            }
-            // Keep content-only loss out of the thread load contract. An
-            // explicit content load retries this head and reports its loss.
-            Err(LoadFailure::Loss(_)) => old.content = None,
-            Err(err) => return Err(err.into()),
-        }
-    }
+    } else {
+        None
+    };
 
     let scanned_to = old.scanned_to.max(scanned_seed(&manifest.indexed_to));
     let row = manifest.newest_row;
@@ -1042,39 +1183,7 @@ async fn apply_reload_locked<S: BlobSource>(
     );
     old.manifest_bytes_hash = hash;
     old.scanned_to = scanned_to;
-    if old.manifest.content.is_none() {
-        old.content = None;
-    }
-
-    let applied = if let Some((walk, charge)) = new_content {
-        if walk.joined {
-            let content = old.content.as_mut().expect("joined resident suffix");
-            content.charge.absorb(charge);
-            walk.apply(content, &cache, account_id)
-                .and_then(|()| apply_tombstones(content, &old.thread, &cache, account_id))
-        } else {
-            let mut content = empty_content();
-            content.charge = charge;
-            let result = walk
-                .apply(&mut content, &cache, account_id)
-                .and_then(|()| apply_tombstones(&mut content, &old.thread, &cache, account_id));
-            if result.is_ok() {
-                old.content = Some(content);
-            }
-            result
-        }
-    } else if let Some(content) = old.content.as_mut() {
-        apply_tombstones(content, &old.thread, &cache, account_id)
-    } else {
-        Ok(())
-    };
-    if applied.is_err() {
-        // The map is still usable. A partially applied optional content part
-        // is discarded on budget refusal.
-        old.content = None;
-        trace_eviction(account_id, EvictReason::Budget);
-    }
-    Ok(true)
+    Ok((true, retired))
 }
 
 impl Server {
@@ -1162,14 +1271,14 @@ impl Server {
         keys: &SessionKeys,
     ) -> Result<bool, ObservedLoadError> {
         let key = keys.swk();
-        let _flight = entry.load_flight.lock().await;
+        let flight = entry.load_flight.lock().await;
         // Serialize the manifest read with applying it. A delayed reload can
         // otherwise overwrite a newer local swap with an older manifest.
         let mut guard = entry.index.write().await;
         let (bytes, manifest) = self
             .read_search_index_manifest(entry.account_id, key)
             .await?;
-        apply_reload_locked(
+        let result = apply_reload_locked(
             self,
             entry,
             &mut guard,
@@ -1179,7 +1288,10 @@ impl Server {
             manifest,
             now(),
         )
-        .await
+        .await;
+        drop(guard);
+        drop(flight);
+        result.map(|(changed, _retired)| changed)
     }
 
     pub async fn za_search_load_content(
