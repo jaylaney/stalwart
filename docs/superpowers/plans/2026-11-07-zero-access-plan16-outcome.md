@@ -40,6 +40,11 @@ Branch `release7-search`, fork point `3649daf00bc5d63f662938eace4dd19d82ac88f2`.
 | 19, intermediate | `ea67be7f3` fixture controls, `28f84bdc6` system benchmark and controls, `f7c02e5bc` failure diagnostics, `fff5e6c10` benchmark client ceiling, and `f4eb2ecc` M30 test opener. Focused independent reviews accepted these changes. |
 | 19, consolidated correction | `53062c367ac0b85596017fed6ebb50edd8a66567` addresses WB1–WB3. [Implementation review](2026-11-07-zero-access-16-search-implementation-review.md) committed separately at `4dde13ade2be92411d76eb7906b14a0423359dc9`. |
 
+A later test-only follow-up integrates the independently reviewed T13 Content
+caller-floor regression from the [remaining-checks report](2026-11-07-zero-access-16-search-remaining-checks-review.md).
+Its full-suite qualification passed with both default and FileSystem blob storage.
+The production implementation and accepted defaults are unchanged.
+
 Task 19 qualification remains incomplete. Both final-head benchmarks
 completed on `4dde13ade`. The post-H7 query served a match with a wire
 limit of 1, and separate internal assertions verified Content membership
@@ -926,25 +931,92 @@ code. The fixture account and call sites are in
 
 ## Mutation runs (plan 16)
 
-**Fresh Step 2 campaign unexecuted.** The original 55 offline drafts were
-inspected. Their separate rebase package reports 55 prepared drafts. Existing
-artifact hashes match their records. The separate primary forward/reverse
-verification request stopped before dispatch without a stated reason and
-did not run. The original 19 screened checks remain a distinct unqualified
-set. The stopped work stays closed to retries and rerouting. No mutant was
-applied or executed.
+**Fresh Step 2 campaign partly executed.** At the earlier local cutoff,
+automatic screening had stopped preparation of 19 checks, and a separate
+forward/reverse verification request for 55 rebased drafts had stopped before
+dispatch. Jay subsequently commissioned an independent validation task on
+`bcc81d177`, whose production and test source matched `53062c367`. Its
+[remaining-checks report](2026-11-07-zero-access-16-search-remaining-checks-review.md)
+records focused, baselined fault runs for the 19 targets, exact restoration,
+and preparation-only verification of all 55 drafts. The earlier stopped
+attempts did not execute; the later evidence belongs to the independent task.
+
+Eighteen targets detected their fault at the named catcher. T13 Caller floor
+was partly demonstrated: standalone changes and Map queryChanges caught the
+missing minimum, but the Content route did not. Its existing zero-second wait
+refused before exercising the caller floor. The separate test-only proposal
+uses a real flag update and a held cache to isolate that floor from the
+publication and Content-checkpoint floors. Its correct-code focused baseline
+passed; removing the Content caller argument then failed at the expected
+error-class assertion. It observed `CannotCalculateChanges` instead of the
+required Content-unavailable error, not a successful stale response.
+
+The proposal has been integrated byte-for-byte in
+`tests/src/za/mail/threads/task13/minimum.rs` after independent Astra review.
+It changes no production code. The full ZA suite passed with both
+default and FileSystem blob storage on this integrated test. Those correct-code
+passes qualify integration; they are separate from the earlier focused fault
+run. Task 19 and the complete Step 2 campaign remain incomplete.
 
 | Fresh preparation category | Status |
 |---|---|
-| 55 offline drafts | Separate rebase prepared. Primary forward/reverse verification of that rebase did not run. Mutation execution and restoration evidence remain pending. |
-| Two race targets | M18 and M26. Automatic screening stopped preparation. Both are unqualified. |
-| Eight paging/view targets | M35, M55, M57, M58, M59, T10-content-floor, T10-final-cap and T13-caller-floor. Automatic screening stopped preparation. All are unqualified. |
-| Nine epoch/recovery targets | M68–M73 and M74a/b/c. Automatic screening stopped preparation. All are unqualified. Partial epoch artifacts remain outside the accepted package. |
+| 55 offline drafts | Independent preparation verification passed for all 55: source binding, forward application and exact reversal. These drafts were not behaviorally executed, and nonempty selection of their catchers remains unverified. |
+| Two race targets | M18 and M26 detected their faults in focused, baselined runs. M26's original masking assertion and the narrower follow-up are both preserved. M18's later after-failed-CAS assertion was not reached. |
+| Eight paging/view targets | M35, M55, M57, M58, M59, T10-content-floor and T10-final-cap detected their faults. T13's standalone/Map routes detected theirs; the existing Content route survived. The added Content fixture passed its focused baseline and caught that fault; full-suite integration qualification passed with both default and FileSystem blob storage. |
+| Nine epoch/recovery targets | M68–M73 and M74a/b/c detected their faults in focused, baselined runs; each production edit was restored exactly. |
 | M30 opener | Correct-code unit passed with 39 opened documents. The wrong-reservation outcome remains unexecuted. R21 covers fixed padding, with distinct reservation-only coverage pending. |
 | Remaining preparation and restored checks | Pending release and execution. |
 
-The 19 screened targets have no accepted fresh preparation or runtime
-result. Classify each as unqualified.
+The report preserves the exact selections, commands, first failing assertions,
+restoration hashes and deviations. These were focused module selections within
+`za::za_tests`, not fault runs under the full suite or FileSystem blob variant.
+M35's secondary admission-equality fixture, M18's after-failed-CAS assertion and
+M58's recovery variants after Thread remain unobserved in this campaign. The
+55 drafts and the other Step 2 rows were not executed by this follow-up.
+
+### T13 Content caller-floor integration, 2026-11-10
+
+The integrated test file has SHA-256
+`125438ccea0d0e3223b38c1dd594d4b7244f2c4d55749368dbea472a7d220c94`.
+It is the exact reviewed 88-line addition to `bcc81d177`, not a test present in
+that original commit. Production sources and the full-suite dispatcher were
+unchanged. Independent Astra review accepted the proposal and the evidence
+calibration; the primary verified the applied bytes and both raw full-suite
+results. The external report's unapplied/focused-only cutoff remains preserved.
+
+Both runs used stable Rust 1.99.0, the normal unoptimized test profile,
+`STORE=RocksDb RUST_MIN_STACK=16777216`, a private temporary directory, and no
+`ZA_SEARCH_*` environment overrides. The second set `BLOB_STORE=FileSystem`;
+the first left it unset. They ran serially, once each, using:
+
+```sh
+export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+cargo test --locked --offline -p tests za::za_tests -- --exact --nocapture
+```
+
+| Blob storage | Selection and result | Cargo exit | Test / command wall time | Evidence |
+|---|---|---|---|---|
+| Default RocksDB | 1 passed, 0 failed, 0 ignored, 111 filtered | 0 | 1640.65 s / 1873.980 s | [Default log](../../../.superpowers/sdd/2026-11-07-zero-access-16-search/task19-t13c-integration-7sev4in8/default/cargo-test.log) |
+| FileSystem, with RocksDB data store | 1 passed, 0 failed, 0 ignored, 111 filtered | 0 | 1739.49 s / 1741.346 s | [FileSystem log](../../../.superpowers/sdd/2026-11-07-zero-access-16-search/task19-t13c-integration-7sev4in8/filesystem/cargo-test.log) |
+
+The new case's banner appeared once in each full run. Both reached the paired
+corpus comparisons and final cleanup, with no panic or watchdog expiry.
+The tested source hashes and diff were unchanged before and after each run.
+Formatting and whitespace checks passed. Both Cargo outputs retained the known
+Apple compact-unwind linker warning and its summary, with no new source warning.
+A supplementary listener-preflight tool warned about an unrelated mounted volume;
+the successful kernel snapshots showed all required ports vacant. No test had
+started during those preflight diagnostics, so they are not runtime retries.
+
+Default log SHA-256:
+`0566591f8539d5832679e52f9406e940f61bd328574d9b76dbb8993fd0792307`.
+FileSystem log SHA-256:
+`37a1a80758d0b877a16d03a138aa41fff850e4d03a85ab234f60f303b9c0a3b2`.
+Commands, environment, source identities, receipts and the retained proposal are
+in the [validation receipt](../../../.superpowers/sdd/2026-11-07-zero-access-16-search/task19-t13c-integration-7sev4in8/final.txt)
+and [evidence inventory](../../../.superpowers/sdd/2026-11-07-zero-access-16-search/task19-t13c-integration-7sev4in8/evidence.sha256).
+These runs close integration of this coverage fix, not the remaining mutation,
+cold-serving or external qualification gaps.
 
 ### Historical task kill checks
 
@@ -1119,7 +1191,7 @@ That observer did not reach system startup logging or a request beyond
 
 - **Tasks 9–10.** Task 9 repaired the test teardown and narrowed the exact push-state assertion to the ingest event with its durable row. Keyed IMAP preserves wire order and distinguishes witness updates from a real flags mutation. The first Task 9 key JMAP run failed at the ordinary Sales/admin thread partition. Later diagnostic and final runs passed. Its original cause remains unexplained. Task 10 turned the mail search refusal tables into served results and parity, including depth-20 BODY, while retaining depth-33 BAD, unsupported/mixed controls, whole-request unavailable and keyless refusal. Mail reads now expect keyed snippets. The trace fixture expects tagged OK for FROM and retains the original redaction and malformed controls.
 - **Tasks 11–12.** The gates table expects exact keyless refusals for the mapped methods, with served mailbox and Core controls; the shared helper moved. Read fixtures retain persisted singleton rows but assert mapped wire IDs and collapse. Task 12 replaces interim UID-set-only THREAD with grouping, and asserts mapped members and derived counts while keeping actual independent singleton controls. Shared keyed cleanup had erased durable log and allocators while keeping the manifest. Its diagnostic isolated that mismatch and its correction preserves the retained Email history/namespace, retaining ordinary resets. The key JMAP run still failed at the old 100 actual vs 978 expected singleton-thread assertion.
-- **Task 13.** Exact old/new mapped IDs, Initial/continuation presence, both retained markers and changed epoch rules replace raw singleton rendering. F15 observed an idle FLAGS/UID notification, unchanged explicit FETCH MODSEQ for that UID and omission from CHANGEDSINCE, with advancing HIGHESTMODSEQ. The caller-only Content queryChanges floor is source-verified; shared minimum/wait/deadline has runtime evidence. Initial key JMAP failed in 9.81 s at 799 of 978 mapped IDs retrieved by the old chunk loader, before Task 12's old singleton assertion. Advancing prefixes across Get batches is a source-supported explanation. Task 17 replaced the loader with content currentness and exact ID coverage and passed canonical key JMAP.
+- **Task 13.** Exact old/new mapped IDs, Initial/continuation presence, both retained markers and changed epoch rules replace raw singleton rendering. F15 observed an idle FLAGS/UID notification, unchanged explicit FETCH MODSEQ for that UID and omission from CHANGEDSINCE, with advancing HIGHESTMODSEQ. At Task 13 acceptance, the caller-only Content queryChanges floor was source-verified and the shared minimum/wait/deadline had runtime evidence. The later independent remaining-checks task exposed the masked Content assertion and supplied the focused baseline/fault-tested case described under Mutation runs; full-suite integration qualification passed with both default and FileSystem blob storage. Initial key JMAP failed in 9.81 s at 799 of 978 mapped IDs retrieved by the old chunk loader, before Task 12's old singleton assertion. Advancing prefixes across Get batches is a source-supported explanation. Task 17 replaced the loader with content currentness and exact ID coverage and passed canonical key JMAP.
 - **Task 14.** The first canonical RocksDB run exited 101 in 531.79 s at the earlier Initial-after-truncation test. A 23.52 s reproduction showed marker 7, retained row 8 and legitimate checkpoint movement 6→8 during reconciliation, with zero publication, unchanged epoch 0 and newest row 3@7, equal inventories and retained Email records, and no later Thread suffix. The one-file fix requires exact complete checkpoint 8, cleared marker and all preserved identity and wire checks. Focused rerun 86.84 s and corrected full RocksDB 722.31 s both exited 0. R16/R20 asserts keyed `{A},{N,N2}` versus ordinary `{A,N,N2}` with D absent.
 - **Task 15.** The 737.88 s canonical run failed the warm-eviction assertion after the fixture's requested budget override missed the actual cache budget. A targeted actual-cache override tests the effective budget. Subsequent scoped corrections covered real allowance cases, cold decode/merge accounting and linked retirement ownership; accepted full RocksDB 766.93 s exit 0. The separate warm-write finding closed at `b51a5e193`.
 - **Task 16.** The first 16a FileSystem attempt stopped before suite execution at a log-directory barrier. The amended freeze ran on both backends. Task 16b's I6 RED saw field 152 still present before Reindex integration. The final recode oracle accepts adaptive compression for sealed blobs, still requiring exact decoded bytes and selected key; the compressible ordinary control requires Zstd. The modeled stale-reset overlap is a single-manager fixture.
@@ -1159,7 +1231,7 @@ That observer did not reach system startup logging or a request beyond
 - Task 3 construction reversal alone did not force both hash iteration orders. The deterministic Task 15 companion forces the downstream-first map traversal and closes that fixture gap; the fresh Task 19 mutation remains pending.
 - Task 9 first Sales failure remains unexplained. Later passes record non-recurrence.
 - Task 10 source review deferred the unchanged ordinary/mixed SAVE construction that may wait on its own saved-search result. No runtime reproduction was claimed.
-- Task 13 caller-only Content floor is source-only. Current-row values in queryChanges are the accepted scope. A revision-indexed performance shortcut depends on Task 19 measurement.
+- Task 13 caller-only Content floor now has a focused correct-code pass and a named fault failure in the independent remaining-checks report. The exact test-only proposal is integrated; the full ZA suite passed with both default and FileSystem blob storage. Current-row values in queryChanges are the accepted scope. A revision-indexed performance shortcut depends on Task 19 measurement.
 - Task 15 warm admission finding closed separately. The benchmark now records 30,000-message sealed headroom and warmed residency. Cold wire serving and final production limit qualification remain open.
 - Task 17 IMAP helper uses a 1.5 s per-line read deadline. Its warm fixture passed. A cold-backlog IMAP wait-budget result remains absent; the 5 s JMAP cutoff was separately reproduced and corrected.
 - Task 18 original ordering timestamps and exact earlier partition schedules remain unobserved. The corpus includes bounded synthetic controls and real mailbox records. Broader attachment-format/client coverage is open.

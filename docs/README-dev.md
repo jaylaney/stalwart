@@ -127,7 +127,7 @@ shipping release build on the source-identical review-record head. The
 first full SMTP attempt exited 101. The permitted exact retry passed
 once, with the cause still unknown. Docker automation and directory
 verification await CI. Both final-head benchmarks completed, bringing the
-matrix to 39 of 41 main rows accounted for locally. Fresh mutations,
+matrix to 39 of 41 main rows accounted for locally. Remaining mutation checks,
 native clients, the separate fresh-store gate, networked-store timing
 and physical multi-node verification remain pending.
 

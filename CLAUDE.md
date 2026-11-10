@@ -236,7 +236,13 @@ coverage verified for 30,000 delivered IDs. Full-size cold serving and
 its linked warm repeat remain unqualified. The final-head format repeat
 measured all 15,000 default messages. The matrix accounts for 39 of 41
 main rows locally. Docker automation and directory verification await CI.
-Fresh mutations, native clients, the separate fresh-store gate,
+The [independent remaining-checks report](docs/superpowers/plans/2026-11-07-zero-access-16-search-remaining-checks-review.md)
+records 18 of 19 targets caught in focused fault runs, plus a T13 Content
+caller-minimum coverage gap. The exact reviewed test-only strengthening is
+integrated; the full ZA suite passed with both default and FileSystem blob
+storage. All 55 rebased drafts passed preparation verification, but their
+behavioral runs and the rest of the mutation
+campaign remain pending. Native clients, the separate fresh-store gate,
 networked-store timing and physical multi-node verification remain pending.
 
 Where release 2 lives: the UID lease in `crates/common/src/za/lease.rs` (`ZA_UID_LEASE_SECS`, default 30, clamped 1..=3600; lease keys start with `store::ZA_UID_LEASE_PREFIX`, which the generic in-memory purge skips, so the asserting sweep is the only lease cleanup); the fan-out in `crates/groupware/src/calendar/fanout.rs` (`za_fan_out` takes an optional lease fence that every recipient item's write asserts): the drain's delegating merge and the PUT create pass theirs; the drain in `crates/groupware/src/calendar/drain.rs` (`ZaDrain::za_drain`, called from `handle_dav_request` in `crates/dav/src/request.rs` for every DAV request whose token holds session keys; `DRAIN_RETRY_SECS = 30` is a constant); a pass attempts at most `DRAIN_PASS_CAP` (32) items, an item that fails `DRAIN_ITEM_FAILURE_LIMIT` (3) times in a session is skipped for the session with later items of its UID waiting behind it, and a private key that does not open suspends the session's drain (the per-session state in `vault::session::ZaDrainState`, the failure bookkeeping in `vault::session::PassState`); and the lease sweep in `common::za::lease::sweep_expired_uid_leases`, called from the maintenance task's purge step (`crates/services/src/task_manager/tasks/maintenance.rs` at 1.0, after `purge_store`). The drain's delegating merge fans out to new delegates under the organizer's UID lease, passing it as the fence; new delegates are detected per instance (`Attendance`, `governing_instance`, shared with the stale-reply check): an address that did not attend the governing instance before, or whose DELEGATED-FROM gained an address.

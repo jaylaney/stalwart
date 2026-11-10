@@ -70,15 +70,27 @@ full SMTP run exited 101 with 75 passed, one failed and three ignored.
 The permitted exact isolated retry passed once. The cause remains unknown.
 Both final-head benchmark repeats completed, with the system serving
 limits below. The matrix accounts for 39 of 41 main rows locally.
-Docker automation and directory verification await CI. Fresh mutation
-execution remains pending. The
+Docker automation and directory verification await CI. The full mutation
+campaign remains incomplete. The
 [outcome note](2026-11-07-zero-access-plan16-outcome.md) records the attempt
 details and remaining gates.
 
-Nineteen checks stopped by automatic screening remain unqualified. A
-separate independent verification request for the updated offline drafts
-stopped before dispatch without a stated reason. No mutation result
-exists for either stopped set.
+After the earlier stopped checks, Jay commissioned an independent validation
+task on source-identical `bcc81d177`. The
+[remaining-checks report](2026-11-07-zero-access-16-search-remaining-checks-review.md)
+records 18 of 19 targets detected in focused, baselined fault runs. The T13
+Content caller-minimum target survived the existing suite; the standalone and
+Map routes were caught. The proposed test-only case passed on correct code
+and caught the missing Content argument. Independent Astra review found no
+actionable flaw, and the exact proposal is integrated. The full ZA
+suite passed with both default and FileSystem blob storage. No production fix
+was required.
+
+The same independent task verified the source binding and exact forward/reverse
+application of all 55 rebased drafts. This was preparation verification, not
+behavioral execution of those drafts; nonempty catcher selection and the rest
+of the Step 2 campaign remain pending. Earlier screening failures remain
+separate historical attempts, without execution results.
 
 The earlier full benchmark at `f4eb2ecc` recorded refusals for full-size
 cold and post-rebuild Content. At `4dde13ade` the post-H7 query served
