@@ -63,19 +63,34 @@ assertions, and leaves production and suite-wide rates unchanged.
 
 ## Remaining qualification
 
-The Task 19 full verification matrix, fresh mutation execution, final-head
-benchmarks and tracked outcome integration are still pending. Nineteen checks
-stopped by automatic screening remain unqualified. A separate independent
-verification request for the updated offline drafts was stopped before dispatch
-without a reason; it is not an observed test failure or a mutation result.
+The later Step 5 matrix ran on `4dde13ade` with source identical to the
+accepted implementation. It records four carried rows, 14 Phase A rows,
+18 Phase B rows and the warning-free shipping release build. The initial
+full SMTP run exited 101 with 75 passed, one failed and three ignored.
+The permitted exact isolated retry passed once. The cause remains unknown.
+Both final-head benchmark repeats completed, with the system serving
+limits below. The matrix accounts for 39 of 41 main rows locally.
+Docker automation and directory verification await CI. Fresh mutation
+execution remains pending. The
+[outcome note](2026-11-07-zero-access-plan16-outcome.md) records the attempt
+details and remaining gates.
 
-The completed full benchmark belongs to `f4eb2ecc`, before this correction.
-Its full-size cold and post-rebuild Content serving remain unqualified.
-Native clients, networked-store timing and physical multi-node behavior also
-remain outside this approval. No merge, push, deployment or release is implied.
+Nineteen checks stopped by automatic screening remain unqualified. A
+separate independent verification request for the updated offline drafts
+stopped before dispatch without a stated reason. No mutation result
+exists for either stopped set.
+
+The earlier full benchmark at `f4eb2ecc` recorded refusals for full-size
+cold and post-rebuild Content. At `4dde13ade` the post-H7 query served
+a match, and the harness independently checked the current head and
+internal coverage for all 30,000 delivered IDs. Full-size cold wire
+serving and the skipped linked warm repeat remain unqualified. Native
+clients, the separate fresh-store gate, networked-store timing and
+physical multi-node behavior remain outside this approval. No merge, push, deployment or release is implied.
 
 The complete original and scoped reports, raw logs and source snapshots are
-retained locally under `.superpowers/sdd/2026-11-07-zero-access-16-search/`.
+retained under `.superpowers/sdd/2026-11-07-zero-access-16-search/` as
+checkout-local ignored files, absent in ordinary clones.
 The scoped reports are `whole-branch-fix-scoped-state-review.md` and
 `whole-branch-fix-scoped-privacy-review.md`; execution evidence is in
 `whole-branch-fix-report.md` and `whole-branch-fix-primary-shipping.json`.
