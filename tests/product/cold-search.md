@@ -43,7 +43,9 @@ which binds the IPv6 wildcard address with IPv4 fallback. The runner connects
 through loopback using newly generated recovery credentials. Recovery provisions
 the loopback HTTP and LMTP listeners, disables application downloads, spam
 filtering and ASN lookups, then stops cleanly. The synthetic key account and
-mail exist only after normal startup.
+mail exist only after normal startup. Before LMTP delivery, the runner opens
+a keyed JMAP session and calls `Mailbox/get` to initialize system folders.
+It validates the response and requires exactly one Inbox.
 
 LMTP accepts only the local recipient. The runner sends a null envelope sender,
 disables authentication, relaying, sender DNS checks, inbound throttles and
@@ -54,9 +56,8 @@ clears inherited Stalwart and zero-access settings. The runner checks startup
 for all fourteen original search defaults.
 
 The LMTP reply with a queue ID acknowledges a committed queue write. The gate
-checks the SMTP queue,
-ordinary index queues and due tasks through the recovery administrator before
-opening a keyed mail session. Bounded setup searches then drive indexing.
+checks the SMTP queue, ordinary index queues and due tasks through the
+recovery administrator after delivery. Bounded setup searches then drive indexing.
 The before-restart public census compares the full unfiltered mailbox ID set
 with the full body-canary result set. Every generated body starts with
 `bodycanary`. Each set must have the expected total, distinct IDs and one stable
@@ -84,8 +85,9 @@ reads. This run retains the host's filesystem caches.
 
 `receipt.json` records the command, binary version and checksum, corpus digest
 and counts, fixture settings, phase, both structured outcomes, and elapsed
-times. The private work directory and sanitized server log are retained on
-failure. The runner sends termination only to its own child.
+times. The `mailbox_initialization` receipt records the setup method, response
+validation, mailbox and Inbox counts, Inbox role and mailbox state. The private
+work directory and sanitized server log are retained on failure. The runner sends termination only to its own child.
 
 Run the mocked checks without listeners or a server.
 

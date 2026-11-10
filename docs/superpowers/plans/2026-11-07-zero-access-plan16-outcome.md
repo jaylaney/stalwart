@@ -53,12 +53,22 @@ cold query refused and its linked warm repeat was skipped.
 [System benchmark](#final-head-system-benchmark) and
 [format benchmark](#final-head-format-benchmark).
 
+The later [cold-start qualification](2026-11-10-zero-access-search-cold-start-outcome.md)
+records a 30,000-message optimized Rust pair after in-process cache
+eviction. Both queries returned the expected result in 26.469 s and
+507.458 µs, with exact-head internal coverage and unchanged durable state.
+The run logged a teardown panic after measurement. The separate optimized
+OSS restart pair served in 23.053 s and 1.026 ms, with matching public
+censuses across restart. Local 30,000-message cold-search qualification
+is complete. All fourteen search settings are unchanged. Memory and
+account sizing defaults remain provisional.
+
 Locally accounted for are 39 of 41 main Step 5 rows on `4dde13ade` and
 source-identical implementation `53062c367`. Four source-identical rows
 were carried, 33 passed, one SMTP row qualified with its one permitted
 exact retry, and one system harness completed with the serving limits
-above. The retry is separate from the main-row count. Two Docker rows
-remain for CI. [Matrix ledger](../../../.superpowers/sdd/2026-11-07-zero-access-16-search/task19-final-matrix-progress.json)
+recorded for that historical run. The retry is separate from the main-row
+count. Two Docker rows remain for CI. [Matrix ledger](../../../.superpowers/sdd/2026-11-07-zero-access-16-search/task19-final-matrix-progress.json)
 
 | Step 5 group | Status |
 |---|---|
@@ -721,9 +731,9 @@ printing is outside wire timing and inside phase wall and cadence.
 The completed default fixture supports sealed-size headroom, full-size
 resident growth with direct milestone warming, and successful full-size
 serving after H7. Full-size cold and the linked warm-repeat wire query
-remain open. This unoptimized benchmark gives no isolated stage timing or
-alternate-setting comparison to support a specific production default
-change. Retain the approved 512 MiB account, 1,536 MiB Content and 256 MiB Thread
+were unqualified on this run. This unoptimized benchmark gives no isolated
+stage timing or alternate-setting comparison to support a specific
+production default change. Retain the approved 512 MiB account, 1,536 MiB Content and 256 MiB Thread
 defaults provisionally. The optimized shipping binary was built
 separately. Observed differences from the earlier run establish no
 controlled causal or release-profile performance attribution.
@@ -863,7 +873,7 @@ code. The fixture account and call sites are in
 
 ## Spec questions and plan calls
 
-- **A1–A4.** Keep the format/system benchmark split. Use existing Term compression and upstream tokenization via the test accessor. Record text-only attachment coverage. The final-head system harness completed. Its post-H7 Content query served, and full-size cold wire serving remains unqualified.
+- **A1–A4.** Keep the format/system benchmark split. Use existing Term compression and upstream tokenization via the test accessor. Record text-only attachment coverage. The final-head system harness completed. Its post-H7 Content query served, and its full-size cold query refused.
 - **A5–A7 and B1.** Use main's post-schema boot refusal. Task 2 owns format constants including derived R=304, a=15, reservation 529 B and K=16. Refuse segment limits outside 2–255. With H=32 KiB, 48 items are within the 61-reservation bound.
 - **B2–B9.** Keep upstream Term/positions, exact allowance and typed refusal, corrupt phrase refusal, access-driven sweep, last-holder accounting, the test-only AssignedIds constructor, cycle-bounded alias resolution and upstream's 16-byte verbatim prefix rule. Thread allowance declines optional compaction within the final inventory bound; typed content-tier overflow refuses the proposed pass.
 - **C1–C8.** Retry-window start is resident and the non-absent attempt count durable. Cursor work uses a separate pass from log work. Manifest hash is recomputed from commit-assigned bytes. Setup uses the existing vault batch extension. `scanned_to` proves complete records only. JMAP triggers once before qualifying own-account mail methods and coordinates the bounded post-pass. Restart controls evict state in-process. H6 governs absent-blob loss after the window. Only a current non-absent transient can reach the attempt bound and skip as Parse.
@@ -1224,7 +1234,11 @@ That observer did not reach system startup logging or a request beyond
 - EmailSubmission/get projects the current thread rather than a stored submission-time prefix. Initial renders present objects as created even if upstream calls them updated or loses the insert. After truncation a gap insert can thread with a message the gap also deleted. Upstream would have threaded that way only when the insert came first.
 - Duration and the checkpoint where the time cap stops reveal admitted processing cost (§2, R30/H4). Delivery still keeps off the features enumerated in §6.4.
 - The permanent-destroy fence covers already admitted creators against the captured vault/manifest evidence. Later issuance from an already authorized stale setup token and potential later rebuild remains the narrow §5.7 residual. This is an authority/lifetime limitation, separate from duplicate-worker cleanup and the tested reset fences.
-- The PostgreSQL point-read figure, native clients, full-size cold serving and its linked warm repeat, and Docker-only evidence remain pending. Direct warmed residency and post-H7 serving are recorded separately.
+- The PostgreSQL point-read figure, native clients, the separate broader
+  fresh-store gate and Docker-only evidence remain pending. The
+  [cold-start qualification](2026-11-10-zero-access-search-cold-start-outcome.md)
+  records the completed local Rust and shipping cold-search measurements
+  and the unresolved Rust teardown anomaly.
 
 ## Deferred findings
 
@@ -1232,7 +1246,7 @@ That observer did not reach system startup logging or a request beyond
 - Task 9 first Sales failure remains unexplained. Later passes record non-recurrence.
 - Task 10 source review deferred the unchanged ordinary/mixed SAVE construction that may wait on its own saved-search result. No runtime reproduction was claimed.
 - Task 13 caller-only Content floor now has a focused correct-code pass and a named fault failure in the independent remaining-checks report. The exact test-only proposal is integrated; the full ZA suite passed with both default and FileSystem blob storage. Current-row values in queryChanges are the accepted scope. A revision-indexed performance shortcut depends on Task 19 measurement.
-- Task 15 warm admission finding closed separately. The benchmark now records 30,000-message sealed headroom and warmed residency. Cold wire serving and final production limit qualification remain open.
+- Task 15 warm admission finding closed separately. The benchmark now records 30,000-message sealed headroom and warmed residency. Final production limit qualification remains open.
 - Task 17 IMAP helper uses a 1.5 s per-line read deadline. Its warm fixture passed. A cold-backlog IMAP wait-budget result remains absent; the 5 s JMAP cutoff was separately reproduced and corrected.
 - Task 18 original ordering timestamps and exact earlier partition schedules remain unobserved. The corpus includes bounded synthetic controls and real mailbox records. Broader attachment-format/client coverage is open.
 

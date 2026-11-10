@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
 """Server-free checks for the shipping cold search runner."""
+from contextlib import ExitStack, redirect_stdout
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, patch
 
@@ -181,6 +184,80 @@ class DeliveryTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_empty_inbox_setup_precedes_delivery_and_is_absent_from_restart(self):
+        events = []
+        ids = tuple(f"id{index}" for index in range(1, 6))
+
+        def jmap_call(method, arguments, timeout):
+            events.append(method)
+            if method == "Mailbox/get":
+                self.assertEqual(arguments, {"properties": ["id", "role"]})
+                self.assertEqual(timeout, 15)
+                return {
+                    "list": [{"id": "mailbox1", "role": "inbox"},
+                             {"id": "mailbox2", "role": "trash"}],
+                    "notFound": [], "state": "state1",
+                }
+            if arguments.get("calculateTotal"):
+                return query_result(ids, total=5)
+            return query_result()
+
+        def deliver(_corpus, _port, _recipient, receipt, _save):
+            events.append("delivery")
+            receipt["queued"] = 5
+
+        def restart(recovery):
+            self.assertIs(recovery, False)
+            events.append("restart")
+
+        server = Mock(config="private-store.json", http_port=16001, lmtp_port=16002, quotas={})
+        server.key_account.return_value = ("synthetic@cold.test", "secret-password")
+        server.redactor.sanitize.side_effect = lambda value: value
+        server.start.side_effect = restart
+        server.stop_clean.side_effect = lambda: events.append("stop")
+        corpus = Mock()
+        corpus.summary.return_value = {"mime_bytes": 5}
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
+            work = Path(directory) / "new"
+            args = SimpleNamespace(work_dir=work, smoke=True, binary=Path("/synthetic"),
+                                   binary_sha256="sha", source_commit="commit", corpus=work)
+            replacements = {
+                "ProductServer": Mock(return_value=server),
+                "Gate": Mock(), "check_startup": Mock(), "retain_server_log": Mock(),
+                "binary_identity": Mock(return_value={}), "file_digest": Mock(return_value="sha"),
+                "Jmap": Mock(return_value=jmap_call), "deliver": deliver,
+            }
+            with ExitStack() as stack:
+                for name, replacement in replacements.items():
+                    stack.enter_context(patch.object(cold, name, replacement))
+                stack.enter_context(patch.object(cold.Corpus, "verify", return_value=corpus))
+                stack.enter_context(redirect_stdout(io.StringIO()))
+                self.assertEqual(cold.run(args, ["synthetic"]), 0)
+            receipt = json.loads((work / "receipt.json").read_text())
+        self.assertEqual(events, [
+            "Mailbox/get", "delivery", "Email/query", "Email/query", "Email/query",
+            "stop", "restart", "Email/query", "Email/query", "Email/query", "Email/query",
+            "stop",
+        ])
+        self.assertEqual(receipt["mailbox_initialization"], {
+            "method": "Mailbox/get", "response_shape_valid": True, "mailbox_count": 2,
+            "inbox_count": 1, "role": "inbox", "state": "state1",
+        })
+        self.assertEqual(receipt["expected"]["query_state"], receipt["pair"][0]["query_state"])
+        self.assertNotIn("secret-password", json.dumps(receipt))
+
+    def test_inbox_initialization_rejects_missing_and_duplicate_inboxes(self):
+        for inbox_count in (0, 2):
+            with self.subTest(inbox_count=inbox_count):
+                result = {"state": "state1", "notFound": [], "list": [
+                    {"id": f"mailbox{index}", "role": "inbox"}
+                    for index in range(inbox_count)
+                ]}
+                receipt = {}
+                with self.assertRaisesRegex(cold.GateError, "exactly one Inbox"):
+                    cold.initialize_inbox(Mock(return_value=result), receipt)
+                self.assertEqual(receipt["mailbox_initialization"]["inbox_count"], inbox_count)
+
     def test_lifecycle_has_no_mail_call_between_restart_and_pair_and_preserves_failure(self):
         server = Mock()
         probe = Mock()

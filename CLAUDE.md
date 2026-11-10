@@ -232,10 +232,18 @@ completed Phases A and B, and a warning-free shipping release build.
 The first full SMTP run failed with exit 101. The permitted exact retry
 passed once, and the cause remains unknown. The final-head system
 harness completed and the post-H7 query served, with internal model
-coverage verified for 30,000 delivered IDs. Full-size cold serving and
-its linked warm repeat remain unqualified. The final-head format repeat
-measured all 15,000 default messages. The matrix accounts for 39 of 41
-main rows locally. Docker automation and directory verification await CI.
+coverage verified for 30,000 delivered IDs. That run's cold query refused
+and its linked repeat was skipped. The final-head format repeat measured
+all 15,000 default messages. The matrix accounts for 39 of 41 main rows
+locally. Docker automation and directory verification await CI.
+The later [cold-start qualification](docs/superpowers/plans/2026-11-10-zero-access-search-cold-start-outcome.md)
+records the optimized 30,000-message Rust pair after in-process cache
+eviction, with the expected results in 26.469 s and 507.458 µs. The run
+logged a teardown panic after measurement. The separate optimized OSS
+restart pair served the expected results in 23.053 s and 1.026 ms with
+matching 30,000-ID public censuses. Local cold-search qualification is
+complete. All fourteen search settings are unchanged. Memory and account
+sizing defaults remain provisional.
 The [independent remaining-checks report](docs/superpowers/plans/2026-11-07-zero-access-16-search-remaining-checks-review.md)
 records 18 of 19 targets caught in focused fault runs, plus a T13 Content
 caller-minimum coverage gap. The exact reviewed test-only strengthening is

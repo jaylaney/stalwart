@@ -49,9 +49,14 @@ configuration. Unset, malformed and zero values use the defaults. The memory
 and account sizing defaults remain provisional after the unoptimized system
 benchmarks on `f4eb2ecc` and `4dde13ade`. The final-head post-H7 wire query
 served and internal model coverage was verified for all 30,000 delivered
-IDs. Full-size cold wire serving and its linked warm repeat remain
-unqualified. The final-head format repeat measured all 15,000 default
-messages and retained the existing positions and compression decisions.
+IDs. Its cold query refused and its linked repeat was skipped. The
+final-head format repeat measured all 15,000 default messages and retained
+the existing positions and compression decisions. The later
+[cold-start qualification](superpowers/plans/2026-11-10-zero-access-search-cold-start-outcome.md)
+records a successful optimized Rust cache-eviction pair at 30,000 messages
+and the subsequent teardown panic. The separate optimized OSS run passed
+the 30,000-message process-restart gate with matching public censuses.
+All fourteen search settings are unchanged.
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |

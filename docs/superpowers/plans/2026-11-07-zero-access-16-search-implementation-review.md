@@ -95,10 +95,15 @@ separate historical attempts, without execution results.
 The earlier full benchmark at `f4eb2ecc` recorded refusals for full-size
 cold and post-rebuild Content. At `4dde13ade` the post-H7 query served
 a match, and the harness independently checked the current head and
-internal coverage for all 30,000 delivered IDs. Full-size cold wire
-serving and the skipped linked warm repeat remain unqualified. Native
-clients, the separate fresh-store gate, networked-store timing and
-physical multi-node behavior remain outside this approval. No merge, push, deployment or release is implied.
+internal coverage for all 30,000 delivered IDs. The cold query refused
+on that run and its linked warm repeat was skipped. The later
+[cold-start qualification](2026-11-10-zero-access-search-cold-start-outcome.md)
+records the 30,000-message optimized Rust result after in-process cache
+eviction and the subsequent teardown panic. The separate optimized OSS
+run passed the 30,000-message process-restart gate with matching public
+censuses. Native clients, the separate broader fresh-store gate,
+networked-store timing and physical multi-node behavior remain outside
+this approval. No merge, push, deployment or release is implied.
 
 The complete original and scoped reports, raw logs and source snapshots are
 retained under `.superpowers/sdd/2026-11-07-zero-access-16-search/` as

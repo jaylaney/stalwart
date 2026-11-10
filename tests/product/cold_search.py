@@ -315,6 +315,29 @@ class Jmap:
         return data
 
 
+def initialize_inbox(jmap, receipt):
+    """Initialize the empty fixture's system folders through a public mail request."""
+    result = jmap("Mailbox/get", {"properties": ["id", "role"]}, timeout=15)
+    mailboxes = result.get("list")
+    state = result.get("state")
+    shape_valid = (
+        isinstance(mailboxes, list) and result.get("notFound") == [] and token(state)
+        and all(isinstance(mailbox, dict) and token(mailbox.get("id"))
+                and "role" in mailbox
+                and (mailbox["role"] is None or token(mailbox["role"]))
+                for mailbox in mailboxes)
+    )
+    inboxes = sum(mailbox["role"] == "inbox" for mailbox in mailboxes) if shape_valid else None
+    receipt["mailbox_initialization"] = {
+        "method": "Mailbox/get", "response_shape_valid": shape_valid,
+        "mailbox_count": len(mailboxes) if isinstance(mailboxes, list) else None,
+        "inbox_count": inboxes, "role": "inbox" if inboxes == 1 else None,
+        "state": state if token(state) else None,
+    }
+    require(shape_valid, "initial Mailbox/get returned an invalid response")
+    require(inboxes == 1, "initial Mailbox/get did not identify exactly one Inbox")
+
+
 def query_fields(result, position, limit):
     ids = result.get("ids")
     state = result.get("queryState")
@@ -515,13 +538,16 @@ def run(args, command):
             "mta_settings": MTA_SETTINGS, "inbound_throttle_enabled": False,
             "applications_enabled": False, "spam_enabled": False, "asn_enabled": False,
         }
+        step("initialize the empty fixture Inbox")
+        jmap = Jmap(server.http_port, auth)
+        initialize_inbox(jmap, receipt)
         step("submit verified fixture via LMTP")
         deliver(corpus, server.lmtp_port, auth[0], receipt, save)
         require(receipt["queued"] == count, "LMTP acknowledgment count differs from the fixture")
         step("drain public delivery and task queues")
         Gate(server, lambda _message: None).wait_for_drain(timeout=SETUP_TIMEOUT)
         step("verify complete public body canary coverage before restart")
-        probe = Probe(Jmap(server.http_port, auth))
+        probe = Probe(jmap)
         expected = probe.prepare(count, receipt, save)
         step("restart and send the two measured queries")
         restart_and_measure(server, probe, expected, receipt, save)
