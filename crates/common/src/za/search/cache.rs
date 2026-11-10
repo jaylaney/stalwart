@@ -140,6 +140,19 @@ impl ZaSearchCache {
         self.inner.entries.lock().unwrap().get(&account_id).cloned()
     }
 
+    /// Peek at the entry table without blocking or touching idle state.
+    #[cfg(feature = "test_mode")]
+    pub fn try_get_for_test(&self, account_id: u32) -> Option<Option<Arc<IndexEntry>>> {
+        Some(
+            self.inner
+                .entries
+                .try_lock()
+                .ok()?
+                .get(&account_id)
+                .cloned(),
+        )
+    }
+
     pub fn remove_account(&self, account_id: u32, reason: EvictReason) {
         if self
             .inner
@@ -390,7 +403,14 @@ impl IndexEntry {
     }
 
     pub async fn read_loaded(self: &Arc<Self>) -> Option<LoadedGuard> {
-        let guard = self.index.clone().read_owned().await;
+        let read = self.index.clone().read_owned();
+        #[cfg(feature = "test_mode")]
+        let read = crate::za::test_hooks::observe_search_wait(
+            self.account_id,
+            crate::za::test_hooks::SearchStage::ResidentIndexWait,
+            read,
+        );
+        let guard = read.await;
         let guard = OwnedRwLockReadGuard::try_map(guard, Option::as_ref).ok()?;
         self.touch();
         Some(guard)
@@ -478,6 +498,20 @@ pub struct LoadedIndex {
 }
 
 impl LoadedIndex {
+    /// Expose the resident optional part's position without allowing the
+    /// diagnostic to take ownership of deferred Content or promote it.
+    #[cfg(feature = "test_mode")]
+    pub fn content_for_test(&self) -> Option<(bool, Option<&ContentHead>, &LoadedContent)> {
+        self.content
+            .as_ref()
+            .map(|content| (true, self.manifest.content.as_ref(), content))
+            .or_else(|| {
+                self.deferred_content
+                    .as_ref()
+                    .map(|(head, part)| (false, Some(head), part))
+            })
+    }
+
     fn has_optional_content(&self) -> bool {
         self.content.is_some() || self.deferred_content.is_some()
     }

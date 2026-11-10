@@ -56,12 +56,14 @@ use types::{
     id::Id,
 };
 
+pub(super) mod cold;
+
 const PLAIN: &str = "search-bench-plain@example.com";
 const CAP_CONTROL: &str = "search-bench-cap@example.com";
 const MIB: u64 = 1 << 20;
 const SMALL: usize = 2_000;
-const DESIGN: usize = 30_000;
-const SEED: u64 = 1;
+pub(super) const DESIGN: usize = 30_000;
+pub(super) const SEED: u64 = 1;
 // Client measurement headroom for owned compaction. Product deadlines are separate.
 const WIRE_TIMEOUT: Duration = Duration::from_secs(600);
 const MILESTONE_LOAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -90,11 +92,20 @@ impl<'a> Wire<'a> {
             .unwrap_or_else(|error| panic!("{method}: {error}"))
     }
 
-    async fn try_call(&self, method: &str, mut args: Value) -> Result<(Duration, Value), String> {
+    async fn try_call(&self, method: &str, args: Value) -> Result<(Duration, Value), String> {
+        self.try_call_with_id(method, args, "bench").await
+    }
+
+    async fn try_call_with_id(
+        &self,
+        method: &str,
+        mut args: Value,
+        call_id: &str,
+    ) -> Result<(Duration, Value), String> {
         args["accountId"] = json!(self.account.id_string());
         let payload = json!({
             "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-            "methodCalls": [[method, args, "bench"]],
+            "methodCalls": [[method, args, call_id]],
         });
         let request = self
             .client
@@ -112,10 +123,9 @@ impl<'a> Wire<'a> {
             .await
             .map_err(|error| transport_failure("body", start.elapsed(), &error))?;
         let elapsed = start.elapsed();
-        assert!(
-            status.is_success(),
-            "{method}: HTTP {status} after {elapsed:?}"
-        );
+        if !status.is_success() {
+            return Err(format!("HTTP {} after {elapsed:?}", status.as_u16()));
+        }
         let response: Value = serde_json::from_slice(&body).map_err(|error| {
             format!(
                 "JSON decode failure after {:?} (wire {elapsed:?}): {:?}, line {}, column {}",
@@ -128,9 +138,15 @@ impl<'a> Wire<'a> {
         let calls = response["methodResponses"].as_array().ok_or_else(|| {
             format!("response envelope failure after {elapsed:?}: missing methodResponses array")
         })?;
-        assert_eq!(calls.len(), 1, "{method}: unexpected method response count");
-        assert!(calls[0][2] == "bench", "{method}: unexpected call ID");
-        Ok((elapsed, calls[0].clone()))
+        let [call] = calls.as_slice() else {
+            return Err(format!(
+                "unexpected method response count after {elapsed:?}"
+            ));
+        };
+        if call[2] != call_id {
+            return Err(format!("unexpected call ID after {elapsed:?}"));
+        }
+        Ok((elapsed, call.clone()))
     }
 
     async fn get(&self) -> Duration {
@@ -241,11 +257,15 @@ fn intervals(period: Duration) -> tokio::time::Interval {
 }
 
 async fn server() -> TestServer {
+    server_named("search_bench").await
+}
+
+async fn server_named(name: &str) -> TestServer {
     assert!(
         std::env::var_os("NO_INSERT").is_none(),
         "benchmark needs a fresh store"
     );
-    TestServerBuilder::new("search_bench")
+    TestServerBuilder::new(name)
         .await
         .with_default_listeners()
         .await

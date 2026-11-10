@@ -8,6 +8,8 @@ use super::{
     pass::{PassOutcome, RecoveryCause, ZaSearchPass, read_change_id},
     rebuild::{ContentRebuildReason, RebuildStarted, ZaSearchRebuild, recovery_timed_out},
 };
+#[cfg(feature = "test_mode")]
+use common::za::test_hooks::{SearchStage, note_search_count, observe_search_wait};
 use common::{
     Server,
     za::search::{
@@ -129,6 +131,8 @@ impl ZaSearchEnsure for Server {
         let mut reentered = false;
         let mut recovered_content = false;
         while tokio::time::Instant::now() < deadline {
+            #[cfg(feature = "test_mode")]
+            note_search_count(account_id, SearchStage::EnsureRound);
             // Do not wait for the resident guard here. A running pass can
             // hold it, in which case the pass-lock wait below owns the wait.
             if let Some(entry) = self.inner.cache.za_search.get(account_id) {
@@ -155,11 +159,10 @@ impl ZaSearchEnsure for Server {
                     // A busy pass can hold the index write guard. Find its
                     // slot without awaiting any reads or loads first.
                     if let Some(entry) = self.inner.cache.za_search.get(account_id) {
-                        drop(
-                            timeout_at(deadline, entry.pass_lock.lock())
-                                .await
-                                .map_err(|_| Unavailable::NotCurrent)?,
-                        );
+                        let wait = timeout_at(deadline, entry.pass_lock.lock());
+                        #[cfg(feature = "test_mode")]
+                        let wait = observe_search_wait(account_id, SearchStage::PassLockWait, wait);
+                        drop(wait.await.map_err(|_| Unavailable::NotCurrent)?);
                     }
                 }
                 Ok(PassOutcome::Current | PassOutcome::Advanced { .. } | PassOutcome::Lost) => {

@@ -45,6 +45,10 @@ use crate::{
     thread::get::ThreadGet,
     vacation::{get::VacationResponseGet, set::VacationResponseSet},
 };
+#[cfg(feature = "test_mode")]
+use common::za::test_hooks::{
+    SearchStage, claim_search_observation, observe_search_wait, with_search_observation,
+};
 use common::{Server, auth::AccessToken, network::memory::MemoryReservation};
 use compact_str::format_compact;
 use email::message::{
@@ -52,6 +56,8 @@ use email::message::{
     za::{search::ensure::ZaSearchEnsure, view::ZaMailView},
 };
 use http_proto::HttpSessionData;
+#[cfg(feature = "test_mode")]
+use jmap_proto::request::method::MethodFunction;
 use jmap_proto::{
     request::{
         Call, CopyRequestMethod, GetRequestMethod, INVALID_ACCOUNT_ID, ParseRequestMethod,
@@ -167,12 +173,33 @@ impl RequestHandler for Server {
 
         let owner = access_token.account_id();
         let keys = access_token.za_keys_for(owner).map(|keys| keys.as_ref());
+        #[cfg(feature = "test_mode")]
+        let search_observation = match request.method_calls.as_slice() {
+            [call]
+                if keys.is_some()
+                    && call.name == MethodName::new(MethodObject::Email, MethodFunction::Query) =>
+            {
+                claim_search_observation(owner, &call.id)
+            }
+            _ => None,
+        };
         let last_adding = if let Some(keys) = keys {
             if request
                 .method_calls
                 .iter()
                 .any(|call| is_mail_method(call.name.obj))
             {
+                #[cfg(feature = "test_mode")]
+                with_search_observation(
+                    search_observation.as_ref(),
+                    observe_search_wait(
+                        owner,
+                        SearchStage::DispatcherPrePass,
+                        self.za_search_pass_hook(owner, keys),
+                    ),
+                )
+                .await;
+                #[cfg(not(feature = "test_mode"))]
                 self.za_search_pass_hook(owner, keys).await;
             }
             last_adding_call(&request.method_calls, owner)
@@ -228,19 +255,22 @@ impl RequestHandler for Server {
 
                 // Add response
                 let method_name = call.name.as_str();
-                match self
-                    .handle_method_call(
-                        call.method,
-                        call.name,
-                        access_token,
-                        &mut next_call,
-                        session,
-                        using,
-                        reservation,
-                        post_write.as_mut(),
-                    )
-                    .await
-                {
+                let method = self.handle_method_call(
+                    call.method,
+                    call.name,
+                    access_token,
+                    &mut next_call,
+                    session,
+                    using,
+                    reservation,
+                    post_write.as_mut(),
+                );
+                #[cfg(feature = "test_mode")]
+                let method = with_search_observation(
+                    search_observation.as_ref(),
+                    observe_search_wait(owner, SearchStage::Method, method),
+                );
+                match method.await {
                     Ok(mut method_response) => {
                         match &mut method_response {
                             ResponseMethod::Set(set_response) => {

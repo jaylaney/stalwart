@@ -14,6 +14,8 @@ use super::{
     seal::{open_content_blob, parse_thread_blob, za_search_key},
     trace::ZA_SEARCH_OVER_BUDGET,
 };
+#[cfg(feature = "test_mode")]
+use crate::za::test_hooks::{SearchStage, note_search_count, observe_search_wait, search_span};
 use crate::{Server, auth::vault::RawValue, za_search_trace};
 use ahash::AHashSet;
 use std::{future::Future, sync::Arc};
@@ -33,6 +35,18 @@ use store::{
 use trc::{EventType, Key, StoreEvent};
 use types::{blob_hash::BlobHash, collection::Collection, field::PrincipalField};
 use vault::{Zeroizing, keys::Secret, session::SessionKeys};
+
+// Preserve the original wait and caller-owned guard. Only the test build
+// wraps the future, so cancellation still drops the same pending operation.
+macro_rules! observe_wait {
+    ($account:expr, $stage:ident, $future:expr) => {{
+        #[cfg(feature = "test_mode")]
+        let future = observe_search_wait($account, SearchStage::$stage, $future);
+        #[cfg(not(feature = "test_mode"))]
+        let future = $future;
+        future.await
+    }};
+}
 
 #[cfg(test)]
 #[path = "load_tests.rs"]
@@ -180,6 +194,8 @@ pub async fn fetch_verified<S: BlobSource>(
     now: u64,
 ) -> Result<Vec<u8>, LoadFailure> {
     #[cfg(feature = "test_mode")]
+    let _span = search_span(entry.account_id, SearchStage::VerifiedBlobFetch);
+    #[cfg(feature = "test_mode")]
     source.count_fetch(entry.account_id);
 
     let fetched = source.fetch(hash).await;
@@ -282,6 +298,8 @@ impl ThreadDelta {
             let bytes = fetch_verified(source, entry, &descriptor.hash, window_secs, now)
                 .await
                 .map_err(|failure| (failure, descriptor.hash.clone()))?;
+            #[cfg(feature = "test_mode")]
+            let _span = search_span(entry.account_id, SearchStage::ThreadOpenDecode);
             let (hidden, public) = parse_thread_blob(key, entry.account_id, &header, &bytes)
                 .map_err(|class| (LoadFailure::Loss(class), descriptor.hash.clone()))?;
             blobs.push((descriptor.segment, hidden, public));
@@ -331,6 +349,8 @@ pub async fn load_thread_part<S: BlobSource>(
     let row = manifest.newest_row;
     let mut loaded = LoadedIndex::empty(manifest);
     loaded.manifest_bytes_hash = manifest_hash(manifest_bytes);
+    #[cfg(feature = "test_mode")]
+    let _span = search_span(entry.account_id, SearchStage::ThreadModelBuild);
     delta.apply(&mut loaded, row);
     Ok(loaded)
 }
@@ -485,9 +505,15 @@ fn open_frames(
     bytes: Vec<u8>,
     mut reserve: impl FnMut(u64) -> bool,
 ) -> Result<(BlobHeader, Vec<OwnedContentFrame>), LoadFailure> {
+    #[cfg(feature = "test_mode")]
+    let opening = search_span(account_id, SearchStage::ContentOpen);
     let (header, plaintext) = open_content_blob(key, account_id, Some(segment), None, &bytes)
         .map_err(LoadFailure::Loss)?;
+    #[cfg(feature = "test_mode")]
+    drop(opening);
     drop(bytes);
+    #[cfg(feature = "test_mode")]
+    let _decoding = search_span(account_id, SearchStage::ContentDecode);
     let records = decode_content_frames(&plaintext, |additional| {
         reserve((plaintext.capacity() as u64).saturating_add(additional as u64))
     })
@@ -578,6 +604,8 @@ impl ContentWalk {
         cache: &ZaSearchCache,
         account_id: u32,
     ) -> Result<(), LoadFailure> {
+        #[cfg(feature = "test_mode")]
+        let _span = search_span(account_id, SearchStage::Postings);
         let budget = LoadFailure::Transient(TransientClass::Budget);
         if !self.joined {
             content.part = ContentPart::default();
@@ -743,11 +771,11 @@ async fn load_entry<S: BlobSource>(
     read_manifest: impl Future<Output = Result<(Vec<u8>, Manifest), ObservedLoadError>>,
 ) -> Result<(), ObservedLoadError> {
     // A resident thread part is available even while content is loading.
-    if entry.index.read().await.is_some() {
+    if observe_wait!(entry.account_id, MapIndexWait, entry.index.read()).is_some() {
         return Ok(());
     }
-    let _flight = entry.load_flight.lock().await;
-    if entry.index.read().await.is_some() {
+    let _flight = observe_wait!(entry.account_id, MapFlightWait, entry.load_flight.lock());
+    if observe_wait!(entry.account_id, MapIndexWait, entry.index.read()).is_some() {
         return Ok(());
     }
 
@@ -773,7 +801,7 @@ async fn load_entry<S: BlobSource>(
         index.thread_bytes,
         entry.account_id,
     );
-    *entry.index.write().await = Some(index);
+    *observe_wait!(entry.account_id, MapIndexWait, entry.index.write()) = Some(index);
     Ok(())
 }
 
@@ -824,7 +852,7 @@ async fn snapshot_content_tombstones(
 ) -> Result<Option<ContentTombstones>, LoadFailure> {
     let invalid = LoadFailure::Transient(TransientClass::Validation);
     let (version, count) = {
-        let guard = entry.index.read().await;
+        let guard = observe_wait!(entry.account_id, ContentIndexWait, entry.index.read());
         let index = guard.as_ref().ok_or(invalid)?;
         if !same_content_target(index, epoch, head) {
             return Ok(None);
@@ -847,7 +875,7 @@ async fn snapshot_content_tombstones(
         (count as u64).saturating_mul(size_of::<u32>() as u64),
         entry.account_id,
     );
-    let guard = entry.index.read().await;
+    let guard = observe_wait!(entry.account_id, ContentIndexWait, entry.index.read());
     let index = guard.as_ref().ok_or(invalid)?;
     if index.manifest_bytes_hash != version || !same_content_target(index, epoch, head) {
         return Ok(None);
@@ -870,7 +898,9 @@ async fn install_content(
     staged: &mut LoadedContent,
     prepared: Result<(), LoadFailure>,
 ) -> Result<bool, LoadFailure> {
-    let mut guard = entry.index.write().await;
+    #[cfg(feature = "test_mode")]
+    let _span = search_span(entry.account_id, SearchStage::ExactGenerationInstall);
+    let mut guard = observe_wait!(entry.account_id, ContentIndexWait, entry.index.write());
     let index = guard
         .as_mut()
         .ok_or(LoadFailure::Transient(TransientClass::Validation))?;
@@ -892,7 +922,11 @@ async fn load_current_content<S: BlobSource>(
     key: &Secret,
     config: &ZaSearchConfig,
 ) -> Result<(), ObservedLoadError> {
-    let _flight = entry.content_load_flight.lock().await;
+    let _flight = observe_wait!(
+        entry.account_id,
+        ContentFlightWait,
+        entry.content_load_flight.lock()
+    );
     let cache = entry
         .cache()
         .ok_or(LoadFailure::Transient(TransientClass::Validation))?;
@@ -903,7 +937,7 @@ async fn load_current_content<S: BlobSource>(
 
     loop {
         let (version, epoch, head, has_deferred) = {
-            let guard = entry.index.read().await;
+            let guard = observe_wait!(entry.account_id, ContentIndexWait, entry.index.read());
             let index = guard.as_ref().ok_or(invalid)?;
             if let Some(head) = &index.manifest.content {
                 content_reservation(head, config)?;
@@ -929,10 +963,12 @@ async fn load_current_content<S: BlobSource>(
 
         let mut untouched_deferred = false;
         if head.is_some() && staged_head.is_none() && has_deferred {
-            let mut guard = entry.index.write().await;
+            let mut guard = observe_wait!(entry.account_id, ContentIndexWait, entry.index.write());
             let index = guard.as_mut().ok_or(invalid)?;
             if index.manifest_bytes_hash != version {
                 drop(guard);
+                #[cfg(feature = "test_mode")]
+                note_search_count(entry.account_id, SearchStage::ContentRetry);
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -1005,6 +1041,8 @@ async fn load_current_content<S: BlobSource>(
                 staged = empty_content();
                 staged_head = None;
                 trace_eviction(entry.account_id, EvictReason::Budget);
+                #[cfg(feature = "test_mode")]
+                note_search_count(entry.account_id, SearchStage::ContentRetry);
                 continue;
             }
 
@@ -1017,12 +1055,14 @@ async fn load_current_content<S: BlobSource>(
                     entry.account_id,
                 );
             }
-            let mut guard = entry.index.write().await;
+            let mut guard = observe_wait!(entry.account_id, ContentIndexWait, entry.index.write());
             let index = guard.as_mut().ok_or(invalid)?;
             if !same_content_target(index, epoch, head.as_ref()) {
                 drop(guard);
                 staged = empty_content();
                 staged_head = None;
+                #[cfg(feature = "test_mode")]
+                note_search_count(entry.account_id, SearchStage::ContentRetry);
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -1044,6 +1084,8 @@ async fn load_current_content<S: BlobSource>(
         }
 
         staged_head = head.clone().map(|head| (epoch, head));
+        #[cfg(feature = "test_mode")]
+        let tombstone_span = search_span(entry.account_id, SearchStage::TombstonePreparation);
         if let Some(tombstones) =
             snapshot_content_tombstones(entry, &cache, epoch, head.as_ref(), &staged.part).await?
         {
@@ -1059,12 +1101,19 @@ async fn load_current_content<S: BlobSource>(
             };
             let version = tombstones.version;
             drop(tombstones);
+            #[cfg(feature = "test_mode")]
+            drop(tombstone_span);
             if install_content(entry, version, epoch, head.as_ref(), &mut staged, prepared).await? {
                 return Ok(());
             }
+        } else {
+            #[cfg(feature = "test_mode")]
+            drop(tombstone_span);
         }
         // A newer committed generation arrived during preparation. A same-head
         // retry just refreshes tombstones. An append can use the verified stage.
+        #[cfg(feature = "test_mode")]
+        note_search_count(entry.account_id, SearchStage::ContentRetry);
         tokio::task::yield_now().await;
     }
 }
@@ -1078,8 +1127,8 @@ pub async fn apply_reload<S: BlobSource>(
     manifest: Manifest,
     now: u64,
 ) -> Result<(), LoadFailure> {
-    let flight = entry.load_flight.lock().await;
-    let mut guard = entry.index.write().await;
+    let flight = observe_wait!(entry.account_id, MapFlightWait, entry.load_flight.lock());
+    let mut guard = observe_wait!(entry.account_id, MapIndexWait, entry.index.write());
     let result = apply_reload_locked(
         source,
         entry,
@@ -1271,10 +1320,10 @@ impl Server {
         keys: &SessionKeys,
     ) -> Result<bool, ObservedLoadError> {
         let key = keys.swk();
-        let flight = entry.load_flight.lock().await;
+        let flight = observe_wait!(entry.account_id, MapFlightWait, entry.load_flight.lock());
         // Serialize the manifest read with applying it. A delayed reload can
         // otherwise overwrite a newer local swap with an older manifest.
-        let mut guard = entry.index.write().await;
+        let mut guard = observe_wait!(entry.account_id, MapIndexWait, entry.index.write());
         let (bytes, manifest) = self
             .read_search_index_manifest(entry.account_id, key)
             .await?;

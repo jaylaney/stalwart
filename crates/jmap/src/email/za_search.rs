@@ -5,6 +5,8 @@
  */
 
 use super::za::{attachment_keyword, first_refused_filter, first_refused_sort};
+#[cfg(feature = "test_mode")]
+use common::za::test_hooks::{SearchStage, note_search_admission, search_span};
 use common::{
     MessageStoreCache, Server,
     auth::AccessToken,
@@ -78,16 +80,29 @@ pub async fn za_content_query(
     }
 
     let deadline = Instant::now() + Duration::from_secs(server.za_search_config().wait_secs);
-    za_view_with_minimum(
+    #[cfg(feature = "test_mode")]
+    let admission_span = search_span(account_id, SearchStage::ContentAdmission);
+    let view = za_view_with_minimum(
         server,
         account_id,
         keys,
         ViewNeed::Content { deadline },
         minimum,
     )
-    .await
-    .map(Some)
-    .map_err(|error| {
+    .await;
+    #[cfg(feature = "test_mode")]
+    {
+        drop(admission_span);
+        note_search_admission(
+            account_id,
+            || {
+                view.as_ref()
+                    .map_or_else(|error| error.into_unavailable().as_str(), |_| "admitted")
+            },
+            deadline,
+        );
+    }
+    view.map(Some).map_err(|error| {
         let reason = error.into_unavailable();
         za_search_trace!(
             ZA_SEARCH_UNAVAILABLE,

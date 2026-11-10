@@ -134,10 +134,10 @@ use super::search::ZaSearchConfig;
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 pub use store::za_test::{
     FORCE_COMMIT_SPLIT, Pause, set_index_chunk_pause, set_second_chunk_fail_once,
@@ -1233,24 +1233,320 @@ pub enum SearchContentWrite {
     },
 }
 
-static SEARCH_CONTENT_WRITES: std::sync::Mutex<Option<(u32, Vec<SearchContentWrite>)>> =
-    std::sync::Mutex::new(None);
+#[derive(Default)]
+struct SearchWriteObservers {
+    events: Option<(u32, Vec<SearchContentWrite>)>,
+    commits: Option<(u32, Arc<AtomicU64>)>,
+}
+
+static SEARCH_CONTENT_WRITES: Mutex<SearchWriteObservers> = Mutex::new(SearchWriteObservers {
+    events: None,
+    commits: None,
+});
 
 pub fn set_search_content_writes(account_id: Option<u32>) {
-    *SEARCH_CONTENT_WRITES.lock().unwrap() = account_id.map(|id| (id, Vec::new()));
+    SEARCH_CONTENT_WRITES.lock().unwrap().events = account_id.map(|id| (id, Vec::new()));
 }
 
 pub fn take_search_content_writes(account_id: u32) -> Vec<SearchContentWrite> {
-    let mut observer = SEARCH_CONTENT_WRITES.lock().unwrap();
-    observer
+    SEARCH_CONTENT_WRITES
+        .lock()
+        .unwrap()
+        .events
         .as_mut()
         .filter(|(id, _)| *id == account_id)
         .map_or_else(Vec::new, |(_, events)| std::mem::take(events))
 }
 
 pub fn note_search_content_write(account_id: u32, event: SearchContentWrite) {
-    let mut observer = SEARCH_CONTENT_WRITES.lock().unwrap();
-    if let Some((_, events)) = observer.as_mut().filter(|(id, _)| *id == account_id) {
+    let mut observers = SEARCH_CONTENT_WRITES.lock().unwrap();
+    if let Some((id, commits)) = &observers.commits
+        && *id == account_id
+        && matches!(event, SearchContentWrite::Committed { .. })
+    {
+        commits.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some((_, events)) = observers
+        .events
+        .as_mut()
+        .filter(|(id, _)| *id == account_id)
+    {
         events.push(event);
+    }
+}
+
+/// Counts all writer commits for this account, including commits outside the
+/// measured request tasks. It retains no events and shares the existing hook.
+pub struct SearchCommitCounter(Arc<AtomicU64>);
+
+impl SearchCommitCounter {
+    pub fn start(account_id: u32) -> Self {
+        let mut observers = SEARCH_CONTENT_WRITES.lock().unwrap();
+        if observers.commits.is_some() {
+            drop(observers);
+            panic!("a search commit counter is active");
+        }
+        let count = Arc::new(AtomicU64::new(0));
+        observers.commits = Some((account_id, Arc::clone(&count)));
+        Self(count)
+    }
+
+    pub fn count(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for SearchCommitCounter {
+    fn drop(&mut self) {
+        SEARCH_CONTENT_WRITES.lock().unwrap().commits = None;
+    }
+}
+
+/// Request-local inclusive timings. A parent stage may include other reported
+/// stages, and cancellation drops the span at the point the wait is stopped.
+#[derive(Clone, Copy, Debug)]
+pub enum SearchStage {
+    DispatcherPrePass,
+    Method,
+    MapFlightWait,
+    MapIndexWait,
+    ResidentIndexWait,
+    ContentFlightWait,
+    ContentIndexWait,
+    PassLockWait,
+    VerifiedBlobFetch,
+    ThreadOpenDecode,
+    ThreadModelBuild,
+    ContentOpen,
+    ContentDecode,
+    Postings,
+    TombstonePreparation,
+    ExactGenerationInstall,
+    EnsureRound,
+    ContentRetry,
+    ViewRetry,
+    ContentAdmission,
+}
+
+impl SearchStage {
+    const ALL: [Self; Self::ContentAdmission as usize + 1] = [
+        Self::DispatcherPrePass,
+        Self::Method,
+        Self::MapFlightWait,
+        Self::MapIndexWait,
+        Self::ResidentIndexWait,
+        Self::ContentFlightWait,
+        Self::ContentIndexWait,
+        Self::PassLockWait,
+        Self::VerifiedBlobFetch,
+        Self::ThreadOpenDecode,
+        Self::ThreadModelBuild,
+        Self::ContentOpen,
+        Self::ContentDecode,
+        Self::Postings,
+        Self::TombstonePreparation,
+        Self::ExactGenerationInstall,
+        Self::EnsureRound,
+        Self::ContentRetry,
+        Self::ViewRetry,
+        Self::ContentAdmission,
+    ];
+}
+
+#[derive(Default)]
+struct StageTotal {
+    count: AtomicU64,
+    nanos: AtomicU64,
+}
+
+#[derive(Debug)]
+pub struct SearchAdmission {
+    pub reason: &'static str,
+    pub remaining: Duration,
+}
+
+pub struct SearchRequestMeasurement {
+    account_id: u32,
+    call_id: String,
+    claimed: AtomicBool,
+    totals: [StageTotal; SearchStage::ALL.len()],
+    admission: OnceLock<SearchAdmission>,
+}
+
+static SEARCH_REQUEST_SERIAL: AtomicU64 = AtomicU64::new(0);
+static PENDING_SEARCH_MEASUREMENT: Mutex<Option<Arc<SearchRequestMeasurement>>> = Mutex::new(None);
+
+tokio::task_local! {
+    static SEARCH_MEASUREMENT: Arc<SearchRequestMeasurement>;
+}
+
+/// Arm a single method call. The dispatcher can claim it only once and
+/// checks both account and call ID. Dropping an unclaimed observation clears it.
+pub struct SearchRequestObservation {
+    measurement: Arc<SearchRequestMeasurement>,
+}
+
+impl SearchRequestObservation {
+    pub fn arm(account_id: u32) -> Self {
+        let serial = SEARCH_REQUEST_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let measurement = Arc::new(SearchRequestMeasurement {
+            account_id,
+            call_id: format!("search-cold-{serial}"),
+            claimed: AtomicBool::new(false),
+            totals: Default::default(),
+            admission: OnceLock::new(),
+        });
+        let mut pending = PENDING_SEARCH_MEASUREMENT.lock().unwrap();
+        if pending.is_some() {
+            drop(pending);
+            panic!("a search observation is already armed");
+        }
+        *pending = Some(Arc::clone(&measurement));
+        Self { measurement }
+    }
+
+    pub fn call_id(&self) -> &str {
+        &self.measurement.call_id
+    }
+
+    pub fn claimed(&self) -> bool {
+        self.measurement.claimed.load(Ordering::Relaxed)
+    }
+
+    pub fn count(&self, stage: SearchStage) -> u64 {
+        self.measurement.totals[stage as usize]
+            .count
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn timings(&self) -> impl Iterator<Item = (SearchStage, u64, Duration)> + '_ {
+        SearchStage::ALL.into_iter().map(|stage| {
+            let total = &self.measurement.totals[stage as usize];
+            (
+                stage,
+                self.count(stage),
+                Duration::from_nanos(total.nanos.load(Ordering::Relaxed)),
+            )
+        })
+    }
+
+    pub fn admission(&self) -> Option<&SearchAdmission> {
+        self.measurement.admission.get()
+    }
+    /// Clear the pending claim after the wire attempt, even when the response
+    /// never reached the dispatcher. Keep already observed timings readable.
+    pub fn disarm(&self) {
+        let mut pending = PENDING_SEARCH_MEASUREMENT.lock().unwrap();
+        if pending
+            .as_ref()
+            .is_some_and(|measurement| Arc::ptr_eq(measurement, &self.measurement))
+        {
+            *pending = None;
+        }
+    }
+}
+
+impl Drop for SearchRequestObservation {
+    fn drop(&mut self) {
+        self.disarm();
+    }
+}
+
+pub fn claim_search_observation(
+    account_id: u32,
+    call_id: &str,
+) -> Option<Arc<SearchRequestMeasurement>> {
+    if !call_id.starts_with("search-cold-") {
+        return None;
+    }
+    let mut pending = PENDING_SEARCH_MEASUREMENT.try_lock().ok()?;
+    if pending.as_ref().is_some_and(|measurement| {
+        measurement.account_id == account_id && measurement.call_id == call_id
+    }) {
+        let measurement = pending.take().unwrap();
+        measurement.claimed.store(true, Ordering::Relaxed);
+        Some(measurement)
+    } else {
+        None
+    }
+}
+
+pub async fn with_search_observation<F: std::future::Future>(
+    observation: Option<&Arc<SearchRequestMeasurement>>,
+    future: F,
+) -> F::Output {
+    match observation {
+        Some(observation) => {
+            SEARCH_MEASUREMENT
+                .scope(Arc::clone(observation), future)
+                .await
+        }
+        None => future.await,
+    }
+}
+
+fn search_measurement(account_id: u32) -> Option<Arc<SearchRequestMeasurement>> {
+    SEARCH_MEASUREMENT
+        .try_with(|measurement| {
+            (measurement.account_id == account_id).then(|| Arc::clone(measurement))
+        })
+        .ok()
+        .flatten()
+}
+
+pub struct SearchSpan {
+    measurement: Arc<SearchRequestMeasurement>,
+    stage: SearchStage,
+    started: Instant,
+}
+
+impl Drop for SearchSpan {
+    fn drop(&mut self) {
+        let nanos = self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.measurement.totals[self.stage as usize]
+            .nanos
+            .fetch_add(nanos, Ordering::Relaxed);
+    }
+}
+
+pub fn search_span(account_id: u32, stage: SearchStage) -> Option<SearchSpan> {
+    let measurement = search_measurement(account_id)?;
+    measurement.totals[stage as usize]
+        .count
+        .fetch_add(1, Ordering::Relaxed);
+    Some(SearchSpan {
+        measurement,
+        stage,
+        started: Instant::now(),
+    })
+}
+
+pub async fn observe_search_wait<F: std::future::Future>(
+    account_id: u32,
+    stage: SearchStage,
+    future: F,
+) -> F::Output {
+    let _span = search_span(account_id, stage);
+    future.await
+}
+
+pub fn note_search_count(account_id: u32, stage: SearchStage) {
+    if let Some(measurement) = search_measurement(account_id) {
+        measurement.totals[stage as usize]
+            .count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn note_search_admission(
+    account_id: u32,
+    reason: impl FnOnce() -> &'static str,
+    deadline: Instant,
+) {
+    if let Some(measurement) = search_measurement(account_id) {
+        let _ = measurement.admission.set(SearchAdmission {
+            reason: reason(),
+            remaining: deadline.saturating_duration_since(Instant::now()),
+        });
     }
 }

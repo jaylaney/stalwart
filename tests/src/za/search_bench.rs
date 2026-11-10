@@ -40,6 +40,7 @@ use utils::{cheeky_hash::CheekyHash, codec::leb128::Leb128Reader};
 use vault::session::SessionKeys;
 
 mod accounting;
+mod export;
 mod system;
 
 const ACCOUNT: &str = "search-bench@example.com";
@@ -638,4 +639,28 @@ async fn deliver(
 #[ignore]
 pub async fn system() {
     system::run().await;
+}
+
+const COLD_PLUMBING_COUNT: usize = 5;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+pub async fn cold_start() {
+    assert!(
+        !cfg!(debug_assertions),
+        "cold_start needs the release profile"
+    );
+    system::cold::run(system::DESIGN, "search_bench_cold_start").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+pub async fn cold_start_plumbing() {
+    system::cold::run(COLD_PLUMBING_COUNT, "search_bench_cold_plumbing").await;
+}
+
+#[test]
+#[ignore]
+pub fn export_corpus() {
+    export::run().expect("corpus export failed");
 }

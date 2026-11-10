@@ -12,6 +12,8 @@ use super::{
     pass::{PassOutcome, ZaSearchPass},
 };
 use crate::cache::MessageCacheFetch;
+#[cfg(feature = "test_mode")]
+use common::za::test_hooks::{SearchStage, note_search_count};
 use common::{
     MessageStoreCache, Server,
     za::search::{
@@ -125,6 +127,8 @@ pub async fn za_view_with_minimum(
             Err(error) => {
                 recover_view_loss(server, account_id, keys, error, &mut recovered, deadline)
                     .await?;
+                #[cfg(feature = "test_mode")]
+                note_search_count(account_id, SearchStage::ViewRetry);
                 continue;
             }
         };
@@ -140,6 +144,8 @@ pub async fn za_view_with_minimum(
                 {
                     recover_view_loss(server, account_id, keys, error, &mut recovered, deadline)
                         .await?;
+                    #[cfg(feature = "test_mode")]
+                    note_search_count(account_id, SearchStage::ViewRetry);
                     continue;
                 }
             } else if !counter_at_or_past(cache.last_change_id, &guard.manifest)
@@ -159,6 +165,8 @@ pub async fn za_view_with_minimum(
                     if guard.content.is_none() || !is_current(&guard, cache.last_change_id) {
                         drop(guard);
                         check_deadline(deadline)?;
+                        #[cfg(feature = "test_mode")]
+                        note_search_count(account_id, SearchStage::ViewRetry);
                         continue;
                     }
                 }
@@ -179,6 +187,8 @@ pub async fn za_view_with_minimum(
         if rounds > 3 {
             return Err(failure(LoadFailure::Transient(TransientClass::Validation)));
         }
+        #[cfg(feature = "test_mode")]
+        note_search_count(account_id, SearchStage::ViewRetry);
     }
 }
 
