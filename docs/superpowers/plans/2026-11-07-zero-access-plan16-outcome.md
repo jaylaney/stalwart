@@ -958,12 +958,15 @@ before the T13 test-only follow-up. Every row except one variant has a behaviour
 | Campaign | Rows | Report |
 |---|---|---|
 | 19 regressions (2026-11-10) | M18, M26, M35, M55, M57, M58, M59, M68–M74, plus three non-plan targets (T10 floor and cap, T13) | [Remaining checks](2026-11-07-zero-access-16-search-remaining-checks-review.md) |
-| 55 drafts (2026-11-10/11) | 49 rows, 55 labels, plus the Task 3 map-order companion | [55 drafts](2026-11-07-zero-access-16-search-mutations55-review.md) |
+| 55 drafts (2026-11-10/11) | 49 plan rows across 54 labels, plus the Task 3 map-order companion (55 labels total) | [55 drafts](2026-11-07-zero-access-16-search-mutations55-review.md) |
 | Remaining rows and follow-ups (2026-11-11) | the 16 rows neither earlier campaign ran, the masked 55-draft follow-ups and an M16 probe | [Remaining rows](2026-11-07-zero-access-16-search-mutations-final-review.md) |
 
-Every run used a whole `za::za_tests` selection, or a unit test by name. Each selection had
-a passing correct-code baseline and a passing restored control. Follow-up selections remove
-whole dispatch calls only, never an assertion. No fault was committed.
+Executed faults used focused selections within `za::za_tests`, or a unit test by
+name, with passing correct-code baselines and restored controls. Failed baseline
+attempts remain recorded separately. The final campaign's follow-ups removed whole
+dispatch calls without changing assertions. The first campaign's M26 follow-up
+temporarily relaxed two masking assertions to reach the later catcher, as recorded
+in its report. No fault was committed.
 
 | Outcome | Rows |
 |---|---|
