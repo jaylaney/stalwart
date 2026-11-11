@@ -62,7 +62,7 @@ use email::{
         changes::ZaRetainedBound,
         ensure::{Unavailable, ZaSearchEnsure, is_current},
         pass::{PassOutcome, ZaSearchPass},
-        rebuild::{RebuildStarted, ZaSearchRebuild},
+        rebuild::{RebuildStarted, ZaSearchRebuild, za_search_content_needs_rebuild},
     },
 };
 use imap_proto::ResponseType;
@@ -3403,6 +3403,8 @@ pub(crate) async fn test_recovery(test: &mut TestServer) {
     clean_messages(test, &key).await;
     case_r10_cursor_finishes_across_restarts(test, &key).await;
     clean_messages(test, &key).await;
+    case_pending_rebuild_cursor_overrides_scanned_state(test, &key).await;
+    clean_messages(test, &key).await;
     case_r22_vanished_cursor_checkpoints(test, &key).await;
     clean_messages(test, &key).await;
     case_h11_missing_manifest_on_an_empty_account(test, &key).await;
@@ -3841,6 +3843,73 @@ async fn case_r10_cursor_finishes_across_restarts(test: &TestServer, key: &Accou
         }
     }
     panic!("the rebuild cursor did not finish in six keyed requests");
+}
+
+async fn case_pending_rebuild_cursor_overrides_scanned_state(test: &TestServer, key: &Account) {
+    println!("case_pending_rebuild_cursor_overrides_scanned_state");
+    let id = account_id(key);
+    let documents = append_many(test, key, 2).await;
+    advanced(test, key, true).await;
+    force_loss(test, id).await;
+
+    let keys = za_unlock(test, id, key.secret()).await;
+    let loss = match test.server.za_search_entry(id, &keys).await {
+        Err(ObservedLoadError::MapLoss(loss)) => loss,
+        _ => panic!("the cold loader did not observe the lost thread blob"),
+    };
+    assert_eq!(
+        test.server
+            .za_search_rebuild_start(id, &keys, loss, None)
+            .await
+            .unwrap(),
+        RebuildStarted::Written
+    );
+    let pending = index(test, id).await;
+    let cursor = pending.cursor.as_ref().expect("pending identity rebuild");
+    let state = email_boundary(test, id).await;
+    assert_eq!(change_id(test, id).await, state);
+
+    let _config = search_config_guard!(test, pass_cap: 1);
+    let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+    {
+        let mut guard = entry.index.write().await;
+        let resident = guard.as_mut().unwrap();
+        assert_eq!(resident.manifest, pending);
+        // A reload can preserve a newer scan watermark from the previous map.
+        // Seed that resident state directly to make the shortcut deterministic.
+        resident.scanned_to = resident.scanned_to.max(state);
+        assert!(state <= resident.scanned_to);
+        assert!(resident.manifest.indexed_to.complete);
+        assert!(resident.manifest.reconciliation.is_none());
+        assert!(resident.manifest.content_to.cursor.is_none());
+        assert!(
+            za_search_content_needs_rebuild(&resident.manifest, &test.server.za_search_config())
+                .is_none()
+        );
+    }
+
+    advanced(test, key, true).await;
+    let partial = index(test, id).await;
+    let next = partial
+        .cursor
+        .as_ref()
+        .expect("second document still pending");
+    assert!(next.next > cursor.next);
+    assert_eq!(next.next, documents[0] + 1);
+    assert_eq!(next.end, cursor.end);
+    assert_held(test, id, &documents, 1).await;
+
+    advanced(test, key, true).await;
+    assert!(index(test, id).await.cursor.is_none());
+    simulate_restart(test, id).await;
+    let rebuilt = za_search_thread_part(test, id, key.secret()).await;
+    let mut indexed = rebuilt
+        .records()
+        .filter(|record| record.deleted.is_none())
+        .map(|record| record.document_id)
+        .collect::<Vec<_>>();
+    indexed.sort_unstable();
+    assert_eq!(indexed, documents);
 }
 
 async fn case_r22_vanished_cursor_checkpoints(test: &TestServer, key: &Account) {

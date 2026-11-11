@@ -248,10 +248,16 @@ The [independent remaining-checks report](docs/superpowers/plans/2026-11-07-zero
 records 18 of 19 targets caught in focused fault runs, plus a T13 Content
 caller-minimum coverage gap. The exact reviewed test-only strengthening is
 integrated; the full ZA suite passed with both default and FileSystem blob
-storage. All 55 rebased drafts passed preparation verification, but their
-behavioral runs and the rest of the mutation
-campaign remain pending. Native clients, the separate fresh-store gate,
-networked-store timing and physical multi-node verification remain pending.
+storage. Three independent mutation campaigns now account for M1–M79 at their
+recorded heads; the [final campaign report](docs/superpowers/plans/2026-11-07-zero-access-16-search-mutations-final-review.md)
+records three survivors (M16, M23 and M48), alternate catchers and the unexecuted
+M29b codec-change variant. The [regression follow-up](docs/superpowers/plans/2026-11-11-zero-access-search-regression-followup.md)
+adds or strengthens those three tests; independent Astra review, all 18 planner
+tests and the full canonical RocksDB ZA suite passed. The new tests have no new
+mutation-run results, and M29b is a recorded campaign exception, not a passed or
+equivalent fault. Task 19 remains incomplete. Native clients, the separate
+fresh-store gate, networked-store timing and physical multi-node verification
+remain pending.
 
 Where release 2 lives: the UID lease in `crates/common/src/za/lease.rs` (`ZA_UID_LEASE_SECS`, default 30, clamped 1..=3600; lease keys start with `store::ZA_UID_LEASE_PREFIX`, which the generic in-memory purge skips, so the asserting sweep is the only lease cleanup); the fan-out in `crates/groupware/src/calendar/fanout.rs` (`za_fan_out` takes an optional lease fence that every recipient item's write asserts): the drain's delegating merge and the PUT create pass theirs; the drain in `crates/groupware/src/calendar/drain.rs` (`ZaDrain::za_drain`, called from `handle_dav_request` in `crates/dav/src/request.rs` for every DAV request whose token holds session keys; `DRAIN_RETRY_SECS = 30` is a constant); a pass attempts at most `DRAIN_PASS_CAP` (32) items, an item that fails `DRAIN_ITEM_FAILURE_LIMIT` (3) times in a session is skipped for the session with later items of its UID waiting behind it, and a private key that does not open suspends the session's drain (the per-session state in `vault::session::ZaDrainState`, the failure bookkeeping in `vault::session::PassState`); and the lease sweep in `common::za::lease::sweep_expired_uid_leases`, called from the maintenance task's purge step (`crates/services/src/task_manager/tasks/maintenance.rs` at 1.0, after `purge_store`). The drain's delegating merge fans out to new delegates under the organizer's UID lease, passing it as the fence; new delegates are detected per instance (`Attendance`, `governing_instance`, shared with the stale-reply check): an address that did not attend the governing instance before, or whose DELEGATED-FROM gained an address.
 

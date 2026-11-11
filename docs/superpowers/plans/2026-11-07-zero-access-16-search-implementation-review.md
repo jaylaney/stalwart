@@ -87,10 +87,17 @@ suite passed with both default and FileSystem blob storage. No production fix
 was required.
 
 The same independent task verified the source binding and exact forward/reverse
-application of all 55 rebased drafts. This was preparation verification, not
-behavioral execution of those drafts; nonempty catcher selection and the rest
-of the Step 2 campaign remain pending. Earlier screening failures remain
-separate historical attempts, without execution results.
+application of all 55 rebased drafts. At that cutoff it had not executed those
+drafts. The later [55-draft campaign](2026-11-07-zero-access-16-search-mutations55-review.md)
+and [remaining-row campaign](2026-11-07-zero-access-16-search-mutations-final-review.md)
+executed the broader sample at `bae62db6f`. They record three survivors (M16,
+M23 and M48), alternate catchers and the unexecuted M29b codec-change variant.
+The [regression follow-up](2026-11-11-zero-access-search-regression-followup.md)
+adds or strengthens the three survivor tests and passed independent Astra review,
+all 18 planner tests and the full canonical RocksDB ZA suite. No new faulty
+variants ran against those strengthened tests. M29b remains an explicit campaign
+exception; Task 19 is not complete. Earlier screening failures remain separate
+historical attempts, without execution results.
 
 The earlier full benchmark at `f4eb2ecc` recorded refusals for full-size
 cold and post-rebuild Content. At `4dde13ade` the post-H7 query served

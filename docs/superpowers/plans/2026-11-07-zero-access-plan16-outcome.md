@@ -1,6 +1,6 @@
 # Zero-access search and threads: plan 16 outcome
 
-Evidence record as of 2026-11-10 UTC for [Plan 16](2026-11-07-zero-access-16-search.md)
+Evidence record as of 2026-11-11 UTC for [Plan 16](2026-11-07-zero-access-16-search.md)
 and the [search design](../specs/2026-11-04-zero-access-search-design.md).
 Current authority is plan revision 27 and spec revision 33. Task 1 measured
 the format at spec revision 20. Revision 21 records the subsequent memory
@@ -62,6 +62,14 @@ OSS restart pair served in 23.053 s and 1.026 ms, with matching public
 censuses across restart. Local 30,000-message cold-search qualification
 is complete. All fourteen search settings are unchanged. Memory and
 account sizing defaults remain provisional.
+
+The three [mutation campaigns](#mutation-runs-plan-16) now account for all 79
+rows at their recorded heads. M16, M23 and M48 survived the executed campaigns;
+the later test-only follow-up passed static review, all 18 planner tests and the
+full canonical RocksDB ZA suite, without new deliberate-fault runs. M29b remains
+unexecuted because it requires a codec change rather than a bounded fault. These
+are explicit draft-PR qualification exceptions, not passed or equivalent mutants.
+Alternative-catcher and unobserved-branch findings remain recorded below.
 
 Locally accounted for are 39 of 41 main Step 5 rows on `4dde13ade` and
 source-identical implementation `53062c367`. Four source-identical rows
@@ -941,7 +949,92 @@ code. The fixture account and call sites are in
 
 ## Mutation runs (plan 16)
 
-**Fresh Step 2 campaign partly executed.** At the earlier local cutoff,
+### Step 2 status after three campaigns (2026-11-11)
+
+Three independent campaigns account for the plan's Step 2 table at their
+recorded source heads. The final two used `bae62db6f`; the first used `bcc81d177`
+before the T13 test-only follow-up. Every row except one variant has a behavioural run.
+
+| Campaign | Rows | Report |
+|---|---|---|
+| 19 regressions (2026-11-10) | M18, M26, M35, M55, M57, M58, M59, M68–M74, plus three non-plan targets (T10 floor and cap, T13) | [Remaining checks](2026-11-07-zero-access-16-search-remaining-checks-review.md) |
+| 55 drafts (2026-11-10/11) | 49 rows, 55 labels, plus the Task 3 map-order companion | [55 drafts](2026-11-07-zero-access-16-search-mutations55-review.md) |
+| Remaining rows and follow-ups (2026-11-11) | the 16 rows neither earlier campaign ran, the masked 55-draft follow-ups and an M16 probe | [Remaining rows](2026-11-07-zero-access-16-search-mutations-final-review.md) |
+
+Every run used a whole `za::za_tests` selection, or a unit test by name. Each selection had
+a passing correct-code baseline and a passing restored control. Follow-up selections remove
+whole dispatch calls only, never an assertion. No fault was committed.
+
+| Outcome | Rows |
+|---|---|
+| Survives every test | M16 (reachable only through an untested race), M23, M48 |
+| Named test doesn't demonstrate it, but other tests catch it | M14 (M50's units, identical patch), M19 (two earlier tests), M22 (two other tests), M31 (unit and R22), M43a (unit and two wire tests), M44 (units), M49 (unit and G12) |
+| Not executed | M29b (needs a hidden-section codec change) |
+| Demonstrated at a named test | every other row and label |
+
+| Row | Result |
+|---|---|
+| M1 | Demonstrated (unit). The R11 reload can't see a symmetric AAD change |
+| M2, M3 | Demonstrated |
+| M4 | Demonstrated at the backlog case, in a focused round |
+| M5 | Demonstrated, both variants (R2 cross-node) |
+| M6 | Demonstrated (unit) |
+| M7 | Demonstrated (unit), and at the backlog case in a focused round |
+| M8 | Demonstrated at R12 paging, in a focused round |
+| M9 | Demonstrated (unit); the front-door control passed |
+| M10–M12 | Demonstrated |
+| M13 | Demonstrated (membership) |
+| M14 | R3 passes; the identical patch is caught by M50's units |
+| M15 | Demonstrated at R3, in a focused round |
+| M16 | **Survives**. The probe shows no fixture reaches its state; a race can |
+| M17, M18, M20 | Demonstrated |
+| M19 | Caught by `case_lost_assertion` and `case_expired_hold_does_not_publish`; R7 not reached |
+| M21 | Demonstrated (unit), and at R14 with the masking tests removed |
+| M22 | Caught by the retention and thread-page cases; named F10 passes |
+| M23 | **Survives**: no test puts an insert and a delete in one record |
+| M24, M25 | Demonstrated (R16/R20, R17) |
+| M26 | Demonstrated |
+| M27 | Demonstrated at F3, with the masking test removed |
+| M28 | Demonstrated: a at the F4 block (focused round), b at R22 |
+| M29 | a: demonstrated (unit); wire F1 unobserved behind a debug assertion. **b: not executed.** c: demonstrated |
+| M30 | Demonstrated (unit); R21 doesn't discriminate |
+| M31 | Caught by its unit and R22's held-set check; R16/R20 not reached |
+| M32 | Demonstrated |
+| M33 | Demonstrated (unit), and at R26 with PL4 removed |
+| M34–M39 | Demonstrated, including both variants of M34 and M38 |
+| M40 | Demonstrated (unit H9); R3 injects no bad tag |
+| M41, M42 | Demonstrated, including both variants of M42 |
+| M43 | a: demonstrated (unit) and caught by two wire tests; named case not reached. b: demonstrated |
+| M44 | Demonstrated (two units); R24/G2 passes when reached |
+| M45, M46, M47 | Demonstrated |
+| M48 | **Survives**: no test re-presents an already-held insert |
+| M49 | Demonstrated (unit; G12); R7 can't discriminate |
+| M50–M63 | Demonstrated |
+| M64 | Demonstrated; the injected-error branch is not reached |
+| M65–M79 | Demonstrated. M66's second branch passes, as expected |
+
+Open decisions for Jay: M14, M16, M23, M44, M48, M22's F10, and M29b. Task 19 remains
+incomplete for the reasons under [Where things stand](#where-things-stand).
+
+### Correct-code regression follow-up (2026-11-11)
+
+The [M16/M23/M48 follow-up](2026-11-11-zero-access-search-regression-followup.md)
+adds a real-pass pending-cursor regression, strengthens the mixed-record planner
+ordering assertion, and directly tests live and retained-deleted held inserts.
+Independent Astra review approved the tests. All 18 planner tests and the full
+canonical RocksDB ZA suite passed; the latter includes M16 in normal recovery
+order and complete differential checks and cleanup. Production behavior is unchanged.
+
+These are correct-code results. No deliberate faulty variant ran in this follow-up,
+so the historical survivor rows above are not changed to mutation kills. The M16
+fixture directly establishes the resident state rather than scheduling the full
+cross-node race. M23 covers the planner contract; a single `Email/set` create and
+destroy commits separately and does not establish a mixed log record. M29b's
+exclusion and the other campaign findings remain as recorded.
+
+### First campaign: 19 regressions (2026-11-10)
+
+**At that point the fresh Step 2 campaign was partly executed.** At the earlier local cutoff,
 automatic screening had stopped preparation of 19 checks, and a separate
 forward/reverse verification request for 55 rebased drafts had stopped before
 dispatch. Jay subsequently commissioned an independent validation task on
@@ -976,6 +1069,8 @@ run. Task 19 and the complete Step 2 campaign remain incomplete.
 | Nine epoch/recovery targets | M68–M73 and M74a/b/c detected their faults in focused, baselined runs; each production edit was restored exactly. |
 | M30 opener | Correct-code unit passed with 39 opened documents. The wrong-reservation outcome remains unexecuted. R21 covers fixed padding, with distinct reservation-only coverage pending. |
 | Remaining preparation and restored checks | Pending release and execution. |
+
+The later campaigns above superseded the 55-draft and remaining-preparation rows of this table.
 
 The report preserves the exact selections, commands, first failing assertions,
 restoration hashes and deviations. These were focused module selections within
@@ -1242,7 +1337,7 @@ That observer did not reach system startup logging or a request beyond
 
 ## Deferred findings
 
-- Task 3 construction reversal alone did not force both hash iteration orders. The deterministic Task 15 companion forces the downstream-first map traversal and closes that fixture gap; the fresh Task 19 mutation remains pending.
+- Task 3 construction reversal alone did not force both hash iteration orders. The deterministic Task 15 companion forces the downstream-first map traversal. The 55-draft campaign's `actual-map-order` companion detected the fault at its chain-order assertion; this former mutation gap is closed.
 - Task 9 first Sales failure remains unexplained. Later passes record non-recurrence.
 - Task 10 source review deferred the unchanged ordinary/mixed SAVE construction that may wait on its own saved-search result. No runtime reproduction was claimed.
 - Task 13 caller-only Content floor now has a focused correct-code pass and a named fault failure in the independent remaining-checks report. The exact test-only proposal is integrated; the full ZA suite passed with both default and FileSystem blob storage. Current-row values in queryChanges are the accepted scope. A revision-indexed performance shortcut depends on Task 19 measurement.
@@ -1274,4 +1369,11 @@ final merge notes.
 
 ## Open questions for Jay
 
-None currently blocks work. Jay approved the provisional limits and both final reviewers. Ask about a default only if completed evidence supports a change.
+Jay approved the provisional limits, both final reviewers and proceeding to a
+draft PR with the remaining qualification listed. M29b is an explicit unexecuted
+campaign exception. The three strengthened tests have correct-code results only;
+new mutation sensitivity and the recorded alternate-catcher findings remain
+unestablished where indicated above. Docker CI, native clients, the separate
+fresh-store gate, networked-store timing and physical multi-node verification
+remain open; opening a draft does not waive them or declare Task 19 complete.
+Ask about a default only if completed evidence supports a change.

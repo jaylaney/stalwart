@@ -1184,14 +1184,26 @@ mod tests {
         base.thread.assign(&fields(9), 9, 3, 9);
         let mut changes = inserts(1..=5);
         changes.push(Change::DeleteItem(singleton(9)));
-        let staged = plan(
-            &base,
-            &records(vec![(11, changes)]),
-            &limits(),
-            &mut opener(4..=5),
-        )
-        .await;
+        let mut opener = opener(4..=5);
+        // Both inserts share the held document's subject. Only 4 refers to 9.
+        for document_id in [4, 5] {
+            let fields = &mut opener
+                .0
+                .get_mut(&document_id)
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .fields;
+            fields.subject_hash = 9;
+            if document_id == 4 {
+                fields.hashes.push(9);
+            }
+        }
+
+        let staged = plan(&base, &records(vec![(11, changes)]), &limits(), &mut opener).await;
         assert_eq!(ids(&staged), [4, 5]);
+        assert_eq!(staged.records[0].thread_id, 9);
+        assert_eq!(staged.records[1].thread_id, 5);
         assert_eq!(
             staged.tombstones,
             [Tombstone {
@@ -1200,6 +1212,43 @@ mod tests {
             }]
         );
         assert_eq!(staged.checkpoint, complete(11));
+    }
+
+    #[tokio::test]
+    async fn a_logged_insert_for_a_held_document_only_advances_the_checkpoint() {
+        let document_id = 7;
+        let records = records(vec![(11, inserts([document_id]))]);
+        for deleted in [None, Some(10)] {
+            let mut base = base();
+            base.thread.assign(&fields(2), 2, 3, 8);
+            base.thread.assign(&fields(2), document_id, 3, 9);
+            if let Some(deleted) = deleted {
+                assert!(base.thread.tombstone(document_id, deleted));
+            }
+            let held = base.thread.record(document_id).unwrap().clone();
+            assert_eq!(held.thread_id, 2);
+            assert_eq!(held.deleted, deleted);
+
+            let mut opener = content_opener([document_id]);
+            let staged = plan(&base, &records, &limits(), &mut opener).await;
+
+            assert!(
+                opener.0.contains_key(&document_id),
+                "opened held document with deletion stamp {deleted:?}"
+            );
+            assert!(staged.records.is_empty() && staged.aliases.is_empty());
+            assert!(staged.content.is_empty() && staged.tombstones.is_empty());
+            assert!(staged.skipped.is_empty());
+            assert_eq!(staged.witness, None);
+            assert_eq!(staged.revision, base.manifest.revision);
+            assert!(matches!(staged.decision, PassDecision::ManifestOnly));
+            assert_eq!(staged.checkpoint, complete(11));
+            assert_eq!(staged.scanned_to, 11);
+
+            let mut thread = base.thread;
+            thread.extend(staged.records, staged.aliases, [], staged.tombstones);
+            assert_eq!(thread.record(document_id), Some(&held));
+        }
     }
 
     #[tokio::test]
