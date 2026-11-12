@@ -683,6 +683,7 @@ fn apply_tombstones<I: Iterator<Item = u32>>(
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn load_content<S: BlobSource>(
     source: &S,
     entry: &IndexEntry,
@@ -1118,6 +1119,7 @@ async fn load_current_content<S: BlobSource>(
     }
 }
 
+#[cfg(test)]
 pub async fn apply_reload<S: BlobSource>(
     source: &S,
     entry: &IndexEntry,

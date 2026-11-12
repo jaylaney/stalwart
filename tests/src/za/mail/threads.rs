@@ -25,10 +25,13 @@ use serde_json::{Value, json};
 use store::{query::log::Change, za_search::manifest::ManifestValue};
 use types::{collection::SyncCollection, id::Id};
 
+mod imap_guards;
+mod pr84;
 mod protocol;
 mod races;
 mod task12;
 mod task13;
+mod trusted_references;
 
 const SENDER: &str = "sender@example.org";
 const KEY: &str = "keymail50@example.com";
@@ -47,6 +50,7 @@ pub async fn test(test: &mut TestServer) {
     case_import_response_state_includes_publication(test, &key, &root, root_id).await;
     case_keyless_stale_prefix(test, &key, root_id, reply_id).await;
     protocol::test(test, &key, &root, root_id).await;
+    trusted_references::test(test, &key, &root, root_id).await;
 
     let race_key = key_mail_account(test, RACE_KEY, STRONG).await;
     races::test(test, &race_key).await;
@@ -65,6 +69,7 @@ pub async fn test(test: &mut TestServer) {
     for account in [&key, &race_key, &plain] {
         test.destroy_all_mailboxes(account).await;
     }
+    imap_guards::test(test).await;
     task12::test(test).await;
     task13::test(test).await;
     test_compaction(test).await;

@@ -902,8 +902,12 @@ mod tests {
         use crate::message::za::search::pass::{PassLimits, PassSources, plan_pass};
         let marker = index.manifest.reconciliation.as_ref().unwrap();
         let diff = difference(index, present.iter().copied(), retained, marker);
+        let mut snapshot = LoadedIndex::empty(index.manifest.clone());
+        snapshot.thread = index.thread.clone();
+        snapshot.scanned_to = index.scanned_to;
+        snapshot.update_records = index.update_records;
         plan_pass(
-            index,
+            &mut snapshot,
             PassSources {
                 gap_inserts: diff.gap_inserts,
                 gap_deletes: diff.gap_deletes,
@@ -917,7 +921,6 @@ mod tests {
                 message_bytes: 32 << 20,
                 elapsed: std::time::Duration::from_secs(2),
                 checkpoint: 1000,
-                skip_after: 8,
                 content_allowed: true,
             },
             std::time::Instant::now(),

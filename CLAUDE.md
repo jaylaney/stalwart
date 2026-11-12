@@ -59,7 +59,7 @@ Registry: configuration and accounts are registry objects. The Rust types in `cr
 `ZA_SEARCH_MEM_MB`, `ZA_SEARCH_THREAD_MEM_MB`, `ZA_SEARCH_ACCOUNT_MAX_MB`,
 `ZA_SEARCH_IDLE_SECS`, `ZA_SEARCH_PASS_CAP`, `ZA_SEARCH_PASS_MB`,
 `ZA_SEARCH_PASS_HIDDEN_KB`, `ZA_SEARCH_PASS_MS`, `ZA_SEARCH_WAIT_SECS`,
-`ZA_SEARCH_SEGMENTS`, `ZA_SEARCH_CHECKPOINT`, `ZA_SEARCH_SKIP_AFTER`,
+`ZA_SEARCH_SEGMENTS`, `ZA_SEARCH_CHECKPOINT`,
 `ZA_SEARCH_ABSENT_RETRY_SECS` and `ZA_SEARCH_PAD_MIN`.
 [Searching key accounts](docs/README-dev.md#searching-key-accounts) has the defaults,
 the four startup refusals and the cluster-wide account-cap rule. Registry objects are edited through JMAP `x:<Type>/set` calls (see `tests/src/utils/registry.rs`).
@@ -176,6 +176,14 @@ Invariants (spec section 12):
   `Email/set` update and destroy (document id, prefix unchecked), identities,
   vacation, Sieve, push and `Core/echo`.
 - Invariant 9 exceptions, applied to every account, ordinary ones included:
+  - IMAP SAVE resolves composite sequences containing `$` against the captured
+    previous search result, independently of a search Map. This avoids waiting
+    for the command's own replacement result channel (search spec 6.2).
+  - Permanent account destruction runs search inventory cleanup for ordinary accounts
+    too. When the vault and manifest are both absent, it scans all 256 blob-link
+    shards for the account's Principal/document-0 links and unlinks under atomic
+    absence assertions. This costs one full blob-link scan per such destruction
+    and preserves orphan/stale-worker cleanup (search spec 5.7, F23).
   - `za_harvest_allowed` decides upstream key-harvest eligibility per recipient after its
     delivery outcome. Only a recipient whose message committed and whose account still reads
     ordinary contributes. Refusals, failures, Sieve outcomes with no write, and duplicates
@@ -242,7 +250,9 @@ eviction, with the expected results in 26.469 s and 507.458 µs. The run
 logged a teardown panic after measurement. The separate optimized OSS
 restart pair served the expected results in 23.053 s and 1.026 ms with
 matching 30,000-ID public censuses. Local cold-search qualification is
-complete. All fourteen search settings are unchanged. Memory and account
+complete at its recorded head. Those runs retained all fourteen original settings;
+the PR 84 fixes retire `ZA_SEARCH_SKIP_AFTER` because transient errors must stay
+pending. Memory and account
 sizing defaults remain provisional.
 The [independent remaining-checks report](docs/superpowers/plans/2026-11-07-zero-access-16-search-remaining-checks-review.md)
 records 18 of 19 targets caught in focused fault runs, plus a T13 Content

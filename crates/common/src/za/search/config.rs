@@ -22,7 +22,6 @@ pub struct ZaSearchConfig {
     pub wait_secs: u64,
     pub segments: usize,
     pub checkpoint: usize,
-    pub skip_after: u8,
     pub absent_retry_secs: u64,
     pub pad_min: usize,
 }
@@ -41,7 +40,6 @@ impl Default for ZaSearchConfig {
             wait_secs: 30,
             segments: 16,
             checkpoint: 1000,
-            skip_after: 8,
             absent_retry_secs: 10,
             pad_min: 65_536,
         }
@@ -54,6 +52,8 @@ impl ZaSearchConfig {
     }
 
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        // ZA_SEARCH_SKIP_AFTER is retired and intentionally ignored: transient
+        // failures remain pending until recovery, regardless of their count.
         let defaults = Self::default();
         let config = Self {
             mem_mb: read(&lookup, "ZA_SEARCH_MEM_MB", defaults.mem_mb),
@@ -67,7 +67,6 @@ impl ZaSearchConfig {
             wait_secs: read(&lookup, "ZA_SEARCH_WAIT_SECS", defaults.wait_secs),
             segments: read(&lookup, "ZA_SEARCH_SEGMENTS", defaults.segments),
             checkpoint: read(&lookup, "ZA_SEARCH_CHECKPOINT", defaults.checkpoint),
-            skip_after: read(&lookup, "ZA_SEARCH_SKIP_AFTER", defaults.skip_after),
             absent_retry_secs: read(
                 &lookup,
                 "ZA_SEARCH_ABSENT_RETRY_SECS",
@@ -153,10 +152,19 @@ mod tests {
         assert_eq!(c.wait_secs, 30);
         assert_eq!(c.segments, 16);
         assert_eq!(c.checkpoint, 1000);
-        assert_eq!(c.skip_after, 8);
         assert_eq!(c.absent_retry_secs, 10);
         assert_eq!(c.pad_min, 65_536);
         assert_eq!(c.hidden_budget(), 32_768);
+    }
+
+    #[test]
+    fn a_retired_skip_threshold_does_not_change_configuration() {
+        for value in ["0", "1", "255", "invalid"] {
+            assert_eq!(
+                cfg(&[("ZA_SEARCH_SKIP_AFTER", value)]).unwrap(),
+                ZaSearchConfig::default()
+            );
+        }
     }
 
     #[test]
@@ -223,13 +231,8 @@ mod tests {
     #[test]
     fn a_zero_is_malformed_where_zero_cannot_work() {
         // Zero means "unset" for the counts and intervals that must be positive.
-        let c = cfg(&[
-            ("ZA_SEARCH_SEGMENTS", "0"),
-            ("ZA_SEARCH_WAIT_SECS", "0"),
-            ("ZA_SEARCH_SKIP_AFTER", "0"),
-        ])
-        .unwrap();
-        assert_eq!((c.segments, c.wait_secs, c.skip_after), (16, 30, 8));
+        let c = cfg(&[("ZA_SEARCH_SEGMENTS", "0"), ("ZA_SEARCH_WAIT_SECS", "0")]).unwrap();
+        assert_eq!((c.segments, c.wait_secs), (16, 30));
     }
 
     #[test]

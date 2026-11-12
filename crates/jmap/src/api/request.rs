@@ -278,6 +278,11 @@ impl RequestHandler for Server {
                                 match set_response {
                                     SetResponseMethod::Email(set_response) => {
                                         set_response.update_created_ids(&mut response);
+                                        if set_response.account_id.is_some_and(|id| {
+                                            access_token.za_keys_for(id.document_id()).is_some()
+                                        }) {
+                                            response.trust_email_creations(set_response);
+                                        }
                                     }
                                     SetResponseMethod::Mailbox(set_response) => {
                                         set_response.update_created_ids(&mut response);
@@ -345,6 +350,12 @@ impl RequestHandler for Server {
                             ResponseMethod::ImportEmail(import_response) => {
                                 // Add created ids
                                 import_response.update_created_ids(&mut response);
+                                if access_token
+                                    .za_keys_for(import_response.account_id.document_id())
+                                    .is_some()
+                                {
+                                    response.trust_email_imports(import_response);
+                                }
                             }
                             ResponseMethod::UploadBlob(upload_response) => {
                                 // Add created blobIds
@@ -375,6 +386,8 @@ impl RequestHandler for Server {
 
                 // Process next call
                 if let Some(next_call) = next_call {
+                    #[cfg(feature = "test_mode")]
+                    za_reference_test::followup_pause(owner).await;
                     call = next_call;
                     call.id
                         .clone_from(&response.method_responses.last().unwrap().id);
@@ -1152,5 +1165,35 @@ mod za_post_write_tests {
         selected.acknowledge(&[]);
         assert!(selected.take_attempt().is_some());
         assert!(selected.take_attempt().is_none());
+    }
+}
+
+#[cfg(feature = "test_mode")]
+pub mod za_reference_test {
+    use common::za::test_hooks::Pause;
+    use std::sync::{Arc, Mutex};
+
+    static FOLLOWUP: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+    pub fn set_followup_pause(pause: Option<Arc<Pause>>) {
+        *FOLLOWUP.lock().unwrap_or_else(|e| e.into_inner()) = pause;
+    }
+
+    pub(super) async fn followup_pause(account_id: u32) {
+        let pause = {
+            let mut slot = FOLLOWUP.lock().unwrap_or_else(|e| e.into_inner());
+            if slot
+                .as_ref()
+                .is_some_and(|pause| pause.account_id == account_id)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.arrived.notify_one();
+            pause.release.notified().await;
+        }
     }
 }

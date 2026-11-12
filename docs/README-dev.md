@@ -56,7 +56,8 @@ the existing positions and compression decisions. The later
 records a successful optimized Rust cache-eviction pair at 30,000 messages
 and the subsequent teardown panic. The separate optimized OSS run passed
 the 30,000-message process-restart gate with matching public censuses.
-All fourteen search settings are unchanged.
+Those qualification runs retained all fourteen original settings. The PR 84
+correction removes the transient skip threshold; the sizing defaults stay unchanged.
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
@@ -71,7 +72,6 @@ All fourteen search settings are unchanged.
 | `ZA_SEARCH_WAIT_SECS` | 30 s | How long a content request keeps completing passes before refusing. |
 | `ZA_SEARCH_SEGMENTS` | 16 | Thread-blob and content-chain compaction threshold, also the tiered content merge fan-in. |
 | `ZA_SEARCH_CHECKPOINT` | 1000 records | Update-only records that trigger a manifest-only checkpoint. |
-| `ZA_SEARCH_SKIP_AFTER` | 8 attempts | Non-absent transient attempts on one document before it is skipped as loss. |
 | `ZA_SEARCH_ABSENT_RETRY_SECS` | 10 s | Retry window for an absent message or index blob before absence is treated as loss. |
 | `ZA_SEARCH_PAD_MIN` | 65536 bytes | Exact publishing target for the hidden thread section and minimum thread compaction padding class. |
 
@@ -113,8 +113,13 @@ can refuse the Content request while a validated Map remains available.
 A missing message blob within its retry
 window aborts the pass and keeps the document pending. The pass preserves
 the matching attempt count, using zero when there is no previous count.
-The separate `ZA_SEARCH_SKIP_AFTER` bound applies to a non-absent transient.
+Non-absent transient failures also stay pending, regardless of the persisted
+attempt count. The old `ZA_SEARCH_SKIP_AFTER` environment variable is ignored.
+A persistent transport or configuration fault may hold Content freshness until
+it is repaired; recovery retries the pending message without a rebuild.
 Eviction can forget the first absence time and extend the effective window.
+The existing 30-second key-sweep event also sweeps idle search entries, without
+requiring another keyed request; active readers, loads and passes remain protected.
 
 A lost or corrupt thread index rebuilds on the next keyed request and publishes
 a new identity epoch. Clients with sync states that cross that boundary need to

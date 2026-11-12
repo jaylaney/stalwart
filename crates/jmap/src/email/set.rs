@@ -156,7 +156,7 @@ impl EmailSet for Server {
         };
 
         let mut last_change_id = None;
-        let will_destroy = response.collect_will_destroy(request.unwrap_destroy());
+        let mut destroy = request.unwrap_destroy();
 
         // Mail spec 4: a create needs the account's keys; updates and
         // destroys do not.
@@ -1145,7 +1145,9 @@ impl EmailSet for Server {
             .update
             .as_ref()
             .is_some_and(|updates| !updates.is_empty())
-            || !will_destroy.is_empty();
+            || destroy
+                .iter()
+                .any(|id| matches!(id, MaybeInvalid::Value(_)));
         let input = if let Some(keys) = keys.filter(|_| has_mutations) {
             Some(
                 self.za_snapshot(account_id, keys)
@@ -1157,6 +1159,31 @@ impl EmailSet for Server {
         };
         let keyless_update =
             keys.is_none() && has_mutations && self.za_is_key_account(account_id).await?;
+        // Only server-generated success targets carry these annotations. Resolve
+        // both lists against this post-create input view before willDestroy.
+        if let Some(update) = &mut request.update {
+            for (position, (id, _)) in update.iter_mut().enumerate() {
+                if let Some(target) = request.arguments.trusted_updates.get(position)
+                    && let MaybeInvalid::Value(original) = id
+                {
+                    *id = match super::trusted_email_id(*target, account_id, input.as_ref()) {
+                        Some(current) => MaybeInvalid::Value(current),
+                        None => MaybeInvalid::Invalid(original.to_string()),
+                    };
+                }
+            }
+        }
+        for (position, id) in destroy.iter_mut().enumerate() {
+            if let Some(target) = request.arguments.trusted_destroy.get(position)
+                && let MaybeInvalid::Value(original) = id
+            {
+                *id = match super::trusted_email_id(*target, account_id, input.as_ref()) {
+                    Some(current) => MaybeInvalid::Value(current),
+                    None => MaybeInvalid::Invalid(original.to_string()),
+                };
+            }
+        }
+        let will_destroy = response.collect_will_destroy(destroy);
         let cache = input.as_ref().map_or(&cache, |input| &input.cache);
         let check_prefix = |id: Id, stored_prefix| match &input {
             Some(input) => input.check_id(id).is_some(),

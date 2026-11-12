@@ -115,25 +115,21 @@ impl ZaSearchCache {
     }
 
     pub fn entry(&self, account_id: u32) -> Arc<IndexEntry> {
-        let entry = {
-            let mut entries = self.inner.entries.lock().unwrap();
-            let entry = entries.entry(account_id).or_insert_with(|| {
-                Arc::new(IndexEntry {
-                    account_id,
-                    index: Arc::default(),
-                    pass_lock: AsyncMutex::default(),
-                    load_flight: AsyncMutex::default(),
-                    content_load_flight: AsyncMutex::default(),
-                    last_used: AtomicU64::new(now()),
-                    absent: Mutex::default(),
-                    cache: Arc::downgrade(&self.inner),
-                })
-            });
-            entry.touch();
-            entry.clone()
-        };
-        self.sweep_idle();
-        entry
+        let mut entries = self.inner.entries.lock().unwrap();
+        let entry = entries.entry(account_id).or_insert_with(|| {
+            Arc::new(IndexEntry {
+                account_id,
+                index: Arc::default(),
+                pass_lock: AsyncMutex::default(),
+                load_flight: AsyncMutex::default(),
+                content_load_flight: AsyncMutex::default(),
+                last_used: AtomicU64::new(now()),
+                absent: Mutex::default(),
+                cache: Arc::downgrade(&self.inner),
+            })
+        });
+        entry.touch();
+        entry.clone()
     }
 
     pub fn get(&self, account_id: u32) -> Option<Arc<IndexEntry>> {
@@ -166,6 +162,7 @@ impl ZaSearchCache {
         }
     }
 
+    #[cfg(test)]
     pub fn drop_content(&self, account_id: u32, reason: EvictReason) {
         if let Some(entry) = self.inner.entries.lock().unwrap().get(&account_id) {
             entry.try_drop_content(reason);
@@ -209,10 +206,12 @@ impl ZaSearchCache {
         true
     }
 
+    #[cfg(test)]
     pub fn admit_content_growth(&self, index: &mut LoadedIndex, account_id: u32) -> bool {
         self.admit_content_growth_with_staged(index, account_id, None)
     }
 
+    #[cfg(test)]
     pub fn admit_content_growth_with_staged(
         &self,
         index: &mut LoadedIndex,
@@ -363,6 +362,16 @@ impl ZaSearchCache {
             }
         }
         fits()
+    }
+
+    #[cfg(feature = "test_mode")]
+    pub fn expire_idle_for_test(&self, account_id: u32) {
+        self.inner.entries.lock().unwrap()[&account_id]
+            .last_used
+            .store(
+                now().saturating_sub(self.config().idle_secs.saturating_add(1)),
+                Ordering::Relaxed,
+            );
     }
 
     #[cfg(feature = "test_mode")]

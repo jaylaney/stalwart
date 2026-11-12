@@ -251,6 +251,7 @@ impl ManifestValue {
         Self::decode_inner(bytes, None)
     }
 
+    #[cfg(test)]
     pub fn decode_inventory(bytes: &[u8]) -> Result<Inventory, ManifestError> {
         Ok(match Self::decode_unverified(bytes)? {
             Self::Index(manifest) => Inventory {

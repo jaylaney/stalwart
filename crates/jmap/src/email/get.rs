@@ -10,6 +10,7 @@ use crate::{
         metadata::{MetadataDocuments, MetadataType, ObjectMetadata, select_properties},
     },
     changes::state::{JmapCacheState, MetadataStateManager},
+    email::trusted_email_id,
 };
 use common::{
     Server,
@@ -37,7 +38,11 @@ use email::{
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, all_ids, unique_properties},
     object::email::{Email, EmailProperty, EmailValue},
-    request::{IntoValid, capability::CapabilityIds},
+    request::{
+        IntoValid,
+        capability::CapabilityIds,
+        reference::{MaybeIdReference, MaybeResultReference},
+    },
     types::date::UTCDate,
 };
 use jmap_tools::{Map, Value};
@@ -69,7 +74,12 @@ impl EmailGet for Server {
         using: CapabilityIds,
         reservation: &mut MemoryReservation,
     ) -> trc::Result<GetResponse<Email>> {
-        let (ids, not_found_ids) = request.unwrap_ids(self.core.jmap.get_max_objects)?;
+        if let Some(MaybeResultReference::Value(ids)) = &request.ids
+            && ids.len() > self.core.jmap.get_max_objects
+        {
+            return Err(trc::JmapEvent::RequestTooLarge.into_err());
+        }
+        let arguments = std::mem::take(&mut request.arguments);
         let is_default = request.properties.is_none();
         let (properties, selection) = select_properties(
             &mut request,
@@ -110,8 +120,7 @@ impl EmailGet for Server {
         let metadata_slots = metadata.as_ref().map_or(0, |get| {
             usize::from(get.wants_shared()) + usize::from(get.wants_private())
         });
-        let body_properties = request
-            .arguments
+        let body_properties = arguments
             .body_properties
             .map(|v| unique_properties(v.into_valid()))
             .unwrap_or_else(|| {
@@ -129,10 +138,10 @@ impl EmailGet for Server {
                 ]
             });
         let options = BodyValueOptions {
-            fetch_text: request.arguments.fetch_text_body_values.unwrap_or(false),
-            fetch_html: request.arguments.fetch_html_body_values.unwrap_or(false),
-            fetch_all: request.arguments.fetch_all_body_values.unwrap_or(false),
-            max_bytes: request.arguments.max_body_value_bytes.unwrap_or(0),
+            fetch_text: arguments.fetch_text_body_values.unwrap_or(false),
+            fetch_html: arguments.fetch_html_body_values.unwrap_or(false),
+            fetch_all: arguments.fetch_all_body_values.unwrap_or(false),
+            max_bytes: arguments.max_body_value_bytes.unwrap_or(0),
         };
         let mut needs_metadata = false;
         for property in &properties {
@@ -189,6 +198,19 @@ impl EmailGet for Server {
                 .await
                 .caused_by(trc::location!())?,
         };
+        // Provenance uses the original list positions, before invalid IDs are
+        // removed by unwrap_ids. Equal literals remain strict in this same list.
+        if let Some(MaybeResultReference::Value(ids)) = &mut request.ids {
+            for (position, id) in ids.iter_mut().enumerate() {
+                if let Some(target) = arguments.trusted_ids.get(&position) {
+                    *id = match trusted_email_id(*target, account_id, snapshot.as_ref()) {
+                        Some(current) => MaybeIdReference::Id(current),
+                        None => MaybeIdReference::Invalid(id.to_string()),
+                    };
+                }
+            }
+        }
+        let (ids, not_found_ids) = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let lookup = |id| match &snapshot {
             Some(snapshot) => cache.email_by_id(&snapshot.check_id(id)?),
             None => cache.email_by_jmap_id(id),

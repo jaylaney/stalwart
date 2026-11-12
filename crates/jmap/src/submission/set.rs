@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::email::trusted_email_id;
 use common::{
     Server,
     auth::AccessToken,
@@ -35,7 +36,7 @@ use jmap_proto::{
     request::{
         Call, MaybeInvalid, RequestMethod, SetRequestMethod,
         method::{MethodFunction, MethodName, MethodObject},
-        reference::{MaybeIdReference, MaybeResultReference},
+        reference::{MaybeIdReference, MaybeResultReference, TrustedEmailTarget},
     },
     types::{date::UTCDate, state::State},
 };
@@ -78,6 +79,7 @@ pub trait EmailSubmissionSet: Sync + Send {
         instance: &Arc<ServerInstance>,
         object: Value<'_, EmailSubmissionProperty, EmailSubmissionValue>,
         snapshot: Option<&ZaSnapshot>,
+        trusted_email_ids: Option<&store::ahash::AHashMap<usize, TrustedEmailTarget>>,
     ) -> impl Future<
         Output = trc::Result<Result<EmailSubmission, SetError<EmailSubmissionProperty>>>,
     > + Send;
@@ -137,6 +139,7 @@ impl EmailSubmissionSet for Server {
                 continue;
             }
 
+            let trusted_email_ids = request.arguments.trusted_email_ids.remove(&id);
             match self
                 .send_message(
                     account_id,
@@ -145,6 +148,7 @@ impl EmailSubmissionSet for Server {
                     instance,
                     object,
                     snapshot.as_ref(),
+                    trusted_email_ids.as_ref(),
                 )
                 .await?
             {
@@ -391,6 +395,12 @@ impl EmailSubmissionSet for Server {
             }
         }
 
+        // Release this method's view. Follow-up targets retain document identity
+        // and are mapped only after Email/set acquires its own input view.
+        let keyed_followup = snapshot.is_some();
+        drop(snapshot);
+        let mut followup_arguments = jmap_proto::object::email::EmailSetArguments::default();
+
         // On success
         let resolve_email_id = |id: MaybeIdReference<Id>| {
             let id = match id {
@@ -398,11 +408,7 @@ impl EmailSubmissionSet for Server {
                 MaybeIdReference::Reference(id_ref) => success_email_ids.get(&id_ref).copied(),
                 MaybeIdReference::Invalid(_) => None,
             }?;
-            Some(
-                snapshot
-                    .as_ref()
-                    .map_or(id, |snapshot| snapshot.map_id(id.document_id())),
-            )
+            Some(id)
         };
         let update = request
             .arguments
@@ -411,7 +417,14 @@ impl EmailSubmissionSet for Server {
                 update
                     .into_iter()
                     .filter_map(|(id, value)| {
-                        resolve_email_id(id).map(|id| (MaybeInvalid::Value(id), value))
+                        resolve_email_id(id).map(|id| {
+                            if keyed_followup {
+                                followup_arguments
+                                    .trusted_updates
+                                    .push(TrustedEmailTarget::new(account_id, id.document_id()));
+                            }
+                            (MaybeInvalid::Value(id), value)
+                        })
                     })
                     .collect::<VecMap<_, _>>()
             })
@@ -422,7 +435,14 @@ impl EmailSubmissionSet for Server {
             .map(|ids| {
                 ids.into_iter()
                     .filter_map(resolve_email_id)
-                    .map(MaybeInvalid::Value)
+                    .map(|id| {
+                        if keyed_followup {
+                            followup_arguments
+                                .trusted_destroy
+                                .push(TrustedEmailTarget::new(account_id, id.document_id()));
+                        }
+                        MaybeInvalid::Value(id)
+                    })
                     .collect::<Vec<_>>()
             })
             .filter(|ids| !ids.is_empty());
@@ -436,7 +456,7 @@ impl EmailSubmissionSet for Server {
                     create: None,
                     update,
                     destroy: destroy.map(MaybeResultReference::Value),
-                    arguments: Default::default(),
+                    arguments: followup_arguments,
                 }))),
             }
             .into();
@@ -453,6 +473,7 @@ impl EmailSubmissionSet for Server {
         instance: &Arc<ServerInstance>,
         object: Value<'_, EmailSubmissionProperty, EmailSubmissionValue>,
         snapshot: Option<&ZaSnapshot>,
+        trusted_email_ids: Option<&store::ahash::AHashMap<usize, TrustedEmailTarget>>,
     ) -> trc::Result<Result<EmailSubmission, SetError<EmailSubmissionProperty>>> {
         let mut submission = EmailSubmission {
             email_id: u32::MAX,
@@ -463,7 +484,7 @@ impl EmailSubmissionSet for Server {
         let mut mail_from: Option<MailFrom<Cow<'_, str>>> = None;
         let mut rcpt_to: Vec<RcptTo<Cow<'_, str>>> = Vec::new();
 
-        for (property, mut value) in object.into_expanded_object() {
+        for (position, (property, mut value)) in object.into_expanded_object().enumerate() {
             if let Err(err) = response.resolve_self_references(&mut value, 0, false) {
                 return Ok(Err(err));
             };
@@ -473,6 +494,16 @@ impl EmailSubmissionSet for Server {
                     Key::Property(EmailSubmissionProperty::EmailId),
                     Value::Element(EmailSubmissionValue::Id(value)),
                 ) => {
+                    let value = if let Some(target) =
+                        trusted_email_ids.and_then(|ids| ids.get(&position))
+                    {
+                        let Some(current) = trusted_email_id(*target, account_id, snapshot) else {
+                            return Ok(Err(SetError::not_found()));
+                        };
+                        current
+                    } else {
+                        value
+                    };
                     if let Some(snapshot) = snapshot {
                         let Some(document_id) = snapshot.check_id(value) else {
                             return Ok(Err(SetError::not_found()));

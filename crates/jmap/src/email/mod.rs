@@ -4,10 +4,14 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use email::message::{ingest::IngestedEmail, za::search::snapshot::ZaSnapshot};
+use email::{
+    cache::email::MessageCacheAccess,
+    message::{ingest::IngestedEmail, za::search::snapshot::ZaSnapshot},
+};
 use jmap_proto::{
     error::set::SetError,
     object::email::{EmailProperty, EmailValue},
+    request::reference::TrustedEmailTarget,
 };
 use jmap_tools::{JsonPointer, JsonPointerItem, Key, Map, Value};
 use types::{id::Id, keyword::Keyword};
@@ -26,6 +30,18 @@ pub mod set;
 pub mod snippet;
 pub mod za;
 pub mod za_search;
+
+/// Resolve only in the consumer's own validated view. A missing document or
+/// different account never falls back to the reference's old numeric value.
+pub(crate) fn trusted_email_id(
+    target: TrustedEmailTarget,
+    account_id: u32,
+    snapshot: Option<&ZaSnapshot>,
+) -> Option<Id> {
+    let snapshot = snapshot?;
+    (target.account_id() == account_id && snapshot.cache.has_email_id(&target.document_id()))
+        .then(|| snapshot.map_id(target.document_id()))
+}
 
 fn ingested_into_object(email: IngestedEmail) -> Map<'static, EmailProperty, EmailValue> {
     Map::with_capacity(3)

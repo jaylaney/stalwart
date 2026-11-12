@@ -1289,6 +1289,63 @@ async fn g6_loads_are_single_flight() {
 
 #[cfg(feature = "test_mode")]
 #[tokio::test]
+async fn s43_entry_lookup_does_not_sweep_other_accounts() {
+    let cache = ZaSearchCache::new(Ok(ZaSearchConfig {
+        idle_secs: 1,
+        ..ZaSearchConfig::default()
+    }));
+    cache.set_content_bytes_for_test(1, 300 * KIB);
+    cache
+        .get(1)
+        .unwrap()
+        .last_used
+        .store(store::write::now() - 2, Ordering::Relaxed);
+
+    // Looking up one account must not scan and evict every other account.
+    drop(cache.entry(2));
+    assert!(cache.get(1).is_some());
+    assert_eq!(cache.content_used(), 300 * KIB);
+
+    cache.sweep_idle();
+    assert!(cache.get(1).is_none());
+    assert_eq!(cache.content_used(), 0);
+}
+
+#[cfg(feature = "test_mode")]
+#[tokio::test]
+async fn s43_idle_sweep_preserves_readers_loaders_and_passes() {
+    for held in ["reader", "pass", "map-load", "content-load"] {
+        let cache = cache();
+        cache.set_content_bytes_for_test(1, 300 * KIB);
+        let entry = cache.get(1).unwrap();
+        let reader = if held == "reader" {
+            Some(entry.read_loaded().await.unwrap())
+        } else {
+            None
+        };
+        let flight = match held {
+            "pass" => Some(entry.pass_lock.lock().await),
+            "map-load" => Some(entry.load_flight.lock().await),
+            "content-load" => Some(entry.content_load_flight.lock().await),
+            _ => None,
+        };
+        cache.expire_idle_for_test(1);
+
+        cache.sweep_idle();
+        assert!(Arc::ptr_eq(&cache.get(1).unwrap(), &entry), "{held}");
+        assert_eq!(cache.content_used(), 300 * KIB, "{held}");
+
+        drop(reader);
+        drop(flight);
+        drop(entry);
+        cache.sweep_idle();
+        assert!(cache.get(1).is_none(), "{held}");
+        assert_eq!(cache.content_used(), 0, "{held}");
+    }
+}
+
+#[cfg(feature = "test_mode")]
+#[tokio::test]
 async fn s43_idle_sweep_and_invalidation_drop_entries() {
     let cache = ZaSearchCache::new(Ok(ZaSearchConfig {
         idle_secs: 1,

@@ -17,6 +17,7 @@ use crate::{
     },
     spawn_op,
 };
+use ahash::AHashMap;
 use common::{
     MessageStoreCache,
     network::SessionStream,
@@ -280,6 +281,40 @@ impl<T: SessionStream> SessionData<T> {
             });
         }
 
+        // Finish selecting the response IDs using the validated cache before
+        // projecting mapped identities or writing any response bytes.
+        if let Some(changed_since) = arguments.changed_since
+            && !is_changed_only
+        {
+            ids.retain(|resolved| {
+                cache
+                    .email_by_id(&resolved.id)
+                    .is_some_and(|message| message.change_id() >= changed_since)
+            });
+        }
+
+        // RFC 9738 requires the highest UIDs to be processed first when truncating
+        let message_limit = message_limit as usize;
+        let limited_uid = if ids.len() > message_limit {
+            let cutoff = ids.len() - message_limit;
+            ids.select_nth_unstable_by_key(cutoff, |resolved| resolved.uid);
+            ids.drain(..cutoff);
+            ids.sort_unstable_by_key(|resolved| resolved.uid);
+            ids.first().map(|resolved| resolved.uid)
+        } else {
+            ids.sort_unstable_by_key(|resolved| resolved.uid);
+            None
+        };
+
+        // Keep only the selected identities alongside their validated cache.
+        // Consuming the view releases its index guard before VANISHED, an
+        // empty response, or any message output can block on the client.
+        let mapped_threads = snapshot.map(|snapshot| {
+            ids.iter()
+                .map(|resolved| (resolved.id, snapshot.thread_of(resolved.id)))
+                .collect::<AHashMap<_, _>>()
+        });
+
         // Convert state to modseq
         if let Some(changed_since) = arguments.changed_since {
             // Send vanished UIDs
@@ -313,14 +348,6 @@ impl<T: SessionStream> SessionData<T> {
                 }
             }
 
-            // Filter out ids without changes
-            if !is_changed_only {
-                ids.retain(|resolved| {
-                    cache
-                        .email_by_id(&resolved.id)
-                        .is_some_and(|message| message.change_id() >= changed_since)
-                });
-            }
             if ids.is_empty() {
                 // Condstore was just enabled, return highest modseq.
                 if enabled_condstore {
@@ -384,18 +411,6 @@ impl<T: SessionStream> SessionData<T> {
 
         // Process each message
         let mut batch = BatchBuilder::new();
-        // RFC 9738 requires the highest UIDs to be processed first when truncating
-        let message_limit = message_limit as usize;
-        let limited_uid = if ids.len() > message_limit {
-            let cutoff = ids.len() - message_limit;
-            ids.select_nth_unstable_by_key(cutoff, |resolved| resolved.uid);
-            ids.drain(..cutoff);
-            ids.sort_unstable_by_key(|resolved| resolved.uid);
-            ids.first().map(|resolved| resolved.uid)
-        } else {
-            ids.sort_unstable_by_key(|resolved| resolved.uid);
-            None
-        };
 
         // Mail spec 7, ruling R33: content reads use the account's keys.
         // Cache-only metadata remains accessible to a stale owner session.
@@ -644,10 +659,9 @@ impl<T: SessionStream> SessionData<T> {
                             }
                             Attribute::ObjectId => {
                                 separate(&mut output, &mut has_items);
-                                let thread_id = snapshot.as_ref().map_or_else(
-                                    || data.thread_id(),
-                                    |snapshot| snapshot.thread_of(id),
-                                );
+                                let thread_id = mapped_threads
+                                    .as_ref()
+                                    .map_or_else(|| data.thread_id(), |threads| threads[&id]);
                                 DataItem::ObjectId(ObjectId {
                                     email_id: Some(Id::from_parts(thread_id, id)),
                                     thread_id: Some(Id::from(thread_id)),

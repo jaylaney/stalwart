@@ -2,7 +2,9 @@
 
 Evidence record as of 2026-11-11 UTC for [Plan 16](2026-11-07-zero-access-16-search.md)
 and the [search design](../specs/2026-11-04-zero-access-search-design.md).
-Current authority is plan revision 27 and spec revision 33. Task 1 measured
+This evidence records plan revision 27 and spec revision 33. The subsequent
+[PR 84 follow-up](2026-11-12-zero-access-search-pr84-fixes-outcome.md) records spec
+revision 34 and its separate verification; the results below do not qualify those later changes. Task 1 measured
 the format at spec revision 20. Revision 21 records the subsequent memory
 default ruling. The task record below distinguishes accepted source and
 controls from pending full qualification.

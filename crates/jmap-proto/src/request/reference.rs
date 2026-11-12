@@ -138,3 +138,27 @@ impl<T: FromStr> MaybeIdReference<T> {
         }
     }
 }
+
+/// Request-local identity minted by successful server Email creation or a
+/// success-gated submission follow-up. This type has no deserializer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedEmailTarget {
+    account_id: u32,
+    document_id: u32,
+}
+
+impl TrustedEmailTarget {
+    pub fn new(account_id: u32, document_id: u32) -> Self {
+        Self {
+            account_id,
+            document_id,
+        }
+    }
+
+    pub fn account_id(self) -> u32 {
+        self.account_id
+    }
+    pub fn document_id(self) -> u32 {
+        self.document_id
+    }
+}

@@ -225,6 +225,7 @@ pub async fn za_tests() {
     mail::gates::test(&mut test).await;
     mail::search::test(&mut test).await;
     mail::threads::test(&mut test).await;
+    mail::cache_idle::test(&mut test).await;
     mail::index::test(&mut test).await;
     mail::differential::test(&mut test).await;
     mail::traces::test(&mut test).await;

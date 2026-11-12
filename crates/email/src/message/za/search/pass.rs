@@ -95,7 +95,6 @@ pub(crate) struct PassLimits {
     pub message_bytes: u64,
     pub elapsed: Duration,
     pub checkpoint: usize,
-    pub skip_after: u8,
     pub content_allowed: bool,
 }
 
@@ -146,7 +145,6 @@ pub(crate) struct Staging {
     pub tombstones: Vec<Tombstone>,
     pub content: Vec<(u32, ContentRecord)>,
     pub skipped: Vec<(u32, LossClass)>,
-    transient_skips: Vec<(u32, TransientClass)>,
     pub checkpoint: Checkpoint,
     pub cursor: CursorStep,
     pub content_cursor: CursorStep,
@@ -178,37 +176,31 @@ impl Staging {
 
     pub(super) fn trace_skipped(&self, account_id: u32) {
         for (document_id, class) in &self.skipped {
-            let reason = self
-                .transient_skips
-                .iter()
-                .find_map(|(id, transient)| (id == document_id).then(|| transient.as_str()))
-                .unwrap_or_else(|| class.as_str());
             za_search_trace!(
                 ZA_SEARCH_SKIPPED,
                 AccountId = account_id,
                 DocumentId = *document_id,
-                Reason = reason
+                Reason = class.as_str()
             );
         }
     }
 
-    fn new(base: &LoadedIndex, marker_bound: Option<u64>) -> Self {
+    fn new(manifest: &Manifest, scanned_to: u64, marker_bound: Option<u64>) -> Self {
         Self {
-            revision: base.manifest.revision,
+            revision: manifest.revision,
             records: Vec::new(),
             aliases: Vec::new(),
             tombstones: Vec::new(),
             content: Vec::new(),
             skipped: Vec::new(),
-            transient_skips: Vec::new(),
-            checkpoint: base.manifest.indexed_to,
+            checkpoint: manifest.indexed_to,
             cursor: CursorStep::None,
             content_cursor: CursorStep::None,
             marker: MarkerStep::Untouched,
             marker_bound,
             suspend_content: false,
             bookkeeping: false,
-            scanned_to: base.scanned_to,
+            scanned_to,
             update_records: 0,
             witness: None,
             #[cfg(any(test, feature = "test_mode"))]
@@ -232,10 +224,12 @@ pub(crate) struct PassSources {
 }
 
 struct Planner<'a> {
-    base: &'a LoadedIndex,
+    manifest: &'a Manifest,
+    scanned_to: u64,
+    update_records: usize,
     limits: &'a PassLimits,
     started: Instant,
-    thread: ThreadPart,
+    thread: &'a mut ThreadPart,
     staging: Staging,
     items: usize,
     reserved: usize,
@@ -268,7 +262,7 @@ impl Planner<'_> {
                     let assignment = self.thread.assign(
                         &indexed.fields,
                         document_id,
-                        self.base.manifest.revision + 1,
+                        self.manifest.revision + 1,
                         created,
                     );
                     #[cfg(any(test, feature = "test_mode"))]
@@ -296,7 +290,6 @@ impl Planner<'_> {
             Err(OpenFailure::Loss(class)) => self.staging.skipped.push((document_id, class)),
             Err(OpenFailure::Transient(class)) => {
                 let previous = self
-                    .base
                     .manifest
                     .failing
                     .as_ref()
@@ -308,20 +301,19 @@ impl Planner<'_> {
                 } else {
                     previous.saturating_add(1)
                 };
-                if !absent && attempts >= self.limits.skip_after {
-                    self.staging.skipped.push((document_id, LossClass::Parse));
-                    self.staging.transient_skips.push((document_id, class));
-                } else {
-                    let mut aborted = Staging::new(self.base, self.staging.marker_bound);
-                    aborted.suspend_content = self.staging.suspend_content;
-                    aborted.decision = PassDecision::Abort { class, document_id };
-                    aborted.failing = Some(FailingDocument {
-                        document_id,
-                        attempts,
-                    });
-                    self.staging = aborted;
-                    return false;
-                }
+                let mut aborted =
+                    Staging::new(self.manifest, self.scanned_to, self.staging.marker_bound);
+                aborted.suspend_content = self.staging.suspend_content;
+                aborted.decision = PassDecision::Abort { class, document_id };
+                aborted.failing = Some(FailingDocument {
+                    document_id,
+                    attempts,
+                });
+                self.staging = aborted;
+                // Only the failure diagnostic survives an aborted pass. This
+                // detached map may contain assignments from its discarded prefix.
+                *self.thread = ThreadPart::default();
+                return false;
             }
         }
         self.consumed = true;
@@ -340,7 +332,7 @@ impl Planner<'_> {
     }
 
     async fn read_sources(&mut self, sources: &PassSources, opener: &mut impl Opener) -> bool {
-        let manifest = &self.base.manifest;
+        let manifest = self.manifest;
         if manifest.cursor.is_some() {
             let mut remaining = sources.cursor.iter().copied().peekable();
             let mut next = None;
@@ -405,7 +397,7 @@ impl Planner<'_> {
     }
 
     async fn read_records(&mut self, records: &ZaChangeRecords, opener: &mut impl Opener) -> bool {
-        if self.base.manifest.reconciliation.is_some() {
+        if self.manifest.reconciliation.is_some() {
             // The store exposes the empty retention marker separately. Once
             // the gap is processed, move through it even when no ordinary
             // Email log record survived the purge.
@@ -418,9 +410,9 @@ impl Planner<'_> {
                 self.consumed = true;
             }
         } else if self.staging.checkpoint.complete
-            && self.base.scanned_to > self.staging.checkpoint.change_id
+            && self.scanned_to > self.staging.checkpoint.change_id
         {
-            self.staging.checkpoint = complete_checkpoint(self.base.scanned_to);
+            self.staging.checkpoint = complete_checkpoint(self.scanned_to);
         }
         for (change_id, changes) in &records.records {
             let change_id = *change_id;
@@ -473,7 +465,7 @@ impl Planner<'_> {
 
     fn finish(mut self, sources: &PassSources) -> Staging {
         let staging = &mut self.staging;
-        if self.base.manifest.reconciliation.is_some()
+        if self.manifest.reconciliation.is_some()
             && sources.gap_inserts.is_empty()
             && sources.gap_deletes.is_empty()
             && staging.checkpoint.complete
@@ -489,7 +481,7 @@ impl Planner<'_> {
         staging.decision = if !staging.records.is_empty() {
             staging.revision += 1;
             staging.suspend_content |=
-                !self.limits.content_allowed && !self.base.manifest.content_to.suspended;
+                !self.limits.content_allowed && !self.manifest.content_to.suspended;
             PassDecision::Publishing
         } else if !staging.tombstones.is_empty() {
             PassDecision::NonPublishing
@@ -502,7 +494,7 @@ impl Planner<'_> {
             || matches!(staging.marker, MarkerStep::GapNext(_))
             || staging.marker_bound.is_some()
             || staging.suspend_content
-            || self.base.update_records + staging.update_records >= self.limits.checkpoint
+            || self.update_records + staging.update_records >= self.limits.checkpoint
         {
             PassDecision::ManifestOnly
         } else {
@@ -521,20 +513,25 @@ fn complete_checkpoint(change_id: u64) -> Checkpoint {
     }
 }
 
+// The caller owns a detached snapshot. Keep its mutated thread map for
+// compaction instead of cloning a second planner overlay. An abort discards it.
 pub(crate) async fn plan_pass(
-    base: &LoadedIndex,
+    base: &mut LoadedIndex,
     sources: PassSources,
     records: &ZaChangeRecords,
     limits: &PassLimits,
     started: Instant,
     opener: &mut impl Opener,
 ) -> Staging {
+    let staging = Staging::new(&base.manifest, base.scanned_to, sources.marker_bound);
     let mut planner = Planner {
-        base,
+        manifest: &base.manifest,
+        scanned_to: base.scanned_to,
+        update_records: base.update_records,
         limits,
         started,
-        thread: base.thread.clone(),
-        staging: Staging::new(base, sources.marker_bound),
+        thread: &mut base.thread,
+        staging,
         items: 0,
         reserved: 0,
         bytes: 0,
@@ -737,7 +734,17 @@ impl ZaSearchPass for Server {
         let hash = manifest_hash(&bytes);
         let search_cache = &self.inner.cache.za_search;
         let mut sources = PassSources::default();
-        let base = {
+        let source_needs_thread = manifest.cursor.is_some()
+            || manifest.content_to.cursor.is_some()
+            || manifest.reconciliation.is_some();
+        let snapshot_thread = |base: &mut LoadedIndex, index: &LoadedIndex| {
+            base.thread_charge = search_cache
+                .admit(PartKind::Thread, index.thread_bytes, account_id)
+                .expect("a thread part is always admitted");
+            base.thread = index.thread.clone();
+            base.thread_bytes = index.thread_bytes;
+        };
+        let mut base = {
             let Some(index) = entry.read_loaded().await else {
                 return Ok(PassOutcome::Lost);
             };
@@ -751,16 +758,13 @@ impl ZaSearchPass for Server {
                 sources.content = items;
                 sources.content_runnable = true;
             }
-            let thread_charge = search_cache
-                .admit(PartKind::Thread, index.thread_bytes, account_id)
-                .expect("a thread part is always admitted");
             let mut base = LoadedIndex::empty(manifest);
             base.manifest_bytes_hash = hash;
-            base.thread = index.thread.clone();
             base.scanned_to = index.scanned_to;
             base.update_records = index.update_records;
-            base.thread_bytes = index.thread_bytes;
-            base.thread_charge = thread_charge;
+            if source_needs_thread {
+                snapshot_thread(&mut base, &index);
+            }
             base
         };
         let records = if let Some(marker) = &base.manifest.reconciliation {
@@ -834,13 +838,31 @@ impl ZaSearchPass for Server {
             }
             records
         };
+        // A flag-only pass uses just manifest and scan metadata. Make this
+        // decision after the retained-log checks above, including a lost
+        // partial record, so the optimization cannot bypass reconciliation.
+        if !source_needs_thread
+            && records.records.iter().any(|(_, changes)| {
+                changes
+                    .iter()
+                    .any(|change| matches!(change, Change::InsertItem(_) | Change::DeleteItem(_)))
+            })
+        {
+            let Some(index) = entry.read_loaded().await else {
+                return Ok(PassOutcome::Lost);
+            };
+            if index.manifest_bytes_hash != hash {
+                za_search_trace!(ZA_SEARCH_LOST, AccountId = account_id);
+                return Ok(PassOutcome::Lost);
+            }
+            snapshot_thread(&mut base, &index);
+        }
         let limits = PassLimits {
             cap: config.pass_cap,
             hidden_bytes: config.pass_hidden_kb * 1024,
             message_bytes: config.pass_mb << 20,
             elapsed: Duration::from_millis(config.pass_ms),
             checkpoint: config.checkpoint,
-            skip_after: config.skip_after,
             content_allowed: !base.manifest.content_to.suspended
                 && base.manifest.content.as_ref().map_or(0, |c| c.size)
                     < config.account_max_mb << 20,
@@ -853,20 +875,22 @@ impl ZaSearchPass for Server {
             content_allowed: limits.content_allowed,
             absent_retry_secs: config.absent_retry_secs,
         };
-        let staging = {
-            let _overlay_charge = search_cache
-                .admit(PartKind::Thread, base.thread_bytes, account_id)
-                .expect("a thread part is always admitted");
-            plan_pass(
-                &base,
-                sources,
-                &records,
-                &limits,
-                Instant::now(),
-                &mut opener,
-            )
-            .await
-        };
+        let staging = plan_pass(
+            &mut base,
+            sources,
+            &records,
+            &limits,
+            Instant::now(),
+            &mut opener,
+        )
+        .await;
+        base.thread_bytes = base.thread.loaded_bytes() as u64;
+        search_cache.grow(
+            &mut base.thread_charge,
+            PartKind::Thread,
+            base.thread_bytes,
+            account_id,
+        );
         #[cfg(feature = "test_mode")]
         common::za::test_hooks::note_za_search_item_aliases(account_id, staging.max_item_aliases);
 
@@ -1022,7 +1046,6 @@ mod tests {
             message_bytes: 32 << 20,
             elapsed: Duration::from_secs(2),
             checkpoint: 1000,
-            skip_after: 8,
             content_allowed: true,
         }
     }
@@ -1044,13 +1067,28 @@ mod tests {
         }
     }
 
+    async fn plan_snapshot(
+        base: &LoadedIndex,
+        sources: PassSources,
+        records: &ZaChangeRecords,
+        limits: &PassLimits,
+        started: Instant,
+        opener: &mut impl Opener,
+    ) -> Staging {
+        let mut snapshot = LoadedIndex::empty(base.manifest.clone());
+        snapshot.thread = base.thread.clone();
+        snapshot.scanned_to = base.scanned_to;
+        snapshot.update_records = base.update_records;
+        super::plan_pass(&mut snapshot, sources, records, limits, started, opener).await
+    }
+
     async fn plan(
         base: &LoadedIndex,
         records: &ZaChangeRecords,
         limits: &PassLimits,
         opener: &mut FakeOpener,
     ) -> Staging {
-        plan_pass(
+        plan_snapshot(
             base,
             PassSources::default(),
             records,
@@ -1304,6 +1342,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_detached_snapshot_retains_assignments_aliases_and_deletions() {
+        let mut snapshot = base();
+        for document_id in [3, 4] {
+            let mut fields = fields(document_id);
+            fields.subject_hash = 9;
+            snapshot.thread.assign(&fields, document_id, 3, 9);
+        }
+        let mut opener = opener([1]);
+        opener.0.get_mut(&1).unwrap().as_mut().unwrap().fields = ThreadFieldsK {
+            hashes: vec![1, 3, 4],
+            subject_hash: 9,
+            sent_at: None,
+        };
+        let mut changes = inserts([1]);
+        changes.push(Change::DeleteItem(singleton(4)));
+        let staged = super::plan_pass(
+            &mut snapshot,
+            PassSources::default(),
+            &records(vec![(11, changes)]),
+            &limits(),
+            Instant::now(),
+            &mut opener,
+        )
+        .await;
+
+        assert!(matches!(staged.decision, PassDecision::Publishing));
+        assert_eq!(staged.checkpoint, complete(11));
+        assert_eq!(
+            staged.aliases,
+            [Alias {
+                source: 4,
+                target: 3,
+                revision: 4
+            }]
+        );
+        assert_eq!(snapshot.thread.record(1).unwrap().thread_id, 3);
+        assert_eq!(snapshot.thread.current_thread(4), 3);
+        assert_eq!(snapshot.thread.record(4).unwrap().deleted, Some(11));
+        assert_eq!(snapshot.thread.exists_at(3, u64::MAX), Some(true));
+        assert_eq!(snapshot.thread.exists_at(4, u64::MAX), Some(false));
+    }
+
+    #[tokio::test]
+    async fn an_aborted_pass_discards_its_detached_thread_snapshot() {
+        let mut snapshot = base();
+        snapshot.thread.assign(&fields(9), 9, 3, 9);
+        let mut opener = opener([1]);
+        opener
+            .0
+            .insert(2, Err(OpenFailure::Transient(TransientClass::Store)));
+        let staged = super::plan_pass(
+            &mut snapshot,
+            PassSources::default(),
+            &records(vec![(11, inserts([1, 2]))]),
+            &limits(),
+            Instant::now(),
+            &mut opener,
+        )
+        .await;
+
+        assert!(matches!(staged.decision, PassDecision::Abort { .. }));
+        assert_eq!(staged.checkpoint, complete(10));
+        assert_eq!(snapshot.thread.records().count(), 0);
+        assert!(staged.records.is_empty() && staged.aliases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_only_passes_keep_partial_and_accumulated_checkpoint_semantics() {
+        for checkpoint in [complete(10), partial(11, 2)] {
+            let mut snapshot = LoadedIndex::empty(manifest_at(checkpoint));
+            snapshot.update_records = 999;
+            let staged = super::plan_pass(
+                &mut snapshot,
+                PassSources::default(),
+                &updates(11, 11),
+                &limits(),
+                Instant::now(),
+                &mut opener([]),
+            )
+            .await;
+            assert!(matches!(staged.decision, PassDecision::ManifestOnly));
+            assert_eq!(staged.checkpoint, complete(11));
+            assert_eq!(staged.scanned_to, 11);
+            assert_eq!(staged.update_records, 1);
+            assert!(staged.records.is_empty() && staged.tombstones.is_empty());
+            assert!(staged.content.is_empty() && staged.witness.is_none());
+            assert_eq!(snapshot.thread.records().count(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn the_decision_follows_what_changed() {
         let mut base = base();
         let limits = limits();
@@ -1336,7 +1465,7 @@ mod tests {
             (4, Err(OpenFailure::Loss(LossClass::StubAbsent))),
             (5, Err(OpenFailure::Loss(LossClass::StubAbsent))),
         ]));
-        let cursor = plan_pass(
+        let cursor = plan_snapshot(
             &base,
             PassSources {
                 cursor: vec![4, 5],
@@ -1381,19 +1510,51 @@ mod tests {
         assert!(first.records.is_empty());
         assert_eq!(first.checkpoint, complete(10));
 
-        base.manifest.failing = Some(FailingDocument {
-            document_id: 2,
-            attempts: 7,
-        });
-        let last = plan(&base, &records, &limits(), &mut fixture()).await;
-        assert_eq!(last.skipped, [(2, LossClass::Parse)]);
-        assert_eq!(last.transient_skips, [(2, TransientClass::BlobStore)]);
-        assert_eq!(ids(&last), [1, 3]);
-        assert_eq!(last.failing, None);
+        // A transport outage cannot turn into definitive loss, even when the
+        // persisted diagnostic counter has already reached its largest value.
+        for class in [
+            TransientClass::Store,
+            TransientClass::BlobStore,
+            TransientClass::Budget,
+            TransientClass::CodecKey,
+            TransientClass::Validation,
+        ] {
+            for previous in [7, 8, u8::MAX] {
+                base.manifest.failing = Some(FailingDocument {
+                    document_id: 2,
+                    attempts: previous,
+                });
+                let mut opener = fixture();
+                opener.0.insert(2, Err(OpenFailure::Transient(class)));
+                let aborted = plan(&base, &records, &limits(), &mut opener).await;
+                assert!(matches!(
+                    aborted.decision,
+                    PassDecision::Abort { class: actual, document_id: 2 } if actual == class
+                ));
+                assert_eq!(
+                    aborted.failing,
+                    Some(FailingDocument {
+                        document_id: 2,
+                        attempts: previous.saturating_add(1),
+                    })
+                );
+                assert_eq!(aborted.checkpoint, complete(10));
+                assert!(aborted.records.is_empty() && aborted.skipped.is_empty());
+                assert!(aborted.content.is_empty() && aborted.aliases.is_empty());
+                assert!(aborted.tombstones.is_empty());
+
+                // Recovery retries the whole aborted record without a rebuild.
+                let recovered =
+                    plan(&base, &records, &limits(), &mut self::opener([1, 2, 3])).await;
+                assert_eq!(ids(&recovered), [1, 2, 3]);
+                assert_eq!(recovered.checkpoint, complete(11));
+                assert!(matches!(recovered.decision, PassDecision::Publishing));
+            }
+        }
     }
 
     #[tokio::test]
-    async fn in_window_absence_discards_staging_after_the_attempt_cap() {
+    async fn in_window_absence_discards_staging_without_incrementing_attempts() {
         let records = records(vec![(11, inserts([1, 2, 3]))]);
         let limits = limits();
         for sources in [
@@ -1417,7 +1578,7 @@ mod tests {
             }
             let failing = FailingDocument {
                 document_id: 2,
-                attempts: limits.skip_after,
+                attempts: u8::MAX,
             };
             base.manifest.failing = Some(failing.clone());
             let mut opener = content_opener([1, 3]);
@@ -1425,7 +1586,7 @@ mod tests {
                 2,
                 Err(OpenFailure::Transient(TransientClass::AbsentWithinWindow)),
             );
-            let staging = plan_pass(
+            let staging = plan_snapshot(
                 &base,
                 sources,
                 &records,
@@ -1451,7 +1612,7 @@ mod tests {
             assert!(matches!(staging.marker, MarkerStep::Untouched));
             assert!(staging.records.is_empty() && staging.aliases.is_empty());
             assert!(staging.content.is_empty() && staging.tombstones.is_empty());
-            assert!(staging.skipped.is_empty() && staging.transient_skips.is_empty());
+            assert!(staging.skipped.is_empty());
             assert!(staging.witness.is_none() && !staging.bookkeeping);
         }
     }
@@ -1466,7 +1627,7 @@ mod tests {
             ..Default::default()
         };
         let records = records(vec![(11, inserts([10]))]);
-        let staged = plan_pass(
+        let staged = plan_snapshot(
             &base,
             sources(),
             &records,
@@ -1486,7 +1647,7 @@ mod tests {
         assert!(matches!(staged.cursor, CursorStep::Exhausted));
         assert_eq!(staged.checkpoint, complete(10));
         let cap2 = PassLimits { cap: 2, ..limits() };
-        let capped = plan_pass(
+        let capped = plan_snapshot(
             &base,
             sources(),
             &records,
@@ -1501,7 +1662,7 @@ mod tests {
         failing
             .0
             .insert(5, Err(OpenFailure::Transient(TransientClass::BlobStore)));
-        let aborted = plan_pass(
+        let aborted = plan_snapshot(
             &base,
             sources(),
             &records,
@@ -1556,7 +1717,7 @@ mod tests {
             content_runnable: true,
             ..Default::default()
         };
-        let first = plan_pass(
+        let first = plan_snapshot(
             &base,
             sources(vec![9, 7, 4]),
             &records,
@@ -1570,7 +1731,7 @@ mod tests {
         assert!(matches!(first.decision, PassDecision::ContentOnly));
         assert!(matches!(first.content_cursor, CursorStep::Advanced(7)));
 
-        let resumed = plan_pass(
+        let resumed = plan_snapshot(
             &base,
             sources(vec![4]),
             &records,
@@ -1586,7 +1747,7 @@ mod tests {
         ] {
             let mut opener = content_opener([9]);
             opener.0.insert(7, Err(failure));
-            let staged = plan_pass(
+            let staged = plan_snapshot(
                 &base,
                 sources(vec![9, 7, 4]),
                 &records,
@@ -1612,7 +1773,7 @@ mod tests {
             content_allowed: false,
             ..limits()
         };
-        let first = plan_pass(
+        let first = plan_snapshot(
             &base,
             sources(vec![9, 7, 4]),
             &records,
@@ -1625,7 +1786,7 @@ mod tests {
         assert!(matches!(first.decision, PassDecision::ManifestOnly));
 
         base.manifest.content_to.suspended = true;
-        let again = plan_pass(
+        let again = plan_snapshot(
             &base,
             sources(vec![9, 7, 4]),
             &records,
@@ -1645,7 +1806,7 @@ mod tests {
             gap_inserts: vec![2],
             ..sources(vec![9, 7, 4])
         };
-        let staged = plan_pass(
+        let staged = plan_snapshot(
             &base,
             gap,
             &records,
@@ -1682,7 +1843,7 @@ mod tests {
         });
         base.thread.assign(&fields(7), 7, 3, 9);
         base.thread.assign(&fields(8), 8, 3, 9);
-        let staged = plan_pass(
+        let staged = plan_snapshot(
             &base,
             PassSources {
                 content: vec![7],
@@ -1719,7 +1880,7 @@ mod tests {
             bound: 40,
             gap_next: 0,
         });
-        let staged = plan_pass(
+        let staged = plan_snapshot(
             &base,
             PassSources {
                 gap_stamp: Some(39),
@@ -1757,7 +1918,7 @@ mod tests {
             gap_deletes: vec![8],
             ..Default::default()
         };
-        let first = plan_pass(
+        let first = plan_snapshot(
             &base,
             sources(vec![2, 5]),
             &records,
@@ -1773,7 +1934,7 @@ mod tests {
         base.manifest.reconciliation.as_mut().unwrap().gap_next = 3;
         let mut reply = indexed(5);
         reply.fields = fields(8);
-        let second = plan_pass(
+        let second = plan_snapshot(
             &base,
             sources(vec![5]),
             &records,
@@ -1799,7 +1960,7 @@ mod tests {
             finish_at: Some(60),
             ..Default::default()
         };
-        let last = plan_pass(
+        let last = plan_snapshot(
             &base,
             finish,
             &updates(41, 60),

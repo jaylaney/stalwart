@@ -1,6 +1,16 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 33 (2026-11-09), execution clarification.
+Date: 2026-11-04. Status: revision 34 (2026-11-12), PR 84 corrections.
+Revision 34 supersedes H5's attempt-count skip policy: a transient failure never
+consumes a message, however often it recurs. The manifest's existing count stays
+diagnostic; the old `ZA_SEARCH_SKIP_AFTER` environment setting is ignored. A
+persistent transient may hold Content freshness until repair, while an available
+Map retains its existing service policy. Definitive loss keeps its skip behavior.
+It also preserves trusted server-created references across method calls of one
+JMAP request without accepting client-supplied stale IDs, releases FETCH's index
+guard before client output, and makes idle eviction periodic. Stored formats and
+ordinary-account destruction's accepted inventory-scan cost are unchanged.
+
 Revision 33 makes the ordinary-thread parity precondition explicit: delivery,
 thread-merge work and deletion cleanup settle between thread-affecting operations.
 Keyed assignment follows the committed history; it does not reproduce candidate
@@ -180,7 +190,8 @@ existence at a range's end comes from the message cache or the log
 outside the range before the record (6.3, H2); a reconciliation inserts
 first and tombstones last (5.4, H3); error classes gain the codec's
 missing key, a retry window for an absent blob and a bounded attempt
-count per document (5.1, H5, H6); the rebuild cost model is stated and
+count per document (5.1, H5, H6; the skip threshold is withdrawn by revision 34);
+the rebuild cost model is stated and
 the caps made consistent (4.4, 5.5, 9.6, H7); a thread-part load is
 never refused for budget (4.3, H8); the manifest carries a keyed tag
 (4.2, H9); the merge survivor rule is upstream's (6.1, H10); a missing
@@ -971,7 +982,11 @@ structure with its own rules:
   emits the `Account` one, `:236-241`, and its `default_role_changed`
   branch, `:719-723`, touches neither `za_keys` nor the index). There is
   no maximum age: a reload is only a cost, and the search key does not
-  change. The budget counts a load's transient footprint too (F18): the
+  change. The existing 30-second key-sweep event also sweeps idle search
+  entries, so expiration does not depend on another keyed request. Active
+  readers, loads and passes retain the eviction safeguards; an entry skipped
+  while busy is reconsidered on a later tick. Entry acquisition does not
+  scan the global resident table. The budget counts a load's transient footprint too (F18): the
   sealed bytes, the decompressed `Zeroizing` buffer and the deserialized
   part coexist for a moment, two to three times the loaded size, and a
   compaction's staging likewise; a load that would exceed the budget
@@ -1032,7 +1047,6 @@ after eviction is the load cost of 4.3. The knobs:
 | `ZA_SEARCH_WAIT_SECS` | 30 | how long a content request completes passes before refusing |
 | `ZA_SEARCH_SEGMENTS` | 16 | thread-blob count, and content-chain length, that trigger compaction |
 | `ZA_SEARCH_CHECKPOINT` | 1000 | update-only records after which a pass writes a manifest-only checkpoint (G19) |
-| `ZA_SEARCH_SKIP_AFTER` | 8 | non-absent transient attempts on one document after which it is skipped as loss (H5) |
 | `ZA_SEARCH_ABSENT_RETRY_SECS` | 10 | retry window for an absent message or index blob before absence is loss (H6) |
 | `ZA_SEARCH_PAD_MIN` | 65536 | exact publishing target and minimum compaction class in bytes (`M`) |
 
@@ -1178,11 +1192,17 @@ In-window absence always aborts without consuming the document or
 advancing the checkpoint, a cursor or Content coverage. It preserves
 the matching count, which is zero if the document has no prior count.
 The first absence timestamp is entry-local and may be forgotten on
-eviction. Existing counts carry no fault class and still count against
-a later non-absent attempt. Only a current non-absent transient can
-reach `ZA_SEARCH_SKIP_AFTER` and skip as loss, with `ZA_SEARCH_SKIPPED`
-carrying that fault's class (H5). In a load, loss of a Thread blob is
-loss of the Map (a rebuild, 5.4), and loss of a Content blob triggers
+eviction. The persisted count carries no fault class and saturates at its
+existing encoded maximum. It is diagnostic only: no count, including one
+loaded from an older manifest, turns a transient into loss. This supersedes
+H5's skip threshold. `ZA_SEARCH_SKIP_AFTER` is no longer read; an old
+process environment containing it has no effect. Repeated store timeouts,
+refused connections, missing codec keys and budget failures remain pending.
+Recovery retries the same item without requiring eviction, rebuild or reindex.
+A persistently inaccessible object can therefore hold Content freshness and
+cause bounded content-request refusal until the operator repairs it; this is
+preferable to silently declaring an incomplete index current. In a load,
+loss of a Thread blob is loss of the Map (a rebuild, 5.4), and loss of a Content blob triggers
 only Content recovery (5.4, H23). A required Thread transient can
 refuse Map (6.2). An optional Content transient affects only the
 Content request (7.4). Nothing is ever skipped for good,
@@ -1863,7 +1883,7 @@ of 4.2, as one model rather than one patch each:
 | The time cap making the checkpoint a function of processing cost (R30, H4) | recorded as the one remaining channel; invariants 48 and 50 narrowed to the byte and count charges | duration is observable anyway |
 | A deletion committed between a pass's log read and its commit, a phantom `created` (H2) | existence at `E` from the cache's present set, or from the log outside the range for a pinned `E`, before the record | a lagging record never decides presence at `E` |
 | A reconciliation tombstoning before it inserts (H3, I1) | gap inserts oldest first, then the gap deletions, then the retained records | a gap insert finds what the gap deleted; a retained insert, which came after every gap deletion, does not, as upstream |
-| One persistently failing object wedging the index (H5) | a per-document non-absent attempt count in the manifest; skipped as loss after `ZA_SEARCH_SKIP_AFTER` | a persistent non-absent fault is bounded and in-window absence always retries |
+| A transient outage silently consuming a message (PR84-1, supersedes H5) | every transient aborts without consuming the item; the existing count is diagnostic only | recovery indexes the pending message without reindexing; persistent faults may hold Content freshness until repair |
 | A lagging blob store read as loss (H6) | absence is loss only past `ZA_SEARCH_ABSENT_RETRY_SECS` | a committed manifest's blob exists |
 | A thread-part load refused for budget, failing every mail method (H8) | thread loads evict idle parts and overrun the soft budget with a trace, never refuse | mail degrades after search |
 | An unauthenticated manifest rewritten from authentic blobs (H9) | the keyed tag; a bad tag is loss | every manifest writer holds keys |
@@ -2045,6 +2065,33 @@ thread map as loaded (5.2) and validated (below):
   remain available during ingestion, and each method's final created IDs are
   registered for later calls only after that method completes. Ordinary
   accounts keep upstream's state and metadata behavior.
+- **Trusted request references (PR84-5).** A successful server-side Email
+  create or import registers the account and document identity of its creation
+  reference for the remainder of that request. Resolving a later `#reference`
+  uses that identity with the later method's validated view, so an intervening
+  thread assignment or merge cannot make the server's own reference stale.
+  Trust attaches to each original reference occurrence, not an allowlist of
+  numeric IDs: a trusted `#reference` and an equal stale literal in the same
+  method still have different admission rules. The binding records provenance
+  before reference expansion erases it and is consumed by the handler's actual
+  validated view, after any same-call creates or post-write pass. A separate
+  dispatcher snapshot would leave a race before the handler acquires its view.
+  Incoming request `createdIds`, literal IDs, and result-reference values do
+  not acquire this exception. Account, ownership, existence and access checks still
+  apply. The same rule covers server-generated `onSuccessUpdateEmail` and
+  `onSuccessDestroyEmail` follow-ups for the successfully submitted documents.
+  No index guard is held across method calls. Stale literal IDs and stale
+  client-provided `createdIds` in these consumers retain the current-prefix refusal below. This
+  adds no new reference grammar: Email/get and submission's emailId support
+  direct creation references; Email/set update keys and direct destroy IDs do
+  not gain `#reference` syntax. Its exception applies to generated onSuccess
+  targets only; ordinary result-reference targets still check the prefix.
+- **Response guard lifetime (PR84-3).** A keyed IMAP FETCH resolves its selected
+  documents and thread IDs from one validated view and retains an owned
+  projection paired with that cache. It drops the index guard before the first
+  network write, including VANISHED and empty-response paths. A blocked client
+  must not prevent a publication or another request from acquiring the index.
+  This does not weaken validation or require cloning the whole thread index.
 - **Keyed sync admission.** Before acquiring a view for Email/changes,
   Thread/changes or Email/queryChanges, derive the minimum Email group
   counter from the supplied state. Intermediate uses its pinned to; a
@@ -2065,8 +2112,8 @@ thread map as loaded (5.2) and validated (below):
   applies before an exhausted Intermediate can fall through to Exact(to).
   The ordinary account's state handling and the keyed write floor stay
   as described above.
-- Every Email id a client supplies to a keyed method is translated
-  before upstream's lookup: 1.0.3 resolves a supplied id with
+- Every Email id a client supplies to a prefix-checking lookup in a keyed
+  method is translated before that lookup: 1.0.3 resolves a supplied id with
   `cache.email_by_jmap_id(id)` (`crates/email/src/cache/email.rs:620-624`,
   a lookup by document id filtered on the prefix) in `Email/get`
   (`get.rs:233, 261, 276`), `SearchSnippet/get` (`snippet.rs:183, 213`),
@@ -2085,6 +2132,11 @@ thread map as loaded (5.2) and validated (below):
   (`crates/jmap/src/api/query.rs:45, 98`; a stale prefix is
   `anchorNotFound`) and `Email/queryChanges`'s `upToId`
   (`changes/query.rs:369`).
+  `EmailSubmission/query`'s `emailIds` filter preserves upstream's
+  document-ID-only metadata comparison. It ignores the supplied thread prefix
+  and needs no Map unless another criterion or sort requires one; a submission
+  may outlive its source Email. This filter emits submission IDs, grants no
+  trusted-reference provenance and does not bypass any Email lookup's checks.
 - Thread ids a client supplies (`Thread/get`, `inThread`,
   `EmailSubmission` `threadIds`) resolve through the thread table; an
   unknown one is `notFound`, as upstream.
@@ -2145,7 +2197,15 @@ Section 10's amendment of mail spec 3.3 says the same.
 For IMAP this key requirement includes FETCH (OBJECTID) and EMAILID/THREADID
 search keys in SEARCH, SORT and THREAD, including an owner's connection opened
 before provisioning. UID and sequence-number operations and other metadata-only
-commands retain their existing policy. This supersedes mail spec section 7's
+commands retain their existing policy. A metadata-only SEARCH or SORT with
+no EMAILID/THREADID criterion and no grouping requirement does not acquire a
+Map; a destroying or unavailable map therefore cannot refuse that command.
+SAVE resolves every sequence containing `$` against its captured previous
+result, including composite UID sets, whether or not the command has a Map.
+It never waits for its own replacement result channel; a missing previous
+result retains the existing refusal. This correction applies to ordinary
+accounts as well.
+This supersedes mail spec section 7's
 treatment of OBJECTID as a keyless cache field. Classify the selected account,
 not merely the session's current key presence. Preserve the existing content
 and unsupported-CC refusals.
@@ -2653,10 +2713,12 @@ thread-valued read with no loadable or validated map fails. A flag
 update whose pass failed is served, with the trace. Loss at load is
 `ZA_SEARCH_REBUILD`, not an error to the client, and the rebuild moves
 the epoch; a transient error at load is `ZA_SEARCH_UNAVAILABLE` and
-nothing else. A transient error in the pass aborts it with nothing
-written; the request is then served only if it emits no thread-valued
-data, and otherwise fails (6.2): singleton ids are never substituted,
-and an older loaded map is never served in place of a validated one.
+nothing else. A transient error in the pass aborts without consuming the
+pending item or publishing index changes; it may write the diagnostic-only
+manifest checkpoint described in 5.1. Thread-valued responses can still use
+an available validated Map (5.2, 6.2). If that Map cannot load or validate,
+they fail: singleton IDs are never substituted, and an unvalidated older
+loaded map is never served.
 
 ## 9. Testing
 
@@ -2754,9 +2816,10 @@ row (I5); upstream's per-account reindex task on a key account writes
 the marker and the next keyed request rebuilds, after a blob store
 that answered "not found" for every key had skipped the backlog (I6);
 non-absent transient failures of one document across an eviction and
-a restart reach `ZA_SEARCH_SKIP_AFTER` through the checkpointed count
-(R34). At least that many in-window absent reads leave the document
-pending until it can be indexed without reindexing (H6); a logged
+a restart preserve the diagnostic count while leaving the checkpoint pending,
+including at counter saturation (PR84-1, supersedes R34's skip threshold).
+Recovery indexes it without reindexing. Repeated in-window absent reads likewise
+leave the document pending until it can be indexed without reindexing (H6); a logged
 deletion is applied whatever a presence snapshot says (R17); the error
 classes map a store timeout to abort and an absent stub to skip (F3);
 paging the stream with a small `maxChanges` reproduces every item
@@ -3250,8 +3313,11 @@ Added:
     publication and the epoch, so that the
     map is of the history the state belongs to, holds every publication
     the state reflects, and the state reflects every publication the map
-    holds; every Email id such a session emits carries it, every id
-    supplied to a keyed method is checked against it, and a thread
+    holds; every Email id such a session emits carries it, and the
+    prefix-checking lookups and identity criteria in 6.2 check supplied
+    IDs against it, with trusted request references resolved in that view.
+    EmailSubmission's document-only metadata filter retains the exception
+    described there. A thread
     change is rendered as upstream renders a merge, from the
     assignments, the alias table and the revision table, with a
     document's thread and a thread's members defined as of any retained
@@ -3860,9 +3926,9 @@ the thread records on every pass, which section 12 rejects on cost.
     tag (H9); the merge survivor is the thread with the most matching
     candidates (H10); a missing manifest is loss on any key account
     (H11), a lost content blob a content-only rebuild (H23); absence of
-    a blob is loss only once its retry window elapses and a document
-    with a persistent non-absent fault is skipped after
-    `ZA_SEARCH_SKIP_AFTER` attempts (H5, H6);
+    a blob is loss only once its retry window elapses; persistent non-absent
+    transient faults stay pending regardless of the diagnostic count
+    (revision 34, supersedes H5; H6's absence window remains);
     a thread-part load is never refused for budget (H8); content
     compaction is tiered while a cursor is pending, by tier so that each
     byte is rewritten once per tier (H7, R32); a reconciliation applies

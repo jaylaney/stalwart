@@ -285,7 +285,7 @@ async fn stage_blobs(
     server: &Server,
     entry: &IndexEntry,
     keys: &SessionKeys,
-    mut base: LoadedIndex,
+    base: LoadedIndex,
     new: &mut Manifest,
     staging: &Staging,
 ) -> Result<PreparedWrite, CompactError> {
@@ -304,20 +304,6 @@ async fn stage_blobs(
             .content
             .as_ref()
             .is_some_and(|head| u64::from(head.length) + 1 >= config.segments as u64);
-    if thread_delta && (compact_thread || compact_content_due) {
-        base.thread.extend(
-            staging.records.iter().cloned(),
-            staging.aliases.iter().copied(),
-            None,
-            staging.tombstones.iter().copied(),
-        );
-        cache.grow(
-            &mut base.thread_charge,
-            PartKind::Thread,
-            base.thread.loaded_bytes() as u64,
-            account_id,
-        );
-    }
     let cursor_pending =
         new.cursor.is_some() || new.content_to.cursor.is_some() || new.reconciliation.is_some();
     let content = if compact_content_due {
@@ -1166,7 +1152,7 @@ mod tests {
             );
         }
         let staging = plan_pass(
-            &base,
+            &mut base,
             PassSources {
                 content: vec![7],
                 content_runnable: true,
@@ -1182,7 +1168,6 @@ mod tests {
                 message_bytes: 32 << 20,
                 elapsed: Duration::from_secs(2),
                 checkpoint: 1000,
-                skip_after: 8,
                 content_allowed: true,
             },
             Instant::now(),

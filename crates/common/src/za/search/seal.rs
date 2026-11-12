@@ -10,11 +10,12 @@ use super::error::LossClass;
 use store::za_search::{
     BlobHeader, BlobKind, FormatError, PadTarget, SectionKind, SegmentId, ZaSearchKey,
     blob::{
-        HiddenSection, PublicSection, decode_content, decode_hidden, decode_public, encode_content,
-        encode_hidden, encode_public, frame_and_pad, unframe,
+        HiddenSection, PublicSection, decode_hidden, decode_public, encode_content, encode_hidden,
+        encode_public, frame_and_pad, unframe,
     },
-    content::ContentRecord,
 };
+#[cfg(any(test, feature = "test_mode"))]
+use store::za_search::{blob::decode_content, content::ContentRecord};
 use types::blob_hash::BlobHash;
 use vault::{
     Zeroizing,
@@ -152,6 +153,7 @@ pub fn seal_content_blob(
     blob
 }
 
+#[cfg(any(test, feature = "test_mode"))]
 pub fn parse_content_blob(
     key: &Secret,
     account_id: u32,

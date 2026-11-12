@@ -2,6 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+The authorized [PR 84 follow-up](2026-11-12-zero-access-search-pr84-fixes.md)
+implements spec revision 34. Its retry and trusted-reference contracts supersede
+this plan's original attempt-count skip rule and cross-method reference handling.
+Historical task and mutation evidence below remains tied to its recorded source.
+
 **Plan revision 27** (2026-11-09) aligns Task 19's mutation catchers with the
 implemented paths. The residual-resolution unit directly tests M9; the metadata
 wire refusal remains a separate control. M27 injects a raw index-blob timeout

@@ -94,21 +94,21 @@ pub(super) async fn za_imap_map_guard<T: SessionStream>(
     saved_search: &mut Option<Option<Arc<Vec<Row>>>>,
     requires_grouping: bool,
 ) -> trc::Result<Option<ZaView>> {
-    let account_id = mailbox.id.account_id;
-    let keys = if requires_grouping
-        || filters
+    if !requires_grouping
+        && !filters
             .iter()
             .any(|filter| matches!(filter, Filter::EmailId(_) | Filter::ThreadId(_)))
     {
-        // A selected owner connection authenticated before provisioning
-        // can remain keyless. Check the selected account before using IDs.
-        data.server
-            .za_mail_keys(&data.access_token, account_id)
-            .await?
-    } else {
-        data.access_token.za_keys_for(account_id).cloned()
-    };
-    let Some(keys) = keys else {
+        return Ok(None);
+    }
+    let account_id = mailbox.id.account_id;
+    // A selected owner connection authenticated before provisioning can
+    // remain keyless. Check the selected account before using mapped IDs.
+    let Some(keys) = data
+        .server
+        .za_mail_keys(&data.access_token, account_id)
+        .await?
+    else {
         return Ok(None);
     };
     capture_saved_search(mailbox, filters, saved_search).await;

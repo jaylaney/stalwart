@@ -369,9 +369,12 @@ impl<T: SessionStream> SessionData<T> {
             match filter {
                 Filter::Sequence(sequence, uid_filter) => {
                     let bare_saved = matches!(sequence, Sequence::SavedSearch);
-                    let resolved = if (bare_saved && prev_saved_search.is_some())
-                        || (snapshot.is_some() && sequence.is_saved_search())
+                    let resolved = if sequence.is_saved_search()
+                        && (prev_saved_search.is_some() || snapshot.is_some())
                     {
+                        // SAVE captures its previous result before registering
+                        // its own channel. Mixed sets must use that capture too,
+                        // even when metadata search does not hold an index guard.
                         // Never fall back to the watch channel with an index guard.
                         let rows = prev_saved_search
                             .as_ref()

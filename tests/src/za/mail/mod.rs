@@ -47,6 +47,7 @@ use trc::{
 use types::{blob::BlobId, blob_hash::BlobHash, collection::Collection, field::EmailField};
 use utils::hash128::Hash128;
 
+pub mod cache_idle;
 pub mod delivery;
 pub mod differential;
 pub mod fence;

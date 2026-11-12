@@ -1687,12 +1687,14 @@ async fn case_flag_changes_write_nothing(test: &TestServer, key: &Account, docum
     let id = account_id(key);
     let bytes = manifest_bytes(test, id).await;
     let links = principal_blob_links(test, id).await;
+    reset_za_search_counters(id);
     for n in 0..100 {
         set_flag(key, document, n % 2 == 0).await;
         assert_eq!(pass(test, key).await, PassOutcome::Current);
     }
     assert_eq!(manifest_bytes(test, id).await, bytes);
     assert_eq!(principal_blob_links(test, id).await, links);
+    assert_eq!(za_search_message_opens(id), 0);
     let last_change = change_id(test, id).await;
     assert!(loaded(test, id).await.scanned_to >= last_change);
 }
@@ -1714,6 +1716,7 @@ async fn case_update_only_checkpoints(test: &TestServer, key: &Account, document
     let mut bytes = manifest_bytes(test, id).await;
     let mut last_checkpoint = 0;
     let mut last_change = since;
+    reset_za_search_counters(id);
     for n in 1..=25 {
         set_flag(key, document, n % 2 == 1).await;
         last_change = change_id(test, id).await;
@@ -1734,6 +1737,7 @@ async fn case_update_only_checkpoints(test: &TestServer, key: &Account, document
     assert_eq!(manifest.content_to.checkpoint, manifest.indexed_to);
     assert_eq!(loaded(test, id).await.scanned_to, last_change);
     assert_eq!(principal_blob_links(test, id).await, links);
+    assert_eq!(za_search_message_opens(id), 0);
     let logs = log_records_since(test, id, SyncCollection::Email, since).await;
     assert_eq!(logs.len(), 25);
     let item = Change::UpdateItem(Id::from_parts(document, document).id());
@@ -1804,47 +1808,61 @@ async fn case_transient_blob_error_aborts_then_indexes(test: &TestServer, key: &
     assert!(index_holds(test, id, document).await);
     assert!(index(test, id).await.failing.is_none());
 
-    let next = deliver_one(test, key, "Repeat transient open").await;
-    set_search_config_override(Some(ZaSearchConfig {
-        skip_after: 2,
-        ..ZaSearchConfig::from_env().unwrap()
-    }));
-    set_search_blob_fail_once(Some(id));
-    assert_eq!(
-        pass(test, key).await,
-        PassOutcome::Aborted(TransientClass::BlobStore)
-    );
-    assert_eq!(
-        index(test, id).await.failing,
-        Some(FailingDocument {
-            document_id: next,
-            attempts: 1
-        })
-    );
+    let needle = "repeatedtransientrecoveryfixture";
+    let next = deliver_one(test, key, needle).await;
+    let before = index(test, id).await;
+    let links = principal_blob_links(test, id).await;
     let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
-    set_search_blob_fail_once(Some(id));
-    advanced(test, key, false).await;
+    // Cross the former default skip threshold and reload the persisted failure
+    // count midway through the outage. None of these attempts consumes mail.
+    for attempts in 1..=10 {
+        if attempts == 9 {
+            simulate_restart(test, id).await;
+        }
+        set_search_blob_fail_once(Some(id));
+        assert_eq!(
+            pass(test, key).await,
+            PassOutcome::Aborted(TransientClass::BlobStore)
+        );
+        let failed = index(test, id).await;
+        assert_eq!(
+            failed.failing,
+            Some(FailingDocument {
+                document_id: next,
+                attempts,
+            })
+        );
+        assert_eq!(failed.indexed_to, before.indexed_to);
+        assert_eq!(failed.content_to, before.content_to);
+        assert_eq!(failed.cursor, before.cursor);
+        assert_eq!(failed.reconciliation, before.reconciliation);
+        assert_eq!(failed.epoch, before.epoch);
+        assert_eq!(principal_blob_links(test, id).await, links);
+        assert!(!index_holds(test, id, next).await);
+    }
     set_search_blob_fail_once(None);
-    set_search_config_override(None);
-    assert!(index(test, id).await.failing.is_none());
-    assert!(!index_holds(test, id, next).await);
     let events = traces.finish().await;
     assert!(
-        events.iter().any(|event| {
-            event.account_id == Some(u64::from(id))
-                && event.details == ZA_SEARCH_SKIPPED
-                && event.reason == TransientClass::BlobStore.as_str()
-                && event
-                    .keys
-                    .contains(&(Key::DocumentId, TraceValue::UInt(u64::from(next))))
+        !events.iter().any(|event| {
+            event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_SKIPPED
         }),
         "{events:?}"
+    );
+
+    advanced(test, key, true).await;
+    let recovered = index(test, id).await;
+    assert!(recovered.failing.is_none());
+    assert_eq!(recovered.epoch, before.epoch);
+    assert!(index_holds(test, id, next).await);
+    assert_eq!(
+        queried(&recovery_query(key, Some(needle)).await),
+        [email_id(next)]
     );
 }
 
 async fn case_in_window_absence_does_not_consume_an_insert(test: &TestServer, key: &Account) {
     println!("case_in_window_absence_does_not_consume_an_insert");
-    let _config = search_config_guard!(test, skip_after: 2, absent_retry_secs: 60, segments: 255);
+    let _config = search_config_guard!(test, absent_retry_secs: 60, segments: 255);
     let id = account_id(key);
     let needle = "absencerecoveryfixture";
     let document = deliver_one(test, key, needle).await;
@@ -1853,13 +1871,12 @@ async fn case_in_window_absence_does_not_consume_an_insert(test: &TestServer, ke
     let saved = stored_blob(test, &hash).await;
     let before = index(test, id).await;
     let links = principal_blob_links(test, id).await;
-    let limit = test.server.za_search_config().skip_after;
 
     let blob_store = test.server.blob_store();
     assert!(blob_store.delete_blob(hash.as_slice()).await.unwrap());
     let start = Instant::now();
     let mut attempts = Vec::new();
-    for _ in 0..=limit {
+    for _ in 0..10 {
         let outcome = test.server.za_search_pass(id, &keys).await;
         let manifest = read_manifest(test, id).await;
         let links = principal_blob_links(test, id).await;
