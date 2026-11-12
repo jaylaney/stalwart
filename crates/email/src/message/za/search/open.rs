@@ -51,6 +51,11 @@ pub fn classify_open_error(err: &trc::Error) -> OpenFailure {
         {
             OpenFailure::Loss(LossClass::Aead)
         }
+        EventType::Store(StoreEvent::DeserializeError)
+            if err.value_as_str(Key::Details) == Some("Archive access failed") =>
+        {
+            OpenFailure::Loss(LossClass::Parse)
+        }
         EventType::Store(StoreEvent::DecryptError) if err.value(Key::Id).is_some() => {
             OpenFailure::Transient(TransientClass::CodecKey)
         }
@@ -166,6 +171,39 @@ mod tests {
     use common::za::search::error::{LossClass, TransientClass};
     use groupware::calendar::seal::SealError;
     use trc::{Key, StoreEvent};
+
+    #[test]
+    fn only_checked_archive_deserialization_is_permanent_loss() {
+        for (error, expected) in [
+            (
+                StoreEvent::DeserializeError
+                    .into_err()
+                    .details("Archive access failed"),
+                OpenFailure::Loss(LossClass::Parse),
+            ),
+            (
+                StoreEvent::DeserializeError.into_err(),
+                OpenFailure::Transient(TransientClass::Store),
+            ),
+            (
+                StoreEvent::DeserializeError
+                    .into_err()
+                    .details("Other decoding failure"),
+                OpenFailure::Transient(TransientClass::Store),
+            ),
+            (
+                trc::Error::new(trc::EventType::Server(trc::ServerEvent::ThreadError))
+                    .details("Archive access failed"),
+                OpenFailure::Transient(TransientClass::Store),
+            ),
+            (
+                StoreEvent::DecryptError.into_err().ctx(Key::Id, 3u32),
+                OpenFailure::Transient(TransientClass::CodecKey),
+            ),
+        ] {
+            assert_eq!(classify_open_error(&error), expected);
+        }
+    }
 
     #[test]
     fn open_errors_are_classified() {

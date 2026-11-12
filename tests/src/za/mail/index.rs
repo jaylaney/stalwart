@@ -108,6 +108,7 @@ const SENDER: &str = "sender@example.org";
 
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access mail index pass tests...");
+    pr84_retry_followup_tests(test).await;
     let admin = test.account("admin@example.com").clone();
     let key = key_mail_account(test, "keymail46@example.com", "Keymail-46!").await;
     let split = key_mail_account(test, "keymail47@example.com", "Keymail-47!").await;
@@ -243,6 +244,472 @@ pub async fn test(test: &mut TestServer) {
     test_recovery(test).await;
     test_compaction(test, &admin).await;
     println!("Zero-access mail index pass tests finished");
+}
+
+/// The focused PR84 runner and canonical ZA suite exercise this same fixture.
+pub async fn pr84_retry_followup_tests(test: &mut TestServer) {
+    use common::za::test_hooks::SearchCommitCounter;
+    use email::message::metadata::MetadataRow;
+    use store::{Deserialize, write::serialize::RawValue};
+    use types::field::EmailField;
+
+    println!("PR84 retry pacing, unchanged abort writes and malformed outer metadata");
+    let key = key_mail_account(test, "keymail-pr84-retry@example.com", "Pr84-Retry!").await;
+    let id = account_id(&key);
+    let document = deliver_one(test, &key, "PR84 retry fixture").await;
+    let keys = za_unlock(test, id, key.secret()).await;
+    let original = index(test, id).await;
+    let original_bytes = manifest_bytes(test, id).await.unwrap();
+
+    // An actual probe at the saturated diagnostic count must not commit the
+    // identical manifest. This uses the existing writer observer, not hashes:
+    // rewriting identical bytes would otherwise be invisible to this test.
+    let mut saturated = original.clone();
+    saturated.failing = Some(FailingDocument {
+        document_id: document,
+        attempts: u8::MAX,
+    });
+    write_manifest_bytes(
+        test,
+        id,
+        Some(ManifestValue::Index(saturated.clone()).encode(&za_search_key(keys.swk()))),
+    )
+    .await;
+    simulate_restart(test, id).await;
+    let commits = SearchCommitCounter::start(id);
+    set_search_blob_fail_once(Some(id));
+    assert_eq!(
+        test.server.za_search_pass(id, &keys).await.unwrap(),
+        PassOutcome::Aborted(TransientClass::BlobStore)
+    );
+    let unchanged_abort_commits = commits.count();
+    drop(commits);
+    assert_eq!(index(test, id).await, saturated);
+
+    // An immediately repeated request must not execute another failing open.
+    // The persisted diagnostic attempts count identifies actual probes even
+    // though the existing message-opens counter counts successful opens only.
+    write_manifest_bytes(test, id, Some(original_bytes.clone())).await;
+    simulate_restart(test, id).await;
+    set_search_blob_fail_once(Some(id));
+    assert_eq!(
+        test.server.za_search_pass(id, &keys).await.unwrap(),
+        PassOutcome::Aborted(TransientClass::BlobStore)
+    );
+    set_search_blob_fail_once(Some(id));
+    let repeated = test.server.za_search_pass(id, &keys).await.unwrap();
+    set_search_blob_fail_once(None);
+    let repeated_probe_attempts = index(test, id).await.failing.unwrap().attempts;
+
+    // A syntactically valid outer row whose unversioned structure is empty
+    // reaches MetadataRow::unarchive's checked archive access. Normal encoded
+    // rows are HASHED; corrupting their hash would exercise a different path.
+    let saved_row = test
+        .server
+        .store()
+        .get_value::<RawValue>(metadata_key(id, document))
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let malformed = vec![0x80, 1, 0, 0, 0, 0x80];
+    let row = MetadataRow::deserialize(&malformed).expect("outer row remains decodable");
+    let error = row
+        .unarchive()
+        .err()
+        .expect("empty structure is not a metadata archive");
+    assert_eq!(
+        error.event_type(),
+        EventType::Store(StoreEvent::DeserializeError)
+    );
+    assert_eq!(
+        error.value_as_str(Key::Details),
+        Some("Archive access failed")
+    );
+    write_manifest_bytes(test, id, Some(original_bytes)).await;
+    simulate_restart(test, id).await;
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Email)
+        .with_document(document)
+        .set(EmailField::Metadata, malformed);
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let malformed_outcome = test.server.za_search_pass(id, &keys).await.unwrap();
+    let repeat_malformed_outcome = test.server.za_search_pass(id, &keys).await.unwrap();
+    let events = traces.finish().await;
+    let malformed_skips = events
+        .iter()
+        .filter(|event| {
+            event.account_id == Some(u64::from(id))
+                && event.details == ZA_SEARCH_SKIPPED
+                && event.reason == LossClass::Parse.as_str()
+                && event
+                    .keys
+                    .contains(&(Key::DocumentId, TraceValue::UInt(u64::from(document))))
+        })
+        .count();
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Email)
+        .with_document(document)
+        .set(EmailField::Metadata, saved_row);
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    simulate_restart(test, id).await;
+    clean_messages(test, &key).await;
+    test.destroy_all_mailboxes(&key).await;
+
+    // Report all three independent RED measurements in a single focused run.
+    assert_eq!(
+        (
+            unchanged_abort_commits,
+            repeated_probe_attempts,
+            malformed_skips,
+            matches!(
+                malformed_outcome,
+                PassOutcome::Advanced {
+                    published: false,
+                    ..
+                }
+            ),
+            repeat_malformed_outcome == PassOutcome::Current
+        ),
+        (0, 1, 1, true, true),
+        "unchanged abort / repeated probe / malformed skip: repeated={repeated:?}, \
+         malformed={malformed_outcome:?}, repeated malformed={repeat_malformed_outcome:?}"
+    );
+    case_pr84_retry_state(test).await;
+}
+
+async fn replace_retry_manifest(
+    test: &TestServer,
+    id: u32,
+    keys: &vault::session::SessionKeys,
+    manifest: &Manifest,
+) {
+    write_manifest_bytes(
+        test,
+        id,
+        Some(ManifestValue::Index(manifest.clone()).encode(&za_search_key(keys.swk()))),
+    )
+    .await;
+}
+
+async fn deferred_retry(
+    test: &TestServer,
+    id: u32,
+    keys: &vault::session::SessionKeys,
+    expected: TransientClass,
+) -> Instant {
+    match test.server.za_search_pass(id, keys).await.unwrap() {
+        PassOutcome::Deferred { class, retry_at } if class == expected => retry_at,
+        other => panic!("expected deferred {expected:?}, got {other:?}"),
+    }
+}
+
+async fn case_pr84_retry_state(test: &mut TestServer) {
+    use crate::utils::za::PauseSlotGuard;
+    use common::za::{
+        search::trace::ZA_SEARCH_ABORTED,
+        test_hooks::{Pause, SEARCH_SWAP_PAUSE, SearchCommitCounter},
+    };
+    use store::za_search::manifest::ContentCursor;
+
+    println!("PR84 cooldown identity, concurrent requests, writes and cancellation");
+    let key = key_mail_account(test, "keymail-pr84-retry-state@example.com", "Pr84-State!").await;
+    let id = account_id(&key);
+    let document = deliver_one(test, &key, "Retry Trace Content Canary").await;
+    let keys = za_unlock(test, id, key.secret()).await;
+    let original = index(test, id).await;
+    let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let commits = SearchCommitCounter::start(id);
+    set_search_blob_fail_once(Some(id));
+    assert_eq!(
+        test.server.za_search_pass(id, &keys).await.unwrap(),
+        PassOutcome::Aborted(TransientClass::BlobStore)
+    );
+    assert_eq!(commits.count(), 1);
+    // Extend only the test clock so scheduling variability cannot expire this
+    // concurrency window. Exact real delay values are covered without sleeps.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    entry.set_open_retry_deadline_for_test(deadline);
+    let results = tokio::join!(
+        test.server.za_search_pass(id, &keys),
+        test.server.za_search_pass(id, &keys),
+        test.server.za_search_pass(id, &keys),
+        test.server.za_search_pass(id, &keys),
+    );
+    for result in [results.0, results.1, results.2, results.3] {
+        assert!(matches!(
+            result.unwrap(),
+            PassOutcome::Deferred { .. } | PassOutcome::Running
+        ));
+    }
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        test.server.za_search_pass_hook(id, &keys),
+    )
+    .await
+    .expect("an opportunistic deferred hook must return promptly");
+    assert_eq!(commits.count(), 1);
+    assert_eq!(index(test, id).await.failing.unwrap().attempts, 1);
+    let events = traces.finish().await;
+    let aborts = events
+        .iter()
+        .filter(|event| {
+            event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_ABORTED
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        aborts.len(),
+        1,
+        "deferred callers must not repeat abort traces"
+    );
+    assert_eq!(aborts[0].reason, TransientClass::BlobStore.as_str());
+    assert!(
+        aborts[0]
+            .keys
+            .contains(&(Key::DocumentId, TraceValue::UInt(u64::from(document))))
+    );
+    assert!(
+        aborts[0]
+            .keys
+            .contains(&(Key::Attempt, TraceValue::UInt(1)))
+    );
+    assert!(aborts[0].keys.iter().all(|(key, _)| matches!(
+        key,
+        Key::AccountId | Key::DocumentId | Key::Attempt | Key::Reason | Key::Details
+    )));
+    assert!(!aborts[0].text.contains("Retry Trace Content Canary"));
+
+    let mut remote = index(test, id).await;
+    remote.failing.as_mut().unwrap().attempts = 9;
+    replace_retry_manifest(test, id, &keys, &remote).await;
+    assert_eq!(
+        deferred_retry(test, id, &keys, TransientClass::BlobStore).await,
+        deadline
+    );
+    assert_eq!(commits.count(), 1);
+    let request_deadline = Instant::now() + Duration::from_millis(80);
+    let result = test
+        .server
+        .za_search_ensure_current(id, &keys, request_deadline)
+        .await;
+    assert!(matches!(
+        result,
+        Err(Unavailable::Transient(TransientClass::BlobStore))
+    ));
+    assert!(Instant::now() >= request_deadline);
+    assert!(Instant::now() - request_deadline < Duration::from_secs(1));
+    assert_eq!(commits.count(), 1);
+    expire_open_retry(test, id);
+    set_search_blob_fail_once(Some(id));
+    let started = Instant::now();
+    assert_eq!(
+        test.server.za_search_pass(id, &keys).await.unwrap(),
+        PassOutcome::Aborted(TransientClass::BlobStore)
+    );
+    let finished = Instant::now();
+    let second_deadline = deferred_retry(test, id, &keys, TransientClass::BlobStore).await;
+    assert!(second_deadline >= started + Duration::from_secs(2));
+    assert!(second_deadline <= finished + Duration::from_secs(2));
+    assert_eq!(index(test, id).await.failing.unwrap().attempts, 10);
+    drop(commits);
+
+    // A changed suspension flag must still be written when the diagnostic
+    // count itself is saturated and unchanged.
+    replace_retry_manifest(test, id, &keys, &original).await;
+    simulate_restart(test, id).await;
+    {
+        let _config = search_config_guard!(test, account_max_mb: 0);
+        let mut capped = original.clone();
+        capped.failing = Some(FailingDocument {
+            document_id: document,
+            attempts: u8::MAX,
+        });
+        capped.content_to.cursor = Some(ContentCursor { next_below: 0 });
+        replace_retry_manifest(test, id, &keys, &capped).await;
+        let commits = SearchCommitCounter::start(id);
+        set_search_blob_fail_once(Some(id));
+        assert_eq!(
+            test.server.za_search_pass(id, &keys).await.unwrap(),
+            PassOutcome::Aborted(TransientClass::BlobStore)
+        );
+        let changed = index(test, id).await;
+        assert!(changed.content_to.suspended);
+        assert_eq!(changed.failing, capped.failing);
+        assert_eq!(changed.indexed_to, capped.indexed_to);
+        assert_eq!(
+            commits.count(),
+            1,
+            "changed suspension is durable despite saturated attempts"
+        );
+    }
+
+    // In-window absence never increments the persisted counter, but every
+    // permitted probe increases the local delay. The repeated zero-count
+    // abort has no write, even though it is an actual permitted probe.
+    replace_retry_manifest(test, id, &keys, &original).await;
+    simulate_restart(test, id).await;
+    {
+        let _config = search_config_guard!(test, absent_retry_secs: 60);
+        let hash = stored_hash(test, id, document).await;
+        let saved = stored_blob(test, &hash).await;
+        let blob_store = test.server.blob_store();
+        assert!(blob_store.delete_blob(hash.as_slice()).await.unwrap());
+        let commits = SearchCommitCounter::start(id);
+        let first = test.server.za_search_pass(id, &keys).await.unwrap();
+        expire_open_retry(test, id);
+        let started = Instant::now();
+        let second = test.server.za_search_pass(id, &keys).await.unwrap();
+        let finished = Instant::now();
+        let retry_at = deferred_retry(test, id, &keys, TransientClass::AbsentWithinWindow).await;
+        blob_store
+            .put_blob(hash.as_slice(), &saved, &test.server.core.blob.email)
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            PassOutcome::Aborted(TransientClass::AbsentWithinWindow)
+        );
+        assert_eq!(
+            second,
+            PassOutcome::Aborted(TransientClass::AbsentWithinWindow)
+        );
+        assert_eq!(index(test, id).await.failing.unwrap().attempts, 0);
+        assert_eq!(
+            commits.count(),
+            1,
+            "only the first absence adds a failure record"
+        );
+        assert!(retry_at >= started + Duration::from_secs(2));
+        assert!(retry_at <= finished + Duration::from_secs(2));
+    }
+
+    // A failed diagnostic write leaves the unchanged observed basis paced.
+    replace_retry_manifest(test, id, &keys, &original).await;
+    simulate_restart(test, id).await;
+    let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+    entry.fail_abort_write_once_for_test();
+    set_search_blob_fail_once(Some(id));
+    let commits = SearchCommitCounter::start(id);
+    assert_eq!(
+        test.server.za_search_pass(id, &keys).await.unwrap(),
+        PassOutcome::Aborted(TransientClass::Store)
+    );
+    assert_eq!(index(test, id).await, original);
+    deferred_retry(test, id, &keys, TransientClass::BlobStore).await;
+    assert_eq!(commits.count(), 0);
+    drop(commits);
+
+    // A diagnostic assertion loser binds to the validated competing count,
+    // preserving its local streak. A reset head cannot inherit that delay.
+    expire_open_retry(test, id);
+    set_search_blob_fail_once(Some(id));
+    let parked = park(test, &key, set_search_commit_pause).await;
+    let mut remote = original.clone();
+    remote.failing = Some(FailingDocument {
+        document_id: document,
+        attempts: 8,
+    });
+    replace_retry_manifest(test, id, &keys, &remote).await;
+    assert_eq!(parked.finish().await, PassOutcome::Lost);
+    deferred_retry(test, id, &keys, TransientClass::BlobStore).await;
+    assert_eq!(index(test, id).await, remote);
+
+    // Cancellation after the diagnostic commit and before the resident swap
+    // still observes the committed basis on the next authoritative load.
+    replace_retry_manifest(test, id, &keys, &original).await;
+    simulate_restart(test, id).await;
+    let _slot = PauseSlotGuard::new(&SEARCH_SWAP_PAUSE);
+    let pause = std::sync::Arc::new(Pause::new(id));
+    set_search_swap_pause(Some(pause.clone()));
+    set_search_blob_fail_once(Some(id));
+    let server = test.server.clone();
+    let task_keys = za_unlock(test, id, key.secret()).await;
+    let task = tokio::spawn(async move { server.za_search_pass(id, &task_keys).await });
+    tokio::time::timeout(Duration::from_secs(5), pause.arrived.notified())
+        .await
+        .unwrap();
+    assert_eq!(index(test, id).await.failing.unwrap().attempts, 1);
+    test.server
+        .inner
+        .cache
+        .za_search
+        .get(id)
+        .unwrap()
+        .set_open_retry_deadline_for_test(Instant::now() + Duration::from_secs(30));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    set_search_swap_pause(None);
+    deferred_retry(test, id, &keys, TransientClass::BlobStore).await;
+    drop(_slot);
+
+    // Invalidation while an abort commit is parked cannot transfer the old
+    // entry's retry state into the replacement entry.
+    replace_retry_manifest(test, id, &keys, &original).await;
+    simulate_restart(test, id).await;
+    set_search_blob_fail_once(Some(id));
+    let parked = park(test, &key, set_search_commit_pause).await;
+    let old = test.server.inner.cache.za_search.get(id).unwrap();
+    test.server
+        .inner
+        .cache
+        .za_search
+        .remove_account(id, EvictReason::Invalidation);
+    let replacement = test.server.inner.cache.za_search.entry(id);
+    assert!(!std::sync::Arc::ptr_eq(&old, &replacement));
+    assert_eq!(
+        parked.finish().await,
+        PassOutcome::Aborted(TransientClass::BlobStore)
+    );
+    set_search_blob_fail_once(Some(id));
+    assert_eq!(
+        test.server.za_search_pass(id, &keys).await.unwrap(),
+        PassOutcome::Aborted(TransientClass::BlobStore)
+    );
+    assert_eq!(index(test, id).await.failing.unwrap().attempts, 2);
+
+    // The next assertion loser sees a reset with no failure record. Repair
+    // must progress immediately, then a different newly pending message also
+    // starts without inheriting the prior document's cooldown.
+    expire_open_retry(test, id);
+    set_search_blob_fail_once(Some(id));
+    let parked = park(test, &key, set_search_commit_pause).await;
+    replace_retry_manifest(test, id, &keys, &original).await;
+    assert_eq!(parked.finish().await, PassOutcome::Lost);
+    advanced(test, &key, true).await;
+    assert!(index(test, id).await.failing.is_none());
+    let next = deliver_one(test, &key, "New retry after real progress").await;
+    set_search_blob_fail_once(Some(id));
+    assert_eq!(
+        test.server.za_search_pass(id, &keys).await.unwrap(),
+        PassOutcome::Aborted(TransientClass::BlobStore)
+    );
+    assert_eq!(
+        index(test, id).await.failing.unwrap(),
+        FailingDocument {
+            document_id: next,
+            attempts: 1
+        }
+    );
+    expire_open_retry(test, id);
+    advanced(test, &key, true).await;
+    clean_messages(test, &key).await;
+    test.destroy_all_mailboxes(&key).await;
+}
+
+fn expire_open_retry(test: &TestServer, id: u32) {
+    test.server
+        .inner
+        .cache
+        .za_search
+        .get(id)
+        .expect("resident search entry")
+        .set_open_retry_deadline_for_test(Instant::now());
 }
 
 fn account_id(account: &Account) -> u32 {
@@ -1804,6 +2271,7 @@ async fn case_transient_blob_error_aborts_then_indexes(test: &TestServer, key: &
     );
     assert_eq!(failed.indexed_to, before);
     assert_eq!(principal_blob_links(test, id).await, links);
+    expire_open_retry(test, id);
     advanced(test, key, true).await;
     assert!(index_holds(test, id, document).await);
     assert!(index(test, id).await.failing.is_none());
@@ -1816,6 +2284,9 @@ async fn case_transient_blob_error_aborts_then_indexes(test: &TestServer, key: &
     // Cross the former default skip threshold and reload the persisted failure
     // count midway through the outage. None of these attempts consumes mail.
     for attempts in 1..=10 {
+        if attempts > 1 {
+            expire_open_retry(test, id);
+        }
         if attempts == 9 {
             simulate_restart(test, id).await;
         }
@@ -1849,6 +2320,7 @@ async fn case_transient_blob_error_aborts_then_indexes(test: &TestServer, key: &
         "{events:?}"
     );
 
+    expire_open_retry(test, id);
     advanced(test, key, true).await;
     let recovered = index(test, id).await;
     assert!(recovered.failing.is_none());
@@ -1876,7 +2348,10 @@ async fn case_in_window_absence_does_not_consume_an_insert(test: &TestServer, ke
     assert!(blob_store.delete_blob(hash.as_slice()).await.unwrap());
     let start = Instant::now();
     let mut attempts = Vec::new();
-    for _ in 0..10 {
+    for attempt in 0..10 {
+        if attempt > 0 {
+            expire_open_retry(test, id);
+        }
         let outcome = test.server.za_search_pass(id, &keys).await;
         let manifest = read_manifest(test, id).await;
         let links = principal_blob_links(test, id).await;
@@ -1911,6 +2386,7 @@ async fn case_in_window_absence_does_not_consume_an_insert(test: &TestServer, ke
         );
     }
 
+    expire_open_retry(test, id);
     advanced(test, key, true).await;
     let after = index(test, id).await;
     assert_eq!(after.epoch, before.epoch);

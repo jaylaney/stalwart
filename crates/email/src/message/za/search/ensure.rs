@@ -225,6 +225,13 @@ impl ZaSearchEnsure for Server {
                         return Err(Unavailable::NotCurrent);
                     }
                 }
+                Ok(PassOutcome::Deferred { class, retry_at }) => {
+                    let retry_at = tokio::time::Instant::from_std(retry_at);
+                    tokio::time::sleep_until(retry_at.min(deadline)).await;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(Unavailable::Transient(class));
+                    }
+                }
                 Ok(PassOutcome::Aborted(class)) => {
                     if timeout_at(deadline, sleep(Duration::from_millis(50)))
                         .await

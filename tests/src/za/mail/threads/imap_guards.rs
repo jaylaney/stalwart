@@ -144,20 +144,34 @@ async fn session<T: SessionStream>(
 async fn metadata_without_map(test: &TestServer, key: &Account, root: u32, reply: u32) {
     let (data, mailbox) = session(test, key, NullIo::default()).await;
     for (sort, identity) in [
-        (None, search::Filter::EmailId(mapped(root, reply).into())),
+        (
+            None,
+            vec![search::Filter::EmailId(mapped(root, reply).into())],
+        ),
         (
             Some(vec![search::Comparator {
                 sort: search::Sort::Arrival,
                 ascending: true,
             }]),
-            search::Filter::ThreadId(Id::from(root).to_string().into()),
+            vec![search::Filter::ThreadId(Id::from(root).to_string().into())],
         ),
         (
             Some(vec![search::Comparator {
                 sort: search::Sort::Size,
                 ascending: true,
             }]),
-            search::Filter::EmailId(mapped(root, reply).into()),
+            vec![search::Filter::EmailId(mapped(root, reply).into())],
+        ),
+        (
+            None,
+            vec![
+                search::Filter::Or,
+                search::Filter::All,
+                search::Filter::Not,
+                search::Filter::EmailId(mapped(root, reply).into()),
+                search::Filter::End,
+                search::Filter::End,
+            ],
         ),
     ] {
         // Removing metadata's no-map fast path must make this request fail.
@@ -189,7 +203,7 @@ async fn metadata_without_map(test: &TestServer, key: &Account, root: u32, reply
                     is_esearch: false,
                     sort: None,
                     result_options: vec![],
-                    filter: vec![identity],
+                    filter: identity,
                 },
                 mailbox.clone(),
                 None,

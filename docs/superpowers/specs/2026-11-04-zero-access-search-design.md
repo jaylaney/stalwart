@@ -1,6 +1,11 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 34 (2026-11-12), PR 84 corrections.
+Date: 2026-11-04. Status: revision 35 (2026-11-12), PR 84 retry follow-up.
+Revision 35 bounds repeated message-open failures with a resident-entry cooldown,
+elides unchanged diagnostic writes, identifies the stuck document in fixed traces,
+and classifies a proved malformed archive-access failure as loss. Atomic abort and
+all stored formats remain unchanged. It also makes the lifetime of returned
+creation IDs explicit; trusted references do not promise cross-request stability.
 Revision 34 supersedes H5's attempt-count skip policy: a transient failure never
 consumes a message, however often it recurs. The manifest's existing count stays
 diagnostic; the old `ZA_SEARCH_SKIP_AFTER` environment setting is ignored. A
@@ -1169,7 +1174,9 @@ nothing (step 2).
 for the pass and the loader alike: **loss**, a stub that the store
 reports absent, a blob the store reports absent for longer than a
 short retry window, or a blob that fails its AEAD or does not parse
-(the blob codec's truncation and decompression failures included); and
+(the blob codec's truncation and decompression failures included, together with
+`StoreEvent::DeserializeError` carrying the store's fixed `Details = "Archive access failed"`
+from checked access to the stored archive); and
 **transient**, any other error: a store or blob-store timeout, a
 refused connection, a budget that cannot make room, a blob the store
 reports absent within the retry window (H6: a blob store without
@@ -1184,8 +1191,8 @@ rebuild every key account's index). In a pass, loss of a message's stub
 or blob skips that message (a trace, never retried, as 1.0.2's index
 queue skips a message whose blob is missing); a transient error aborts
 the pass with no index write, no blob, no checkpoint, `indexed_to`
-unchanged, and the next pass retries; the one write an aborted pass
-makes is a manifest-only checkpoint (above) carrying the id of the
+unchanged, and a later permitted pass retries. An aborted pass may write a
+manifest-only checkpoint (above) carrying the id of the
 document whose open failed and its count of non-absent transient
 attempts. This public count survives eviction and restart (R34).
 In-window absence always aborts without consuming the document or
@@ -1199,6 +1206,36 @@ H5's skip threshold. `ZA_SEARCH_SKIP_AFTER` is no longer read; an old
 process environment containing it has no effect. Repeated store timeouts,
 refused connections, missing codec keys and budget failures remain pending.
 Recovery retries the same item without requiring eviction, rebuild or reindex.
+Unknown errors, including generic deserialization errors without that fixed archive
+classification and non-Store errors, remain transient; a codec key configuration
+fault is not evidence that the message is corrupt.
+
+**Retry pacing (PR84 follow-up).** An actual transient message-open failure arms a
+monotonic cooldown on the resident account entry: 1, 2, 4, 8, 16, then at most 30
+seconds. A local consecutive-probe streak controls that delay, independently of
+the persisted diagnostic count, including for in-window absence. The pass lock
+serializes probes. After validating the manifest, a deferred pass performs no
+message open, thread copy, log replay, manifest commit or repeated abort trace;
+an opportunistic request hook returns promptly. A Content waiter sleeps only
+until the earlier of the retry deadline and its original request deadline.
+
+Cooldown identity follows the resulting validated manifest, including a successful
+diagnostic-only commit. A validated remote change only to the same failing
+message's diagnostic attempt count preserves the local streak and deadline;
+it does not permit nodes to defeat each other's backoff. A different pending
+message, meaningful progress or lifecycle change, successful progress, or entry
+replacement clears it. A failed diagnostic write retains the delay against the
+unchanged observed manifest; an assertion loser may bind only to the actual
+validated resulting head. A reset or missing failure record cannot inherit a
+stale generation's cooldown. Before staging an abort's write, compare the whole
+next manifest with the base: equality returns the aborted outcome without a
+store commit. A changed suspension flag or reconciliation bound still persists.
+
+Atomic abort deliberately discards a healthy prefix. It is replayed only on a
+permitted probe, and later chronological work still waits for the fault to be
+repaired. The pacing bound is per node and resident entry; eviction or restart
+can allow a fresh immediate probe, and recovery can wait up to the capped retry
+delay. There is no new persisted timestamp, cross-node lease or prefix publication.
 A persistently inaccessible object can therefore hold Content freshness and
 cause bounded content-request refusal until the operator repairs it; this is
 preferable to silently declaring an incomplete index current. In a load,
@@ -1884,6 +1921,8 @@ of 4.2, as one model rather than one patch each:
 | A deletion committed between a pass's log read and its commit, a phantom `created` (H2) | existence at `E` from the cache's present set, or from the log outside the range for a pinned `E`, before the record | a lagging record never decides presence at `E` |
 | A reconciliation tombstoning before it inserts (H3, I1) | gap inserts oldest first, then the gap deletions, then the retained records | a gap insert finds what the gap deleted; a retained insert, which came after every gap deletion, does not, as upstream |
 | A transient outage silently consuming a message (PR84-1, supersedes H5) | every transient aborts without consuming the item; the existing count is diagnostic only | recovery indexes the pending message without reindexing; persistent faults may hold Content freshness until repair |
+| Persistent failed opens causing retry/write amplification (PR84 follow-up) | capped resident-entry cooldown survives same-document diagnostic-count updates; identical abort manifests are not written | per-node pacing, original Content deadline, and safe document/attempt diagnostics; healthy prefix still waits |
+| A proved corrupt stored archive holding the pending checkpoint (PR84 follow-up) | fixed checked-archive access failure is parse loss; unknown errors remain transient | the corrupt row is consumed once, with no content in traces |
 | A lagging blob store read as loss (H6) | absence is loss only past `ZA_SEARCH_ABSENT_RETRY_SECS` | a committed manifest's blob exists |
 | A thread-part load refused for budget, failing every mail method (H8) | thread loads evict idle parts and overrun the soft budget with a trace, never refuse | mail degrades after search |
 | An unauthenticated manifest rewritten from authentic blobs (H9) | the keyed tag; a bad tag is loss | every manifest writer holds keys |
@@ -2086,6 +2125,16 @@ thread map as loaded (5.2) and validated (below):
   direct creation references; Email/set update keys and direct destroy IDs do
   not gain `#reference` syntax. Its exception applies to generated onSuccess
   targets only; ordinary result-reference targets still check the prefix.
+  **Returned-ID lifetime.** Each Email/set or Email/import response's created IDs
+  describe that method's final validated snapshot. Later methods do not rewrite
+  an earlier response or its corresponding top-level `createdIds` values when
+  threading advances. An ID can therefore already have an obsolete prefix when
+  the enclosing request finishes. Its same-request `#creationReference` remains
+  usable through the trusted identity above, but a result-reference value from
+  the earlier response, or that ID supplied literally or through client
+  `createdIds` in a later request, receives the ordinary current-prefix check
+  and may return `notFound`. Clients discover the replacement through the normal
+  changes/query flow. This exception does not promise cross-request ID stability.
 - **Response guard lifetime (PR84-3).** A keyed IMAP FETCH resolves its selected
   documents and thread IDs from one validated view and retains an owned
   projection paired with that cache. It drops the index guard before the first
@@ -2699,7 +2748,7 @@ event), with these constants:
 |---|---|---|
 | `ZA_SEARCH_PASS` | a pass committed | account id, inserts, tombstones, whether it published, revision, `indexed_to` |
 | `ZA_SEARCH_SKIPPED` | a message was skipped in a pass for loss (5.1) | account id, document id, the loss class (stub absent, blob absent, would not open) |
-| `ZA_SEARCH_ABORTED` | a pass aborted on a transient error (5.1) or a tiered promotion limit (5.5) | account id, the error class or the fixed `"tier-overflow"` reason |
+| `ZA_SEARCH_ABORTED` | an actual failed probe aborts a pass (5.1), or a tiered promotion limit (5.5) | account id and fixed error class/reason; a message-open failure also carries document id and diagnostic attempt count; deferred probes emit no repeat |
 | `ZA_SEARCH_LOST` | a manifest write lost its assertion | account id |
 | `ZA_SEARCH_REBUILD` | a rebuild, content-only rebuild or reconciliation started or finished | account id, which, the loss class, the cursor size, the epoch |
 | `ZA_SEARCH_SUSPENDED` | content indexing stopped above the account cap | account id, the chain's size |
@@ -2715,7 +2764,9 @@ update whose pass failed is served, with the trace. Loss at load is
 the epoch; a transient error at load is `ZA_SEARCH_UNAVAILABLE` and
 nothing else. A transient error in the pass aborts without consuming the
 pending item or publishing index changes; it may write the diagnostic-only
-manifest checkpoint described in 5.1. Thread-valued responses can still use
+manifest checkpoint described in 5.1 only when it changes. Its trace identifies
+the document and diagnostic count using ids/counts only; the underlying archive
+error, raw bytes and message content are never logged. Thread-valued responses can still use
 an available validated Map (5.2, 6.2). If that Map cannot load or validate,
 they fail: singleton IDs are never substituted, and an unvalidated older
 loaded map is never served.
@@ -2818,7 +2869,18 @@ that answered "not found" for every key had skipped the backlog (I6);
 non-absent transient failures of one document across an eviction and
 a restart preserve the diagnostic count while leaving the checkpoint pending,
 including at counter saturation (PR84-1, supersedes R34's skip threshold).
-Recovery indexes it without reindexing. Repeated in-window absent reads likewise
+Recovery indexes it without reindexing. With an explicit monotonic test clock,
+retry delays are 1, 2, 4, 8, 16, then 30 seconds; requests before a deadline do
+not open, copy/replay or commit and do not emit another abort trace. Concurrent
+callers share the one probe. Diagnostic-only updates from a second node retain
+the deadline; meaningful progress, reset and replacement clear it. Unchanged
+saturated-count and absent manifests issue no commit, while suspension/marker
+changes persist. Failed diagnostic writes, assertion losers and cancellation
+cannot transfer an old cooldown to another generation. Content waits keep their
+original deadline. The actual abort trace includes document ID and attempt count
+with no content or raw archive canary. A malformed unversioned outer metadata
+archive is consumed once as parse loss, with generic deserialization, non-Store
+and codec-key faults retaining transient controls. Repeated in-window absent reads likewise
 leave the document pending until it can be indexed without reindexing (H6); a logged
 deletion is applied whatever a presence snapshot says (R17); the error
 classes map a store timeout to abort and an absent stub to skip (F3);
@@ -2999,7 +3061,7 @@ and `fence.rs` and `index_task.rs` reach `keymail45` and `plainmail49`):
   "no map" and the unavailable refusal, and no rebuild (F7); a blob
   store that times out once (hook `SEARCH_BLOB_FAIL_ONCE`) aborts the
   pass with no index write, its attempt count checkpointed, and the
-  next pass indexes the message, and
+  next permitted pass indexes the message, and
   the same at load gives "no map" once and no rebuild (F3); a node
   whose loaded map is of the previous epoch with an equal or higher
   revision than the rebuilt manifest's (hook `SEARCH_SNAPSHOT_PAUSE`
@@ -3939,8 +4001,8 @@ the thread records on every pass, which section 12 rejects on cost.
     the time cap's processing-cost channel is recorded, not claimed away
     (R30, H4).
 26. Cursor movement, a consumed insert or deletion that staged
-    nothing, and an aborted pass's attempt count (R34), are durable
-    progress through a manifest-only checkpoint,
+    nothing, and a changed aborted-attempt diagnostic count (R34), are durable
+    progress through a manifest-only checkpoint; an identical abort writes nothing,
     which update-only runs also write past `ZA_SEARCH_CHECKPOINT`
     records (R22, R26, G19); `content_to` and a
     suspended flag govern content-only rebuilds (R23); mailbox entries

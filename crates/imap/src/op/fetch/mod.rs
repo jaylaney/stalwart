@@ -306,7 +306,9 @@ impl<T: SessionStream> SessionData<T> {
             None
         };
 
-        // Keep only the selected identities alongside their validated cache.
+        // Selection, filtering and truncation are complete before projection;
+        // output below borrows this unchanged `ids` vector. Keep only the
+        // selected identities alongside their validated cache.
         // Consuming the view releases its index guard before VANISHED, an
         // empty response, or any message output can block on the client.
         let mapped_threads = snapshot.map(|snapshot| {

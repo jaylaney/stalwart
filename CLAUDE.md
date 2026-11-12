@@ -252,8 +252,15 @@ restart pair served the expected results in 23.053 s and 1.026 ms with
 matching 30,000-ID public censuses. Local cold-search qualification is
 complete at its recorded head. Those runs retained all fourteen original settings;
 the PR 84 fixes retire `ZA_SEARCH_SKIP_AFTER` because transient errors must stay
-pending. Memory and account
-sizing defaults remain provisional.
+pending. Spec revision 35 adds a resident-entry cooldown (1, 2, 4, 8, 16,
+then at most 30 seconds) for actual failed message opens, skips identical abort
+manifest writes, and adds document/attempt diagnostics without logging raw errors.
+Atomic abort still holds the healthy prefix and later work until repair; pacing
+is per node/resident entry. Unknown failures and missing codec keys stay transient.
+Created Email IDs remain paired with each method's final state; later methods do
+not rewrite earlier response/createdIds values after a merge. The same-request
+trusted-reference exception does not make literal IDs stable across requests.
+Memory and account sizing defaults remain provisional.
 The [independent remaining-checks report](docs/superpowers/plans/2026-11-07-zero-access-16-search-remaining-checks-review.md)
 records 18 of 19 targets caught in focused fault runs, plus a T13 Content
 caller-minimum coverage gap. The exact reviewed test-only strengthening is

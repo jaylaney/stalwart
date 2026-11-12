@@ -117,6 +117,16 @@ Non-absent transient failures also stay pending, regardless of the persisted
 attempt count. The old `ZA_SEARCH_SKIP_AFTER` environment variable is ignored.
 A persistent transport or configuration fault may hold Content freshness until
 it is repaired; recovery retries the pending message without a rebuild.
+Actual failed opens use a resident-entry cooldown of 1, 2, 4, 8, 16, then at most
+30 seconds. Deferred request hooks do no message-open or diagnostic-write work;
+Content waits keep their original deadline. Diagnostic-count-only writes by
+another node do not reset this node's cooldown. Unchanged abort manifests are
+not committed again. Actual failed probes trace the document ID, diagnostic
+attempt count and fixed reason, never archive bytes or message content. A proved
+`Archive access failed` error from stored archive validation is parse loss;
+unknown errors and missing codec keys remain transient. The healthy prefix of an
+aborted pass still waits for repair and is replayed only at permitted probes.
+The bound is per node/resident entry, so restart or eviction allows a fresh probe.
 Eviction can forget the first absence time and extend the effective window.
 The existing 30-second key-sweep event also sweeps idle search entries, without
 requiring another keyed request; active readers, loads and passes remain protected.

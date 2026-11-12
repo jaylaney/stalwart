@@ -562,6 +562,11 @@ pub(crate) async fn write_pass(
     staging: Staging,
 ) -> trc::Result<PassOutcome> {
     let mut new = next_manifest(&base.manifest, &staging);
+    if let PassDecision::Abort { class, .. } = staging.decision
+        && new == base.manifest
+    {
+        return Ok(PassOutcome::Aborted(class));
+    }
     let base_hash = base.manifest_bytes_hash;
     let base_manifest = base.manifest.clone();
     let prepared = match stage_blobs(server, entry, keys, base, &mut new, &staging).await {
@@ -681,7 +686,16 @@ async fn commit_and_swap(
     if expires_by.is_some_and(|deadline| deadline <= now()) {
         return Ok(trace_abort(account_id, TransientClass::BlobStore));
     }
-    let result = server.commit_batch(batch).await;
+    #[cfg(feature = "test_mode")]
+    let fail_abort = matches!(staging.decision, PassDecision::Abort { .. })
+        && entry.take_abort_write_failure_for_test();
+    #[cfg(not(feature = "test_mode"))]
+    let fail_abort = false;
+    let result = if fail_abort {
+        Err(trc::StoreEvent::UnexpectedError.into_err())
+    } else {
+        server.commit_batch(batch).await
+    };
     // Only now has the transaction disposed of the retirement operations.
     if let Some(charge) = &mut charged.content_charge {
         server.inner.cache.za_search.grow(
@@ -693,6 +707,9 @@ async fn commit_and_swap(
     }
     match result {
         Ok(assigned) => {
+            if matches!(staging.decision, PassDecision::Abort { .. }) {
+                entry.commit_open_retry(base, &new);
+            }
             if publishing {
                 new.newest_row.change_id = assigned
                     .change_id(account_id, SyncCollection::Email.change_group())
@@ -701,14 +718,23 @@ async fn commit_and_swap(
         }
         Err(err) if err.is_assertion_failure() => {
             za_search_trace!(ZA_SEARCH_LOST, AccountId = account_id);
+            let retry = entry.take_open_retry();
             drop(charged);
             drop(threads);
-            if let Err(failure) = server.za_search_reload_if_moved(entry, keys).await {
-                za_search_trace!(
-                    ZA_SEARCH_ABORTED,
-                    AccountId = account_id,
-                    Reason = failure.as_str()
-                );
+            match server.za_search_reload_if_moved(entry, keys).await {
+                Ok(_) => {
+                    let current = entry.index.read().await;
+                    if let Some(current) = current.as_ref() {
+                        entry.restore_open_retry(retry, &new, &current.manifest);
+                    }
+                }
+                Err(failure) => {
+                    za_search_trace!(
+                        ZA_SEARCH_ABORTED,
+                        AccountId = account_id,
+                        Reason = failure.as_str()
+                    );
+                }
             }
             return Ok(PassOutcome::Lost);
         }
@@ -1177,6 +1203,37 @@ mod tests {
         )
         .await;
         (manifest, staging)
+    }
+
+    #[tokio::test]
+    async fn aborts_preserve_changed_suspension_and_reconciliation_bounds() {
+        let (mut manifest, mut staging) = mixed_staging(Vec::new(), vec![8], false).await;
+        let failing = store::za_search::manifest::FailingDocument {
+            document_id: 7,
+            attempts: u8::MAX,
+        };
+        manifest.failing = Some(failing.clone());
+        staging.decision = PassDecision::Abort {
+            class: TransientClass::Store,
+            document_id: 7,
+        };
+        staging.failing = Some(failing);
+        staging.marker = MarkerStep::Untouched;
+        staging.marker_bound = None;
+        staging.suspend_content = false;
+        assert_eq!(next_manifest(&manifest, &staging), manifest);
+        staging.suspend_content = true;
+        let suspended = next_manifest(&manifest, &staging);
+        assert!(suspended.content_to.suspended);
+        assert_eq!(suspended.indexed_to, manifest.indexed_to);
+        assert_eq!(suspended.failing, manifest.failing);
+        staging.suspend_content = false;
+        staging.marker_bound = Some(41);
+        let reconciled = next_manifest(&manifest, &staging);
+        assert_eq!(reconciled.reconciliation.as_ref().unwrap().bound, 41);
+        assert_ne!(reconciled, manifest);
+        assert_eq!(reconciled.indexed_to, manifest.indexed_to);
+        assert_eq!(reconciled.failing, manifest.failing);
     }
 
     #[tokio::test]

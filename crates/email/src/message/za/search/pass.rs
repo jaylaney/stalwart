@@ -57,6 +57,10 @@ pub enum PassOutcome {
     },
     Running,
     Aborted(TransientClass),
+    Deferred {
+        class: TransientClass,
+        retry_at: Instant,
+    },
     Lost,
     NoMap(NoMapReason),
     ContentLoss(ContentLoss),
@@ -677,6 +681,7 @@ impl ZaSearchPass for Server {
                 && manifest.indexed_to.complete
                 && state <= index.scanned_to
             {
+                entry.clear_open_retry();
                 return Ok(PassOutcome::Current);
             }
             index.manifest_bytes_hash
@@ -698,9 +703,11 @@ impl ZaSearchPass for Server {
         let (bytes, manifest) = match read {
             Ok(Some((bytes, ManifestValue::Index(manifest)))) => (bytes, manifest),
             Ok(Some((_, ManifestValue::Destroying(_)))) => {
+                entry.clear_open_retry();
                 return Ok(PassOutcome::NoMap(NoMapReason::Destroying));
             }
             Ok(None) => {
+                entry.clear_open_retry();
                 return Ok(PassOutcome::Recovery(RecoveryCause::Loss(
                     MapLoss::missing(),
                 )));
@@ -708,6 +715,19 @@ impl ZaSearchPass for Server {
             Err(failure) => return Ok(failure.into()),
         };
         drop(key);
+        if !self
+            .inner
+            .cache
+            .za_search
+            .get(account_id)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &entry))
+        {
+            entry.clear_open_retry();
+            return Ok(PassOutcome::Lost);
+        }
+        if let Some((class, retry_at)) = entry.defer_open_retry(&manifest, Instant::now()) {
+            return Ok(PassOutcome::Deferred { class, retry_at });
+        }
         if let Some(reason) = za_search_content_needs_rebuild(&manifest, &config) {
             match self
                 .za_search_content_rebuild_start(account_id, keys, reason, None)
@@ -899,9 +919,15 @@ impl ZaSearchPass for Server {
                 staging.failing.as_ref().map(|f| f.document_id),
                 Some(document_id)
             );
+            entry.note_open_failure(&base.manifest, document_id, class, Instant::now());
             za_search_trace!(
                 ZA_SEARCH_ABORTED,
                 AccountId = account_id,
+                DocumentId = document_id,
+                Attempt = staging
+                    .failing
+                    .as_ref()
+                    .map_or(0, |f| u32::from(f.attempts)),
                 Reason = class.as_str()
             );
         }
@@ -913,6 +939,7 @@ impl ZaSearchPass for Server {
                 index.scanned_to = index.scanned_to.max(staging.scanned_to);
                 index.update_records += staging.update_records;
             }
+            entry.clear_open_retry();
             Ok(PassOutcome::Current)
         } else {
             let finished = [
@@ -929,6 +956,7 @@ impl ZaSearchPass for Server {
             let epoch = base.manifest.epoch;
             let outcome = write_pass(self, account_id, keys, &entry, &bytes, base, staging).await?;
             if matches!(outcome, PassOutcome::Advanced { .. }) {
+                entry.clear_open_retry();
                 for (done, kind) in finished {
                     if done {
                         za_search_trace!(

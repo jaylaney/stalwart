@@ -5,7 +5,7 @@
  */
 
 use super::{email_create, email_id, import_args, mailbox_ids, mapped, method, upload};
-use crate::utils::{account::Account, server::TestServer};
+use crate::utils::{account::Account, jmap::JmapResponse, server::TestServer};
 use serde_json::json;
 use types::id::Id;
 
@@ -131,9 +131,123 @@ pub(super) async fn test(test: &TestServer, key: &Account, root: &str, root_id: 
             "destroy": [submission]}),
         )
         .await;
+        case_returned_id_lifetime(key, root, root_id, importing).await;
     }
     case_generated_followup(test, key, false).await;
     case_generated_followup(test, key, true).await;
+}
+
+async fn case_returned_id_lifetime(key: &Account, root: &str, root_id: u32, importing: bool) {
+    let creation_method = if importing {
+        "Email/import"
+    } else {
+        "Email/set"
+    };
+    let arguments = if importing {
+        let blob = upload(
+            key,
+            &super::reply_to(root, "Task 11 mapped id", "returned import ID lifetime"),
+        )
+        .await;
+        import_args(key, "earlier", &blob, mailbox_ids())
+    } else {
+        json!({
+            "accountId": key.id_string(),
+            "create": {"earlier": email_create(key, "Re: Task 11 mapped id", Some(root))}
+        })
+    };
+    // Opt in to top-level createdIds, and keep the created document alive
+    // after the final adding method publishes its thread assignment.
+    let raw = key
+        .jmap_raw_post(
+            json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "createdIds": {},
+                "methodCalls": [
+                    [creation_method, arguments, "earlier"],
+                    ["Email/set", {"accountId": key.id_string(), "create": {
+                        "invalid": {"mailboxIds": {(Id::from(u32::MAX - 1).to_string()): true}}
+                    }}, "publish"],
+                    ["Email/get", {"accountId": key.id_string(), "ids": ["#earlier"],
+                        "properties": ["id", "threadId"]}, "current"]
+                ]
+            })
+            .to_string(),
+            "application/json",
+        )
+        .await;
+    assert_eq!(raw.status, 200, "{}", raw.text());
+    let reply = JmapResponse(raw.json().expect("returned-ID lifetime response is JSON"));
+    let earlier = method(&reply, 0, creation_method);
+    let early_id = email_id(&earlier["created"]["earlier"]["id"]);
+    assert_eq!(early_id.prefix_id(), early_id.document_id(), "{earlier}");
+    assert_ne!(early_id.prefix_id(), root_id);
+    assert_eq!(
+        earlier["created"]["earlier"]["threadId"],
+        Id::from(early_id.document_id()).to_string()
+    );
+    assert_eq!(
+        reply.0["createdIds"],
+        json!({"earlier": early_id.to_string()})
+    );
+    let published = method(&reply, 1, "Email/set");
+    assert!(
+        published["notCreated"].get("invalid").is_some(),
+        "{published}"
+    );
+    assert_ne!(earlier["newState"], published["newState"]);
+    let current_id = mapped(root_id, early_id.document_id());
+    let current = method(&reply, 2, "Email/get");
+    assert_eq!(
+        current["list"],
+        json!([{"id": &current_id, "threadId": Id::from(root_id).to_string()}])
+    );
+    assert_eq!(current["state"], published["newState"]);
+
+    // A new request cannot inherit the earlier request's trusted binding,
+    // including when it sends back the server's unchanged createdIds map.
+    let raw = key
+        .jmap_raw_post(
+            json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "createdIds": reply.0["createdIds"],
+                "methodCalls": [
+                    ["Email/get", {"accountId": key.id_string(), "ids": [early_id.to_string()],
+                        "properties": ["id"]}, "old-literal"],
+                    ["Email/get", {"accountId": key.id_string(), "ids": ["#earlier"],
+                        "properties": ["id"]}, "old-client-reference"],
+                    ["Email/get", {"accountId": key.id_string(), "ids": [&current_id],
+                        "properties": ["id"]}, "current-literal"]
+                ]
+            })
+            .to_string(),
+            "application/json",
+        )
+        .await;
+    assert_eq!(raw.status, 200, "{}", raw.text());
+    let fresh = JmapResponse(
+        raw.json()
+            .expect("fresh returned-ID lifetime response is JSON"),
+    );
+    for ordinal in [0, 1] {
+        let stale = method(&fresh, ordinal, "Email/get");
+        assert_eq!(stale["list"], json!([]), "{stale}");
+        assert_eq!(stale["notFound"], json!([early_id.to_string()]), "{stale}");
+    }
+    assert_eq!(
+        method(&fresh, 2, "Email/get")["list"],
+        json!([{"id": &current_id}])
+    );
+    let removed = key
+        .jmap_method_call(
+            "Email/set",
+            json!({"accountId": key.id_string(), "destroy": [&current_id]}),
+        )
+        .await;
+    assert_eq!(
+        method(&removed, 0, "Email/set")["destroyed"],
+        json!([current_id])
+    );
 }
 
 // This pause is after the submission handler returned and dropped its view,

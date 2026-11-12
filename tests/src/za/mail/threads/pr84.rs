@@ -67,6 +67,8 @@ async fn pr84_regression_tests() {
     admin.reload_settings().await;
     test.insert_account(admin);
 
+    crate::za::mail::index::pr84_retry_followup_tests(&mut test).await;
+
     let key = key_mail_account(&mut test, "keymail-pr84-references@example.com", STRONG).await;
     let (root, root_id, _) = case_mapped_get_and_query(&test, &key).await;
     protocol::test(&test, &key, &root, root_id).await;
