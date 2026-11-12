@@ -5,7 +5,7 @@
  */
 
 use super::{
-    pass::{PassOutcome, RecoveryCause, ZaSearchPass, read_change_id},
+    pass::{PassOutcome, RecoveryCause, ZaSearchPass, read_change_id, run_pass},
     rebuild::{ContentRebuildReason, RebuildStarted, ZaSearchRebuild, recovery_timed_out},
 };
 #[cfg(feature = "test_mode")]
@@ -146,7 +146,11 @@ impl ZaSearchEnsure for Server {
                         false
                     }
                 };
+                let cooling = entry
+                    .retry_schedule()
+                    .is_some_and(|(_, retry_at, _)| Instant::now() < retry_at);
                 if backfill
+                    && !cooling
                     && load_content(self, &entry, keys, deadline, &mut recovered_content).await?
                 {
                     continue;
@@ -154,7 +158,7 @@ impl ZaSearchEnsure for Server {
             }
             // A pass owns its transaction through its outcome. Check the
             // deadline between passes and bound waits separately.
-            match self.za_search_pass(account_id, keys).await {
+            match run_pass(self, account_id, keys, Some(deadline)).await {
                 Ok(PassOutcome::Running) => {
                     // A busy pass can hold the index write guard. Find its
                     // slot without awaiting any reads or loads first.
@@ -226,8 +230,15 @@ impl ZaSearchEnsure for Server {
                     }
                 }
                 Ok(PassOutcome::Deferred { class, retry_at }) => {
-                    let retry_at = tokio::time::Instant::from_std(retry_at);
-                    tokio::time::sleep_until(retry_at.min(deadline)).await;
+                    let wake = self
+                        .inner
+                        .cache
+                        .za_search
+                        .get(account_id)
+                        .and_then(|entry| entry.retry_schedule())
+                        .map_or_else(Instant::now, |(_, _, observe_at)| retry_at.min(observe_at));
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(wake).min(deadline))
+                        .await;
                     if tokio::time::Instant::now() >= deadline {
                         return Err(Unavailable::Transient(class));
                     }

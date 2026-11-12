@@ -784,12 +784,26 @@ async fn load_entry<S: BlobSource>(
         .cache()
         .ok_or(LoadFailure::Transient(TransientClass::Validation))?;
     let (bytes, manifest) = read_manifest.await?;
-    let charge = reserve_thread(&cache, &manifest.thread_blobs, entry.account_id);
+    let index = load_observed_thread(source, entry, key, config, &bytes, manifest, &cache).await?;
+    *observe_wait!(entry.account_id, MapIndexWait, entry.index.write()) = Some(index);
+    Ok(())
+}
+
+async fn load_observed_thread<S: BlobSource>(
+    source: &S,
+    entry: &IndexEntry,
+    key: &Secret,
+    config: &ZaSearchConfig,
+    bytes: &[u8],
+    manifest: Manifest,
+    cache: &ZaSearchCache,
+) -> Result<LoadedIndex, ObservedLoadError> {
+    let charge = reserve_thread(cache, &manifest.thread_blobs, entry.account_id);
     let mut index = load_thread_part(
         source,
         entry,
         key,
-        &bytes,
+        bytes,
         manifest,
         config.absent_retry_secs,
         now(),
@@ -802,8 +816,7 @@ async fn load_entry<S: BlobSource>(
         index.thread_bytes,
         entry.account_id,
     );
-    *observe_wait!(entry.account_id, MapIndexWait, entry.index.write()) = Some(index);
-    Ok(())
+    Ok(index)
 }
 
 fn content_reservation(head: &ContentHead, config: &ZaSearchConfig) -> Result<u64, LoadFailure> {
@@ -1259,6 +1272,11 @@ impl Server {
         key: &ZaSearchKey,
     ) -> Result<Option<(Vec<u8>, ManifestValue)>, ObservedLoadError> {
         #[cfg(feature = "test_mode")]
+        crate::za::test_hooks::count_search_pass_work(
+            account_id,
+            crate::za::test_hooks::SearchPassWork::Manifest,
+        );
+        #[cfg(feature = "test_mode")]
         if crate::za::test_hooks::take_search_manifest_fail(account_id) {
             return Err(LoadFailure::Transient(TransientClass::Store).into());
         }
@@ -1343,6 +1361,78 @@ impl Server {
         drop(guard);
         drop(flight);
         result.map(|(changed, _retired)| changed)
+    }
+
+    /// The account pass owns pass_lock. An unchanged authenticated resident head
+    /// needs only shared access, so a served view can stay pinned through commit.
+    /// Cold/moved heads reauthenticate under reload's load/index serialization.
+    /// Every actual target is retained before Thread I/O; service APIs are unchanged.
+    pub async fn za_search_load_for_pass(
+        &self,
+        entry: &IndexEntry,
+        keys: &SessionKeys,
+        observed: &mut Option<Manifest>,
+    ) -> Result<(Vec<u8>, Manifest), ObservedLoadError> {
+        {
+            let guard = observe_wait!(entry.account_id, MapIndexWait, entry.index.read());
+            if let Some(index) = guard.as_ref() {
+                let (bytes, manifest) = self
+                    .read_search_index_manifest(entry.account_id, keys.swk())
+                    .await?;
+                *observed = Some(manifest.clone());
+                entry.defer_open_retry(&manifest, std::time::Instant::now());
+                if index.manifest_bytes_hash == manifest_hash(&bytes) {
+                    return Ok((bytes, manifest));
+                }
+            }
+        }
+        // Never apply the snapshot obtained before waiting for exclusive access:
+        // a service reload or completed swap may have installed a newer head.
+        let flight = observe_wait!(entry.account_id, MapFlightWait, entry.load_flight.lock());
+        let mut guard = observe_wait!(entry.account_id, MapIndexWait, entry.index.write());
+        let (bytes, manifest) = self
+            .read_search_index_manifest(entry.account_id, keys.swk())
+            .await?;
+        *observed = Some(manifest.clone());
+        // A successful observation resolves an unknown episode or meaningful
+        // change before a later Thread failure can arm a new episode.
+        entry.defer_open_retry(&manifest, std::time::Instant::now());
+        let config = self.za_search_config();
+        let retired = if guard.is_some() {
+            apply_reload_locked(
+                self,
+                entry,
+                &mut guard,
+                keys.swk(),
+                &config,
+                &bytes,
+                manifest.clone(),
+                now(),
+            )
+            .await?
+            .1
+        } else {
+            let cache = entry
+                .cache()
+                .ok_or(LoadFailure::Transient(TransientClass::Validation))?;
+            *guard = Some(
+                load_observed_thread(
+                    self,
+                    entry,
+                    keys.swk(),
+                    &config,
+                    &bytes,
+                    manifest.clone(),
+                    &cache,
+                )
+                .await?,
+            );
+            None
+        };
+        drop(guard);
+        drop(flight);
+        drop(retired);
+        Ok((bytes, manifest))
     }
 
     pub async fn za_search_load_content(

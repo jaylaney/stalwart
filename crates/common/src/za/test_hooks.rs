@@ -857,6 +857,7 @@ pub async fn propfind_admitted_pause_point(reader: u32) {
 
 // Zero-access search hooks. The consuming tasks place the pause points and flags.
 pub static SEARCH_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_RETRY_OBSERVATION_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_SWAP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_SNAPSHOT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_VIEW_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -887,6 +888,14 @@ pub fn set_search_commit_pause(pause: Option<Arc<Pause>>) {
 
 pub async fn search_commit_pause_point(account_id: u32) {
     wait(take_for(&SEARCH_COMMIT_PAUSE, account_id)).await;
+}
+
+pub fn set_search_retry_observation_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_RETRY_OBSERVATION_PAUSE, pause);
+}
+
+pub async fn search_retry_observation_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_RETRY_OBSERVATION_PAUSE, account_id)).await;
 }
 
 pub fn set_search_swap_pause(pause: Option<Arc<Pause>>) {
@@ -971,6 +980,95 @@ pub fn set_search_rebuild_create_pause(pause: Option<Arc<Pause>>) {
 
 pub async fn search_rebuild_create_pause_point(account_id: u32) {
     wait(take_for(&SEARCH_REBUILD_CREATE_PAUSE, account_id)).await;
+}
+
+/// Account-scoped attempted work, including failed operations. The fault is
+/// one-shot, and RAII clears it even when a regression assertion fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchPassWork {
+    Manifest,
+    Open,
+    Upload,
+    Commit,
+    Mailboxes,
+}
+
+struct PassFault {
+    account_id: u32,
+    work: SearchPassWork,
+    remaining: usize,
+    consumed: bool,
+}
+static SEARCH_PASS_FAULT: Mutex<Option<PassFault>> = Mutex::new(None);
+static SEARCH_PASS_COUNTS: std::sync::LazyLock<Mutex<HashMap<u32, [u64; 5]>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub struct SearchPassFaultOnce(());
+impl SearchPassFaultOnce {
+    pub fn new(account_id: u32, work: SearchPassWork, occurrence: usize) -> Self {
+        let mut slot = SEARCH_PASS_FAULT.lock().unwrap();
+        assert!(slot.is_none() && occurrence > 0);
+        *slot = Some(PassFault {
+            account_id,
+            work,
+            remaining: occurrence,
+            consumed: false,
+        });
+        Self(())
+    }
+    pub fn was_consumed(&self) -> bool {
+        SEARCH_PASS_FAULT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|fault| fault.consumed)
+    }
+}
+impl Drop for SearchPassFaultOnce {
+    fn drop(&mut self) {
+        *SEARCH_PASS_FAULT.lock().unwrap() = None;
+    }
+}
+pub fn take_search_pass_fault(account_id: u32, work: SearchPassWork) -> bool {
+    let mut slot = SEARCH_PASS_FAULT.lock().unwrap();
+    if let Some(fault) = slot.as_mut()
+        && fault.account_id == account_id
+        && fault.work == work
+        && !fault.consumed
+    {
+        fault.remaining -= 1;
+        if fault.remaining == 0 {
+            fault.consumed = true;
+            return true;
+        }
+    }
+    false
+}
+pub fn count_search_pass_work(account_id: u32, work: SearchPassWork) {
+    if let Some(counts) = SEARCH_PASS_COUNTS.lock().unwrap().get_mut(&account_id) {
+        counts[work as usize] += 1;
+    }
+}
+pub struct SearchPassCounter(u32);
+impl SearchPassCounter {
+    pub fn start(account_id: u32) -> Self {
+        assert!(
+            SEARCH_PASS_COUNTS
+                .lock()
+                .unwrap()
+                .insert(account_id, [0; 5])
+                .is_none()
+        );
+        Self(account_id)
+    }
+    pub fn counts(&self) -> [u64; 5] {
+        SEARCH_PASS_COUNTS.lock().unwrap()[&self.0]
+    }
+}
+impl Drop for SearchPassCounter {
+    fn drop(&mut self) {
+        SEARCH_PASS_COUNTS.lock().unwrap().remove(&self.0);
+    }
 }
 
 struct BlobTimeout {

@@ -13,7 +13,7 @@ use common::{
         error::TransientClass,
         load::{ContentChainReader, ObservedLoadError, VerifiedContentNode, content_frame_bytes},
         seal::{build_thread_blob, seal_content_blob},
-        trace::ZA_SEARCH_ABORTED,
+        trace::ZA_SEARCH_COMPACTION_SKIPPED,
     },
     za_search_trace,
 };
@@ -164,7 +164,7 @@ pub(super) async fn compact_threads(
         Ok(bytes) => bytes,
         Err(FormatError::AllowanceExceeded) => {
             za_search_trace!(
-                ZA_SEARCH_ABORTED,
+                ZA_SEARCH_COMPACTION_SKIPPED,
                 AccountId = account_id,
                 Reason = "allowance"
             );

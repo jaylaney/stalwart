@@ -1514,7 +1514,7 @@ async fn view_local_swap_while_acquiring(test: &TestServer, account: &Account) {
 
 /// Publication after validation cannot split the result/state pair or make
 /// this response queue a second read behind a writer.
-async fn acquired_view_survives_publication_and_a_queued_writer(
+pub(super) async fn acquired_view_survives_publication_and_a_queued_writer(
     test: &TestServer,
     account: &Account,
 ) {

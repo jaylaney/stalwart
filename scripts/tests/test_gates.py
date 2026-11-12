@@ -761,8 +761,8 @@ class WorkflowTests(unittest.TestCase):
                                "SPAM_RULES_URL: https://github.com/stalwartlabs/spam-filter/"
                                "releases/download/v3.0.3/")
         self.assertReports(problems, "'SMTP Tests'", "SPAM_RULES_URL")
-        problems = self.edited("    timeout-minutes: 120\n\n    env:\n      STORE: RocksDb\n",
-                               "    timeout-minutes: 120\n\n    env:\n      STORE: Sqlite\n")
+        problems = self.edited("    timeout-minutes: 240\n\n    env:\n      STORE: RocksDb\n",
+                               "    timeout-minutes: 240\n\n    env:\n      STORE: Sqlite\n")
         self.assertReports(problems, "job zero-access", "STORE")
 
     def test_a_dropped_or_disabled_step_fails(self):

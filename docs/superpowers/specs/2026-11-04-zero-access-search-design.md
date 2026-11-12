@@ -1,6 +1,10 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 35 (2026-11-12), PR 84 retry follow-up.
+Date: 2026-11-04. Status: revision 36 (2026-11-12), PR 84 account-pass retry follow-up.
+Revision 36 makes retry admission cover an account pass, including required loads
+and writes, independently of the failing document or operation. Deferred callers
+share bounded authenticated manifest observation so remote progress can be noticed
+before the local retry deadline. Stored formats and atomic aborts are unchanged.
 Revision 35 bounds repeated message-open failures with a resident-entry cooldown,
 elides unchanged diagnostic writes, identifies the stuck document in fixed traces,
 and classifies a proved malformed archive-access failure as loss. Atomic abort and
@@ -1189,7 +1193,7 @@ names it, so absence is loss only when it persists past
 removed a codec key is a configuration fault to repair, not a reason to
 rebuild every key account's index). In a pass, loss of a message's stub
 or blob skips that message (a trace, never retried, as 1.0.2's index
-queue skips a message whose blob is missing); a transient error aborts
+queue skips a message whose blob is missing); a transient message-open error aborts
 the pass with no index write, no blob, no checkpoint, `indexed_to`
 unchanged, and a later permitted pass retries. An aborted pass may write a
 manifest-only checkpoint (above) carrying the id of the
@@ -1210,35 +1214,72 @@ Unknown errors, including generic deserialization errors without that fixed arch
 classification and non-Store errors, remain transient; a codec key configuration
 fault is not evidence that the message is corrupt.
 
-**Retry pacing (PR84 follow-up).** An actual transient message-open failure arms a
-monotonic cooldown on the resident account entry: 1, 2, 4, 8, 16, then at most 30
-seconds. A local consecutive-probe streak controls that delay, independently of
-the persisted diagnostic count, including for in-window absence. The pass lock
-serializes probes. After validating the manifest, a deferred pass performs no
-message open, thread copy, log replay, manifest commit or repeated abort trace;
-an opportunistic request hook returns promptly. A Content waiter sleeps only
-until the earlier of the retry deadline and its original request deadline.
+**Retry pacing (PR84 account-pass follow-up).** One admitted account pass is one
+probe, including its required loads, replay, staging and publication. Its first
+transient failure arms a monotonic resident-entry delay of 1, 2, 4, 8, 16, then at
+most 30 seconds. The consecutive unsuccessful-probe streak is independent of
+operation, document, fault class and the persisted per-document diagnostic count.
+Successful opens in a discarded prefix are not progress. Raw infrastructure errors
+leaving the pass join this policy; loss, ordinary assertion contention, unsupported
+formats and destroying accounts keep their distinct outcomes. Independently required
+Map and optional Content service loads retain their existing availability policy.
 
-Cooldown identity follows the resulting validated manifest, including a successful
-diagnostic-only commit. A validated remote change only to the same failing
-message's diagnostic attempt count preserves the local streak and deadline;
-it does not permit nodes to defeat each other's backoff. A different pending
-message, meaningful progress or lifecycle change, successful progress, or entry
-replacement clears it. A failed diagnostic write retains the delay against the
-unchanged observed manifest; an assertion loser may bind only to the actual
-validated resulting head. A reset or missing failure record cannot inherit a
-stale generation's cooldown. Before staging an abort's write, compare the whole
-next manifest with the base: equality returns the aborted outcome without a
-store commit. A changed suspension flag or reconciliation bound still persists.
+The pass lock serializes admission **before** required Thread loading. An unchanged
+authenticated resident head is usable under a shared index guard: a pinned served
+view must not prevent a new pass from reaching its publication/swap boundary merely
+because admission wants to inspect that same head. A cold or moved target that needs
+exclusive installation is authenticated again after obtaining the write guard, so a
+read-to-write transition cannot apply a stale observation. During a delay, callers
+share at most one authenticated manifest observation per second on the resident entry. Before that observation time, a call returns Deferred without
+I/O. Observation alone performs no Thread or Content load, thread copy, retained-log
+read, message open, staging, upload, commit or repeated abort trace. An unchanged
+head, diagnostic-only change or failed observation preserves the probe deadline
+and streak; it does not extend them. A meaningful authenticated change re-enters
+normal validation/loading. The observer is never authority to serve cached content
+or publish. Metadata hooks promptly defer; a Content waiter wakes for the next
+shared observation, probe deadline or original request deadline, whichever is first.
+It can discover another node's progress even when its local retry deadline exceeds
+the request deadline. All observer/loader waits retain that original deadline;
+an already-owned transaction still settles through its outcome.
+
+The retry basis compares all meaningful manifest fields exactly. Some-to-Some
+failure-diagnostic changes, including a different document or count, and diagnostic
+creation (None-to-Some) alone are not progress. Some-to-None is an explicit clear
+signal. Two None diagnostics still pace a non-open failure. Meaningful progress,
+reset/lifecycle change, a pass proved current, or entry replacement clears the old
+episode. Live Email state advancing alone does not clear it. A manifest-read failure
+is unknown, not evidence of absence or equality: keep only a same-entry scheduling
+delay with any previously authenticated historical basis. A cold unknown episode
+cannot claim a concrete generation; its first authenticated target clears/rebases
+it before expensive work. Unknown observations authorize no results, writes or loss
+recovery. Missing, destroying or incompatible heads use existing classification.
+
+Record an observed failure before a subsequent await, so cancellation or a failed
+diagnostic write cannot erase its delay. Count and trace at most one primary failure
+per admitted probe, with a fixed reason and optional document/diagnostic count; a
+secondary diagnostic-write failure adds neither another abort nor another increment.
+The optional count is proposed diagnostic metadata when that write fails, not a
+claim of durability. An acknowledged diagnostic-only commit rebinds synchronously;
+an acknowledged progress commit clears synchronously, both before any resident-swap
+await. An assertion loser binds only an authoritative actual head under the same
+basis rules, never its proposed output; an unresolved reload retains at most the
+historical same-entry scheduling delay. Only message-open failures persist the
+existing document diagnostic. Before staging an abort's write, complete manifest
+equality elides it; changed suspension or reconciliation data still persists.
 
 Atomic abort deliberately discards a healthy prefix. It is replayed only on a
-permitted probe, and later chronological work still waits for the fault to be
-repaired. The pacing bound is per node and resident entry; eviction or restart
-can allow a fresh immediate probe, and recovery can wait up to the capped retry
-delay. There is no new persisted timestamp, cross-node lease or prefix publication.
-A persistently inaccessible object can therefore hold Content freshness and
-cause bounded content-request refusal until the operator repairs it; this is
-preferable to silently declaring an incomplete index current. In a load,
+permitted probe; later chronological work, including index bookkeeping for flags,
+deletions and cursors, waits too. Successful mutation requests themselves are not
+rolled back. A newly created/imported message absent from the served map can retain
+its singleton returned ID during cooldown; a later successful publication may change
+its prefix when it joins another thread. The **Returned-ID lifetime** contract below
+applies to those earlier responses. A failed probe or a remaining backlog need not
+change the ID. The pacing bound is per node and resident entry; eviction or restart
+can allow a fresh immediate probe, and local recovery can wait up to the capped delay.
+There is no new persisted timestamp, cross-node lease or prefix publication. A
+persistently inaccessible object can hold Content freshness and cause bounded
+content-request refusal until repair, rather than declaring an incomplete index
+current. In a load,
 loss of a Thread blob is loss of the Map (a rebuild, 5.4), and loss of a Content blob triggers
 only Content recovery (5.4, H23). A required Thread transient can
 refuse Map (6.2). An optional Content transient affects only the
@@ -1921,7 +1962,7 @@ of 4.2, as one model rather than one patch each:
 | A deletion committed between a pass's log read and its commit, a phantom `created` (H2) | existence at `E` from the cache's present set, or from the log outside the range for a pinned `E`, before the record | a lagging record never decides presence at `E` |
 | A reconciliation tombstoning before it inserts (H3, I1) | gap inserts oldest first, then the gap deletions, then the retained records | a gap insert finds what the gap deleted; a retained insert, which came after every gap deletion, does not, as upstream |
 | A transient outage silently consuming a message (PR84-1, supersedes H5) | every transient aborts without consuming the item; the existing count is diagnostic only | recovery indexes the pending message without reindexing; persistent faults may hold Content freshness until repair |
-| Persistent failed opens causing retry/write amplification (PR84 follow-up) | capped resident-entry cooldown survives same-document diagnostic-count updates; identical abort manifests are not written | per-node pacing, original Content deadline, and safe document/attempt diagnostics; healthy prefix still waits |
+| Persistent failed account passes causing retry/write amplification (PR84 follow-up) | capped resident-entry cooldown covers required loads/writes and changing failing documents; shared bounded manifest observation notices remote progress; identical abort manifests are not written | per-node pacing, original Content deadline, one primary fixed-reason abort and optional document/attempt diagnostics; healthy prefix still waits |
 | A proved corrupt stored archive holding the pending checkpoint (PR84 follow-up) | fixed checked-archive access failure is parse loss; unknown errors remain transient | the corrupt row is consumed once, with no content in traces |
 | A lagging blob store read as loss (H6) | absence is loss only past `ZA_SEARCH_ABSENT_RETRY_SECS` | a committed manifest's blob exists |
 | A thread-part load refused for budget, failing every mail method (H8) | thread loads evict idle parts and overrun the soft budget with a trace, never refuse | mail degrades after search |
@@ -2749,6 +2790,7 @@ event), with these constants:
 | `ZA_SEARCH_PASS` | a pass committed | account id, inserts, tombstones, whether it published, revision, `indexed_to` |
 | `ZA_SEARCH_SKIPPED` | a message was skipped in a pass for loss (5.1) | account id, document id, the loss class (stub absent, blob absent, would not open) |
 | `ZA_SEARCH_ABORTED` | an actual failed probe aborts a pass (5.1), or a tiered promotion limit (5.5) | account id and fixed error class/reason; a message-open failure also carries document id and diagnostic attempt count; deferred probes emit no repeat |
+| `ZA_SEARCH_COMPACTION_SKIPPED` | optional Thread compaction exceeds its public allowance and falls back to the existing uncompacted path | account id and fixed reason `allowance`; this is not a pass abort, and any later failure emits its one primary abort separately |
 | `ZA_SEARCH_LOST` | a manifest write lost its assertion | account id |
 | `ZA_SEARCH_REBUILD` | a rebuild, content-only rebuild or reconciliation started or finished | account id, which, the loss class, the cursor size, the epoch |
 | `ZA_SEARCH_SUSPENDED` | content indexing stopped above the account cap | account id, the chain's size |
@@ -2870,14 +2912,20 @@ non-absent transient failures of one document across an eviction and
 a restart preserve the diagnostic count while leaving the checkpoint pending,
 including at counter saturation (PR84-1, supersedes R34's skip threshold).
 Recovery indexes it without reindexing. With an explicit monotonic test clock,
-retry delays are 1, 2, 4, 8, 16, then 30 seconds; requests before a deadline do
+retry delays are 1, 2, 4, 8, 16, then 30 seconds across changing documents and failure
+stages; requests before a deadline do
 not open, copy/replay or commit and do not emit another abort trace. Concurrent
 callers share the one probe. Diagnostic-only updates from a second node retain
 the deadline; meaningful progress, reset and replacement clear it. Unchanged
 saturated-count and absent manifests issue no commit, while suspension/marker
 changes persist. Failed diagnostic writes, assertion losers and cancellation
 cannot transfer an old cooldown to another generation. Content waits keep their
-original deadline. The actual abort trace includes document ID and attempt count
+original deadline while shared bounded manifest observations can discover remote
+publication before the local retry time. Cold required-Thread, staging and write
+failures are paced; unknown manifest reads do not invent a generation. Synthetic
+clock and parked-hook checks distinguish cheap observations from expensive probes.
+An open failure plus a diagnostic-write failure emits one primary abort, not two.
+The actual message-open abort trace includes document ID and proposed attempt count
 with no content or raw archive canary. A malformed unversioned outer metadata
 archive is consumed once as parse loss, with generic deserialization, non-Store
 and codec-key faults retaining transient controls. Repeated in-window absent reads likewise

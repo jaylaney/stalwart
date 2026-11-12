@@ -117,15 +117,26 @@ Non-absent transient failures also stay pending, regardless of the persisted
 attempt count. The old `ZA_SEARCH_SKIP_AFTER` environment variable is ignored.
 A persistent transport or configuration fault may hold Content freshness until
 it is repaired; recovery retries the pending message without a rebuild.
-Actual failed opens use a resident-entry cooldown of 1, 2, 4, 8, 16, then at most
-30 seconds. Deferred request hooks do no message-open or diagnostic-write work;
-Content waits keep their original deadline. Diagnostic-count-only writes by
-another node do not reset this node's cooldown. Unchanged abort manifests are
-not committed again. Actual failed probes trace the document ID, diagnostic
-attempt count and fixed reason, never archive bytes or message content. A proved
-`Archive access failed` error from stored archive validation is parse loss;
-unknown errors and missing codec keys remain transient. The healthy prefix of an
-aborted pass still waits for repair and is replayed only at permitted probes.
+Actual failed account passes, including required loads and writes, use a resident-entry
+cooldown of 1, 2, 4, 8, 16, then at most 30 seconds. Changing failing documents or
+operations does not reset that streak. Deferred callers share at most one authenticated
+manifest check per second; they perform no index-blob load, replay, message open or
+write merely to check for progress. A Content waiter can notice another node's progress
+before its local retry time, while retaining the original request deadline and normal
+current-view validation. Diagnostic-only updates do not reset the delay; explicit
+clearing or meaningful progress does. Failed observations do not establish a manifest
+generation or extend the probe deadline. Unchanged abort manifests are not committed
+again. Each failed probe emits one fixed-reason abort, with document ID and proposed
+diagnostic attempt count when a message open caused it; secondary diagnostic-write
+errors do not duplicate it. Allowed compaction fallback emits a separate
+`ZA_SEARCH_COMPACTION_SKIPPED` event with reason `allowance`; a later failure
+still emits its one actual abort. No raw archive bytes or message content are logged.
+A proved `Archive access failed` error from stored archive validation is parse loss;
+unknown errors and missing codec keys remain transient. The healthy prefix and later
+index bookkeeping wait for repair and are replayed only at permitted probes. This can
+leave newly created/imported messages with singleton returned IDs until a successful
+publication joins them to another thread; earlier responses retain their original IDs
+and ordinary stale-ID rules still apply. Mutation requests themselves remain committed.
 The bound is per node/resident entry, so restart or eviction allows a fresh probe.
 Eviction can forget the first absence time and extend the effective window.
 The existing 30-second key-sweep event also sweeps idle search entries, without

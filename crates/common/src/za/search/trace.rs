@@ -9,6 +9,7 @@
 pub const ZA_SEARCH_PASS: &str = "zero-access: search pass";
 pub const ZA_SEARCH_SKIPPED: &str = "zero-access: search message skipped";
 pub const ZA_SEARCH_ABORTED: &str = "zero-access: search pass aborted";
+pub const ZA_SEARCH_COMPACTION_SKIPPED: &str = "zero-access: search compaction skipped";
 pub const ZA_SEARCH_LOST: &str = "zero-access: search manifest write lost";
 pub const ZA_SEARCH_REBUILD: &str = "zero-access: search rebuild";
 pub const ZA_SEARCH_SUSPENDED: &str = "zero-access: search content indexing suspended";
@@ -46,6 +47,7 @@ mod tests {
             ZA_SEARCH_PASS,
             ZA_SEARCH_SKIPPED,
             ZA_SEARCH_ABORTED,
+            ZA_SEARCH_COMPACTION_SKIPPED,
             ZA_SEARCH_LOST,
             ZA_SEARCH_REBUILD,
             ZA_SEARCH_SUSPENDED,

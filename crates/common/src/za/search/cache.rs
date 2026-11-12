@@ -413,29 +413,20 @@ pub struct IndexEntry {
     cache: Weak<CacheState>,
 }
 
-/// One resident entry's consecutive failed probes. Never serialized. The pass
-/// lock owns transitions; the mutex lets validation and test clocks inspect it.
+/// One resident entry's consecutive failed account probes. Never serialized.
+/// Only the pass-lock owner changes admission, observations and outcomes.
 pub struct OpenRetry {
-    basis: Manifest,
-    document_id: u32,
+    // None means no manifest has ever authenticated in this episode. A failed
+    // observation retains a historical Some basis without claiming it is current.
+    basis: Option<Manifest>,
     streak: u8,
     class: TransientClass,
     deadline: Instant,
+    observe_at: Instant,
 }
 
-fn same_retry_basis(left: &Manifest, right: &Manifest, document_id: u32) -> bool {
-    if left == right {
-        return true;
-    }
-    if !left
-        .failing
-        .as_ref()
-        .is_some_and(|f| f.document_id == document_id)
-        || !right
-            .failing
-            .as_ref()
-            .is_some_and(|f| f.document_id == document_id)
-    {
+fn same_retry_basis(left: &Manifest, right: &Manifest) -> bool {
+    if left.failing.is_some() && right.failing.is_none() {
         return false;
     }
     let mut normalized = right.clone();
@@ -443,27 +434,34 @@ fn same_retry_basis(left: &Manifest, right: &Manifest, document_id: u32) -> bool
     left == &normalized
 }
 
-// An actual probe can create or replace the diagnostic failure record. Every
-// other manifest field remains part of the cooldown's identity, regardless of
-// which writer commits the result.
-fn diagnostic_only_change(before: &Manifest, after: &Manifest, document_id: u32) -> bool {
-    if !after
-        .failing
-        .as_ref()
-        .is_some_and(|f| f.document_id == document_id)
-    {
-        return false;
-    }
-    let mut normalized = after.clone();
-    normalized.failing = before.failing.clone();
-    before == &normalized
-}
-
 pub type LoadedGuard = OwnedRwLockReadGuard<Option<LoadedIndex>, LoadedIndex>;
 
 impl IndexEntry {
-    /// Called under pass_lock, after the authoritative manifest is validated.
-    /// A remote diagnostic count is not progress and cannot defeat pacing.
+    /// Read-only scheduling information. The pass lock owns the decision to
+    /// observe; a waiter uses this only to choose its next bounded wakeup.
+    pub fn retry_schedule(&self) -> Option<(TransientClass, Instant, Instant)> {
+        self.open_retry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|retry| (retry.class, retry.deadline, retry.observe_at))
+    }
+
+    /// Reserve the next shared observation before awaiting I/O. Cancellation
+    /// and failed reads consume this observation slot, never a failed probe.
+    pub fn begin_retry_observation(&self, now: Instant) -> bool {
+        if let Some(retry) = self.open_retry.lock().unwrap().as_mut()
+            && now >= retry.observe_at
+        {
+            retry.observe_at = now + Duration::from_secs(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Called under pass_lock with an authenticated actual head. Diagnostic
+    /// replacement/creation is not progress; explicit clearing is progress.
     pub fn defer_open_retry(
         &self,
         manifest: &Manifest,
@@ -471,31 +469,38 @@ impl IndexEntry {
     ) -> Option<(TransientClass, Instant)> {
         let mut slot = self.open_retry.lock().unwrap();
         let retry = slot.as_mut()?;
-        if !same_retry_basis(&retry.basis, manifest, retry.document_id) {
+        if !retry
+            .basis
+            .as_ref()
+            .is_some_and(|basis| same_retry_basis(basis, manifest))
+        {
             *slot = None;
             return None;
         }
-        retry.basis = manifest.clone();
+        retry.basis = Some(manifest.clone());
         (now < retry.deadline).then_some((retry.class, retry.deadline))
     }
 
-    /// Arm before awaiting the diagnostic write. Cancellation or a failed
-    /// write leaves the delay bound to this already validated observation.
-    pub fn note_open_failure(
+    /// Record the first transient of an admitted probe synchronously. Unknown
+    /// reads may retain a historical basis, but cannot create a generation.
+    pub fn note_pass_failure(
         &self,
-        observed: &Manifest,
-        document_id: u32,
+        observed: Option<&Manifest>,
         class: TransientClass,
         now: Instant,
     ) {
         let mut slot = self.open_retry.lock().unwrap();
-        let streak = slot
-            .as_ref()
-            .filter(|retry| {
-                retry.document_id == document_id
-                    && same_retry_basis(&retry.basis, observed, document_id)
-            })
-            .map_or(1, |retry| retry.streak.saturating_add(1));
+        let prior = slot.as_ref().filter(|retry| match observed {
+            Some(observed) => retry
+                .basis
+                .as_ref()
+                .is_some_and(|basis| same_retry_basis(basis, observed)),
+            None => true,
+        });
+        let streak = prior.map_or(1, |retry| retry.streak.saturating_add(1));
+        let basis = observed
+            .cloned()
+            .or_else(|| prior.and_then(|retry| retry.basis.clone()));
         let delay = match streak {
             1 => 1,
             2 => 2,
@@ -505,54 +510,29 @@ impl IndexEntry {
             _ => 30,
         };
         *slot = Some(OpenRetry {
-            basis: observed.clone(),
-            document_id,
+            basis,
             streak,
             class,
             deadline: now + Duration::from_secs(delay),
+            observe_at: now + Duration::from_secs(1),
         });
     }
 
-    /// The successful asserted batch validates this exact resulting manifest.
-    /// Rebind before any await, including the resident-swap cancellation point.
+    /// Settle an acknowledged batch before any resident-swap await. Compare
+    /// the actual committed manifest, including all meaningful progress.
     pub fn commit_open_retry(&self, before: &Manifest, after: &Manifest) {
         let mut slot = self.open_retry.lock().unwrap();
         if let Some(retry) = slot.as_mut() {
-            if same_retry_basis(&retry.basis, before, retry.document_id)
-                && diagnostic_only_change(before, after, retry.document_id)
+            if retry
+                .basis
+                .as_ref()
+                .is_some_and(|basis| same_retry_basis(basis, before))
+                && same_retry_basis(before, after)
             {
-                retry.basis = after.clone();
+                retry.basis = Some(after.clone());
             } else {
                 *slot = None;
             }
-        }
-    }
-
-    /// Take before awaiting an assertion loser's reload. If that task is
-    /// cancelled, no unvalidated loser state remains armed on the entry.
-    pub fn take_open_retry(&self) -> Option<OpenRetry> {
-        self.open_retry.lock().unwrap().take()
-    }
-
-    /// Restore only for a validated head with the same pending document and
-    /// either the observed basis or the proposed diagnostic-only result.
-    pub fn restore_open_retry(
-        &self,
-        retry: Option<OpenRetry>,
-        expected: &Manifest,
-        current: &Manifest,
-    ) {
-        if let Some(mut retry) = retry
-            && current
-                .failing
-                .as_ref()
-                .is_some_and(|f| f.document_id == retry.document_id)
-            && (same_retry_basis(&retry.basis, current, retry.document_id)
-                || (diagnostic_only_change(&retry.basis, expected, retry.document_id)
-                    && same_retry_basis(expected, current, retry.document_id)))
-        {
-            retry.basis = current.clone();
-            *self.open_retry.lock().unwrap() = Some(retry);
         }
     }
 
@@ -570,6 +550,16 @@ impl IndexEntry {
             .as_mut()
             .expect("an open retry is armed")
             .deadline = deadline;
+    }
+
+    #[cfg(feature = "test_mode")]
+    pub fn set_retry_observation_for_test(&self, observe_at: Instant) {
+        self.open_retry
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("a retry is armed")
+            .observe_at = observe_at;
     }
 
     #[cfg(feature = "test_mode")]
@@ -946,7 +936,7 @@ mod retry_tests {
             let mut basis = failing(0);
             let mut now = Instant::now();
             for delay in [1, 2, 4, 8, 16, 30, 30, 30] {
-                entry.note_open_failure(&basis, 7, class, now);
+                entry.note_pass_failure(Some(&basis), class, now);
                 let mut committed = basis.clone();
                 if class != TransientClass::AbsentWithinWindow {
                     committed.failing.as_mut().unwrap().attempts += 1;
@@ -985,14 +975,43 @@ mod retry_tests {
     }
 
     #[test]
-    fn progress_lifecycle_and_pending_document_changes_clear_retry() {
+    fn account_retry_streak_survives_alternating_documents_and_fault_classes() {
+        let cache = ZaSearchCache::new(Ok(ZaSearchConfig::default()));
+        let entry = cache.entry(1);
+        let mut observed = failing(0);
+        let mut now = Instant::now();
+        for (index, delay) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            let document_id = if index % 2 == 0 { 7 } else { 8 };
+            let class = if index % 2 == 0 {
+                TransientClass::Store
+            } else {
+                TransientClass::BlobStore
+            };
+            entry.note_pass_failure(Some(&observed), class, now);
+            let mut committed = observed.clone();
+            committed.failing = Some(FailingDocument {
+                document_id,
+                attempts: 1,
+            });
+            entry.commit_open_retry(&observed, &committed);
+            let expected = now + Duration::from_secs(delay);
+            assert_eq!(
+                entry.defer_open_retry(&committed, now),
+                Some((class, expected)),
+                "a diagnostic-only document change cannot reset the account streak"
+            );
+            assert_eq!(entry.defer_open_retry(&committed, expected), None);
+            observed = committed;
+            now = expected;
+        }
+    }
+
+    #[test]
+    fn progress_and_lifecycle_changes_clear_retry() {
         let original = failing(4);
         let mut changes = Vec::new();
         let mut changed = original.clone();
         changed.failing = None;
-        changes.push(changed);
-        let mut changed = original.clone();
-        changed.failing.as_mut().unwrap().document_id = 8;
         changes.push(changed);
         let mut changed = original.clone();
         changed.epoch += 1;
@@ -1019,10 +1038,10 @@ mod retry_tests {
             let cache = ZaSearchCache::new(Ok(ZaSearchConfig::default()));
             let entry = cache.entry(1);
             let now = Instant::now();
-            entry.note_open_failure(&original, 7, TransientClass::Store, now);
+            entry.note_pass_failure(Some(&original), TransientClass::Store, now);
             assert!(entry.defer_open_retry(&original, now).is_some());
             assert_eq!(entry.defer_open_retry(&changed, now), None);
-            entry.note_open_failure(&changed, 7, TransientClass::Store, now);
+            entry.note_pass_failure(Some(&changed), TransientClass::Store, now);
             assert_eq!(
                 entry.defer_open_retry(&changed, now),
                 Some((TransientClass::Store, now + Duration::from_secs(1)))
@@ -1040,26 +1059,23 @@ mod retry_tests {
             failing: None,
             ..failing(0)
         };
-        let expected = failing(1);
         let now = Instant::now();
-        entry.note_open_failure(&observed, 7, TransientClass::Store, now);
+        entry.note_pass_failure(Some(&observed), TransientClass::Store, now);
         // A failed write retains the unchanged observation, even with no
-        // persisted failure record yet. A loser cannot restore that reset head.
+        // persisted failure record yet. A winner with the same None is not progress.
         assert!(entry.defer_open_retry(&observed, now).is_some());
-        let retry = entry.take_open_retry();
-        entry.restore_open_retry(retry, &expected, &observed);
-        assert_eq!(entry.defer_open_retry(&observed, now), None);
-        entry.note_open_failure(&observed, 7, TransientClass::Store, now);
-        let retry = entry.take_open_retry();
+        entry.defer_open_retry(&observed, now);
+        assert!(entry.defer_open_retry(&observed, now).is_some());
+        entry.clear_open_retry();
+        entry.note_pass_failure(Some(&observed), TransientClass::Store, now);
         let remote = failing(9);
-        entry.restore_open_retry(retry, &expected, &remote);
+        entry.defer_open_retry(&remote, now);
         assert_eq!(
             entry.defer_open_retry(&remote, now),
             Some((TransientClass::Store, now + Duration::from_secs(1)))
         );
-        entry.note_open_failure(
-            &remote,
-            7,
+        entry.note_pass_failure(
+            Some(&remote),
             TransientClass::Store,
             now + Duration::from_secs(1),
         );
@@ -1067,12 +1083,11 @@ mod retry_tests {
             entry.defer_open_retry(&remote, now),
             Some((TransientClass::Store, now + Duration::from_secs(3)))
         );
-        let retry = entry.take_open_retry();
         let replacement = Manifest {
             epoch: 10,
             ..remote
         };
-        entry.restore_open_retry(retry, &expected, &replacement);
+        entry.defer_open_retry(&replacement, now);
         assert_eq!(entry.defer_open_retry(&replacement, now), None);
     }
 
@@ -1086,10 +1101,10 @@ mod retry_tests {
         });
         let mut now = Instant::now();
         for delay in [1, 2, 4, 8, 16] {
-            entry.note_open_failure(&before, 7, TransientClass::Store, now);
+            entry.note_pass_failure(Some(&before), TransientClass::Store, now);
             now += Duration::from_secs(delay);
         }
-        entry.note_open_failure(&before, 7, TransientClass::Store, now);
+        entry.note_pass_failure(Some(&before), TransientClass::Store, now);
         assert_eq!(
             entry.defer_open_retry(&before, now),
             Some((TransientClass::Store, now + Duration::from_secs(30)))
@@ -1103,8 +1118,7 @@ mod retry_tests {
             after.reconciliation.as_mut().unwrap().bound = 11;
         }
         if assertion_winner {
-            let retry = entry.take_open_retry();
-            entry.restore_open_retry(retry, &after, &after);
+            entry.defer_open_retry(&after, now);
         } else {
             entry.commit_open_retry(&before, &after);
         }
@@ -1113,7 +1127,7 @@ mod retry_tests {
             None,
             "meaningful abort state must clear the old 30-second cooldown"
         );
-        entry.note_open_failure(&after, 7, TransientClass::Store, now);
+        entry.note_pass_failure(Some(&after), TransientClass::Store, now);
         assert_eq!(
             entry.defer_open_retry(&after, now),
             Some((TransientClass::Store, now + Duration::from_secs(1))),
@@ -1153,11 +1167,10 @@ mod retry_tests {
                     attempts,
                 });
                 let now = Instant::now();
-                entry.note_open_failure(&before, 7, TransientClass::Store, now);
+                entry.note_pass_failure(Some(&before), TransientClass::Store, now);
                 let after = failing(prior_attempts.unwrap_or_default() + 1);
                 if assertion_winner {
-                    let retry = entry.take_open_retry();
-                    entry.restore_open_retry(retry, &after, &after);
+                    entry.defer_open_retry(&after, now);
                 } else {
                     entry.commit_open_retry(&before, &after);
                 }
@@ -1170,9 +1183,8 @@ mod retry_tests {
                     entry.defer_open_retry(&remote, now),
                     Some((TransientClass::Store, now + Duration::from_secs(1)))
                 );
-                entry.note_open_failure(
-                    &remote,
-                    7,
+                entry.note_pass_failure(
+                    Some(&remote),
                     TransientClass::Store,
                     now + Duration::from_secs(1),
                 );
@@ -1185,22 +1197,20 @@ mod retry_tests {
     }
 
     #[test]
-    fn a_new_actual_failing_document_restarts_the_streak_and_binds_its_diagnostic() {
+    fn a_new_actual_failing_document_preserves_the_streak_and_binds_its_diagnostic() {
         for assertion_winner in [false, true] {
             let cache = ZaSearchCache::new(Ok(ZaSearchConfig::default()));
             let entry = cache.entry(1);
             let before = failing(4);
             let now = Instant::now();
-            entry.note_open_failure(&before, 7, TransientClass::Store, now);
-            entry.note_open_failure(
-                &before,
-                7,
+            entry.note_pass_failure(Some(&before), TransientClass::Store, now);
+            entry.note_pass_failure(
+                Some(&before),
                 TransientClass::Store,
                 now + Duration::from_secs(1),
             );
-            entry.note_open_failure(
-                &before,
-                8,
+            entry.note_pass_failure(
+                Some(&before),
                 TransientClass::Store,
                 now + Duration::from_secs(3),
             );
@@ -1210,16 +1220,86 @@ mod retry_tests {
                 attempts: 1,
             });
             if assertion_winner {
-                let retry = entry.take_open_retry();
-                entry.restore_open_retry(retry, &after, &after);
+                entry.defer_open_retry(&after, now);
             } else {
                 entry.commit_open_retry(&before, &after);
             }
             assert_eq!(
                 entry.defer_open_retry(&after, now + Duration::from_secs(3)),
-                Some((TransientClass::Store, now + Duration::from_secs(4)))
+                Some((TransientClass::Store, now + Duration::from_secs(7)))
             );
         }
+    }
+
+    #[test]
+    fn diagnostic_transitions_preserve_only_the_same_meaningful_basis() {
+        let cache = ZaSearchCache::new(Ok(ZaSearchConfig::default()));
+        let entry = cache.entry(1);
+        let now = Instant::now();
+        let mut none = failing(0);
+        none.failing = None;
+        entry.note_pass_failure(Some(&none), TransientClass::Budget, now);
+        let schedule = entry.retry_schedule().unwrap();
+        assert!(entry.defer_open_retry(&none, now).is_some());
+        let mut diagnostic = failing(9);
+        diagnostic.failing.as_mut().unwrap().document_id = 99;
+        assert!(entry.defer_open_retry(&diagnostic, now).is_some());
+        diagnostic.failing.as_mut().unwrap().document_id = 17;
+        diagnostic.failing.as_mut().unwrap().attempts = 255;
+        assert!(entry.defer_open_retry(&diagnostic, now).is_some());
+        assert_eq!(entry.retry_schedule(), Some(schedule));
+        assert_eq!(entry.defer_open_retry(&none, now), None);
+        assert!(entry.retry_schedule().is_none());
+    }
+
+    #[test]
+    fn unknown_observations_keep_schedule_without_claiming_a_generation() {
+        let cache = ZaSearchCache::new(Ok(ZaSearchConfig::default()));
+        let entry = cache.entry(1);
+        let now = Instant::now();
+        entry.note_pass_failure(None, TransientClass::Store, now);
+        let initial = entry.retry_schedule().unwrap();
+        assert!(!entry.begin_retry_observation(now));
+        assert!(entry.begin_retry_observation(initial.2));
+        assert!(!entry.begin_retry_observation(initial.2));
+        // A failed observation changes only the shared cadence. It is not a
+        // probe and cannot change the deadline or grow the failure streak.
+        assert_eq!(
+            entry.retry_schedule(),
+            Some((initial.0, initial.1, initial.2 + Duration::from_secs(1)))
+        );
+        assert_eq!(entry.defer_open_retry(&failing(2), now), None);
+        entry.note_pass_failure(Some(&failing(2)), TransientClass::BlobStore, now);
+        assert_eq!(
+            entry.retry_schedule().unwrap().1,
+            now + Duration::from_secs(1)
+        );
+        entry.note_pass_failure(None, TransientClass::Store, now + Duration::from_secs(1));
+        assert_eq!(
+            entry.retry_schedule().unwrap().1,
+            now + Duration::from_secs(3)
+        );
+        assert!(entry.defer_open_retry(&failing(9), now).is_some());
+        let replacement = Manifest {
+            epoch: 10,
+            ..failing(9)
+        };
+        assert_eq!(entry.defer_open_retry(&replacement, now), None);
+    }
+
+    #[test]
+    fn actual_winner_generation_change_clears_historical_retry() {
+        let cache = ZaSearchCache::new(Ok(ZaSearchConfig::default()));
+        let entry = cache.entry(1);
+        let now = Instant::now();
+        let before = failing(4);
+        entry.note_pass_failure(Some(&before), TransientClass::Store, now);
+        let actual = Manifest {
+            epoch: 10,
+            ..before.clone()
+        };
+        entry.defer_open_retry(&actual, now);
+        assert!(entry.retry_schedule().is_none());
     }
 
     #[test]
@@ -1228,7 +1308,7 @@ mod retry_tests {
         let old = cache.entry(1);
         let basis = failing(1);
         let now = Instant::now();
-        old.note_open_failure(&basis, 7, TransientClass::Store, now);
+        old.note_pass_failure(Some(&basis), TransientClass::Store, now);
         cache.remove_account(1, EvictReason::Invalidation);
         let new = cache.entry(1);
         assert!(!Arc::ptr_eq(&old, &new));

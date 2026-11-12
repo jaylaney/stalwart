@@ -563,6 +563,11 @@ struct ServerOpener<'a> {
 
 impl Opener for ServerOpener<'_> {
     async fn open(&mut self, document_id: u32) -> Result<Indexed, OpenFailure> {
+        #[cfg(feature = "test_mode")]
+        common::za::test_hooks::count_search_pass_work(
+            self.account_id,
+            common::za::test_hooks::SearchPassWork::Open,
+        );
         let opened = self
             .server
             .za_open_for_index(
@@ -658,83 +663,205 @@ impl ZaSearchPass for Server {
         account_id: u32,
         keys: &SessionKeys,
     ) -> trc::Result<PassOutcome> {
-        let config = self.za_search_config();
-        let entry = self.inner.cache.za_search.entry(account_id);
-        // A running pass can hold the index write guard during a reload.
-        // Check the pass slot before awaiting any loaded state or load flight.
-        let Ok(_pass) = entry.pass_lock.try_lock() else {
-            return Ok(PassOutcome::Running);
-        };
-        if let Err(failure) = self.za_search_load_entry(&entry, keys).await {
-            return Ok(failure.into());
+        run_pass(self, account_id, keys, None).await
+    }
+}
+
+/// The first observed failure owns this probe's delay and trace, including when
+/// a secondary diagnostic write or assertion-winner reload also fails.
+pub(crate) struct PassProbe<'a> {
+    entry: &'a IndexEntry,
+    pub observed: Option<Manifest>,
+    failure: Option<TransientClass>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl PassProbe<'_> {
+    pub fn fail(
+        &mut self,
+        class: TransientClass,
+        reason: &'static str,
+        diagnostic: Option<&FailingDocument>,
+    ) {
+        if self.failure.is_some() {
+            return;
         }
-        let state = read_change_id(self, account_id).await?;
-        let loaded_hash = {
+        self.failure = Some(class);
+        self.entry
+            .note_pass_failure(self.observed.as_ref(), class, Instant::now());
+        if let Some(diagnostic) = diagnostic {
+            za_search_trace!(
+                ZA_SEARCH_ABORTED,
+                AccountId = self.entry.account_id,
+                DocumentId = diagnostic.document_id,
+                Attempt = u32::from(diagnostic.attempts),
+                Reason = reason
+            );
+        } else {
+            za_search_trace!(
+                ZA_SEARCH_ABORTED,
+                AccountId = self.entry.account_id,
+                Reason = reason
+            );
+        }
+    }
+
+    async fn load(
+        &mut self,
+        server: &Server,
+        keys: &SessionKeys,
+    ) -> Result<(Vec<u8>, Manifest), ObservedLoadError> {
+        pass_wait(
+            self.deadline,
+            server.za_search_load_for_pass(self.entry, keys, &mut self.observed),
+        )
+        .await
+        .unwrap_or_else(|()| Err(LoadFailure::Transient(TransientClass::Store).into()))
+    }
+
+    pub async fn resolve_winner(&mut self, server: &Server, keys: &SessionKeys) {
+        // Keep the historical scheduling state while this await is unresolved.
+        // The loader settles against only the authenticated actual winner.
+        if let Err(failure) = self.load(server, keys).await {
+            if let LoadFailure::Transient(class) = failure.classification() {
+                self.fail(class, class.as_str(), None);
+            } else {
+                self.entry.clear_open_retry();
+            }
+        }
+    }
+}
+
+fn resident_entry(server: &Server, entry: &IndexEntry) -> bool {
+    server
+        .inner
+        .cache
+        .za_search
+        .get(entry.account_id)
+        .is_some_and(|current| std::ptr::eq(current.as_ref(), entry))
+}
+
+async fn pass_wait<F: Future>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Result<F::Output, ()> {
+    if let Some(deadline) = deadline {
+        tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| ())
+    } else {
+        Ok(future.await)
+    }
+}
+
+pub(super) async fn run_pass(
+    server: &Server,
+    account_id: u32,
+    keys: &SessionKeys,
+    deadline: Option<tokio::time::Instant>,
+) -> trc::Result<PassOutcome> {
+    let config = server.za_search_config();
+    let entry = server.inner.cache.za_search.entry(account_id);
+    // A running pass can hold the index write guard during a reload.
+    // Check the pass slot before awaiting any loaded state or load flight.
+    let Ok(_pass) = entry.pass_lock.try_lock() else {
+        return Ok(PassOutcome::Running);
+    };
+    if let Some((class, retry_at, observe_at)) = entry.retry_schedule()
+        && Instant::now() < retry_at
+    {
+        if Instant::now() < observe_at {
+            return Ok(PassOutcome::Deferred { class, retry_at });
+        }
+        entry.begin_retry_observation(Instant::now());
+        let observation = pass_wait(deadline, async {
+            #[cfg(feature = "test_mode")]
+            common::za::test_hooks::search_retry_observation_pause_point(account_id).await;
+            server
+                .za_search_read_manifest(account_id, &za_search_key(keys.swk()))
+                .await
+        })
+        .await;
+        if !resident_entry(server, &entry) {
+            entry.clear_open_retry();
+            return Ok(PassOutcome::Lost);
+        }
+        match observation {
+            Ok(Ok(Some((_, ManifestValue::Index(manifest))))) => {
+                if let Some((class, retry_at)) = entry.defer_open_retry(&manifest, Instant::now()) {
+                    return Ok(PassOutcome::Deferred { class, retry_at });
+                }
+            }
+            Err(()) | Ok(Err(ObservedLoadError::Other(LoadFailure::Transient(_)))) => {
+                return Ok(PassOutcome::Deferred { class, retry_at });
+            }
+            Ok(Ok(None)) => {
+                entry.clear_open_retry();
+                return Ok(PassOutcome::Recovery(RecoveryCause::Loss(
+                    MapLoss::missing(),
+                )));
+            }
+            Ok(Ok(Some((_, ManifestValue::Destroying(_))))) => {
+                entry.clear_open_retry();
+                return Ok(PassOutcome::NoMap(NoMapReason::Destroying));
+            }
+            Ok(Err(failure)) => {
+                entry.clear_open_retry();
+                return Ok(failure.into());
+            }
+        }
+    }
+    let mut probe = PassProbe {
+        entry: &entry,
+        observed: None,
+        failure: None,
+        deadline,
+    };
+    let result: trc::Result<PassOutcome> = async {
+        let (bytes, manifest) = match pass_wait(
+            deadline,
+            server.za_search_load_for_pass(&entry, keys, &mut probe.observed),
+        )
+        .await
+        {
+            Ok(Ok(target)) => target,
+            Ok(Err(failure)) => return Ok(failure.into()),
+            Err(()) => return Ok(PassOutcome::Aborted(TransientClass::Store)),
+        };
+        if !resident_entry(server, &entry) {
+            entry.clear_open_retry();
+            return Ok(PassOutcome::Lost);
+        }
+        let state = read_change_id(server, account_id).await?;
+        {
             let Some(index) = entry.read_loaded().await else {
                 return Ok(PassOutcome::Lost);
             };
-            let manifest = &index.manifest;
+            if index.manifest_bytes_hash != manifest_hash(&bytes) {
+                return Ok(PassOutcome::Lost);
+            }
             if manifest.cursor.is_none()
                 && manifest.reconciliation.is_none()
                 && manifest.content_to.cursor.is_none()
-                && za_search_content_needs_rebuild(manifest, &config).is_none()
+                && za_search_content_needs_rebuild(&manifest, &config).is_none()
                 && manifest.indexed_to.complete
                 && state <= index.scanned_to
             {
                 entry.clear_open_retry();
                 return Ok(PassOutcome::Current);
             }
-            index.manifest_bytes_hash
-        };
-
+        }
         #[cfg(feature = "test_mode")]
         common::za::test_hooks::search_sweep_pause_point(account_id).await;
 
-        let key = za_search_key(keys.swk());
-        let mut read = self.za_search_read_manifest(account_id, &key).await;
-        if let Ok(Some((bytes, ManifestValue::Index(_)))) = &read
-            && manifest_hash(bytes) != loaded_hash
-        {
-            if let Err(failure) = self.za_search_reload_if_moved(&entry, keys).await {
-                return Ok(failure.into());
-            }
-            read = self.za_search_read_manifest(account_id, &key).await;
-        }
-        let (bytes, manifest) = match read {
-            Ok(Some((bytes, ManifestValue::Index(manifest)))) => (bytes, manifest),
-            Ok(Some((_, ManifestValue::Destroying(_)))) => {
-                entry.clear_open_retry();
-                return Ok(PassOutcome::NoMap(NoMapReason::Destroying));
-            }
-            Ok(None) => {
-                entry.clear_open_retry();
-                return Ok(PassOutcome::Recovery(RecoveryCause::Loss(
-                    MapLoss::missing(),
-                )));
-            }
-            Err(failure) => return Ok(failure.into()),
-        };
-        drop(key);
-        if !self
-            .inner
-            .cache
-            .za_search
-            .get(account_id)
-            .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &entry))
-        {
-            entry.clear_open_retry();
-            return Ok(PassOutcome::Lost);
-        }
-        if let Some((class, retry_at)) = entry.defer_open_retry(&manifest, Instant::now()) {
-            return Ok(PassOutcome::Deferred { class, retry_at });
-        }
         if let Some(reason) = za_search_content_needs_rebuild(&manifest, &config) {
-            match self
+            match server
                 .za_search_content_rebuild_start(account_id, keys, reason, None)
                 .await
             {
                 Ok(()) => {
-                    if let Err(failure) = self.za_search_reload_if_moved(&entry, keys).await {
+                    entry.clear_open_retry();
+                    if let Err(failure) = probe.load(server, keys).await {
                         return Ok(failure.into());
                     }
                     return Ok(PassOutcome::Advanced {
@@ -744,7 +871,7 @@ impl ZaSearchPass for Server {
                 }
                 Err(err) if err.is_assertion_failure() => {
                     za_search_trace!(ZA_SEARCH_LOST, AccountId = account_id);
-                    self.za_search_reload_if_moved(&entry, keys).await.ok();
+                    probe.resolve_winner(server, keys).await;
                     return Ok(PassOutcome::Lost);
                 }
                 Err(err) => return Err(err),
@@ -752,7 +879,7 @@ impl ZaSearchPass for Server {
         }
 
         let hash = manifest_hash(&bytes);
-        let search_cache = &self.inner.cache.za_search;
+        let search_cache = &server.inner.cache.za_search;
         let mut sources = PassSources::default();
         let source_needs_thread = manifest.cursor.is_some()
             || manifest.content_to.cursor.is_some()
@@ -788,21 +915,29 @@ impl ZaSearchPass for Server {
             base
         };
         let records = if let Some(marker) = &base.manifest.reconciliation {
-            let Some(present) = observe_present(self, account_id).await? else {
+            let Some(present) = observe_present(server, account_id).await? else {
                 return Ok(PassOutcome::Lost);
             };
-            let mut retained = self
+            let mut retained = server
                 .store()
                 .za_changes_records(account_id, SyncCollection::Email, None, usize::MAX)
                 .await?;
-            let bound = self
+            let bound = server
                 .za_retained_bound(account_id)
                 .await?
                 .max(retained.first_retained.unwrap_or_default());
             match second_truncation(marker.bound, bound, &base.manifest.indexed_to) {
                 SecondTruncation::Restart => {
-                    return start_reconciliation(self, &entry, keys, &bytes, base.manifest, bound)
-                        .await;
+                    return start_reconciliation(
+                        server,
+                        &entry,
+                        keys,
+                        &bytes,
+                        base.manifest,
+                        bound,
+                        &mut probe,
+                    )
+                    .await;
                 }
                 SecondTruncation::BoundMoved => sources.marker_bound = Some(bound),
                 SecondTruncation::No => (),
@@ -823,12 +958,20 @@ impl ZaSearchPass for Server {
             }
             retained
         } else if let Some(bounds) = &base.manifest.cursor {
-            let bound = self.za_retained_bound(account_id).await?;
+            let bound = server.za_retained_bound(account_id).await?;
             if second_truncation(0, bound, &base.manifest.indexed_to) == SecondTruncation::Restart {
-                return start_reconciliation(self, &entry, keys, &bytes, base.manifest, bound)
-                    .await;
+                return start_reconciliation(
+                    server,
+                    &entry,
+                    keys,
+                    &bytes,
+                    base.manifest,
+                    bound,
+                    &mut probe,
+                )
+                .await;
             }
-            let Some(present) = observe_present(self, account_id).await? else {
+            let Some(present) = observe_present(server, account_id).await? else {
                 return Ok(PassOutcome::Lost);
             };
             sources.cursor = cursor_items(bounds, present.documents);
@@ -839,7 +982,7 @@ impl ZaSearchPass for Server {
             } else {
                 base.manifest.indexed_to
             };
-            let records = self
+            let records = server
                 .store()
                 .za_changes_records(
                     account_id,
@@ -849,12 +992,20 @@ impl ZaSearchPass for Server {
                 )
                 .await?;
             if records.truncated || records.resumed_record_lost {
-                let bound = self
+                let bound = server
                     .za_retained_bound(account_id)
                     .await?
                     .max(records.first_retained.unwrap_or_default());
-                return start_reconciliation(self, &entry, keys, &bytes, base.manifest, bound)
-                    .await;
+                return start_reconciliation(
+                    server,
+                    &entry,
+                    keys,
+                    &bytes,
+                    base.manifest,
+                    bound,
+                    &mut probe,
+                )
+                .await;
             }
             records
         };
@@ -888,7 +1039,7 @@ impl ZaSearchPass for Server {
                     < config.account_max_mb << 20,
         };
         let mut opener = ServerOpener {
-            server: self,
+            server: server,
             account_id,
             keys,
             entry: &entry,
@@ -919,17 +1070,7 @@ impl ZaSearchPass for Server {
                 staging.failing.as_ref().map(|f| f.document_id),
                 Some(document_id)
             );
-            entry.note_open_failure(&base.manifest, document_id, class, Instant::now());
-            za_search_trace!(
-                ZA_SEARCH_ABORTED,
-                AccountId = account_id,
-                DocumentId = document_id,
-                Attempt = staging
-                    .failing
-                    .as_ref()
-                    .map_or(0, |f| u32::from(f.attempts)),
-                Reason = class.as_str()
-            );
+            probe.fail(class, class.as_str(), staging.failing.as_ref());
         }
         if matches!(staging.decision, PassDecision::Nothing) {
             let mut guard = entry.index.write().await;
@@ -954,7 +1095,10 @@ impl ZaSearchPass for Server {
                 ),
             ];
             let epoch = base.manifest.epoch;
-            let outcome = write_pass(self, account_id, keys, &entry, &bytes, base, staging).await?;
+            let outcome = write_pass(
+                server, account_id, keys, &entry, &bytes, base, staging, &mut probe,
+            )
+            .await?;
             if matches!(outcome, PassOutcome::Advanced { .. }) {
                 entry.clear_open_retry();
                 for (done, kind) in finished {
@@ -972,8 +1116,22 @@ impl ZaSearchPass for Server {
             Ok(outcome)
         }
     }
+    .await;
+    match &result {
+        Ok(PassOutcome::Aborted(class)) => probe.fail(*class, class.as_str(), None),
+        Err(error) if !error.is_assertion_failure() => {
+            probe.fail(TransientClass::Store, TransientClass::Store.as_str(), None);
+            return Ok(PassOutcome::Aborted(TransientClass::Store));
+        }
+        Ok(PassOutcome::NoMap(_) | PassOutcome::ContentLoss(_) | PassOutcome::Recovery(_)) => {
+            entry.clear_open_retry()
+        }
+        _ => (),
+    }
+    result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_reconciliation(
     server: &Server,
     entry: &IndexEntry,
@@ -981,20 +1139,22 @@ async fn start_reconciliation(
     bytes: &[u8],
     manifest: Manifest,
     bound: u64,
+    probe: &mut PassProbe<'_>,
 ) -> trc::Result<PassOutcome> {
     let id = entry.account_id;
     match za_search_reconcile_start(server, id, keys, bytes, manifest, bound).await {
         Ok(()) => {
+            entry.clear_open_retry();
             // The next pass must start from the committed marker, even on an
             // idle account where the prior resident scanned_to was current.
-            match server.za_search_reload_if_moved(entry, keys).await {
+            match probe.load(server, keys).await {
                 Ok(_) => Ok(PassOutcome::Recovery(RecoveryCause::Truncated)),
                 Err(failure) => Ok(failure.into()),
             }
         }
         Err(err) if err.is_assertion_failure() => {
             za_search_trace!(ZA_SEARCH_LOST, AccountId = id);
-            server.za_search_reload_if_moved(entry, keys).await.ok();
+            probe.resolve_winner(server, keys).await;
             Ok(PassOutcome::Lost)
         }
         Err(err) => Err(err),

@@ -6,11 +6,14 @@
 
 use super::{
     compact::{CompactError, CompactedContent, CompactedThreads, compact_content, compact_threads},
-    pass::{CursorStep, MarkerStep, PassDecision, PassOutcome, Staging},
+    pass::{CursorStep, MarkerStep, PassDecision, PassOutcome, PassProbe, Staging},
 };
 use crate::cache::MessageCacheFetch;
 #[cfg(feature = "test_mode")]
-use common::za::test_hooks::{SearchContentWrite, note_search_content_write};
+use common::za::test_hooks::{
+    SearchContentWrite, SearchPassWork, count_search_pass_work, note_search_content_write,
+    take_search_pass_fault,
+};
 use common::{
     Server,
     storage::blob::BlobHold,
@@ -22,10 +25,7 @@ use common::{
         error::{LoadFailure, TransientClass},
         load::ObservedLoadError,
         seal::{build_content_blob, build_thread_blob, za_search_key},
-        trace::{
-            ZA_SEARCH_ABORTED, ZA_SEARCH_EVICTED, ZA_SEARCH_LOST, ZA_SEARCH_PASS,
-            ZA_SEARCH_SUSPENDED,
-        },
+        trace::{ZA_SEARCH_EVICTED, ZA_SEARCH_LOST, ZA_SEARCH_PASS, ZA_SEARCH_SUSPENDED},
     },
     za_search_trace,
 };
@@ -150,6 +150,13 @@ async fn hold(
     account_id: u32,
     bytes: Vec<u8>,
 ) -> Result<StagedBlob, TransientClass> {
+    #[cfg(feature = "test_mode")]
+    {
+        count_search_pass_work(account_id, SearchPassWork::Upload);
+        if take_search_pass_fault(account_id, SearchPassWork::Upload) {
+            return Err(TransientClass::BlobStore);
+        }
+    }
     let hold_for = server.core.jmap.upload_tmp_ttl;
     #[cfg(feature = "test_mode")]
     let hold_for = {
@@ -552,6 +559,7 @@ fn build_batch(
     batch
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_pass(
     server: &Server,
     account_id: u32,
@@ -560,6 +568,7 @@ pub(crate) async fn write_pass(
     previous_bytes: &[u8],
     base: LoadedIndex,
     staging: Staging,
+    probe: &mut PassProbe<'_>,
 ) -> trc::Result<PassOutcome> {
     let mut new = next_manifest(&base.manifest, &staging);
     if let PassDecision::Abort { class, .. } = staging.decision
@@ -575,19 +584,19 @@ pub(crate) async fn write_pass(
             return Ok(match error {
                 ObservedLoadError::ContentLoss(loss) => PassOutcome::ContentLoss(loss),
                 other => match other.classification() {
-                    LoadFailure::Transient(class) => trace_abort(account_id, class),
-                    _ => trace_abort(account_id, TransientClass::Validation),
+                    LoadFailure::Transient(class) => abort_probe(probe, class),
+                    _ => abort_probe(probe, TransientClass::Validation),
                 },
             });
         }
-        Err(CompactError::Transient(class)) => return Ok(trace_abort(account_id, class)),
+        Err(CompactError::Transient(class)) => return Ok(abort_probe(probe, class)),
         Err(error @ (CompactError::TierOverflow | CompactError::ThreadInventory)) => {
             let reason = if matches!(error, CompactError::TierOverflow) {
                 "tier-overflow"
             } else {
                 "segments"
             };
-            za_search_trace!(ZA_SEARCH_ABORTED, AccountId = account_id, Reason = reason);
+            probe.fail(TransientClass::Validation, reason, None);
             return Ok(PassOutcome::Aborted(TransientClass::Validation));
         }
     };
@@ -602,6 +611,7 @@ pub(crate) async fn write_pass(
         new,
         prepared,
         staging,
+        probe,
     )
     .await
 }
@@ -618,6 +628,7 @@ async fn commit_and_swap(
     mut new: Manifest,
     prepared: PreparedWrite,
     staging: Staging,
+    probe: &mut PassProbe<'_>,
 ) -> trc::Result<PassOutcome> {
     // The retirement vector and batch locals drop before the charge,
     // including cancellation during mailbox lookup and commit.
@@ -654,6 +665,13 @@ async fn commit_and_swap(
                     .map(|mailbox| mailbox.document_id),
             );
         } else {
+            #[cfg(feature = "test_mode")]
+            {
+                count_search_pass_work(account_id, SearchPassWork::Mailboxes);
+                if take_search_pass_fault(account_id, SearchPassWork::Mailboxes) {
+                    return Err(trc::StoreEvent::UnexpectedError.into_err());
+                }
+            }
             server
                 .archives(
                     account_id,
@@ -684,13 +702,18 @@ async fn commit_and_swap(
     #[cfg(feature = "test_mode")]
     common::za::test_hooks::search_commit_pause_point(account_id).await;
     if expires_by.is_some_and(|deadline| deadline <= now()) {
-        return Ok(trace_abort(account_id, TransientClass::BlobStore));
+        return Ok(abort_probe(probe, TransientClass::BlobStore));
     }
     #[cfg(feature = "test_mode")]
     let fail_abort = matches!(staging.decision, PassDecision::Abort { .. })
         && entry.take_abort_write_failure_for_test();
     #[cfg(not(feature = "test_mode"))]
     let fail_abort = false;
+    #[cfg(feature = "test_mode")]
+    let fail_abort = {
+        count_search_pass_work(account_id, SearchPassWork::Commit);
+        fail_abort || take_search_pass_fault(account_id, SearchPassWork::Commit)
+    };
     let result = if fail_abort {
         Err(trc::StoreEvent::UnexpectedError.into_err())
     } else {
@@ -707,38 +730,21 @@ async fn commit_and_swap(
     }
     match result {
         Ok(assigned) => {
-            if matches!(staging.decision, PassDecision::Abort { .. }) {
-                entry.commit_open_retry(base, &new);
-            }
             if publishing {
                 new.newest_row.change_id = assigned
                     .change_id(account_id, SyncCollection::Email.change_group())
                     .expect("the witness update allocated a change id");
             }
+            entry.commit_open_retry(base, &new);
         }
         Err(err) if err.is_assertion_failure() => {
             za_search_trace!(ZA_SEARCH_LOST, AccountId = account_id);
-            let retry = entry.take_open_retry();
             drop(charged);
             drop(threads);
-            match server.za_search_reload_if_moved(entry, keys).await {
-                Ok(_) => {
-                    let current = entry.index.read().await;
-                    if let Some(current) = current.as_ref() {
-                        entry.restore_open_retry(retry, &new, &current.manifest);
-                    }
-                }
-                Err(failure) => {
-                    za_search_trace!(
-                        ZA_SEARCH_ABORTED,
-                        AccountId = account_id,
-                        Reason = failure.as_str()
-                    );
-                }
-            }
+            probe.resolve_winner(server, keys).await;
             return Ok(PassOutcome::Lost);
         }
-        Err(_) => return Ok(trace_abort(account_id, TransientClass::Store)),
+        Err(_) => return Ok(abort_probe(probe, TransientClass::Store)),
     }
     #[cfg(feature = "test_mode")]
     if let Some(tier) = content_tier {
@@ -1084,12 +1090,8 @@ fn evict_warm_content(index: &mut LoadedIndex, account_id: u32) {
     );
 }
 
-fn trace_abort(account_id: u32, class: TransientClass) -> PassOutcome {
-    za_search_trace!(
-        ZA_SEARCH_ABORTED,
-        AccountId = account_id,
-        Reason = class.as_str()
-    );
+fn abort_probe(probe: &mut PassProbe<'_>, class: TransientClass) -> PassOutcome {
+    probe.fail(class, class.as_str(), None);
     PassOutcome::Aborted(class)
 }
 
