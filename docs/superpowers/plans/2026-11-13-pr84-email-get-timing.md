@@ -60,6 +60,6 @@ aggregates from the fixture without altering the wire attempt or its deadline.
 **Interfaces:** Consume immutable Task1 diff and test commands; produce reviewed code, local receipts and hosted stage evidence.
 
 - [x] Independent review checks all five failure modes and unchanged behavior/coverage.
-- [ ] After PR85 timing ends, root formats, compiles affected and shipping configurations, runs observation controls and the whole canonical ZA suite sequentially.
-- [ ] Freeze binary/source identity, commit/push the isolated diagnostic branch, and dispatch its Test workflow; do not silently fold it into PR85 or update PR84's base.
+- [x] After PR85 timing ends, root formats, compiles affected and shipping configurations, runs observation controls and the whole canonical ZA suite sequentially.
+- [x] Freeze binary/source identity, commit/push the isolated diagnostic branch, and dispatch its Test workflow; do not silently fold it into PR85 or update PR84's base.
 - [ ] Read actual hosted aggregate evidence and distinguish measured stage attribution from hypotheses. Decide the next fix from that evidence.

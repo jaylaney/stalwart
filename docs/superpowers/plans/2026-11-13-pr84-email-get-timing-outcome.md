@@ -1,9 +1,11 @@
 # PR84 keyed Email/get diagnostic outcome
 
 This isolated diagnostic is based on PR84 head `9b1df344b`. It does not change
-PR84's branch or PR85's corpus optimization. Source review, formatting, the affected integration-test build and both focused
-observer controls passed. The shipping check is running; the canonical local suite
-and hosted measurements remain pending.
+PR84's branch or PR85's corpus optimization. Source review, formatting, the affected
+integration-test build, both focused observer controls, shipping check and complete
+local ZA suite passed. The code is
+committed as `5dfc21fc5` on `codex/pr84-email-get-timing`. Hosted stage measurements
+remain pending; no timeout fix or hosted cause is claimed.
 
 ## Scope
 
@@ -32,13 +34,44 @@ routing claim is made. Root inspected the actual diff and owns execution.
 Formatting and diff hygiene pass. The affected integration target compiled in
 448.36 seconds. The new common observer control and the existing cold-query
 observer control each passed (one test each). Their intentional caught panics
-exercise unwind cleanup and are not failed checks.
+exercise unwind cleanup and are not failed checks. The integration link emitted
+a macOS compact-unwind-table size warning; compilation and the unwind controls
+passed.
 
 The shipping `cargo check -p stalwart --no-default-features --features rocks`
-is still running. The complete canonical ZA suite remains pending. Builds and
-suites serialize after PR85's timed validation. The isolated diagnostic branch
-is published to start CI while remaining local validation proceeds; publication
-is not a claim of complete qualification or a timeout fix.
+passed in 286.22 seconds. The complete `za::za_tests --exact --nocapture` passed
+in 1,726.94 seconds with RocksDb, default blob storage, a 16 MiB Rust minimum
+stack and backtraces enabled. It retained all 3,258 paired messages and three
+fallbacks, boundary 3259 after 68 requests, all 183 forms with only the pinned K
+deviation, G5 and cleanup. No filesystem diagnostic run was performed. Builds
+and suites ran serially after PR85's timed validation.
+
+The selected request claimed its observation and returned all 400 rows; every
+required span completed with no partial or in-flight operation. The fixed report
+contained its expected 24 lines. Independent receipt review verified source and
+binary identity, log hashes, local results and these diagnostic counts.
+
+| Local measurement | Elapsed | Completed operations |
+| --- | ---: | ---: |
+| Client request | 537.977 ms | 1 |
+| Dispatcher pre-pass | 0.217 ms | 1 |
+| Method | 528.053 ms | 1 |
+| Snapshot | 0.104 ms | 1 |
+| Metadata batch reads | 1.247 ms | 2 |
+| Metadata row opening | 515.672 ms | 400 |
+
+These are inclusive measurements from one local test-profile run, not disjoint
+costs to add together or a performance comparison. Metadata row opening dominates
+this local method; this does not establish the hosted timeout's cause, or isolate
+which operation inside row opening is responsible.
+
+[Diagnostic CI run 43497837906](https://github.com/jaylaney/stalwart/actions/runs/43497837906)
+is bound to code commit `5dfc21fc5`. Style/gates, unit tests, upstream and ordinary
+protocol suites, product build, fresh-store restart and independent CalDAV client
+passed. ZA and retention remain running. This is a status snapshot, not a final
+CI pass. The subsequent outcome/plan update changes documentation only. The
+fresh-store success does not turn PR85's separate initial failure into a pass or
+establish its cause.
 
 ## Evidence and interpretation
 
