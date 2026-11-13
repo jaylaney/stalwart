@@ -765,6 +765,35 @@ class WorkflowTests(unittest.TestCase):
                                "    timeout-minutes: 240\n\n    env:\n      STORE: Sqlite\n")
         self.assertReports(problems, "job zero-access", "STORE")
 
+    def test_zero_access_backtraces_are_required_at_job_and_step_scope(self):
+        # Removing the job setting must be rejected even when no step overrides it.
+        without_backtrace = self.text.replace('      RUST_BACKTRACE: "1"\n', "")
+        problems = ci_steps.check_workflow(without_backtrace)
+        self.assertReports(problems, "job zero-access", "RUST_BACKTRACE")
+        self.assertReports(problems, "'Zero-access Tests'", "RUST_BACKTRACE")
+        for value in ("0", "full"):
+            with self.subTest(value=value):
+                problems = self.edited('      RUST_BACKTRACE: "1"\n',
+                                       f'      RUST_BACKTRACE: "{value}"\n')
+                self.assertReports(problems, "job zero-access", "RUST_BACKTRACE")
+                self.assertReports(problems, "'Zero-access Tests'", "RUST_BACKTRACE")
+        for value in ("0", "1"):
+            with self.subTest(step_override=value):
+                problems = self.edited("          BLOB_STORE: FileSystem\n",
+                                       "          BLOB_STORE: FileSystem\n"
+                                       f'          RUST_BACKTRACE: "{value}"\n')
+                self.assertReports(problems, "filesystem blob store", "overrides",
+                                   "RUST_BACKTRACE")
+
+    def test_job_diagnostics_do_not_allow_arbitrary_environment(self):
+        problems = self.edited('      RUST_BACKTRACE: "1"\n',
+                               '      RUST_BACKTRACE: "1"\n      ZA_ONLY: setup\n')
+        self.assertReports(problems, "job zero-access", "ZA_ONLY")
+        self.assertReports(problems, "'Zero-access Tests'", "ZA_ONLY")
+        problems = self.edited('  UNIT_TEST_FEATURES: >-\n',
+                               '  RUST_BACKTRACE: "1"\n  UNIT_TEST_FEATURES: >-\n')
+        self.assertReports(problems, "'Directory Tests'", "RUST_BACKTRACE")
+
     def test_a_dropped_or_disabled_step_fails(self):
         problems = self.edited("      - name: Automation Tests\n", "      - name: Automation\n")
         self.assertReports(problems, "'Automation Tests'", "missing")
@@ -835,6 +864,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(problems and problems[0].startswith("test.yml:"), problems)
 
     def test_the_net_and_the_capture_follow_the_table_and_the_baseline(self):
+        # CI-only job diagnostics must not alter the historical measurement environment.
         with open(BASELINE, encoding="utf-8") as f:
             baseline = json.load(f)
         net = coverage_net.STEPS

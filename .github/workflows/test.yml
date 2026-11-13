@@ -311,6 +311,7 @@ jobs:
     env:
       STORE: RocksDb
       RUST_MIN_STACK: "16777216"
+      RUST_BACKTRACE: "1"
 
     steps:
       - name: Checkout

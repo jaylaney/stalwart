@@ -156,9 +156,10 @@ impl ZaSearchEnsure for Server {
                     continue;
                 }
             }
-            // A pass owns its transaction through its outcome. Check the
-            // deadline between passes and bound waits separately.
+            // Observer and loader waits retain this request's deadline.
+            // Once a pass owns its transaction, let that transaction settle.
             match run_pass(self, account_id, keys, Some(deadline)).await {
+                Ok(PassOutcome::Deadline) => return Err(Unavailable::NotCurrent),
                 Ok(PassOutcome::Running) => {
                     // A busy pass can hold the index write guard. Find its
                     // slot without awaiting any reads or loads first.
@@ -352,10 +353,18 @@ async fn load_content(
     deadline: tokio::time::Instant,
     recovered: &mut bool,
 ) -> Result<bool, Unavailable> {
-    match timeout_at(deadline, server.za_search_load_content(entry, keys))
+    let wait = async {
+        timeout_at(deadline, async {
+            #[cfg(feature = "test_mode")]
+            common::za::test_hooks::search_content_wait_pause_point(entry.account_id).await;
+            server.za_search_load_content(entry, keys).await
+        })
         .await
-        .map_err(|_| Unavailable::NotCurrent)?
-    {
+        .map_err(|_| ())
+    };
+    #[cfg(feature = "test_mode")]
+    let wait = common::za::test_hooks::search_deadline_wait(entry.account_id, Some(deadline), wait);
+    match wait.await.map_err(|_| Unavailable::NotCurrent)? {
         Ok(()) => Ok(false),
         Err(ObservedLoadError::ContentLoss(loss)) if !*recovered => {
             *recovered = true;

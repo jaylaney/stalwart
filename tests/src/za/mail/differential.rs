@@ -34,7 +34,9 @@ use mail_parser::{HeaderName, HeaderValue, MessageParser, mailbox::mbox::Message
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     io::Cursor,
+    time::Instant,
 };
 use store::{
     write::now,
@@ -73,6 +75,79 @@ struct Fixture<'a> {
     partition: Vec<Vec<usize>>,
 }
 
+// Keep these labels independent of account names, IDs, and request/response contents.
+struct DiagnosticStep {
+    label: String,
+    started: Instant,
+    complete: bool,
+}
+
+impl DiagnosticStep {
+    fn new(label: String) -> Self {
+        println!("differential: begin {label}");
+        Self {
+            label,
+            started: Instant::now(),
+            complete: false,
+        }
+    }
+
+    fn phase(phase: &'static str, mode: &'static str) -> Self {
+        Self::new(format!("phase={phase} mode={mode}"))
+    }
+
+    fn request(
+        phase: &'static str,
+        mode: &'static str,
+        method: &'static str,
+        page: usize,
+        items: Option<usize>,
+    ) -> Self {
+        let items = items.map_or_else(|| "all".to_string(), |items| items.to_string());
+        Self::new(format!(
+            "phase={phase} mode={mode} method={method} page={page} items={items}"
+        ))
+    }
+
+    fn query_page(mode: &'static str, page: usize, position: usize) -> Self {
+        Self::new(format!(
+            "phase=inventory mode={mode} method=Email/query page={page} position={position} limit={PAGE}"
+        ))
+    }
+
+    fn finish(mut self) {
+        println!(
+            "differential: complete {} elapsed={:?}",
+            self.label,
+            self.started.elapsed()
+        );
+        self.complete = true;
+    }
+}
+
+impl Drop for DiagnosticStep {
+    fn drop(&mut self) {
+        if !self.complete {
+            let outcome = if std::thread::panicking() {
+                "unwinding"
+            } else {
+                "cancelled"
+            };
+            println!(
+                "differential: {outcome} {} elapsed={:?}",
+                self.label,
+                self.started.elapsed()
+            );
+        }
+    }
+}
+
+async fn observed<T>(step: DiagnosticStep, future: impl Future<Output = T>) -> T {
+    let result = future.await;
+    step.finish();
+    result
+}
+
 pub async fn test(test: &mut TestServer) {
     println!("differential: paired corpus");
     let key = key_mail_account(test, "keymail64@example.com", STRONG).await;
@@ -94,11 +169,34 @@ pub async fn test(test: &mut TestServer) {
         deliver_corpus(test, &key, &plain, &corpus).await;
     restore_bulk_lmtp_rates(test, saved_rates).await;
     finish_bulk_delivery_indexing(test, &key).await;
-    za_index_current(&key).await;
-    test.wait_for_tasks().await;
+    observed(
+        DiagnosticStep::phase("currentness", "key"),
+        za_index_current(&key),
+    )
+    .await;
+    observed(
+        DiagnosticStep::phase("task_drain", "paired"),
+        test.wait_for_tasks(),
+    )
+    .await;
 
-    let key = inventory(test, &key, key_docs, &corpus, &expected_received_at).await;
-    let plain = inventory(test, &plain, plain_docs, &corpus, &expected_received_at).await;
+    let key = observed(
+        DiagnosticStep::phase("inventory", "key"),
+        inventory(test, &key, key_docs, &corpus, &expected_received_at, "key"),
+    )
+    .await;
+    let plain = observed(
+        DiagnosticStep::phase("inventory", "plain"),
+        inventory(
+            test,
+            &plain,
+            plain_docs,
+            &corpus,
+            &expected_received_at,
+            "plain",
+        ),
+    )
+    .await;
     for (ordinal, (key, plain)) in key.received_at.iter().zip(&plain.received_at).enumerate() {
         assert_eq!(
             key, plain,
@@ -106,7 +204,7 @@ pub async fn test(test: &mut TestServer) {
         );
     }
     compare_partitions(&key, &plain);
-    for fixture in [&key, &plain] {
+    for (mode, fixture) in [("key", &key), ("plain", &plain)] {
         let mut update = serde_json::Map::new();
         for (n, id) in fixture.emails[..10].iter().enumerate() {
             let mut flags = json!({"keywords/$seen": true});
@@ -119,13 +217,14 @@ pub async fn test(test: &mut TestServer) {
             }
             update.insert(id.to_string(), flags);
         }
-        let reply = fixture
-            .account
-            .jmap_method_call(
+        let reply = observed(
+            DiagnosticStep::request("keyword_update", mode, "Email/set", 1, Some(update.len())),
+            fixture.account.jmap_method_call(
                 "Email/set",
                 json!({"accountId": fixture.account.id_string(), "update": update}),
-            )
-            .await;
+            ),
+        )
+        .await;
         assert_eq!(reply.name_at(0), "Email/set");
         assert_eq!(
             reply.method_response()["updated"]
@@ -136,10 +235,23 @@ pub async fn test(test: &mut TestServer) {
         );
     }
 
-    let jmap = compare_jmap(&key, &plain, &corpus[0]).await;
-    let imap = compare_imap(&key, &plain, &corpus).await;
-    case_g5(test, key.account).await;
+    let jmap = observed(
+        DiagnosticStep::phase("jmap_comparison", "paired"),
+        compare_jmap(&key, &plain, &corpus[0]),
+    )
+    .await;
+    let imap = observed(
+        DiagnosticStep::phase("imap_comparison", "paired"),
+        compare_imap(&key, &plain, &corpus),
+    )
+    .await;
+    observed(
+        DiagnosticStep::phase("g5", "key"),
+        case_g5(test, key.account),
+    )
+    .await;
 
+    let cleanup = DiagnosticStep::phase("cleanup", "paired");
     for fixture in [&key, &plain] {
         test.destroy_all_mailboxes(fixture.account).await;
         assert!(
@@ -150,6 +262,7 @@ pub async fn test(test: &mut TestServer) {
     }
     admin.destroy_account(plain.account.clone()).await;
     test.wait_for_tasks().await;
+    cleanup.finish();
     println!(
         "differential: {} forms compared, 0 differences beyond the pinned K deviation",
         jmap + imap
@@ -512,11 +625,14 @@ async fn inventory<'a>(
     docs: Vec<u32>,
     corpus: &[Vec<u8>],
     expected_received_at: &[u64],
+    mode: &'static str,
 ) -> Fixture<'a> {
     let id = account.id().document_id();
-    let mailboxes = account
-        .jmap_get("Mailbox", ["id", "role"], Vec::<String>::new())
-        .await;
+    let mailboxes = observed(
+        DiagnosticStep::request("inventory", mode, "Mailbox/get", 1, None),
+        account.jmap_get("Mailbox", ["id", "role"], Vec::<String>::new()),
+    )
+    .await;
     assert_eq!(mailboxes.name_at(0), "Mailbox/get");
     let inbox = parse_id(
         &mailboxes
@@ -526,7 +642,8 @@ async fn inventory<'a>(
             .unwrap()["id"],
     );
     assert_eq!(inbox.document_id(), INBOX_ID);
-    let order = query_ids(account, &Value::Null, &received_sort(), false).await;
+    let order =
+        query_ids_observed(account, &Value::Null, &received_sort(), false, Some(mode)).await;
     assert_eq!(order.len(), TOTAL);
     let doc_to_ordinal = docs
         .iter()
@@ -563,9 +680,10 @@ async fn inventory<'a>(
         .unzip();
     assert_eq!(uids.iter().copied().collect::<BTreeSet<_>>().len(), TOTAL);
 
-    for chunk in order.chunks(PAGE) {
-        let reply = account
-            .jmap_get(
+    for (page, chunk) in order.chunks(PAGE).enumerate() {
+        let reply = observed(
+            DiagnosticStep::request("inventory", mode, "Email/get", page + 1, Some(chunk.len())),
+            account.jmap_get(
                 "Email",
                 [
                     "id",
@@ -577,8 +695,9 @@ async fn inventory<'a>(
                     "size",
                 ],
                 chunk.iter(),
-            )
-            .await;
+            ),
+        )
+        .await;
         assert_eq!(reply.name_at(0), "Email/get");
         assert_eq!(reply.not_found().count(), 0);
         assert_eq!(reply.list().len(), chunk.len());
@@ -637,10 +756,12 @@ async fn inventory<'a>(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    for chunk in distinct.chunks(PAGE) {
-        let reply = account
-            .jmap_get("Thread", ["id", "emailIds"], chunk.iter())
-            .await;
+    for (page, chunk) in distinct.chunks(PAGE).enumerate() {
+        let reply = observed(
+            DiagnosticStep::request("inventory", mode, "Thread/get", page + 1, Some(chunk.len())),
+            account.jmap_get("Thread", ["id", "emailIds"], chunk.iter()),
+        )
+        .await;
         assert_eq!(reply.name_at(0), "Thread/get");
         assert_eq!(reply.not_found().count(), 0);
         assert_eq!(reply.list().len(), chunk.len());
@@ -708,8 +829,19 @@ fn received_sort() -> Value {
 }
 
 async fn query_ids(account: &Account, filter: &Value, sort: &Value, collapse: bool) -> Vec<Id> {
+    query_ids_observed(account, filter, sort, collapse, None).await
+}
+
+async fn query_ids_observed(
+    account: &Account,
+    filter: &Value,
+    sort: &Value,
+    collapse: bool,
+    mode: Option<&'static str>,
+) -> Vec<Id> {
     let mut ids = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut page_number = 0;
     loop {
         let mut args = json!({
             "accountId": account.id_string(),
@@ -719,7 +851,12 @@ async fn query_ids(account: &Account, filter: &Value, sort: &Value, collapse: bo
         if !filter.is_null() {
             args["filter"] = filter.clone();
         }
+        page_number += 1;
+        let step = mode.map(|mode| DiagnosticStep::query_page(mode, page_number, ids.len()));
         let reply = account.jmap_method_call("Email/query", args).await;
+        if let Some(step) = step {
+            step.finish();
+        }
         assert_eq!(
             reply.name_at(0),
             "Email/query",

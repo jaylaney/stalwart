@@ -26,7 +26,10 @@ use common::{
         error::{LoadFailure, LossClass, NoMapReason, TransientClass},
         load::{ContentLoss, MapLoss, ObservedLoadError},
         seal::za_search_key,
-        trace::{ZA_SEARCH_ABORTED, ZA_SEARCH_LOST, ZA_SEARCH_REBUILD, ZA_SEARCH_SKIPPED},
+        trace::{
+            ZA_SEARCH_ABORTED, ZA_SEARCH_LOST, ZA_SEARCH_REBUILD, ZA_SEARCH_SKIPPED,
+            backend_error_class,
+        },
     },
     za_search_trace,
 };
@@ -56,6 +59,7 @@ pub enum PassOutcome {
         indexed_to: Checkpoint,
     },
     Running,
+    Deadline,
     Aborted(TransientClass),
     Deferred {
         class: TransientClass,
@@ -568,6 +572,13 @@ impl Opener for ServerOpener<'_> {
             self.account_id,
             common::za::test_hooks::SearchPassWork::Open,
         );
+        #[cfg(feature = "test_mode")]
+        if common::za::test_hooks::take_search_pass_fault(
+            self.account_id,
+            common::za::test_hooks::SearchPassWork::Open,
+        ) {
+            return Err(OpenFailure::Transient(TransientClass::Store));
+        }
         let opened = self
             .server
             .za_open_for_index(
@@ -674,6 +685,7 @@ pub(crate) struct PassProbe<'a> {
     pub observed: Option<Manifest>,
     failure: Option<TransientClass>,
     deadline: Option<tokio::time::Instant>,
+    pub operation: &'static str,
 }
 
 impl PassProbe<'_> {
@@ -706,28 +718,70 @@ impl PassProbe<'_> {
         }
     }
 
+    pub fn fail_backend(&mut self, error: &trc::Error) {
+        if self.failure.is_some() {
+            return;
+        }
+        let class = TransientClass::Store;
+        self.failure = Some(class);
+        self.entry
+            .note_pass_failure(self.observed.as_ref(), class, Instant::now());
+        za_search_trace!(
+            ZA_SEARCH_ABORTED,
+            AccountId = self.entry.account_id,
+            Reason = class.as_str(),
+            Type = backend_error_class(error),
+            Source = self.operation
+        );
+    }
+
     async fn load(
         &mut self,
         server: &Server,
         keys: &SessionKeys,
-    ) -> Result<(Vec<u8>, Manifest), ObservedLoadError> {
+    ) -> Result<(Vec<u8>, Manifest), PassLoadError> {
         pass_wait(
+            self.entry.account_id,
             self.deadline,
             server.za_search_load_for_pass(self.entry, keys, &mut self.observed),
         )
         .await
-        .unwrap_or_else(|()| Err(LoadFailure::Transient(TransientClass::Store).into()))
+        .map_err(|()| PassLoadError::Deadline)?
+        .map_err(PassLoadError::Observed)
     }
 
     pub async fn resolve_winner(&mut self, server: &Server, keys: &SessionKeys) {
         // Keep the historical scheduling state while this await is unresolved.
-        // The loader settles against only the authenticated actual winner.
-        if let Err(failure) = self.load(server, keys).await {
+        // Only an authenticated actual winner may settle its basis; a caller
+        // deadline is neither an observed store fault nor progress.
+        if let Err(PassLoadError::Observed(failure)) = self.load(server, keys).await {
             if let LoadFailure::Transient(class) = failure.classification() {
                 self.fail(class, class.as_str(), None);
             } else {
                 self.entry.clear_open_retry();
             }
+        }
+    }
+
+    pub fn commit_abort(&self, before: &Manifest, after: &Manifest) {
+        debug_assert!(
+            self.failure.is_some(),
+            "abort settlement follows its primary failure"
+        );
+        self.entry.commit_aborted_retry(before, after);
+    }
+}
+
+enum PassLoadError {
+    Deadline,
+    Observed(ObservedLoadError),
+}
+
+impl From<PassLoadError> for PassOutcome {
+    fn from(failure: PassLoadError) -> Self {
+        match failure {
+            PassLoadError::Deadline => Self::Deadline,
+            PassLoadError::Observed(failure) => failure.into(),
         }
     }
 }
@@ -742,16 +796,33 @@ fn resident_entry(server: &Server, entry: &IndexEntry) -> bool {
 }
 
 async fn pass_wait<F: Future>(
+    _account_id: u32,
     deadline: Option<tokio::time::Instant>,
     future: F,
 ) -> Result<F::Output, ()> {
-    if let Some(deadline) = deadline {
-        tokio::time::timeout_at(deadline, future)
-            .await
-            .map_err(|_| ())
-    } else {
-        Ok(future.await)
-    }
+    let wait = async {
+        if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, future)
+                .await
+                .map_err(|_| ())
+        } else {
+            Ok(future.await)
+        }
+    };
+    #[cfg(feature = "test_mode")]
+    let wait = common::za::test_hooks::search_deadline_wait(_account_id, deadline, wait);
+    wait.await
+}
+
+/// Exercise the actual pass deadline without ensure-current's early guard.
+#[cfg(feature = "test_mode")]
+pub async fn run_pass_with_deadline_for_test(
+    server: &Server,
+    account_id: u32,
+    keys: &SessionKeys,
+    deadline: Instant,
+) -> trc::Result<PassOutcome> {
+    run_pass(server, account_id, keys, Some(deadline.into())).await
 }
 
 pub(super) async fn run_pass(
@@ -774,7 +845,7 @@ pub(super) async fn run_pass(
             return Ok(PassOutcome::Deferred { class, retry_at });
         }
         entry.begin_retry_observation(Instant::now());
-        let observation = pass_wait(deadline, async {
+        let observation = pass_wait(account_id, deadline, async {
             #[cfg(feature = "test_mode")]
             common::za::test_hooks::search_retry_observation_pause_point(account_id).await;
             server
@@ -792,7 +863,8 @@ pub(super) async fn run_pass(
                     return Ok(PassOutcome::Deferred { class, retry_at });
                 }
             }
-            Err(()) | Ok(Err(ObservedLoadError::Other(LoadFailure::Transient(_)))) => {
+            Err(()) => return Ok(PassOutcome::Deadline),
+            Ok(Err(ObservedLoadError::Other(LoadFailure::Transient(_)))) => {
                 return Ok(PassOutcome::Deferred { class, retry_at });
             }
             Ok(Ok(None)) => {
@@ -816,22 +888,18 @@ pub(super) async fn run_pass(
         observed: None,
         failure: None,
         deadline,
+        operation: "pass",
     };
     let result: trc::Result<PassOutcome> = async {
-        let (bytes, manifest) = match pass_wait(
-            deadline,
-            server.za_search_load_for_pass(&entry, keys, &mut probe.observed),
-        )
-        .await
-        {
-            Ok(Ok(target)) => target,
-            Ok(Err(failure)) => return Ok(failure.into()),
-            Err(()) => return Ok(PassOutcome::Aborted(TransientClass::Store)),
+        let (bytes, manifest) = match probe.load(server, keys).await {
+            Ok(target) => target,
+            Err(failure) => return Ok(failure.into()),
         };
         if !resident_entry(server, &entry) {
             entry.clear_open_retry();
             return Ok(PassOutcome::Lost);
         }
+        probe.operation = "state";
         let state = read_change_id(server, account_id).await?;
         {
             let Some(index) = entry.read_loaded().await else {
@@ -855,6 +923,7 @@ pub(super) async fn run_pass(
         common::za::test_hooks::search_sweep_pause_point(account_id).await;
 
         if let Some(reason) = za_search_content_needs_rebuild(&manifest, &config) {
+            probe.operation = "content-rebuild";
             match server
                 .za_search_content_rebuild_start(account_id, keys, reason, None)
                 .await
@@ -915,13 +984,16 @@ pub(super) async fn run_pass(
             base
         };
         let records = if let Some(marker) = &base.manifest.reconciliation {
+            probe.operation = "present";
             let Some(present) = observe_present(server, account_id).await? else {
                 return Ok(PassOutcome::Lost);
             };
+            probe.operation = "retained-log";
             let mut retained = server
                 .store()
                 .za_changes_records(account_id, SyncCollection::Email, None, usize::MAX)
                 .await?;
+            probe.operation = "retained-bound";
             let bound = server
                 .za_retained_bound(account_id)
                 .await?
@@ -958,6 +1030,7 @@ pub(super) async fn run_pass(
             }
             retained
         } else if let Some(bounds) = &base.manifest.cursor {
+            probe.operation = "retained-bound";
             let bound = server.za_retained_bound(account_id).await?;
             if second_truncation(0, bound, &base.manifest.indexed_to) == SecondTruncation::Restart {
                 return start_reconciliation(
@@ -971,6 +1044,7 @@ pub(super) async fn run_pass(
                 )
                 .await;
             }
+            probe.operation = "present";
             let Some(present) = observe_present(server, account_id).await? else {
                 return Ok(PassOutcome::Lost);
             };
@@ -982,6 +1056,7 @@ pub(super) async fn run_pass(
             } else {
                 base.manifest.indexed_to
             };
+            probe.operation = "retained-log";
             let records = server
                 .store()
                 .za_changes_records(
@@ -992,6 +1067,7 @@ pub(super) async fn run_pass(
                 )
                 .await?;
             if records.truncated || records.resumed_record_lost {
+                probe.operation = "retained-bound";
                 let bound = server
                     .za_retained_bound(account_id)
                     .await?
@@ -1120,7 +1196,7 @@ pub(super) async fn run_pass(
     match &result {
         Ok(PassOutcome::Aborted(class)) => probe.fail(*class, class.as_str(), None),
         Err(error) if !error.is_assertion_failure() => {
-            probe.fail(TransientClass::Store, TransientClass::Store.as_str(), None);
+            probe.fail_backend(error);
             return Ok(PassOutcome::Aborted(TransientClass::Store));
         }
         Ok(PassOutcome::NoMap(_) | PassOutcome::ContentLoss(_) | PassOutcome::Recovery(_)) => {
@@ -1142,6 +1218,7 @@ async fn start_reconciliation(
     probe: &mut PassProbe<'_>,
 ) -> trc::Result<PassOutcome> {
     let id = entry.account_id;
+    probe.operation = "reconcile";
     match za_search_reconcile_start(server, id, keys, bytes, manifest, bound).await {
         Ok(()) => {
             entry.clear_open_retry();

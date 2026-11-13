@@ -103,8 +103,8 @@ pub async fn za_view_with_minimum(
         let entry = match need {
             ViewNeed::Map => map_entry.as_ref().expect("a map entry").clone(),
             ViewNeed::Content { deadline: original } => {
-                // Ensure-current owns any pass it starts. Only the separate
-                // read waits below are cancelled at the deadline.
+                // Ensure-current bounds observer and loader waits by the
+                // original deadline while allowing an owned transaction to settle.
                 let entry = server
                     .za_search_ensure_current(account_id, keys, original)
                     .await

@@ -1397,6 +1397,8 @@ impl Server {
         // A successful observation resolves an unknown episode or meaningful
         // change before a later Thread failure can arm a new episode.
         entry.defer_open_retry(&manifest, std::time::Instant::now());
+        #[cfg(feature = "test_mode")]
+        crate::za::test_hooks::search_required_load_pause_point(entry.account_id).await;
         let config = self.za_search_config();
         let retired = if guard.is_some() {
             apply_reload_locked(

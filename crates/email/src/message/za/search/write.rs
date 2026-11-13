@@ -654,6 +654,7 @@ async fn commit_and_swap(
     let witness = publishing.then(|| staging.witness.expect("publishing indexed a message"));
     let mut mailboxes = Vec::new();
     if publishing {
+        probe.operation = "mailboxes";
         // Witness only existing mailboxes. Loading the ordinary message
         // cache on a cold account can provision default mailboxes.
         if let Some(cache) = server.fresh_messages(account_id) {
@@ -668,8 +669,11 @@ async fn commit_and_swap(
             #[cfg(feature = "test_mode")]
             {
                 count_search_pass_work(account_id, SearchPassWork::Mailboxes);
-                if take_search_pass_fault(account_id, SearchPassWork::Mailboxes) {
-                    return Err(trc::StoreEvent::UnexpectedError.into_err());
+                if let Some(error) = common::za::test_hooks::take_search_pass_error(
+                    account_id,
+                    SearchPassWork::Mailboxes,
+                ) {
+                    return Err(error);
                 }
             }
             server
@@ -714,6 +718,7 @@ async fn commit_and_swap(
         count_search_pass_work(account_id, SearchPassWork::Commit);
         fail_abort || take_search_pass_fault(account_id, SearchPassWork::Commit)
     };
+    probe.operation = "commit";
     let result = if fail_abort {
         Err(trc::StoreEvent::UnexpectedError.into_err())
     } else {
@@ -735,7 +740,11 @@ async fn commit_and_swap(
                     .change_id(account_id, SyncCollection::Email.change_group())
                     .expect("the witness update allocated a change id");
             }
-            entry.commit_open_retry(base, &new);
+            if matches!(staging.decision, PassDecision::Abort { .. }) {
+                probe.commit_abort(base, &new);
+            } else {
+                entry.commit_open_retry(base, &new);
+            }
         }
         Err(err) if err.is_assertion_failure() => {
             za_search_trace!(ZA_SEARCH_LOST, AccountId = account_id);
@@ -744,7 +753,10 @@ async fn commit_and_swap(
             probe.resolve_winner(server, keys).await;
             return Ok(PassOutcome::Lost);
         }
-        Err(_) => return Ok(abort_probe(probe, TransientClass::Store)),
+        Err(error) => {
+            probe.fail_backend(&error);
+            return Ok(PassOutcome::Aborted(TransientClass::Store));
+        }
     }
     #[cfg(feature = "test_mode")]
     if let Some(tier) = content_tier {

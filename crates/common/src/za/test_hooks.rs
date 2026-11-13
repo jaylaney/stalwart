@@ -857,6 +857,91 @@ pub async fn propfind_admitted_pause_point(reader: u32) {
 
 // Zero-access search hooks. The consuming tasks place the pause points and flags.
 pub static SEARCH_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_REQUIRED_LOAD_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_CONTENT_WAIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub fn set_search_required_load_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_REQUIRED_LOAD_PAUSE, pause);
+}
+pub async fn search_required_load_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_REQUIRED_LOAD_PAUSE, account_id)).await;
+}
+pub fn set_search_content_wait_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_CONTENT_WAIT_PAUSE, pause);
+}
+pub async fn search_content_wait_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_CONTENT_WAIT_PAUSE, account_id)).await;
+}
+
+struct WaitDeadline {
+    account_id: u32,
+    expired: tokio::sync::watch::Sender<bool>,
+    consumed: tokio::sync::Notify,
+    deadlines: Mutex<Vec<tokio::time::Instant>>,
+}
+static SEARCH_WAIT_DEADLINE: Mutex<Option<Arc<WaitDeadline>>> = Mutex::new(None);
+
+/// Explicit request expiry after an acknowledged wait. This seam selects the
+/// same result as timeout_at; it never wraps an owned transaction or changes
+/// the entry's retry clock. Tests also cover the real timer branch.
+pub struct SearchWaitDeadline(Arc<WaitDeadline>);
+impl SearchWaitDeadline {
+    pub fn new(account_id: u32) -> Self {
+        let mut slot = SEARCH_WAIT_DEADLINE.lock().unwrap();
+        assert!(slot.is_none());
+        let deadline = Arc::new(WaitDeadline {
+            account_id,
+            expired: tokio::sync::watch::channel(false).0,
+            consumed: tokio::sync::Notify::new(),
+            deadlines: Mutex::new(Vec::new()),
+        });
+        *slot = Some(deadline.clone());
+        Self(deadline)
+    }
+    pub fn expire(&self) {
+        self.0.expired.send_replace(true);
+    }
+    /// Keep the operation parked until its timeout branch has been selected.
+    pub async fn wait_expired(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.0.consumed.notified())
+            .await
+            .expect("the parked search wait did not consume explicit expiry");
+    }
+    pub fn deadlines(&self) -> Vec<tokio::time::Instant> {
+        self.0.deadlines.lock().unwrap().clone()
+    }
+}
+impl Drop for SearchWaitDeadline {
+    fn drop(&mut self) {
+        SEARCH_WAIT_DEADLINE.lock().unwrap().take();
+    }
+}
+pub async fn search_deadline_wait<T>(
+    account_id: u32,
+    deadline: Option<tokio::time::Instant>,
+    wait: impl std::future::Future<Output = Result<T, ()>>,
+) -> Result<T, ()> {
+    let control = SEARCH_WAIT_DEADLINE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|control| control.account_id == account_id && deadline.is_some())
+        .cloned();
+    if let Some(control) = control {
+        control.deadlines.lock().unwrap().push(deadline.unwrap());
+        let mut expired = control.expired.subscribe();
+        tokio::select! {
+            result = wait => result,
+            _ = expired.wait_for(|expired| *expired) => {
+                control.consumed.notify_one();
+                Err(())
+            },
+        }
+    } else {
+        wait.await
+    }
+}
+
 pub static SEARCH_RETRY_OBSERVATION_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_SWAP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_SNAPSHOT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -998,6 +1083,7 @@ struct PassFault {
     work: SearchPassWork,
     remaining: usize,
     consumed: bool,
+    error: Option<trc::Error>,
 }
 static SEARCH_PASS_FAULT: Mutex<Option<PassFault>> = Mutex::new(None);
 static SEARCH_PASS_COUNTS: std::sync::LazyLock<Mutex<HashMap<u32, [u64; 5]>>> =
@@ -1006,6 +1092,20 @@ static SEARCH_PASS_COUNTS: std::sync::LazyLock<Mutex<HashMap<u32, [u64; 5]>>> =
 pub struct SearchPassFaultOnce(());
 impl SearchPassFaultOnce {
     pub fn new(account_id: u32, work: SearchPassWork, occurrence: usize) -> Self {
+        Self::with_error(
+            account_id,
+            work,
+            occurrence,
+            trc::StoreEvent::UnexpectedError.into_err(),
+        )
+    }
+
+    pub fn with_error(
+        account_id: u32,
+        work: SearchPassWork,
+        occurrence: usize,
+        error: trc::Error,
+    ) -> Self {
         let mut slot = SEARCH_PASS_FAULT.lock().unwrap();
         assert!(slot.is_none() && occurrence > 0);
         *slot = Some(PassFault {
@@ -1013,6 +1113,7 @@ impl SearchPassFaultOnce {
             work,
             remaining: occurrence,
             consumed: false,
+            error: Some(error),
         });
         Self(())
     }
@@ -1044,6 +1145,18 @@ pub fn take_search_pass_fault(account_id: u32, work: SearchPassWork) -> bool {
     }
     false
 }
+pub fn take_search_pass_error(account_id: u32, work: SearchPassWork) -> Option<trc::Error> {
+    if take_search_pass_fault(account_id, work) {
+        SEARCH_PASS_FAULT
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|fault| fault.error.take())
+    } else {
+        None
+    }
+}
+
 pub fn count_search_pass_work(account_id: u32, work: SearchPassWork) {
     if let Some(counts) = SEARCH_PASS_COUNTS.lock().unwrap().get_mut(&account_id) {
         counts[work as usize] += 1;

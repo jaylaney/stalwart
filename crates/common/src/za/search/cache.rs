@@ -536,6 +536,25 @@ impl IndexEntry {
         }
     }
 
+    /// Settle this probe's acknowledged abort. Its discarded prefix made no
+    /// progress, even when suspension or reconciliation bookkeeping changed.
+    /// The pass owner must have recorded its primary failure before committing.
+    pub fn commit_aborted_retry(&self, before: &Manifest, after: &Manifest) {
+        let mut slot = self.open_retry.lock().unwrap();
+        if let Some(retry) = slot.as_mut() {
+            if retry
+                .basis
+                .as_ref()
+                .is_some_and(|basis| same_retry_basis(basis, before))
+            {
+                retry.basis = Some(after.clone());
+            } else {
+                // Never reconstruct a superseded or cleared episode.
+                *slot = None;
+            }
+        }
+    }
+
     pub fn clear_open_retry(&self) {
         self.open_retry.lock().unwrap().take();
     }
@@ -1091,7 +1110,7 @@ mod retry_tests {
         assert_eq!(entry.defer_open_retry(&replacement, now), None);
     }
 
-    fn assert_meaningful_abort_change_clears_retry(assertion_winner: bool, suspension: bool) {
+    fn assert_abort_settlement_retry(assertion_winner: bool, suspension: bool) {
         let cache = ZaSearchCache::new(Ok(ZaSearchConfig::default()));
         let entry = cache.entry(1);
         let mut before = failing(4);
@@ -1117,42 +1136,80 @@ mod retry_tests {
         } else {
             after.reconciliation.as_mut().unwrap().bound = 11;
         }
+        let failed_schedule = entry.retry_schedule();
         if assertion_winner {
             entry.defer_open_retry(&after, now);
+            assert_eq!(entry.retry_schedule(), None);
+            entry.note_pass_failure(Some(&after), TransientClass::Store, now);
+            assert_eq!(
+                entry.defer_open_retry(&after, now),
+                Some((TransientClass::Store, now + Duration::from_secs(1))),
+                "an independently authenticated meaningful winner clears the old episode"
+            );
         } else {
-            entry.commit_open_retry(&before, &after);
+            entry.commit_aborted_retry(&before, &after);
+            assert_eq!(
+                entry.retry_schedule(),
+                failed_schedule,
+                "own abort bookkeeping must retain the current failed probe exactly"
+            );
+            assert_eq!(
+                entry.defer_open_retry(&after, now),
+                Some((TransientClass::Store, now + Duration::from_secs(30))),
+                "the recorded failure must bind to the acknowledged abort manifest"
+            );
         }
-        assert_eq!(
-            entry.defer_open_retry(&after, now),
-            None,
-            "meaningful abort state must clear the old 30-second cooldown"
-        );
-        entry.note_pass_failure(Some(&after), TransientClass::Store, now);
-        assert_eq!(
-            entry.defer_open_retry(&after, now),
-            Some((TransientClass::Store, now + Duration::from_secs(1))),
-            "the next actual fault must start a fresh local streak"
-        );
     }
 
     #[test]
-    fn local_suspension_abort_commit_clears_retry() {
-        assert_meaningful_abort_change_clears_retry(false, true);
+    fn local_suspension_abort_commit_preserves_retry() {
+        assert_abort_settlement_retry(false, true);
     }
 
     #[test]
-    fn local_reconciliation_abort_commit_clears_retry() {
-        assert_meaningful_abort_change_clears_retry(false, false);
+    fn local_reconciliation_abort_commit_preserves_retry() {
+        assert_abort_settlement_retry(false, false);
     }
 
     #[test]
     fn winning_suspension_abort_commit_clears_retry() {
-        assert_meaningful_abort_change_clears_retry(true, true);
+        assert_abort_settlement_retry(true, true);
     }
 
     #[test]
     fn winning_reconciliation_abort_commit_clears_retry() {
-        assert_meaningful_abort_change_clears_retry(true, false);
+        assert_abort_settlement_retry(true, false);
+    }
+
+    #[test]
+    fn own_abort_rebase_preserves_unsaturated_streak_and_never_restores_a_cleared_slot() {
+        let cache = ZaSearchCache::new(Ok(ZaSearchConfig::default()));
+        let entry = cache.entry(1);
+        let before = failing(4);
+        let mut now = Instant::now();
+        for delay in [1, 2] {
+            entry.note_pass_failure(Some(&before), TransientClass::Store, now);
+            now += Duration::from_secs(delay);
+        }
+        entry.note_pass_failure(Some(&before), TransientClass::BlobStore, now);
+        let schedule = entry.retry_schedule();
+        let mut after = before.clone();
+        after.content_to.suspended = true;
+        entry.commit_aborted_retry(&before, &after);
+        assert_eq!(entry.retry_schedule(), schedule);
+        assert_eq!(
+            entry.defer_open_retry(&after, now),
+            Some((TransientClass::BlobStore, now + Duration::from_secs(4)))
+        );
+        now += Duration::from_secs(4);
+        entry.note_pass_failure(Some(&after), TransientClass::Store, now);
+        assert_eq!(
+            entry.defer_open_retry(&after, now),
+            Some((TransientClass::Store, now + Duration::from_secs(8)))
+        );
+        entry.clear_open_retry();
+        entry.commit_aborted_retry(&before, &after);
+        assert_eq!(entry.retry_schedule(), None);
     }
 
     #[test]

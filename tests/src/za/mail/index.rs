@@ -387,6 +387,7 @@ pub async fn pr84_retry_followup_tests(test: &mut TestServer) {
     );
     case_pr84_retry_state(test).await;
     case_pr84_account_pass(test).await;
+    case_pr84_abort_bookkeeping(test).await;
     let timeout = key_mail_account(
         test,
         "keymail-pr84-thread-timeout@example.com",
@@ -760,6 +761,438 @@ async fn case_pr84_retry_state(test: &mut TestServer) {
     test.destroy_all_mailboxes(&key).await;
 }
 
+fn seed_expired_retry(entry: &common::za::search::cache::IndexEntry, basis: &Manifest) {
+    let mut now = Instant::now() - Duration::from_secs(31);
+    for delay in [1, 2, 4, 8, 16] {
+        entry.note_pass_failure(Some(basis), TransientClass::CodecKey, now);
+        now += Duration::from_secs(delay);
+    }
+    assert!(entry.retry_schedule().unwrap().1 <= Instant::now());
+}
+
+async fn case_pr84_abort_bookkeeping(test: &mut TestServer) {
+    use crate::utils::za::PauseSlotGuard;
+    use common::za::search::trace::ZA_SEARCH_ABORTED;
+    use common::za::test_hooks::{
+        Pause, SEARCH_COMMIT_PAUSE, SEARCH_SWAP_PAUSE, SearchPassCounter, SearchPassFaultOnce,
+        SearchPassWork,
+    };
+    use store::za_search::manifest::{ContentCursor, ReconciliationMarker};
+    println!("PR84 acknowledged own-abort bookkeeping and swap cancellation");
+    let account = key_mail_account(
+        test,
+        "keymail-pr84-bookkeeping@example.com",
+        "Pr84-Bookkeeping!",
+    )
+    .await;
+    let id = account_id(&account);
+    let baseline = deliver_one(test, &account, "Bookkeeping indexed baseline").await;
+    advanced(test, &account, true).await;
+    // A fresh log has no retention marker: za_retained_bound returns zero,
+    // not its first ordinary record. Checkpoint a flag update, then use the
+    // real truncation path before appending the still-pending prefix and tail.
+    let checkpoint = {
+        let _config = search_config_guard!(test, checkpoint: 1);
+        set_flag(&account, baseline, true).await;
+        advanced(test, &account, false).await
+    };
+    let original = index(test, id).await;
+    assert!(
+        checkpoint.complete,
+        "baseline checkpoint is partial: {checkpoint:?}"
+    );
+    assert_eq!(original.indexed_to, checkpoint);
+    assert_eq!(
+        original.content_to.checkpoint, checkpoint,
+        "flag-only setup must keep Content current"
+    );
+    let bound = test
+        .server
+        .truncate_change_log(id, SyncCollection::Email.into(), 0)
+        .await
+        .unwrap()
+        .expect("the baseline Email log must produce a truncation marker");
+    assert_eq!(
+        bound, checkpoint.change_id,
+        "actual Email retention marker must equal the completed baseline checkpoint"
+    );
+    assert!(
+        bound > 0,
+        "a moved marker needs a positive persisted bound: {bound}, checkpoint={checkpoint:?}"
+    );
+    assert_eq!(
+        test.server
+            .store()
+            .za_log_first_retained(id, SyncCollection::Email)
+            .await
+            .unwrap(),
+        Some(bound)
+    );
+    let prefix = deliver_one(test, &account, "Discarded healthy prefix").await;
+    let failing = deliver_one(test, &account, "Bookkeeping failing tail").await;
+    let keys = za_unlock(test, id, account.secret()).await;
+    assert_eq!(
+        test.server.za_retained_bound(id).await.unwrap(),
+        bound,
+        "product bound must retain the real marker after the pending inserts"
+    );
+    let pending = log_records_since(test, id, SyncCollection::Email, checkpoint.change_id).await;
+    for document in [prefix, failing] {
+        assert!(
+            pending.iter().any(|(_, changes)| changes.iter().any(
+                |change| matches!(change, Change::InsertItem(item) if *item as u32 == document)
+            )),
+            "pending document {document} must remain in the retained log beyond checkpoint {checkpoint:?}: {pending:?}"
+        );
+    }
+    let missing_hash = stored_hash(test, id, failing).await;
+    let saved_blob = stored_blob(test, &missing_hash).await;
+    for suspension in [false, true] {
+        for absent in [false, true] {
+            let _config = search_config_guard!(test, account_max_mb: if suspension { 0 } else { 512 }, absent_retry_secs: 60);
+            let mut before = original.clone();
+            before.failing = Some(FailingDocument {
+                document_id: failing,
+                attempts: if absent { 0 } else { u8::MAX },
+            });
+            if suspension {
+                before.content_to.cursor = Some(ContentCursor { next_below: 0 });
+            } else {
+                before.reconciliation = Some(ReconciliationMarker {
+                    bound: bound - 1,
+                    gap_next: 0,
+                });
+            }
+            replace_retry_manifest(test, id, &keys, &before).await;
+            simulate_restart(test, id).await;
+            let entry = test.server.za_search_entry(id, &keys).await.unwrap();
+            seed_expired_retry(&entry, &before);
+            let links = principal_blob_links(test, id).await;
+            let counter = SearchPassCounter::start(id);
+            let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+            let fault = (!absent).then(|| SearchPassFaultOnce::new(id, SearchPassWork::Open, 2));
+            if absent {
+                assert!(
+                    test.server
+                        .blob_store()
+                        .delete_blob(missing_hash.as_slice())
+                        .await
+                        .unwrap()
+                );
+            }
+            let _commit_slot = PauseSlotGuard::new(&SEARCH_COMMIT_PAUSE);
+            let _swap_slot = PauseSlotGuard::new(&SEARCH_SWAP_PAUSE);
+            let commit = std::sync::Arc::new(Pause::new(id));
+            let swap = std::sync::Arc::new(Pause::new(id));
+            set_search_commit_pause(Some(commit.clone()));
+            set_search_swap_pause(Some(swap.clone()));
+            let server = test.server.clone();
+            let task_keys = keys.clone();
+            let mut tasks = tokio::task::JoinSet::new();
+            let task = tasks.spawn(async move { server.za_search_pass(id, &task_keys).await });
+            tokio::time::timeout(Duration::from_secs(5), commit.arrived.notified())
+                .await
+                .unwrap();
+            let class = if absent {
+                TransientClass::AbsentWithinWindow
+            } else {
+                TransientClass::Store
+            };
+            let schedule = entry
+                .retry_schedule()
+                .expect("the primary failed before the commit wait");
+            assert_eq!(schedule.0, class);
+            assert!(schedule.1 > Instant::now() + Duration::from_secs(20));
+            commit.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), swap.arrived.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                entry.retry_schedule(),
+                Some(schedule),
+                "settlement must preserve every scheduling field before swap"
+            );
+            let after = index(test, id).await;
+            assert_eq!(after.indexed_to, before.indexed_to);
+            assert_eq!(after.content_to.checkpoint, before.content_to.checkpoint);
+            assert_eq!(after.content_to.cursor, before.content_to.cursor);
+            assert_eq!(
+                after.failing, before.failing,
+                "saturated and absent diagnostics remain identical"
+            );
+            assert_eq!(after.thread_blobs, before.thread_blobs);
+            assert_eq!(after.content, before.content);
+            if suspension {
+                assert!(after.content_to.suspended);
+            } else {
+                assert_eq!(after.reconciliation.as_ref().unwrap().bound, bound);
+                assert_eq!(after.reconciliation.as_ref().unwrap().gap_next, 0);
+            }
+            assert_eq!(principal_blob_links(test, id).await, links);
+            assert_eq!(counter.counts()[SearchPassWork::Open as usize], 2);
+            assert_eq!(counter.counts()[SearchPassWork::Commit as usize], 1);
+            task.abort();
+            assert!(tasks.join_next().await.unwrap().unwrap_err().is_cancelled());
+            swap.release.notify_one();
+            let counts = counter.counts();
+            // The real 30-second probe delay remains; pin only the shared
+            // observation cadence to make the no-work assertion deterministic.
+            entry.set_retry_observation_for_test(schedule.1);
+            assert_eq!(deferred_retry(test, id, &keys, class).await, schedule.1);
+            assert_eq!(counter.counts(), counts);
+            assert!(!index_holds(test, id, prefix).await);
+            let events = traces.finish().await;
+            let aborts = events
+                .iter()
+                .filter(|event| {
+                    event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_ABORTED
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(aborts.len(), 1);
+            assert_eq!(aborts[0].reason, class.as_str());
+            if let Some(fault) = fault {
+                assert!(fault.was_consumed());
+            }
+            if absent {
+                test.server
+                    .blob_store()
+                    .put_blob(
+                        missing_hash.as_slice(),
+                        &saved_blob,
+                        &test.server.core.blob.email,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+    replace_retry_manifest(test, id, &keys, &original).await;
+    simulate_restart(test, id).await;
+    advanced(test, &account, true).await;
+    clean_messages(test, &account).await;
+    test.destroy_all_mailboxes(&account).await;
+}
+
+async fn pr84_loader_deadlines(
+    test: &TestServer,
+    id: u32,
+    keys: &std::sync::Arc<vault::session::SessionKeys>,
+    basis: &Manifest,
+    thread_hash: &BlobHash,
+) {
+    use common::za::{
+        search::trace::ZA_SEARCH_ABORTED,
+        test_hooks::{SearchPassCounter, SearchWaitDeadline, set_search_required_load_pause},
+    };
+    use email::message::za::search::pass::run_pass_with_deadline_for_test;
+    for prior in [false, true] {
+        for flight in [false, true] {
+            simulate_restart(test, id).await;
+            let entry = test.server.inner.cache.za_search.entry(id);
+            if prior {
+                seed_expired_retry(&entry, basis);
+            }
+            let before = entry.retry_schedule();
+            let index_guard = if flight {
+                None
+            } else {
+                Some(entry.index.write().await)
+            };
+            let flight_guard = if flight {
+                Some(entry.load_flight.lock().await)
+            } else {
+                None
+            };
+            let counter = SearchPassCounter::start(id);
+            let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+            assert_eq!(
+                run_pass_with_deadline_for_test(&test.server, id, keys, Instant::now())
+                    .await
+                    .unwrap(),
+                PassOutcome::Deadline
+            );
+            assert_eq!(
+                entry.retry_schedule(),
+                before,
+                "real loader timeout is neutral, including an expired long streak"
+            );
+            assert_eq!(counter.counts(), [0; 5]);
+            drop(index_guard);
+            drop(flight_guard);
+            assert!(
+                !traces
+                    .finish()
+                    .await
+                    .iter()
+                    .any(|event| event.account_id == Some(u64::from(id))
+                        && event.details == ZA_SEARCH_ABORTED)
+            );
+        }
+    }
+    // Authenticate a required Thread target, then expire only its loader wait.
+    // A meaningful observation must still clear an obsolete historical basis.
+    for changed_basis in [false, true] {
+        simulate_restart(test, id).await;
+        let entry = test.server.inner.cache.za_search.entry(id);
+        let mut historical = basis.clone();
+        if changed_basis {
+            historical.content_to.suspended = !historical.content_to.suspended;
+        }
+        seed_expired_retry(&entry, &historical);
+        let before = entry.retry_schedule();
+        let expiry = SearchWaitDeadline::new(id);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let counter = SearchPassCounter::start(id);
+        let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+        let server = test.server.clone();
+        let task_keys = keys.clone();
+        let parked = HookParked::start(id, set_search_required_load_pause, async move {
+            run_pass_with_deadline_for_test(&server, id, &task_keys, deadline).await
+        })
+        .await;
+        let observed = if changed_basis { None } else { before };
+        assert_eq!(entry.retry_schedule(), observed);
+        expiry.expire();
+        expiry.wait_expired().await;
+        assert_eq!(parked.finish().await.unwrap(), PassOutcome::Deadline);
+        assert_eq!(entry.retry_schedule(), observed);
+        assert_eq!(expiry.deadlines(), vec![deadline.into()]);
+        assert_eq!(&counter.counts()[1..], &[0; 4]);
+        assert!(
+            !traces
+                .finish()
+                .await
+                .iter()
+                .any(|event| event.account_id == Some(u64::from(id))
+                    && event.details == ZA_SEARCH_ABORTED)
+        );
+        drop(expiry);
+        let fault = SearchBlobTimeoutOnce::new(id, thread_hash.clone());
+        assert_eq!(
+            test.server.za_search_pass(id, keys).await.unwrap(),
+            PassOutcome::Aborted(TransientClass::BlobStore)
+        );
+        assert!(
+            fault.was_consumed(),
+            "a later caller is immediately eligible for required loading"
+        );
+        if !changed_basis {
+            assert!(entry.retry_schedule().unwrap().1 > Instant::now() + Duration::from_secs(20));
+        }
+    }
+}
+
+async fn pr84_winner_deadlines(
+    test: &TestServer,
+    id: u32,
+    keys: &std::sync::Arc<vault::session::SessionKeys>,
+    basis: &Manifest,
+) {
+    use crate::utils::za::PauseSlotGuard;
+    use common::za::{
+        search::trace::ZA_SEARCH_ABORTED,
+        test_hooks::{
+            Pause, SEARCH_COMMIT_PAUSE, SEARCH_REQUIRED_LOAD_PAUSE, SearchWaitDeadline,
+            set_search_required_load_pause,
+        },
+    };
+    use email::message::za::search::pass::run_pass_with_deadline_for_test;
+    for (primary_failure, meaningful_winner) in
+        [(false, false), (true, false), (true, true), (false, true)]
+    {
+        replace_retry_manifest(test, id, keys, basis).await;
+        simulate_restart(test, id).await;
+        let entry = test.server.za_search_entry(id, keys).await.unwrap();
+        seed_expired_retry(&entry, basis);
+        let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+        let expiry = SearchWaitDeadline::new(id);
+        let _commit_slot = PauseSlotGuard::new(&SEARCH_COMMIT_PAUSE);
+        let _load_slot = PauseSlotGuard::new(&SEARCH_REQUIRED_LOAD_PAUSE);
+        let commit = std::sync::Arc::new(Pause::new(id));
+        set_search_commit_pause(Some(commit.clone()));
+        if primary_failure {
+            set_search_blob_fail_once(Some(id));
+        }
+        let server = test.server.clone();
+        let task_keys = keys.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            run_pass_with_deadline_for_test(
+                &server,
+                id,
+                &task_keys,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), commit.arrived.notified())
+            .await
+            .unwrap();
+        let recorded = entry.retry_schedule();
+        let mut winner = basis.clone();
+        winner.failing = Some(FailingDocument {
+            document_id: u32::MAX,
+            attempts: 9,
+        });
+        if meaningful_winner {
+            winner.content_to.suspended = !basis.content_to.suspended;
+        }
+        replace_retry_manifest(test, id, keys, &winner).await;
+        let load = std::sync::Arc::new(Pause::new(id));
+        let index_guard = if meaningful_winner {
+            set_search_required_load_pause(Some(load.clone()));
+            None
+        } else {
+            Some(entry.index.write().await)
+        };
+        // Even an expired caller must allow its already-owned assertion batch
+        // to resolve; only the subsequent winner loader is deadline-bounded.
+        if !meaningful_winner {
+            expiry.expire();
+        }
+        commit.release.notify_one();
+        if meaningful_winner {
+            tokio::time::timeout(Duration::from_secs(5), load.arrived.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                entry.retry_schedule(),
+                None,
+                "the actual meaningful winner clears the earlier failure before expiry"
+            );
+            expiry.expire();
+            expiry.wait_expired().await;
+            load.release.notify_one();
+        }
+        if !meaningful_winner {
+            expiry.wait_expired().await;
+        }
+        assert_eq!(
+            tasks.join_next().await.unwrap().unwrap().unwrap(),
+            PassOutcome::Lost
+        );
+        assert_eq!(
+            entry.retry_schedule(),
+            if meaningful_winner { None } else { recorded }
+        );
+        drop(index_guard);
+        assert_eq!(index(test, id).await, winner);
+        let events = traces.finish().await;
+        let aborts = events
+            .iter()
+            .filter(|event| {
+                event.account_id == Some(u64::from(id)) && event.details == ZA_SEARCH_ABORTED
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(aborts.len(), usize::from(primary_failure));
+        if primary_failure {
+            assert_eq!(aborts[0].reason, TransientClass::BlobStore.as_str());
+        }
+    }
+    replace_retry_manifest(test, id, keys, basis).await;
+    simulate_restart(test, id).await;
+}
+
 async fn case_pr84_account_pass(test: &mut TestServer) {
     use common::za::{
         search::trace::ZA_SEARCH_ABORTED,
@@ -783,19 +1216,67 @@ async fn case_pr84_account_pass(test: &mut TestServer) {
     let basis = index(test, id).await;
     let links = principal_blob_links(test, id).await;
     let thread_hash = basis.thread_blobs[0].hash.clone();
+    pr84_loader_deadlines(test, id, &keys, &basis, &thread_hash).await;
+    pr84_winner_deadlines(test, id, &keys, &basis).await;
 
     // Each injected fault occurs after successful opens, including failure on
     // the second upload (a staged prefix) and the raw mailbox-enumeration Err.
-    for (work, occurrence, class) in [
-        (SearchPassWork::Upload, 1, TransientClass::BlobStore),
-        (SearchPassWork::Upload, 2, TransientClass::BlobStore),
-        (SearchPassWork::Commit, 1, TransientClass::Store),
-        (SearchPassWork::Mailboxes, 1, TransientClass::Store),
+    for (work, occurrence, class, backend) in [
+        (SearchPassWork::Upload, 1, TransientClass::BlobStore, None),
+        (SearchPassWork::Upload, 2, TransientClass::BlobStore, None),
+        (
+            SearchPassWork::Commit,
+            1,
+            TransientClass::Store,
+            Some("unexpected"),
+        ),
+        (
+            SearchPassWork::Mailboxes,
+            1,
+            TransientClass::Store,
+            Some("data-corruption"),
+        ),
+        (
+            SearchPassWork::Mailboxes,
+            1,
+            TransientClass::Store,
+            Some("other"),
+        ),
     ] {
         simulate_restart(test, id).await;
         let counter = SearchPassCounter::start(id);
-        let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
-        let fault = SearchPassFaultOnce::new(id, work, occurrence);
+        let traces = Traced::start(&[
+            ZA_SEARCH_EVENT_TYPE,
+            EventType::Store(StoreEvent::DataCorruption),
+            EventType::Store(StoreEvent::BlobRead),
+            EventType::Store(StoreEvent::RocksdbError),
+        ]);
+        let fault = if work == SearchPassWork::Mailboxes {
+            let event = if backend == Some("other") {
+                StoreEvent::BlobRead
+            } else {
+                StoreEvent::DataCorruption
+            };
+            SearchPassFaultOnce::with_error(
+                id,
+                work,
+                occurrence,
+                event
+                    .into_err()
+                    .details("RawDetailsCanary")
+                    .reason("RawReasonCanary")
+                    .ctx(Key::CausedBy, "RawLocationCanary")
+                    .ctx(Key::Key, b"RawKeyCanary".to_vec())
+                    .ctx(Key::Value, b"RawValueCanary".to_vec())
+                    .caused_by(
+                        StoreEvent::RocksdbError
+                            .into_err()
+                            .details("NestedCauseCanary"),
+                    ),
+            )
+        } else {
+            SearchPassFaultOnce::new(id, work, occurrence)
+        };
         let outcome = test.server.za_search_pass(id, &keys).await;
         assert!(
             fault.was_consumed(),
@@ -825,6 +1306,42 @@ async fn case_pr84_account_pass(test: &mut TestServer) {
             .collect::<Vec<_>>();
         assert_eq!(aborts.len(), 1);
         assert_eq!(aborts[0].reason, class.as_str());
+        if let Some(backend) = backend {
+            assert!(
+                aborts[0]
+                    .keys
+                    .contains(&(Key::Type, TraceValue::from(backend)))
+            );
+            let operation = if work == SearchPassWork::Commit {
+                "commit"
+            } else {
+                "mailboxes"
+            };
+            assert!(
+                aborts[0]
+                    .keys
+                    .contains(&(Key::Source, TraceValue::from(operation)))
+            );
+            assert!(aborts[0].keys.iter().all(|(key, _)| matches!(
+                key,
+                Key::Details | Key::AccountId | Key::Reason | Key::Type | Key::Source
+            )));
+        }
+        for event in &events {
+            for canary in [
+                "RawDetailsCanary",
+                "RawReasonCanary",
+                "RawLocationCanary",
+                "RawKeyCanary",
+                "RawValueCanary",
+                "NestedCauseCanary",
+            ] {
+                assert!(
+                    !event.text.contains(canary),
+                    "raw backend payload reached a trace"
+                );
+            }
+        }
         assert!(
             !aborts[0]
                 .keys
@@ -857,6 +1374,7 @@ async fn case_pr84_account_pass(test: &mut TestServer) {
         retry_at
     );
     let after = counter.counts();
+    entry.set_retry_observation_for_test(retry_at);
     assert_eq!(
         after[SearchPassWork::Manifest as usize],
         before[SearchPassWork::Manifest as usize] + 1
@@ -949,8 +1467,8 @@ async fn case_pr84_account_pass(test: &mut TestServer) {
     );
     drop(counter);
 
-    // An observation itself is bounded by the original request deadline; a
-    // cancellation here keeps the unchanged retry and performs no manifest I/O.
+    // Expire only after ensure-current's observer acknowledges its park,
+    // exercising the request path without real-clock setup races.
     replace_retry_manifest(test, id, &keys, &basis).await;
     simulate_restart(test, id).await;
     set_search_blob_fail_once(Some(id));
@@ -962,7 +1480,8 @@ async fn case_pr84_account_pass(test: &mut TestServer) {
     let retry_at = extend_retry_window(test, id);
     entry.set_retry_observation_for_test(Instant::now());
     let counter = SearchPassCounter::start(id);
-    let deadline = Instant::now() + Duration::from_millis(200);
+    let expiry = common::za::test_hooks::SearchWaitDeadline::new(id);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let server = test.server.clone();
     let waiter_keys = keys.clone();
     let parked = HookParked::start(id, set_search_retry_observation_pause, async move {
@@ -971,34 +1490,55 @@ async fn case_pr84_account_pass(test: &mut TestServer) {
             .await
     })
     .await;
-    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-    assert!(matches!(
-        parked.finish().await,
-        Err(Unavailable::Transient(TransientClass::BlobStore))
-    ));
-    assert_eq!(entry.retry_schedule().unwrap().1, retry_at);
-    assert_eq!(counter.counts(), [0; 5]);
-    drop(counter);
-
-    // A moved valid head can still need optional Content. Its wait must use
-    // the same original deadline, rather than obtaining a fresh duration.
-    entry.set_retry_observation_for_test(Instant::now());
-    let content_flight = entry.content_load_flight.lock().await;
-    let deadline = Instant::now() + Duration::from_millis(200);
-    let server = test.server.clone();
-    let waiter_keys = keys.clone();
-    let parked = HookParked::start(id, set_search_retry_observation_pause, async move {
-        server
-            .za_search_ensure_current(id, &waiter_keys, deadline)
-            .await
-    })
-    .await;
-    replace_retry_manifest(test, id, &keys, &published).await;
+    expiry.expire();
+    expiry.wait_expired().await;
     assert!(matches!(
         parked.finish().await,
         Err(Unavailable::NotCurrent)
     ));
-    assert!(Instant::now() >= deadline);
+    assert_eq!(entry.retry_schedule().unwrap().1, retry_at);
+    assert_eq!(counter.counts(), [0; 5]);
+    assert_eq!(expiry.deadlines(), vec![deadline.into()]);
+    drop(expiry);
+    drop(counter);
+
+    // A moved valid head still needs optional Content. Acknowledging its wait
+    // before explicit expiry proves it receives the same original deadline.
+    entry.set_retry_observation_for_test(Instant::now());
+    replace_retry_manifest(test, id, &keys, &published).await;
+    let content_flight = entry.content_load_flight.lock().await;
+    let expiry = common::za::test_hooks::SearchWaitDeadline::new(id);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let server = test.server.clone();
+    let waiter_keys = keys.clone();
+    let parked = HookParked::start(
+        id,
+        common::za::test_hooks::set_search_content_wait_pause,
+        async move {
+            server
+                .za_search_ensure_current(id, &waiter_keys, deadline)
+                .await
+        },
+    )
+    .await;
+    expiry.expire();
+    expiry.wait_expired().await;
+    assert!(matches!(
+        parked.finish().await,
+        Err(Unavailable::NotCurrent)
+    ));
+    let deadlines = expiry.deadlines();
+    assert!(deadlines.len() >= 2);
+    assert!(
+        deadlines
+            .iter()
+            .all(|observed| *observed == deadline.into())
+    );
+    assert!(
+        entry.retry_schedule().is_none(),
+        "meaningful remote progress stays cleared after expiry"
+    );
+    drop(expiry);
     drop(content_flight);
     test.server
         .za_search_ensure_current(id, &keys, Instant::now() + Duration::from_secs(5))

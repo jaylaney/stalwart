@@ -23,6 +23,36 @@ pub const ZA_SEARCH_CALENDAR_EVENT: trc::CalendarEvent = trc::CalendarEvent::Iti
 
 pub const ZA_SEARCH_EVENT_TYPE: trc::EventType = trc::EventType::Calendar(ZA_SEARCH_CALENDAR_EVENT);
 
+/// Classify only the typed discriminator. Context and nested causes may hold
+/// plaintext or arbitrary bytes and must never enter a search trace.
+pub fn backend_error_class(error: &trc::Error) -> &'static str {
+    use trc::{EventType, NetworkEvent, StoreEvent};
+    match error.as_ref() {
+        EventType::Store(StoreEvent::FoundationdbError) => "foundationdb",
+        EventType::Store(StoreEvent::MysqlError) => "mysql",
+        EventType::Store(StoreEvent::PostgresqlError) => "postgresql",
+        EventType::Store(StoreEvent::RocksdbError) => "rocksdb",
+        EventType::Store(StoreEvent::SqliteError) => "sqlite",
+        EventType::Store(StoreEvent::RedisError) => "redis",
+        EventType::Store(StoreEvent::S3Error) => "s3",
+        EventType::Store(StoreEvent::AzureError) => "azure",
+        EventType::Store(StoreEvent::FilesystemError) => "filesystem",
+        EventType::Store(StoreEvent::PoolError) => "pool",
+        EventType::Store(StoreEvent::DataCorruption) => "data-corruption",
+        EventType::Store(StoreEvent::DecompressError) => "decompress",
+        EventType::Store(StoreEvent::DecryptError) => "decrypt",
+        EventType::Store(StoreEvent::DeserializeError) => "deserialize",
+        EventType::Store(StoreEvent::NotFound) => "not-found",
+        EventType::Store(StoreEvent::NotConfigured) => "not-configured",
+        EventType::Store(StoreEvent::NotSupported) => "not-supported",
+        EventType::Store(StoreEvent::UnexpectedError) => "unexpected",
+        EventType::Store(StoreEvent::CryptoError) => "crypto",
+        EventType::Store(StoreEvent::HttpStoreError) => "http-store",
+        EventType::Network(NetworkEvent::Timeout) => "timeout",
+        _ => "other",
+    }
+}
+
 /// Emit a fixed search trace with ids, counts, revisions or reason classes.
 #[macro_export]
 macro_rules! za_search_trace {

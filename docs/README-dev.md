@@ -123,12 +123,18 @@ operations does not reset that streak. Deferred callers share at most one authen
 manifest check per second; they perform no index-blob load, replay, message open or
 write merely to check for progress. A Content waiter can notice another node's progress
 before its local retry time, while retaining the original request deadline and normal
-current-view validation. Diagnostic-only updates do not reset the delay; explicit
-clearing or meaningful progress does. Failed observations do not establish a manifest
+current-view validation. Expiring a caller deadline during a loader wait adds no
+backend failure, abort trace or cooldown; an earlier actual failure is preserved.
+An acknowledged own-abort write preserves and rebinds that failed probe even when
+it also updates reconciliation-bound or suspension bookkeeping. Diagnostic-only
+updates do not reset the delay; explicit clearing or meaningful progress does.
+Failed observations do not establish a manifest
 generation or extend the probe deadline. Unchanged abort manifests are not committed
 again. Each failed probe emits one fixed-reason abort, with document ID and proposed
-diagnostic attempt count when a message open caused it; secondary diagnostic-write
-errors do not duplicate it. Allowed compaction fallback emits a separate
+diagnostic attempt count when a message open caused it. Raw infrastructure faults
+may add fixed backend and operation classes, never the error payload or its stored
+key/value context; secondary diagnostic-write errors do not duplicate the abort.
+Allowed compaction fallback emits a separate
 `ZA_SEARCH_COMPACTION_SKIPPED` event with reason `allowance`; a later failure
 still emits its one actual abort. No raw archive bytes or message content are logged.
 A proved `Archive access failed` error from stored archive validation is parse loss;

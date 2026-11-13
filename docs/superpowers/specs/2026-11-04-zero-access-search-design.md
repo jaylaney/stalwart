@@ -1,6 +1,10 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 36 (2026-11-12), PR 84 account-pass retry follow-up.
+Date: 2026-11-04. Status: revision 37 (2026-11-13), PR 84 retry settlement follow-up.
+Revision 37 distinguishes caller deadline expiry from an observed backend fault,
+preserves the current failure through its own acknowledged abort metadata write,
+and adds bounded backend/operation classification to the existing safe abort trace.
+Stored formats, atomic aborts and independently observed progress rules are unchanged.
 Revision 36 makes retry admission cover an account pass, including required loads
 and writes, independently of the failing document or operation. Deferred callers
 share bounded authenticated manifest observation so remote progress can be noticed
@@ -1221,8 +1225,14 @@ most 30 seconds. The consecutive unsuccessful-probe streak is independent of
 operation, document, fault class and the persisted per-document diagnostic count.
 Successful opens in a discarded prefix are not progress. Raw infrastructure errors
 leaving the pass join this policy; loss, ordinary assertion contention, unsupported
-formats and destroying accounts keep their distinct outcomes. Independently required
-Map and optional Content service loads retain their existing availability policy.
+formats and destroying accounts keep their distinct outcomes. Caller deadline
+expiry while waiting for an observer, loader or its locks is not an observed backend
+failure: it adds no failure, abort trace, delay or streak increment. It also does not
+clear or extend a failure already recorded before a later wait. Authenticated
+meaningful observations and acknowledged progress retain their normal settlement;
+a timeout never restores an obsolete basis. An owned transaction still settles
+through its outcome. Independently required Map and optional Content service loads
+retain their existing availability policy.
 
 The pass lock serializes admission **before** required Thread loading. An unchanged
 authenticated resident head is usable under a shared index guard: a pinned served
@@ -1230,8 +1240,9 @@ view must not prevent a new pass from reaching its publication/swap boundary mer
 because admission wants to inspect that same head. A cold or moved target that needs
 exclusive installation is authenticated again after obtaining the write guard, so a
 read-to-write transition cannot apply a stale observation. During a delay, callers
-share at most one authenticated manifest observation per second on the resident entry. Before that observation time, a call returns Deferred without
-I/O. Observation alone performs no Thread or Content load, thread copy, retained-log
+share at most one authenticated manifest observation per second on the resident
+entry. Before that observation time, a call returns Deferred without I/O. Observation
+alone performs no Thread or Content load, thread copy, retained-log
 read, message open, staging, upload, commit or repeated abort trace. An unchanged
 head, diagnostic-only change or failed observation preserves the probe deadline
 and streak; it does not extend them. A meaningful authenticated change re-enters
@@ -1259,13 +1270,24 @@ diagnostic write cannot erase its delay. Count and trace at most one primary fai
 per admitted probe, with a fixed reason and optional document/diagnostic count; a
 secondary diagnostic-write failure adds neither another abort nor another increment.
 The optional count is proposed diagnostic metadata when that write fails, not a
-claim of durability. An acknowledged diagnostic-only commit rebinds synchronously;
-an acknowledged progress commit clears synchronously, both before any resident-swap
-await. An assertion loser binds only an authoritative actual head under the same
-basis rules, never its proposed output; an unresolved reload retains at most the
+claim of durability. An acknowledged own-abort commit rebinds the current failed
+probe synchronously to its actual committed manifest, preserving its exact streak,
+class, deadline and observation schedule before any resident-swap await. This holds
+even if that abort also updates reconciliation-bound or suspension bookkeeping: its
+healthy prefix was discarded, so those own-abort fields do not prove successful
+index progress. This narrow provenance rule does not weaken the meaningful-basis
+comparison for independent observations or assertion winners. An acknowledged
+progress commit still clears synchronously before the resident-swap await. An
+assertion loser binds only an authoritative actual head under the same basis rules,
+never its proposed output; an unresolved reload retains at most the
 historical same-entry scheduling delay. Only message-open failures persist the
 existing document diagnostic. Before staging an abort's write, complete manifest
 equality elides it; changed suspension or reconciliation data still persists.
+A raw infrastructure error may enrich the first abort with an allowlisted typed
+backend classification and a local fixed operation label. Unknown types use a fixed
+fallback. Do not log or format the original error, its context or nested cause;
+raw Details, Reason, Location, Key and Value fields are not copied. This adds no
+second primary abort and does not change retry classification or timing.
 
 Atomic abort deliberately discards a healthy prefix. It is replayed only on a
 permitted probe; later chronological work, including index bookkeeping for flags,
@@ -2777,7 +2799,7 @@ rendering rules. Section 9.5's differential test holds it.
 
 ## 8. Error handling and traces
 
-Traces of this release carry ids and counts and nothing else: no term,
+Traces of this release carry ids, counts and fixed server-defined classes only: no term,
 header, Message-ID, subject, sort key, thread membership or
 client-supplied string (mail spec invariant 30 extends to the index).
 The fork adds no event variants (the enums are generated); it traces
@@ -2789,7 +2811,7 @@ event), with these constants:
 |---|---|---|
 | `ZA_SEARCH_PASS` | a pass committed | account id, inserts, tombstones, whether it published, revision, `indexed_to` |
 | `ZA_SEARCH_SKIPPED` | a message was skipped in a pass for loss (5.1) | account id, document id, the loss class (stub absent, blob absent, would not open) |
-| `ZA_SEARCH_ABORTED` | an actual failed probe aborts a pass (5.1), or a tiered promotion limit (5.5) | account id and fixed error class/reason; a message-open failure also carries document id and diagnostic attempt count; deferred probes emit no repeat |
+| `ZA_SEARCH_ABORTED` | an actual failed probe aborts a pass (5.1), or a tiered promotion limit (5.5) | account id and fixed error class/reason; a raw backend error may add allowlisted backend and fixed operation classes; a message-open failure also carries document id and diagnostic attempt count; caller deadline expiry and deferred probes emit no new abort |
 | `ZA_SEARCH_COMPACTION_SKIPPED` | optional Thread compaction exceeds its public allowance and falls back to the existing uncompacted path | account id and fixed reason `allowance`; this is not a pass abort, and any later failure emits its one primary abort separately |
 | `ZA_SEARCH_LOST` | a manifest write lost its assertion | account id |
 | `ZA_SEARCH_REBUILD` | a rebuild, content-only rebuild or reconciliation started or finished | account id, which, the loss class, the cursor size, the epoch |
