@@ -53,18 +53,18 @@ batch, and report progress without changing awaited work.
   with a timer, no spawned task. Existing diagnostics may be reused/extended if
   their other callers' semantics remain unchanged.
 
-- [ ] Read the spec and ignored `recon.md` and `contract.md` reports.
-- [ ] Preserve all existing assertions. Make the smallest extractions so the
+- [x] Read the spec and ignored `recon.md` and `contract.md` reports.
+- [x] Preserve all existing assertions. Make the smallest extractions so the
   default and optimized routes execute the same scan and decrypt implementations.
-- [ ] Add batch-local key reuse after inventory/count validation. Do not reuse in
+- [x] Add batch-local key reuse after inventory/count validation. Do not reuse in
   headerless verification, G5, authentication lifecycle cases, or across batches.
-- [ ] Add setup and bulk-index phase boundaries, completed-pair/batch progress,
+- [x] Add setup and bulk-index phase boundaries, completed-pair/batch progress,
   elapsed delivery-barrier and verification timing, and ten-second pending
   heartbeats. Avoid per-message begin/end output and nested active timers.
-- [ ] Add meaningful focused tests only where needed to establish new observer
+- [x] Add meaningful focused tests only where needed to establish new observer
   behavior (single future, prompt completion, cancellation); avoid tests that
   merely restate polling constants. Root executes all validation.
-- [ ] Return exact diff summary, invariants inspected, risks and proposed checks.
+- [x] Return exact diff summary, invariants inspected, risks and proposed checks.
   Do not build, test, commit, push, or spawn agents.
 
 ### Task 2: Validate, independently review, and publish
@@ -78,17 +78,17 @@ batch, and report progress without changing awaited work.
 - Produce full default/filesystem receipts, A/B setup measurements, independent
   source review, and a separate follow-up PR.
 
-- [ ] Root runs unchanged baseline `za::za_tests --exact --nocapture` with external
+- [x] Root runs unchanged baseline `za::za_tests --exact --nocapture` with external
   timestamps; record binary SHA/source binding, environment and fresh fixture.
-- [ ] Independent reviewer checks the patch against the complete preservation
+- [x] Independent reviewer checks the patch against the complete preservation
   checklist and the five review risks before final compilation.
-- [ ] Root runs rustfmt check, builds the tests target, and runs the final complete
+- [x] Root runs rustfmt check, builds the tests target, and runs the final complete
   canonical suite in default and filesystem blob modes serially. Unit observer
   tests, if added, run separately. Record initial failures and any retries.
-- [ ] Compare the same coarse setup interval and full suite time. Report observed
+- [x] Compare the same coarse setup interval and full suite time. Report observed
   gain and remaining cost; do not claim hosted CI improvement from local data.
-- [ ] Fresh clean-context whole-follow-up-branch reviewer checks base/head,
+- [x] Fresh clean-context whole-follow-up-branch reviewer checks base/head,
   contracts and receipts. Root adjudicates and verifies any necessary fix.
-- [ ] Root commits, pushes to the fork and creates/attaches a follow-up PR against
+- [x] Root commits, pushes to the fork and creates/attaches a follow-up PR against
   `release7-search` while #84 is open. The Test workflow targets main, so dispatch
   it manually for the follow-up branch and report pending CI as pending.
