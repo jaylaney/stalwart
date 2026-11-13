@@ -24,6 +24,7 @@ use crate::{
     za::{STRONG, user_permissions},
 };
 use chrono::Utc;
+use common::za::test_hooks::{SearchRequestObservation, SearchStage};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess},
     mailbox::INBOX_ID,
@@ -139,6 +140,91 @@ impl Drop for DiagnosticStep {
                 self.started.elapsed()
             );
         }
+    }
+}
+
+// Armed only for the canonical first keyed inventory Get. Drop reports once on
+// return, unwind, or cancellation, including spans that the server still owns.
+struct InventoryGetObservation {
+    observation: SearchRequestObservation,
+    complete: bool,
+}
+
+impl InventoryGetObservation {
+    fn new(account_id: u32) -> Self {
+        Self {
+            observation: SearchRequestObservation::arm(account_id),
+            complete: false,
+        }
+    }
+
+    fn finish(mut self, items: usize) {
+        self.observation.disarm();
+        assert_eq!(items, PAGE);
+        assert!(
+            self.observation.claimed(),
+            "first keyed Get must be observed"
+        );
+        for stage in [
+            SearchStage::DispatcherPrePass,
+            SearchStage::Method,
+            SearchStage::GetSnapshot,
+            SearchStage::GetMetadataBatch,
+            SearchStage::GetMetadataOpen,
+        ] {
+            let progress = self.observation.progress(stage);
+            assert!(
+                progress.completed > 0,
+                "first keyed Get must record {stage:?}"
+            );
+            assert_eq!(progress.started, progress.completed);
+            assert_eq!((progress.partial, progress.in_flight), (0, 0));
+        }
+        assert_eq!(
+            self.observation
+                .progress(SearchStage::GetSnapshot)
+                .completed,
+            1
+        );
+        assert_eq!(
+            self.observation
+                .progress(SearchStage::GetMetadataOpen)
+                .completed,
+            items as u64
+        );
+        self.complete = true;
+    }
+}
+
+impl Drop for InventoryGetObservation {
+    fn drop(&mut self) {
+        self.observation.disarm();
+        let outcome = if self.complete {
+            "complete"
+        } else if std::thread::panicking() {
+            "unwinding"
+        } else {
+            "cancelled"
+        };
+        let mut report = format!(
+            "differential: server-get outcome={outcome} phase=inventory mode=key method=Email/get page=1 items={PAGE} claimed={} timings=inclusive completed=operation-returned partial=unmarked-drop sampling=per-stage\n",
+            self.observation.claimed(),
+        );
+        for (stage, progress) in self.observation.progress_stages() {
+            report.push_str(&format!(
+                "differential: server-get stage={stage:?} count={} started={} completed={} partial={} in_flight={} elapsed_inclusive={:?} in_flight_elapsed={:?}\n",
+                progress.count,
+                progress.started,
+                progress.completed,
+                progress.partial,
+                progress.in_flight,
+                progress.elapsed,
+                progress.in_flight_elapsed,
+            ));
+        }
+        // A fixed number of aggregate lines, no row data or raw error context.
+        // Ignore output failure so reporting cannot replace an original panic.
+        let _ = std::io::Write::write_all(&mut std::io::stdout().lock(), report.as_bytes());
     }
 }
 
@@ -681,26 +767,47 @@ async fn inventory<'a>(
     assert_eq!(uids.iter().copied().collect::<BTreeSet<_>>().len(), TOTAL);
 
     for (page, chunk) in order.chunks(PAGE).enumerate() {
+        let observation = (mode == "key" && page == 0)
+            .then(|| InventoryGetObservation::new(account.id().document_id()));
+        let properties = [
+            "id",
+            "threadId",
+            "messageId",
+            "mailboxIds",
+            "subject",
+            "sentAt",
+            "size",
+        ];
         let reply = observed(
             DiagnosticStep::request("inventory", mode, "Email/get", page + 1, Some(chunk.len())),
-            account.jmap_get(
-                "Email",
-                [
-                    "id",
-                    "threadId",
-                    "messageId",
-                    "mailboxIds",
-                    "subject",
-                    "sentAt",
-                    "size",
-                ],
-                chunk.iter(),
-            ),
+            async {
+                if let Some(observation) = &observation {
+                    // Identical to jmap_get's populated account/properties/ids
+                    // body; only the opaque call ID differs. Keep its generic
+                    // client, capabilities, TLS setup, and five-second deadline.
+                    account
+                        .jmap_method_calls(json!([[
+                            "Email/get",
+                            {
+                                "accountId": account.id_string(),
+                                "properties": properties,
+                                "ids": chunk.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                            },
+                            observation.observation.call_id(),
+                        ]]))
+                        .await
+                } else {
+                    account.jmap_get("Email", properties, chunk.iter()).await
+                }
+            },
         )
         .await;
         assert_eq!(reply.name_at(0), "Email/get");
         assert_eq!(reply.not_found().count(), 0);
         assert_eq!(reply.list().len(), chunk.len());
+        if let Some(observation) = observation {
+            observation.finish(chunk.len());
+        }
         for email in reply.list() {
             let email_id = parse_id(&email["id"]);
             let witness = doc_to_ordinal[&email_id.document_id()];

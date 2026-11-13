@@ -177,7 +177,15 @@ impl RequestHandler for Server {
         let search_observation = match request.method_calls.as_slice() {
             [call]
                 if keys.is_some()
-                    && call.name == MethodName::new(MethodObject::Email, MethodFunction::Query) =>
+                    && (call.name
+                        == MethodName::new(MethodObject::Email, MethodFunction::Query)
+                        || (call.name
+                            == MethodName::new(MethodObject::Email, MethodFunction::Get)
+                            && matches!(
+                                &call.method,
+                                RequestMethod::Get(GetRequestMethod::Email(request))
+                                    if request.account_id.document_id() == owner
+                            ))) =>
             {
                 claim_search_observation(owner, &call.id)
             }

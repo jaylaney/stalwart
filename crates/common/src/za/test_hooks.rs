@@ -1401,6 +1401,159 @@ pub fn reset_za_search_counters(account_id: u32) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn search_observation_tracks_complete_pending_and_dropped_spans() {
+        use std::{
+            future::Future,
+            panic::AssertUnwindSafe,
+            task::{Context, Waker},
+        };
+
+        const ACCOUNT: u32 = 29;
+        assert!(search_span(ACCOUNT, SearchStage::Method).is_none());
+        let unclaimed = SearchRequestObservation::arm(ACCOUNT);
+        let stale_call_id = unclaimed.call_id().to_owned();
+        assert!(claim_search_observation(ACCOUNT + 1, unclaimed.call_id()).is_none());
+        assert!(claim_search_observation(ACCOUNT, "search-cold-wrong").is_none());
+        assert!(!unclaimed.claimed());
+        unclaimed.disarm();
+        assert!(claim_search_observation(ACCOUNT, unclaimed.call_id()).is_none());
+        drop(unclaimed);
+
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _unclaimed = SearchRequestObservation::arm(ACCOUNT);
+                panic!("exercise unclaimed observation cleanup");
+            })
+            .is_err()
+        );
+
+        let observation = SearchRequestObservation::arm(ACCOUNT);
+        assert!(claim_search_observation(ACCOUNT, &stale_call_id).is_none());
+        let claimed = claim_search_observation(ACCOUNT, observation.call_id()).unwrap();
+        assert!(observation.claimed());
+        assert!(claim_search_observation(ACCOUNT, observation.call_id()).is_none());
+        let next = SearchRequestObservation::arm(ACCOUNT);
+
+        with_search_observation(Some(&claimed), async {
+            assert!(search_span(ACCOUNT + 1, SearchStage::Method).is_none());
+            note_search_count(ACCOUNT, SearchStage::ContentRetry);
+            assert_eq!(
+                observe_search_wait(ACCOUNT, SearchStage::GetSnapshot, std::future::ready(7),)
+                    .await,
+                7
+            );
+            // Explicit completion also works for synchronous spans.
+            search_span(ACCOUNT, SearchStage::GetSnapshot)
+                .unwrap()
+                .finish();
+            // Legacy RAII spans retain their count and ended elapsed time. A
+            // bare Drop is partial, since it cannot prove operation completion.
+            drop(search_span(ACCOUNT, SearchStage::ThreadOpenDecode));
+        })
+        .await;
+        let complete = observation.progress(SearchStage::GetSnapshot);
+        assert_eq!(
+            (
+                complete.started,
+                complete.completed,
+                complete.partial,
+                complete.in_flight
+            ),
+            (2, 2, 0, 0)
+        );
+        assert_eq!(observation.count(SearchStage::GetSnapshot), 2);
+        let legacy = observation
+            .timings()
+            .find(|(stage, _, _)| matches!(stage, SearchStage::GetSnapshot))
+            .unwrap();
+        assert_eq!((legacy.1, legacy.2), (complete.count, complete.elapsed));
+        assert_eq!(
+            observation.progress(SearchStage::ThreadOpenDecode).partial,
+            1
+        );
+        let event = observation.progress(SearchStage::ContentRetry);
+        assert_eq!((event.count, event.started, event.in_flight), (1, 0, 0));
+
+        // This future contains only std::future::pending, so polling its entry
+        // does not depend on Tokio cooperative readiness or a select race.
+        let mut pending = Box::pin(with_search_observation(
+            Some(&claimed),
+            observe_search_wait(
+                ACCOUNT,
+                SearchStage::GetMetadataOpen,
+                std::future::pending::<()>(),
+            ),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+        let active = observation.progress(SearchStage::GetMetadataOpen);
+        assert_eq!(
+            (
+                active.count,
+                active.started,
+                active.completed,
+                active.partial,
+                active.in_flight
+            ),
+            (1, 1, 0, 0, 1)
+        );
+        assert_eq!(active.elapsed, active.in_flight_elapsed);
+        // A client-side disarm does not discard a still-running server's data.
+        observation.disarm();
+        assert_eq!(
+            observation.progress(SearchStage::GetMetadataOpen).in_flight,
+            1
+        );
+        drop(pending);
+        let cancelled = observation.progress(SearchStage::GetMetadataOpen);
+        assert_eq!(
+            (cancelled.completed, cancelled.partial, cancelled.in_flight),
+            (0, 1, 0)
+        );
+        assert!(cancelled.elapsed >= active.elapsed);
+        assert_eq!(cancelled.in_flight_elapsed, Duration::ZERO);
+
+        let unpolled = with_search_observation(
+            Some(&claimed),
+            observe_search_wait(
+                ACCOUNT,
+                SearchStage::GetMetadataBatch,
+                std::future::ready(()),
+            ),
+        );
+        drop(unpolled);
+        assert_eq!(observation.count(SearchStage::GetMetadataBatch), 0);
+
+        let mut unwinding = Box::pin(with_search_observation(
+            Some(&claimed),
+            observe_search_wait(ACCOUNT, SearchStage::Method, async {
+                panic!("exercise active observation cleanup");
+            }),
+        ));
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = unwinding.as_mut().poll(&mut context);
+            }))
+            .is_err()
+        );
+        drop(unwinding);
+        let unwound = observation.progress(SearchStage::Method);
+        assert_eq!(
+            (
+                unwound.started,
+                unwound.completed,
+                unwound.partial,
+                unwound.in_flight
+            ),
+            (1, 0, 1, 0)
+        );
+        assert!(search_span(ACCOUNT, SearchStage::Method).is_none());
+        assert_eq!(next.count(SearchStage::Method), 0);
+        drop(observation);
+        assert!(claim_search_observation(ACCOUNT, next.call_id()).is_some());
+    }
+
     #[test]
     fn search_blob_failure_is_taken_once_by_its_account() {
         set_search_blob_fail_once(Some(5));
@@ -1514,7 +1667,8 @@ impl Drop for SearchCommitCounter {
 }
 
 /// Request-local inclusive timings. A parent stage may include other reported
-/// stages, and cancellation drops the span at the point the wait is stopped.
+/// stages. Legacy timings retain elapsed time for ended spans; progress also
+/// includes active spans and distinguishes explicit completion from partial drops.
 #[derive(Clone, Copy, Debug)]
 pub enum SearchStage {
     DispatcherPrePass,
@@ -1537,10 +1691,13 @@ pub enum SearchStage {
     ContentRetry,
     ViewRetry,
     ContentAdmission,
+    GetSnapshot,
+    GetMetadataBatch,
+    GetMetadataOpen,
 }
 
 impl SearchStage {
-    const ALL: [Self; Self::ContentAdmission as usize + 1] = [
+    const ALL: [Self; Self::GetMetadataOpen as usize + 1] = [
         Self::DispatcherPrePass,
         Self::Method,
         Self::MapFlightWait,
@@ -1561,13 +1718,39 @@ impl SearchStage {
         Self::ContentRetry,
         Self::ViewRetry,
         Self::ContentAdmission,
+        Self::GetSnapshot,
+        Self::GetMetadataBatch,
+        Self::GetMetadataOpen,
     ];
 }
 
 #[derive(Default)]
 struct StageTotal {
-    count: AtomicU64,
-    nanos: AtomicU64,
+    count: u64,
+    started: u64,
+    completed: u64,
+    partial: u64,
+    elapsed: Duration,
+    // Sum of active start offsets from the measurement's epoch. This permits
+    // constant-space elapsed accounting without retaining an entry per span.
+    active_started_nanos: u128,
+}
+
+/// A single stage snapshot. Timings are inclusive and must not be summed across
+/// nested stages. `partial` means dropped without explicit completion, including
+/// legacy bare RAII spans; it does not establish why the span ended.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchStageProgress {
+    /// Legacy count: span starts plus instantaneous count-only events.
+    pub count: u64,
+    pub started: u64,
+    /// Explicit operation returns, including returned errors; not a success count.
+    pub completed: u64,
+    pub partial: u64,
+    pub in_flight: u64,
+    /// Ended span time plus the elapsed time of still-active spans at this sample.
+    pub elapsed: Duration,
+    pub in_flight_elapsed: Duration,
 }
 
 #[derive(Debug)]
@@ -1580,7 +1763,8 @@ pub struct SearchRequestMeasurement {
     account_id: u32,
     call_id: String,
     claimed: AtomicBool,
-    totals: [StageTotal; SearchStage::ALL.len()],
+    started: Instant,
+    totals: [Mutex<StageTotal>; SearchStage::ALL.len()],
     admission: OnceLock<SearchAdmission>,
 }
 
@@ -1604,6 +1788,7 @@ impl SearchRequestObservation {
             account_id,
             call_id: format!("search-cold-{serial}"),
             claimed: AtomicBool::new(false),
+            started: Instant::now(),
             totals: Default::default(),
             admission: OnceLock::new(),
         });
@@ -1626,19 +1811,44 @@ impl SearchRequestObservation {
 
     pub fn count(&self, stage: SearchStage) -> u64 {
         self.measurement.totals[stage as usize]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
             .count
-            .load(Ordering::Relaxed)
     }
 
     pub fn timings(&self) -> impl Iterator<Item = (SearchStage, u64, Duration)> + '_ {
         SearchStage::ALL.into_iter().map(|stage| {
-            let total = &self.measurement.totals[stage as usize];
-            (
-                stage,
-                self.count(stage),
-                Duration::from_nanos(total.nanos.load(Ordering::Relaxed)),
-            )
+            let total = self.measurement.totals[stage as usize]
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (stage, total.count, total.elapsed)
         })
+    }
+
+    pub fn progress(&self, stage: SearchStage) -> SearchStageProgress {
+        let total = self.measurement.totals[stage as usize]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Sample after locking so a newly started span cannot be newer than now.
+        let now = self.measurement.started.elapsed().as_nanos();
+        let in_flight = total.started - total.completed - total.partial;
+        let active_nanos = now * u128::from(in_flight) - total.active_started_nanos;
+        let in_flight_elapsed = Duration::from_nanos(active_nanos.min(u64::MAX as u128) as u64);
+        SearchStageProgress {
+            count: total.count,
+            started: total.started,
+            completed: total.completed,
+            partial: total.partial,
+            in_flight,
+            elapsed: total.elapsed + in_flight_elapsed,
+            in_flight_elapsed,
+        }
+    }
+
+    pub fn progress_stages(&self) -> impl Iterator<Item = (SearchStage, SearchStageProgress)> + '_ {
+        SearchStage::ALL
+            .into_iter()
+            .map(|stage| (stage, self.progress(stage)))
     }
 
     pub fn admission(&self) -> Option<&SearchAdmission> {
@@ -1709,26 +1919,52 @@ pub struct SearchSpan {
     measurement: Arc<SearchRequestMeasurement>,
     stage: SearchStage,
     started: Instant,
+    complete: bool,
+}
+
+impl SearchSpan {
+    /// Mark a span whose operation returned (including a returned error). A bare
+    /// drop remains partial because cancellation and normal scope exit cannot be
+    /// distinguished by Drop alone.
+    pub fn finish(mut self) {
+        self.complete = true;
+    }
 }
 
 impl Drop for SearchSpan {
     fn drop(&mut self) {
-        let nanos = self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        self.measurement.totals[self.stage as usize]
-            .nanos
-            .fetch_add(nanos, Ordering::Relaxed);
+        let mut total = self.measurement.totals[self.stage as usize]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        total.elapsed += self.started.elapsed();
+        total.active_started_nanos -= self
+            .started
+            .duration_since(self.measurement.started)
+            .as_nanos();
+        if self.complete {
+            total.completed += 1;
+        } else {
+            total.partial += 1;
+        }
     }
 }
 
 pub fn search_span(account_id: u32, stage: SearchStage) -> Option<SearchSpan> {
     let measurement = search_measurement(account_id)?;
-    measurement.totals[stage as usize]
-        .count
-        .fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    {
+        let mut total = measurement.totals[stage as usize]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        total.count += 1;
+        total.started += 1;
+        total.active_started_nanos += started.duration_since(measurement.started).as_nanos();
+    }
     Some(SearchSpan {
         measurement,
         stage,
-        started: Instant::now(),
+        started,
+        complete: false,
     })
 }
 
@@ -1737,15 +1973,20 @@ pub async fn observe_search_wait<F: std::future::Future>(
     stage: SearchStage,
     future: F,
 ) -> F::Output {
-    let _span = search_span(account_id, stage);
-    future.await
+    let span = search_span(account_id, stage);
+    let result = future.await;
+    if let Some(span) = span {
+        span.finish();
+    }
+    result
 }
 
 pub fn note_search_count(account_id: u32, stage: SearchStage) {
     if let Some(measurement) = search_measurement(account_id) {
         measurement.totals[stage as usize]
-            .count
-            .fetch_add(1, Ordering::Relaxed);
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .count += 1;
     }
 }
 

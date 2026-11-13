@@ -12,6 +12,8 @@ use crate::{
     changes::state::{JmapCacheState, MetadataStateManager},
     email::trusted_email_id,
 };
+#[cfg(feature = "test_mode")]
+use common::za::test_hooks::{SearchStage, observe_search_wait};
 use common::{
     Server,
     auth::AccessToken,
@@ -184,11 +186,16 @@ impl EmailGet for Server {
             .await?;
         let keys = self.za_mail_keys(access_token, account_id).await?;
         let snapshot = match &keys {
-            Some(keys) => Some(
-                self.za_snapshot(account_id, keys)
-                    .await
-                    .map_err(|reason| za_no_map_error(reason, account_id))?,
-            ),
+            Some(keys) => {
+                let snapshot = self.za_snapshot(account_id, keys);
+                #[cfg(feature = "test_mode")]
+                let snapshot = observe_search_wait(account_id, SearchStage::GetSnapshot, snapshot);
+                Some(
+                    snapshot
+                        .await
+                        .map_err(|reason| za_no_map_error(reason, account_id))?,
+                )
+            }
             None => None,
         };
         let cache = match &snapshot {
@@ -309,9 +316,10 @@ impl EmailGet for Server {
             }
 
             loop {
-                self.read_metadata_batch(account_id, form, &mut batch)
-                    .await
-                    .caused_by(trc::location!())?;
+                let read = self.read_metadata_batch(account_id, form, &mut batch);
+                #[cfg(feature = "test_mode")]
+                let read = observe_search_wait(account_id, SearchStage::GetMetadataBatch, read);
+                read.await.caused_by(trc::location!())?;
 
                 for &id in chunk {
                     let Some(data) = lookup(id).filter(|data| access.allows(*data)) else {
@@ -340,15 +348,16 @@ impl EmailGet for Server {
                     // unreadable message is not found.
                     let opened = match (keys.as_deref(), metadata) {
                         (Some(keys), Some(MetadataValue::Row(row))) if needs_content => {
-                            match za_readable(
-                                self.za_open_metadata_row(
-                                    row,
-                                    Some(keys),
-                                    account_id,
-                                    id.document_id(),
-                                )
-                                .await,
-                            )? {
+                            let open = self.za_open_metadata_row(
+                                row,
+                                Some(keys),
+                                account_id,
+                                id.document_id(),
+                            );
+                            #[cfg(feature = "test_mode")]
+                            let open =
+                                observe_search_wait(account_id, SearchStage::GetMetadataOpen, open);
+                            match za_readable(open.await)? {
                                 Some(opened) => opened.map(MetadataValue::Row),
                                 None => {
                                     response.push_not_found(id);
