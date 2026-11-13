@@ -28,7 +28,8 @@ from the keys or verify that an explicit ID matches. Do not cache payloads.
 Emit fixed-label setup phases, completed-pair counts, batch counts, elapsed time,
 and a ten-second heartbeat while an await remains pending. Observe one pinned
 future without cancellation/restart, new timeouts, background tasks, or store
-queries for logging. Completion must return immediately. Do not log credentials,
+queries for logging. Return a ready work result in the same poll; ordinary scheduler
+cooperation still applies. Do not log credentials,
 keys, raw MIME, headers, Message-IDs, account names, or content-derived hashes.
 Keep output bounded to phase/batch transitions and one active heartbeat.
 

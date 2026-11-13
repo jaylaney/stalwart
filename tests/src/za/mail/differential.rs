@@ -200,7 +200,11 @@ async fn check_setup_observer() {
         panic!("ready work must not wait for a heartbeat")
     });
     tokio::pin!(ready);
-    assert_eq!(futures::poll!(&mut ready), Poll::Ready(7));
+    // Probe the observer independently of Tokio select!/channel cooperative yielding.
+    assert_eq!(
+        futures::poll!(tokio::task::unconstrained(&mut ready)),
+        Poll::Ready(7)
+    );
 
     let started = Cell::new(0);
     let dropped = Cell::new(0);
@@ -219,7 +223,7 @@ async fn check_setup_observer() {
             heartbeat_seen.send(()).unwrap();
         },
     ));
-    assert!(futures::poll!(&mut pending).is_pending());
+    assert!(futures::poll!(tokio::task::unconstrained(&mut pending)).is_pending());
     // Wait for an actual heartbeat rather than assuming a short sleep ran it.
     tokio::select! {
         result = &mut pending => panic!("pending work completed before release: {result}"),
@@ -228,7 +232,10 @@ async fn check_setup_observer() {
     assert_eq!((started.get(), dropped.get()), (1, 0));
     let before_completion = heartbeats.get();
     complete.send(19).unwrap();
-    assert_eq!(futures::poll!(&mut pending), Poll::Ready(19));
+    assert_eq!(
+        futures::poll!(tokio::task::unconstrained(&mut pending)),
+        Poll::Ready(19)
+    );
     assert_eq!(heartbeats.get(), before_completion);
     assert_eq!((started.get(), dropped.get()), (1, 1));
     drop(pending);
@@ -243,7 +250,7 @@ async fn check_setup_observer() {
         Duration::from_secs(3600),
         || panic!("cancelled work must not retain its observer"),
     ));
-    assert!(futures::poll!(&mut cancelled).is_pending());
+    assert!(futures::poll!(tokio::task::unconstrained(&mut cancelled)).is_pending());
     drop(cancelled);
     assert_eq!(dropped.get(), 1);
     assert!(sender.send(()).is_err());
