@@ -11,6 +11,7 @@ use crate::{
         imap::{ImapConnection, Type as ImapReplyType},
         pop3::{Pop3Connection, ResponseType as Pop3Reply},
         server::TestServer,
+        storage::wait_for_tasks_with_poll_interval,
     },
     za::tracing::{WsStream, ws_call},
 };
@@ -1349,10 +1350,22 @@ pub async fn wait_for_delivery(test: &TestServer) {
     test.wait_for_tasks().await;
 }
 
+/// The same task/SMTP/task barrier, using one explicit cadence for all three polls.
+pub async fn wait_for_delivery_with_poll_interval(test: &TestServer, poll_interval: Duration) {
+    wait_for_tasks_with_poll_interval(&test.server, false, false, poll_interval).await;
+    wait_for_queue_with_poll_interval(test, poll_interval).await;
+    // Ingest can queue index tasks of its own.
+    wait_for_tasks_with_poll_interval(&test.server, false, false, poll_interval).await;
+}
+
 /// Waits until the SMTP queue is empty, without waiting for tasks: the
 /// iMIP modules read outbound mail at the sink once its delivery is done.
 /// Panics after ten seconds, naming what is still queued.
 pub async fn wait_for_queue(test: &TestServer) {
+    wait_for_queue_with_poll_interval(test, Duration::from_millis(100)).await;
+}
+
+async fn wait_for_queue_with_poll_interval(test: &TestServer, poll_interval: Duration) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let queued = queued_recipients(test).await;
@@ -1363,7 +1376,7 @@ pub async fn wait_for_queue(test: &TestServer) {
             std::time::Instant::now() < deadline,
             "mail still queued for {queued:?}"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
