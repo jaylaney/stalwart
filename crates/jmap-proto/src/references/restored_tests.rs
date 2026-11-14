@@ -860,3 +860,147 @@ fn eval_depth_limit_substitutes_element_at_max_depth() {
         .unwrap();
     assert_eq!(resolved, &Value::Element(MailboxValue::Id(Id::new(99))));
 }
+
+#[test]
+fn trusted_email_references_are_per_occurrence_and_follow_binding_replacement() {
+    use crate::method::{get::GetRequest, set::SetResponse};
+    use crate::object::email::Email;
+    use crate::object::mailbox::Mailbox;
+    let id = Id::from_parts(3, 42);
+    let mut response = Response::new(0, AHashMap::from_iter([("client".into(), id.into())]), 0);
+    let mut created = SetResponse::<Email>::from_request(&Default::default(), 0).unwrap();
+    created.account_id = Some(Id::new(7));
+    created.created("server".into(), id);
+    created.update_created_ids(&mut response);
+    response.trust_email_creations(&created);
+
+    let resolve = |response: &Response<'_>| {
+        let mut request = RequestMethod::Get(GetRequestMethod::Email(Box::new(
+            serde_json::from_str::<GetRequest<Email>>(
+                &serde_json::json!({
+                    "accountId": Id::new(7).to_string(),
+                    "ids": ["invalid-id!", "#server", id.to_string(), "#client"]
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        )));
+        response.resolve_references(&mut request).unwrap();
+        let RequestMethod::Get(GetRequestMethod::Email(request)) = request else {
+            panic!()
+        };
+        request
+    };
+    let request = resolve(&response);
+    assert_eq!(request.arguments.trusted_ids.len(), 1);
+    let target = request.arguments.trusted_ids.get(&1).unwrap();
+    assert_eq!(target.account_id(), 7);
+    assert_eq!(target.document_id(), 42);
+    // A non-Email object replaces the same label with the same numeric ID.
+    // Numeric equality must not preserve the earlier type provenance.
+    let mut mailbox = SetResponse::<Mailbox>::from_request(&Default::default(), 0).unwrap();
+    mailbox.created("server".into(), id);
+    mailbox.update_created_ids(&mut response);
+    assert!(resolve(&response).arguments.trusted_ids.is_empty());
+    // A later successful Email creation can replace that binding again.
+    created.account_id = Some(Id::new(8));
+    created.update_created_ids(&mut response);
+    response.trust_email_creations(&created);
+    assert_eq!(
+        resolve(&response)
+            .arguments
+            .trusted_ids
+            .get(&1)
+            .unwrap()
+            .account_id(),
+        8
+    );
+}
+
+#[test]
+fn submission_trust_follows_create_name_and_does_not_cover_equal_literals() {
+    use crate::method::set::SetResponse;
+    use crate::object::email::Email;
+    let id = Id::from_parts(3, 42);
+    let mut response = Response::new(0, AHashMap::from_iter([("client".into(), id.into())]), 0);
+    let mut created = SetResponse::<Email>::from_request(&Default::default(), 0).unwrap();
+    created.account_id = Some(Id::new(7));
+    created.created("server".into(), id);
+    created.update_created_ids(&mut response);
+    response.trust_email_creations(&created);
+    let json = serde_json::json!({"using": ["urn:ietf:params:jmap:submission"], "methodCalls": [
+        ["EmailSubmission/set", {"accountId": Id::new(7).to_string(), "create": {
+            "trusted": {"emailId": "#server", "identityId": "#later"},
+            "literal": {"emailId": id.to_string()},
+            "incoming": {"emailId": "#client"},
+            "later": {"emailId": id.to_string()}
+        }}, "s"]
+    ]});
+    let json = json.to_string();
+    let mut request = Request::parse(json.as_bytes(), 16, usize::MAX).unwrap();
+    let method = &mut request.method_calls[0].method;
+    response.resolve_references(method).unwrap();
+    let RequestMethod::Set(SetRequestMethod::EmailSubmission(request)) = method else {
+        panic!()
+    };
+    assert_eq!(request.arguments.trusted_email_ids.len(), 1);
+    assert!(request.arguments.trusted_email_ids.contains_key("trusted"));
+    assert_ne!(
+        request.create.as_ref().unwrap().iter().next().unwrap().0,
+        "trusted"
+    );
+}
+
+#[test]
+fn duplicate_submission_properties_do_not_share_reference_trust() {
+    use crate::{method::set::SetResponse, object::email::Email};
+    let id = Id::from_parts(3, 42);
+    let mut response = Response::new(0, AHashMap::new(), 0);
+    let mut created = SetResponse::<Email>::from_request(&Default::default(), 0).unwrap();
+    created.account_id = Some(Id::new(7));
+    created.created("server".into(), id);
+    created.update_created_ids(&mut response);
+    response.trust_email_creations(&created);
+    // Value's object vector retains duplicate property occurrences.
+    let json = format!(
+        r##"{{"using":["urn:ietf:params:jmap:submission"],"methodCalls":[
+        ["EmailSubmission/set",{{"accountId":"{}","create":{{
+            "s":{{"emailId":"#server","emailId":"{}"}}
+        }}}},"s"]]}}"##,
+        Id::new(7),
+        id
+    );
+    let mut request = Request::parse(json.as_bytes(), 16, usize::MAX).unwrap();
+    response
+        .resolve_references(&mut request.method_calls[0].method)
+        .unwrap();
+    let RequestMethod::Set(SetRequestMethod::EmailSubmission(request)) =
+        &request.method_calls[0].method
+    else {
+        panic!()
+    };
+    let trusted = request.arguments.trusted_email_ids.get("s").unwrap();
+    assert_eq!(trusted.len(), 1);
+    assert!(trusted.contains_key(&0));
+    assert!(!trusted.contains_key(&1));
+}
+
+#[test]
+fn untrusted_wire_arguments_cannot_mint_email_target_provenance() {
+    use crate::method::{get::GetRequest, set::SetRequest};
+    use crate::object::{email::Email, email_submission::EmailSubmission};
+    let forged = serde_json::json!({
+        "trusted_ids": {"0": {"account_id": 1, "document_id": 2}},
+        "trusted_email_ids": {"s": {"0": {"account_id": 1, "document_id": 2}}},
+        "trusted_updates": [{"account_id": 1, "document_id": 2}],
+        "trusted_destroy": [{"account_id": 1, "document_id": 2}]
+    });
+    let get: GetRequest<Email> = serde_json::from_str(&forged.to_string()).unwrap();
+    assert!(get.arguments.trusted_ids.is_empty());
+    let json = forged.to_string();
+    let set: SetRequest<Email> = serde_json::from_str(&json).unwrap();
+    assert!(set.arguments.trusted_updates.is_empty());
+    assert!(set.arguments.trusted_destroy.is_empty());
+    let submission: SetRequest<EmailSubmission> = serde_json::from_str(&json).unwrap();
+    assert!(submission.arguments.trusted_email_ids.is_empty());
+}

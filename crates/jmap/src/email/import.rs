@@ -5,12 +5,15 @@
  */
 
 use crate::{
-    api::metadata::{MetadataType, ObjectMetadata},
+    api::{
+        metadata::{MetadataType, ObjectMetadata},
+        request::PostWriteCall,
+    },
     blob::download::BlobDownload,
     changes::state::JmapCacheState,
     email::{
         grouped::{GroupedIngest, QueuedEmail},
-        ingested_into_object, invalid_keywords,
+        ingested_into_object, invalid_keywords, map_created_ids,
     },
 };
 use common::storage::blob::FetchedBlob;
@@ -20,6 +23,7 @@ use common::{
     ipc::{EmailPush, PushNotification},
     za::mail::za_keyless_refusal,
 };
+use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
 use email::{
     cache::{MessageCacheFetch, mailbox::MailboxCacheAccess},
     mailbox::JUNK_ID,
@@ -48,6 +52,7 @@ pub trait EmailImport: Sync + Send {
         access_token: &AccessToken,
         session: &HttpSessionData,
         using: CapabilityIds,
+        post_write: Option<&mut PostWriteCall<'_>>,
     ) -> impl Future<Output = trc::Result<ImportEmailResponse>> + Send;
 }
 
@@ -58,6 +63,7 @@ impl EmailImport for Server {
         access_token: &AccessToken,
         session: &HttpSessionData,
         using: CapabilityIds,
+        mut post_write: Option<&mut PostWriteCall<'_>>,
     ) -> trc::Result<ImportEmailResponse> {
         // Validate state
         let account_id = request.account_id.document_id();
@@ -238,6 +244,7 @@ impl EmailImport for Server {
                     &mut last_change_id,
                     &mut delivered,
                     account_id,
+                    post_write.as_deref_mut(),
                 )
                 .await
             {
@@ -268,6 +275,7 @@ impl EmailImport for Server {
                 &mut last_change_id,
                 &mut delivered,
                 account_id,
+                post_write.as_deref_mut(),
             ) {
                 recheck.finish(self, session.session_id).await;
                 return Err(err);
@@ -282,10 +290,14 @@ impl EmailImport for Server {
             &mut last_change_id,
             &mut delivered,
             account_id,
+            post_write.as_deref_mut(),
         )
         .await;
         recheck.finish(self, session.session_id).await;
         flushed?;
+        if let Some(post_write) = post_write {
+            post_write.attempt(self).await;
+        }
 
         // Update state
         if let Some(change_id) = last_change_id {
@@ -297,7 +309,16 @@ impl EmailImport for Server {
                 }))
                 .await;
             }
+        }
 
+        if let Some(keys) = access_token.za_keys_for(account_id) {
+            let snapshot = self
+                .za_response_snapshot(account_id, keys, last_change_id)
+                .await
+                .map_err(|reason| za_no_map_error(reason, account_id))?;
+            map_created_ids(&snapshot, response.created.values_mut());
+            response.new_state = snapshot.cache.get_state(false);
+        } else if let Some(change_id) = last_change_id {
             response.new_state = metadata
                 .viewer_change_id(self, account_id)
                 .await?
@@ -308,6 +329,7 @@ impl EmailImport for Server {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush(
     server: &Server,
     grouped: &mut GroupedIngest<'_, FetchedBlob>,
@@ -316,6 +338,7 @@ async fn flush(
     last_change_id: &mut Option<u64>,
     delivered: &mut Vec<u32>,
     account_id: u32,
+    post_write: Option<&mut PostWriteCall<'_>>,
 ) -> trc::Result<()> {
     grouped.flush(server).await?;
     record(
@@ -325,6 +348,7 @@ async fn flush(
         last_change_id,
         delivered,
         account_id,
+        post_write,
     )
 }
 
@@ -335,7 +359,11 @@ fn record(
     last_change_id: &mut Option<u64>,
     delivered: &mut Vec<u32>,
     account_id: u32,
+    post_write: Option<&mut PostWriteCall<'_>>,
 ) -> trc::Result<()> {
+    if let Some(post_write) = post_write {
+        post_write.acknowledge(&grouped.results);
+    }
     for (id, result) in grouped.results.drain(..) {
         match result {
             Ok(mut email) => {

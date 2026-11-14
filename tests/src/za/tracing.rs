@@ -559,7 +559,7 @@ async fn jmap_upload(user: &str, secret: &str, account_id: &str, canary: &str) {
 }
 
 /// Write one masked client frame (RFC 6455 section 5.2).
-async fn ws_send(stream: &mut (impl AsyncWriteExt + Unpin), opcode: u8, payload: &[u8]) {
+pub(super) async fn ws_send(stream: &mut (impl AsyncWriteExt + Unpin), opcode: u8, payload: &[u8]) {
     let mask = [0x5a, 0x17, 0xc3, 0x8e];
     let mut frame = vec![0x80 | opcode];
     match payload.len() {
@@ -581,7 +581,7 @@ async fn ws_send(stream: &mut (impl AsyncWriteExt + Unpin), opcode: u8, payload:
 
 /// Read one unmasked server frame: its opcode and payload, or `None` once
 /// the server has hung up.
-async fn ws_recv(stream: &mut (impl AsyncReadExt + Unpin)) -> Option<(u8, Vec<u8>)> {
+pub(super) async fn ws_recv(stream: &mut (impl AsyncReadExt + Unpin)) -> Option<(u8, Vec<u8>)> {
     let mut head = [0u8; 2];
     stream.read_exact(&mut head).await.ok()?;
     let len = match head[1] & 0x7f {
@@ -594,7 +594,7 @@ async fn ws_recv(stream: &mut (impl AsyncReadExt + Unpin)) -> Option<(u8, Vec<u8
     Some((head[0] & 0x0f, payload))
 }
 
-pub(super) type WsStream = BufReader<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+pub(crate) type WsStream = BufReader<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
 
 /// Open a JMAP WebSocket with Basic credentials.
 pub(super) async fn ws_connect(user: &str, secret: &str) -> WsStream {
@@ -639,7 +639,7 @@ pub(super) async fn ws_connect(user: &str, secret: &str) -> WsStream {
 
 /// Send `message` as one text frame and return the server's text reply,
 /// answering pings meanwhile.
-pub(super) async fn ws_call(stream: &mut WsStream, message: &str) -> String {
+pub(crate) async fn ws_call(stream: &mut WsStream, message: &str) -> String {
     ws_send(stream, 0x1, message.as_bytes()).await;
     let reply = loop {
         match ws_recv(stream)

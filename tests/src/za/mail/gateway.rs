@@ -313,7 +313,7 @@ async fn harvest_loses_to_provisioning(test: &mut TestServer, admin: &Account) {
     .await;
     let mut record = VaultRecord::pending(vec![3; 32], now() as i64 + 3600);
     test.server
-        .za_vault_commit(account_id, &mut record, None, None)
+        .za_vault_commit(account_id, &mut record, None, None, None)
         .await
         .unwrap();
     parked.finish().await;

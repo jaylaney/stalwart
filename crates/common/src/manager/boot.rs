@@ -208,6 +208,35 @@ impl BootManager {
                         za_keys.max_entries
                     ),
                 );
+                let za_search = cache.za_search.config();
+                trc::event!(
+                    Server(trc::ServerEvent::Startup),
+                    Details = "Zero-access search",
+                    Value = format!(
+                        concat!(
+                            "ZA_SEARCH_MEM_MB={} ZA_SEARCH_THREAD_MEM_MB={} ",
+                            "ZA_SEARCH_ACCOUNT_MAX_MB={} ZA_SEARCH_IDLE_SECS={} ",
+                            "ZA_SEARCH_PASS_CAP={} ZA_SEARCH_PASS_MB={} ",
+                            "ZA_SEARCH_PASS_HIDDEN_KB={} ZA_SEARCH_PASS_MS={} ",
+                            "ZA_SEARCH_WAIT_SECS={} ZA_SEARCH_SEGMENTS={} ",
+                            "ZA_SEARCH_CHECKPOINT={} ",
+                            "ZA_SEARCH_ABSENT_RETRY_SECS={} ZA_SEARCH_PAD_MIN={}",
+                        ),
+                        za_search.mem_mb,
+                        za_search.thread_mem_mb,
+                        za_search.account_max_mb,
+                        za_search.idle_secs,
+                        za_search.pass_cap,
+                        za_search.pass_mb,
+                        za_search.pass_hidden_kb,
+                        za_search.pass_ms,
+                        za_search.wait_secs,
+                        za_search.segments,
+                        za_search.checkpoint,
+                        za_search.absent_retry_secs,
+                        za_search.pad_min,
+                    ),
+                );
                 #[cfg(feature = "test_mode")]
                 trc::event!(
                     Registry(trc::RegistryEvent::BuildWarning),

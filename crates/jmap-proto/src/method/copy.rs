@@ -203,7 +203,7 @@ impl<T: JmapObject> CopyResponse<T> {
                 && let Some(Value::Element(id)) = obj.get(&Key::Property(T::ID_PROPERTY))
                 && let Some(id) = id.as_any_id()
             {
-                response.created_ids.insert(create_id.clone(), id);
+                response.push_created_id(create_id.clone(), id);
             }
         }
     }

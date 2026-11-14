@@ -40,10 +40,10 @@ use crate::utils::{
     smtp::SmtpConnection,
     webdav::DummyWebDavClient,
     za::{
-        HookParked, delete_event_records, hold_index_partition, partition_status, plant_event,
-        plant_plain_message, queue_entries, release_index_partition, search_keys,
-        unindex_search_account, unindex_search_documents, wait_for_delivery, wait_for_index_queue,
-        za_post_as, za_setup, za_setup_token,
+        HookParked, delete_event_records, hold_index_partition, manifest_bytes, partition_status,
+        plant_event, plant_plain_message, principal_blob_links, queue_entries,
+        release_index_partition, search_keys, unindex_search_account, unindex_search_documents,
+        wait_for_delivery, wait_for_index_queue, za_post_as, za_setup, za_setup_token,
     },
 };
 use common::za::test_hooks::{self, ForceCommitSplit};
@@ -455,6 +455,8 @@ pub async fn test_reindex(test: &mut TestServer) {
     }
     assert_visible_fields_only(test, key_id, "delivered").await;
     assert_indexes_tokens(test, plain_id, "delivered").await;
+    assert!(manifest_bytes(test, plain_id).await.is_none());
+    assert!(principal_blob_links(test, plain_id).await.is_empty());
 
     for (account, account_id) in [(&key, key_id), (&plain, plain_id)] {
         unindex_search_account(test, SearchIndex::Email, account_id).await;
@@ -475,6 +477,8 @@ pub async fn test_reindex(test: &mut TestServer) {
     test.wait_for_tasks().await;
     assert_visible_fields_only(test, key_id, "reindexed").await;
     assert_indexes_tokens(test, plain_id, "reindexed").await;
+    assert!(manifest_bytes(test, plain_id).await.is_none());
+    assert!(principal_blob_links(test, plain_id).await.is_empty());
 
     // The visible fields still answer: the arrival time and the size sort
     // the key account's messages, from the message cache. Each order is
@@ -668,6 +672,27 @@ pub async fn test_blob_recode_keeps_sealed(test: &mut TestServer) {
         hashes.push((hash, decoded));
     }
 
+    // Publish a keyed Principal index before the existing codec sweeps.
+    let reply = key
+        .jmap_method_call(
+            "Email/get",
+            json!({"accountId": key.id_string(), "properties": ["id"]}),
+        )
+        .await;
+    assert_eq!(reply.list().len(), 1, "{reply:?}");
+    let (principal_hash, _) = principal_blob_links(test, key_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("keyed request published a Principal index blob");
+    let decoded = test
+        .server
+        .get_blob(principal_hash.as_slice(), 0..usize::MAX)
+        .await
+        .unwrap()
+        .unwrap();
+    hashes.push((principal_hash, decoded));
+
     let codec_key = create_blob_codec_key(&admin).await;
     admin.reload_settings().await;
     test.reload_core();
@@ -686,6 +711,13 @@ pub async fn test_blob_recode_keeps_sealed(test: &mut TestServer) {
             .await
             .unwrap()
             .unwrap();
+        if index == 2 {
+            assert_eq!(
+                BlobFormat::of(&encoded).unwrap().key_id,
+                Some(codec_key.document_id()),
+                "the Principal index blob missed the codec sweep"
+            );
+        }
         assert_ne!(
             encoded.last().unwrap() & 0x10,
             0,

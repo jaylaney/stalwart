@@ -70,7 +70,7 @@ struct Queue {
     heap: BinaryHeap<Action>,
 }
 
-/// Zero-access key cache sweep interval. Spec 5 requires a sweep at least
+/// Zero-access key and search cache sweep interval. Spec 5 requires a key sweep at least
 /// every 60 seconds; half that leaves room for wake-up latency and for the
 /// inline awaits of other events drained in the same pass.
 const ZA_KEY_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -153,7 +153,7 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
             // Calculate expensive metrics
             queue.schedule(Instant::now(), Event::CalculateMetrics);
 
-            // Zero-access key cache sweep (process-local, every node)
+            // Zero-access key and search cache sweep (process-local, every node)
             queue.schedule(Instant::now() + ZA_KEY_SWEEP_INTERVAL, Event::ZaKeySweep);
 
             // SPDX-SnippetBegin
@@ -266,6 +266,7 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                     Event::ZaKeySweep => {
                         queue.schedule(Instant::now() + ZA_KEY_SWEEP_INTERVAL, Event::ZaKeySweep);
                         server.inner.cache.za_sweep_keys(Instant::now());
+                        server.inner.cache.za_search.sweep_idle();
                     }
                     Event::RenewNodeIdLease => {
                         queue.schedule(

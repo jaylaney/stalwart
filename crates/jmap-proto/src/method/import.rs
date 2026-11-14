@@ -141,7 +141,7 @@ impl ImportEmailResponse {
                 && let Some(Value::Element(EmailValue::Id(id))) =
                     obj.get(&Key::Property(EmailProperty::Id))
             {
-                response.created_ids.insert(user_id.clone(), AnyId::Id(*id));
+                response.push_created_id(user_id.clone(), AnyId::Id(*id));
             }
         }
     }

@@ -36,6 +36,153 @@ provenance, and the release checklist. Record fork release changes in the
 - Key cache: unlocked keys are held per node in process memory only, never shared across a cluster or written to disk. Each node applies `ZA_KEY_IDLE_SECS` (sliding idle timeout, 900), `ZA_KEY_MAX_AGE_SECS` (hard cap from login, 3600) and `ZA_KEY_MAX_ENTRIES` (LRU bound, 10000), swept every 30 seconds; a node logs the effective values at startup. `SessionKeys` are attached by the HTTP layer for one request, and by the IMAP and POP3 login handlers for the life of the authenticated connection (mail spec 3.3; mail logins do not use the key cache: each derives afresh and the keys live in the connection's own state); WebSocket, EventSource, ManageSieve and SMTP sessions never hold them.
 - Test builds (`test_mode` feature) use weakened Argon2 parameters for new passwords and log a warning at startup; never deploy them.
 
+## Searching key accounts
+
+Release 7 builds a per-account search and thread index inside requests holding
+that account's keys. The server derives the search key from the account's master
+key and seals the index into blobs linked to the principal document. Field 152
+on the principal holds the clear, keyed-tagged manifest. Each server process
+loads the index into memory while the account is in use.
+
+The server reads these environment variables at startup and logs the effective
+configuration. Unset, malformed and zero values use the defaults. The memory
+and account sizing defaults remain provisional after the unoptimized system
+benchmarks on `f4eb2ecc` and `4dde13ade`. The final-head post-H7 wire query
+served and internal model coverage was verified for all 30,000 delivered
+IDs. Its cold query refused and its linked repeat was skipped. The
+final-head format repeat measured all 15,000 default messages and retained
+the existing positions and compression decisions. The later
+[cold-start qualification](superpowers/plans/2026-11-10-zero-access-search-cold-start-outcome.md)
+records a successful optimized Rust cache-eviction pair at 30,000 messages
+and the subsequent teardown panic. The separate optimized OSS run passed
+the 30,000-message process-restart gate with matching public censuses.
+Those qualification runs retained all fourteen original settings. The PR 84
+correction removes the transient skip threshold; the sizing defaults stay unchanged.
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `ZA_SEARCH_MEM_MB` | 1536 MiB | Per-process budget for loaded content parts and their transient allocations. |
+| `ZA_SEARCH_THREAD_MEM_MB` | 256 MiB | Separate soft per-process budget for thread parts and their transient allocations. |
+| `ZA_SEARCH_ACCOUNT_MAX_MB` | 512 MiB | Per-account cap for the sealed content chain. Applies to loads and extensions. |
+| `ZA_SEARCH_IDLE_SECS` | 900 s | Idle time after which a loaded index can be evicted. |
+| `ZA_SEARCH_PASS_CAP` | 48 items | Admitted-item limit checked at the next insert boundary. |
+| `ZA_SEARCH_PASS_MB` | 32 MiB | Opened message bytes limit checked at the next insert boundary. |
+| `ZA_SEARCH_PASS_HIDDEN_KB` | 32 KiB | Reserved hidden thread bytes limit checked at the next insert boundary. |
+| `ZA_SEARCH_PASS_MS` | 2000 ms | Elapsed-time limit checked at the next insert boundary. |
+| `ZA_SEARCH_WAIT_SECS` | 30 s | How long a content request keeps completing passes before refusing. |
+| `ZA_SEARCH_SEGMENTS` | 16 | Thread-blob and content-chain compaction threshold, also the tiered content merge fan-in. |
+| `ZA_SEARCH_CHECKPOINT` | 1000 records | Update-only records that trigger a manifest-only checkpoint. |
+| `ZA_SEARCH_ABSENT_RETRY_SECS` | 10 s | Retry window for an absent message or index blob before absence is treated as loss. |
+| `ZA_SEARCH_PAD_MIN` | 65536 bytes | Exact publishing target for the hidden thread section and minimum thread compaction padding class. |
+
+An owned pass finishes its compaction and transaction before the content wait
+deadline is checked again. Request latency can therefore exceed both the pass
+admission interval and the content wait duration.
+
+`K = 16` is a format constant. A change requires a format bump and rebuild.
+The startup refusals below use the encoded record bound `R = 304` bytes and
+alias length `a = 15` bytes. The server prints the actual values in place of
+the placeholders.
+
+```text
+ZA_SEARCH_PAD_MIN={value} is below {min_pad} = ZA_SEARCH_PASS_HIDDEN_KB·1024 + R + (K − 1)·a + 4; refusing to start
+ZA_SEARCH_PASS_CAP={value} is above {max_pass_cap} = floor(ZA_SEARCH_PASS_HIDDEN_KB·1024 / (R + (K − 1)·a)); refusing to start
+ZA_SEARCH_ACCOUNT_MAX_MB={value} is above {max_account_mb} = floor(ZA_SEARCH_MEM_MB / 3); refusing to start
+ZA_SEARCH_SEGMENTS={value} is outside 2..=255; refusing to start
+```
+
+Size the per-process content and thread budgets separately. Content requests
+can be refused when content will not fit. A thread load evicts eligible
+idle parts and may exceed its soft budget, with a trace for the overrun.
+Set the same `ZA_SEARCH_ACCOUNT_MAX_MB` on every node of a cluster. The
+suspended flag lives in the shared manifest, so nodes with different caps can
+undo each other's suspension and repeatedly rewrite the manifest on requests.
+
+The fixed `ZA_SEARCH_*` trace details identify passes, rebuilds, suspension,
+refusal, eviction and errors using account or document ids, counts, sizes,
+versions and reason classes. A content request that cannot obtain a current
+content part returns
+`Search for this account is not available right now; try again shortly.`
+
+Loads are single-flight per account and part. Map refresh
+reads the authenticated manifest and required Thread blobs. The Content
+flight prepares the optional model outside the shared index guard and
+publishes it only against the exact target. An optional Content failure
+can refuse the Content request while a validated Map remains available.
+
+A missing message blob within its retry
+window aborts the pass and keeps the document pending. The pass preserves
+the matching attempt count, using zero when there is no previous count.
+Non-absent transient failures also stay pending, regardless of the persisted
+attempt count. The old `ZA_SEARCH_SKIP_AFTER` environment variable is ignored.
+A persistent transport or configuration fault may hold Content freshness until
+it is repaired; recovery retries the pending message without a rebuild.
+Actual failed account passes, including required loads and writes, use a resident-entry
+cooldown of 1, 2, 4, 8, 16, then at most 30 seconds. Changing failing documents or
+operations does not reset that streak. Deferred callers share at most one authenticated
+manifest check per second; they perform no index-blob load, replay, message open or
+write merely to check for progress. A Content waiter can notice another node's progress
+before its local retry time, while retaining the original request deadline and normal
+current-view validation. Expiring a caller deadline during a loader wait adds no
+backend failure, abort trace or cooldown; an earlier actual failure is preserved.
+An acknowledged own-abort write preserves and rebinds that failed probe even when
+it also updates reconciliation-bound or suspension bookkeeping. Diagnostic-only
+updates do not reset the delay; explicit clearing or meaningful progress does.
+Failed observations do not establish a manifest
+generation or extend the probe deadline. Unchanged abort manifests are not committed
+again. Each failed probe emits one fixed-reason abort, with document ID and proposed
+diagnostic attempt count when a message open caused it. Raw infrastructure faults
+may add fixed backend and operation classes, never the error payload or its stored
+key/value context; secondary diagnostic-write errors do not duplicate the abort.
+Allowed compaction fallback emits a separate
+`ZA_SEARCH_COMPACTION_SKIPPED` event with reason `allowance`; a later failure
+still emits its one actual abort. No raw archive bytes or message content are logged.
+A proved `Archive access failed` error from stored archive validation is parse loss;
+unknown errors and missing codec keys remain transient. The healthy prefix and later
+index bookkeeping wait for repair and are replayed only at permitted probes. This can
+leave newly created/imported messages with singleton returned IDs until a successful
+publication joins them to another thread; earlier responses retain their original IDs
+and ordinary stale-ID rules still apply. Mutation requests themselves remain committed.
+The bound is per node/resident entry, so restart or eviction allows a fresh probe.
+Eviction can forget the first absence time and extend the effective window.
+The existing 30-second key-sweep event also sweeps idle search entries, without
+requiring another keyed request; active readers, loads and passes remain protected.
+
+A lost or corrupt thread index rebuilds on the next keyed request and publishes
+a new identity epoch. Clients with sync states that cross that boundary need to
+resync. Isolated content loss rebuilds content without changing thread identity.
+If a blob store incorrectly answered “not found,” repair it and then run the
+upstream per-account reindex task (`Task::AccountMaintenance`, type `Reindex`).
+For a key account, the task resets the search index through its destroying
+marker so the next keyed request can rebuild.
+
+Run the ignored benchmarks by name in separate processes. Each creates its own test server. The
+[plan 16 outcome note](superpowers/plans/2026-11-07-zero-access-plan16-outcome.md)
+records the benchmark figures and qualification status. The final matrix
+includes four carried rows, completed Phases A and B, and a warning-free
+shipping release build on the source-identical review-record head. The
+first full SMTP attempt exited 101. The permitted exact retry passed
+once, with the cause still unknown. Docker automation and directory
+verification await CI. Both final-head benchmarks completed, bringing the
+matrix to 39 of 41 main rows accounted for locally. Remaining mutation checks,
+native clients, the separate fresh-store gate, networked-store timing
+and physical multi-node verification remain pending.
+
+```sh
+STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::search_bench::format -- --exact --ignored --nocapture
+STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::search_bench::system -- --exact --ignored --nocapture
+```
+
+The thread, index, differential and search leak modules run inside
+`za::za_tests`. Run the integration suites one at a time.
+
+```sh
+STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests
+STORE=RocksDb BLOB_STORE=FileSystem RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests
+STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests imap::imap_tests
+STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests jmap::jmap_tests
+```
+
 ## Merging upstream
 
 The current integrated upstream base is Stalwart `v1.0.3`, commit

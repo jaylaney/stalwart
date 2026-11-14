@@ -9,7 +9,9 @@ use crate::{
     search::{MAX_STORED_DOCUMENT_SIZE, SearchField},
     write::{
         AnyKey, Dictionary, SearchIndex,
-        compress::{COMPRESS_WATERMARK_DICTIONARY, compress, decompress_into},
+        compress::{
+            COMPRESS_WATERMARK_DICTIONARY, compress, decompress_into, decompression_capacity,
+        },
     },
 };
 use utils::{
@@ -102,6 +104,11 @@ impl Writer {
         plain
     }
 
+    #[cfg(feature = "test_mode")]
+    pub(crate) fn into_raw_bytes(self) -> Vec<u8> {
+        self.buf
+    }
+
     pub fn push_leb128<T: Leb128>(&mut self, value: T) {
         self.buf.push_leb128(value);
     }
@@ -113,6 +120,15 @@ impl Writer {
     pub fn push_term(&mut self, term: &CheekyHash) {
         self.buf.push(term.len() as u8);
         self.buf.extend_from_slice(term.as_key());
+    }
+}
+
+pub(crate) fn document_scratch_size(stored: &[u8]) -> Option<usize> {
+    let (marker, payload) = stored.split_last()?;
+    match *marker {
+        DOCUMENT_PLAIN => Some(0),
+        DOCUMENT_ZSTD => decompression_capacity(payload, MAX_STORED_DOCUMENT_SIZE).ok(),
+        _ => None,
     }
 }
 

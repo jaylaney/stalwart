@@ -303,11 +303,15 @@ jobs:
     # so one failure does not hide the others; the job still fails. The test
     # and upstream-suites jobs do the same.
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # A default-mode retry exhausted the previous 2h budget before finishing.
+    # Allow both blob modes and later suites within a finite job limit; keep
+    # client deadlines, suite selection and retry counts unchanged.
+    timeout-minutes: 240
 
     env:
       STORE: RocksDb
       RUST_MIN_STACK: "16777216"
+      RUST_BACKTRACE: "1"
 
     steps:
       - name: Checkout

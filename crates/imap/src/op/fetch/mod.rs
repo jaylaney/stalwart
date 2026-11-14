@@ -17,6 +17,7 @@ use crate::{
     },
     spawn_op,
 };
+use ahash::AHashMap;
 use common::{
     MessageStoreCache,
     network::SessionStream,
@@ -24,6 +25,7 @@ use common::{
     za::ZA_MAIL_UNREADABLE,
 };
 use compact_str::{CompactString, format_compact};
+use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess},
     message::{
@@ -55,7 +57,11 @@ use types::{
 use za::ZaFetchedBlob;
 
 impl<T: SessionStream> Session<T> {
-    pub async fn handle_fetch(&mut self, requests: Vec<Request<Command>>) -> trc::Result<()> {
+    pub async fn handle_fetch(
+        &mut self,
+        requests: Vec<Request<Command>>,
+        finish_before_next: bool,
+    ) -> trc::Result<()> {
         // Validate access
         self.assert_has_permission(Permission::ImapFetch)?;
 
@@ -104,9 +110,13 @@ impl<T: SessionStream> Session<T> {
             op.as_ref()
                 .is_ok_and(|(_, _, arguments)| arguments.sets_seen())
         });
-        let _write_permit;
+        let _inline_permit;
         let permit = if sets_seen {
-            _write_permit = self.acquire_write_permit().await;
+            _inline_permit = self.acquire_write_permit().await;
+            None
+        } else if finish_before_next {
+            // Preserve adjacent FETCH response order across separate keyed hooks.
+            _inline_permit = self.acquire_read_permit().await;
             None
         } else {
             self.acquire_read_permit().await
@@ -187,9 +197,37 @@ impl<T: SessionStream> SessionData<T> {
             .za_assert_mail_route(&self.access_token, account_id)
             .await
             .imap_ctx(&arguments.tag, trc::location!())?;
-        let cache = match cache {
-            Some(cache) => cache,
-            None => self
+        let keys = if arguments.attributes.contains(&Attribute::ObjectId) {
+            self.server
+                .za_mail_keys(&self.access_token, account_id)
+                .await
+                .imap_ctx(&arguments.tag, trc::location!())?
+        } else {
+            None
+        };
+        // A SAVE producer can need the index write lock before sending rows.
+        let saved = if keys.is_some() && arguments.sequence_set.is_saved_search() {
+            Some(mailbox.get_saved_search().await)
+        } else {
+            None
+        };
+        let snapshot = if let Some(keys) = keys.as_deref() {
+            Some(
+                self.server
+                    .za_snapshot(account_id, keys)
+                    .await
+                    .map_err(|reason| {
+                        za_no_map_error(reason, account_id).code(ResponseCode::Unavailable)
+                    })
+                    .imap_ctx(&arguments.tag, trc::location!())?,
+            )
+        } else {
+            None
+        };
+        let cache = match (snapshot.as_ref(), cache) {
+            (Some(snapshot), _) => snapshot.cache.clone(),
+            (None, Some(cache)) => cache,
+            (None, None) => self
                 .server
                 .get_cached_messages(account_id)
                 .await
@@ -212,11 +250,72 @@ impl<T: SessionStream> SessionData<T> {
         let is_changed_only = changed_ids.is_some();
         let mut ids = match changed_ids {
             Some(ids) => ids,
+            None if snapshot.is_some() => {
+                let saved = match saved {
+                    Some(Some(rows)) => Some(rows),
+                    Some(None) => {
+                        return Err(trc::ImapEvent::Error
+                            .into_err()
+                            .details("No saved search found.")
+                            .id(arguments.tag));
+                    }
+                    None => None,
+                };
+                mailbox.view.lock().resolve(
+                    &arguments.sequence_set,
+                    is_uid,
+                    saved.as_deref().map(Vec::as_slice),
+                )
+            }
             None => mailbox
                 .resolve(&arguments.sequence_set, is_uid)
                 .await
                 .imap_ctx(&arguments.tag, trc::location!())?,
         };
+
+        if snapshot.is_some() {
+            ids.retain(|resolved| {
+                cache
+                    .email_by_id(&resolved.id)
+                    .is_some_and(|message| message.has_mailbox_id(mailbox.id.mailbox_id))
+            });
+        }
+
+        // Finish selecting the response IDs using the validated cache before
+        // projecting mapped identities or writing any response bytes.
+        if let Some(changed_since) = arguments.changed_since
+            && !is_changed_only
+        {
+            ids.retain(|resolved| {
+                cache
+                    .email_by_id(&resolved.id)
+                    .is_some_and(|message| message.change_id() >= changed_since)
+            });
+        }
+
+        // RFC 9738 requires the highest UIDs to be processed first when truncating
+        let message_limit = message_limit as usize;
+        let limited_uid = if ids.len() > message_limit {
+            let cutoff = ids.len() - message_limit;
+            ids.select_nth_unstable_by_key(cutoff, |resolved| resolved.uid);
+            ids.drain(..cutoff);
+            ids.sort_unstable_by_key(|resolved| resolved.uid);
+            ids.first().map(|resolved| resolved.uid)
+        } else {
+            ids.sort_unstable_by_key(|resolved| resolved.uid);
+            None
+        };
+
+        // Selection, filtering and truncation are complete before projection;
+        // output below borrows this unchanged `ids` vector. Keep only the
+        // selected identities alongside their validated cache.
+        // Consuming the view releases its index guard before VANISHED, an
+        // empty response, or any message output can block on the client.
+        let mapped_threads = snapshot.map(|snapshot| {
+            ids.iter()
+                .map(|resolved| (resolved.id, snapshot.thread_of(resolved.id)))
+                .collect::<AHashMap<_, _>>()
+        });
 
         // Convert state to modseq
         if let Some(changed_since) = arguments.changed_since {
@@ -251,14 +350,6 @@ impl<T: SessionStream> SessionData<T> {
                 }
             }
 
-            // Filter out ids without changes
-            if !is_changed_only {
-                ids.retain(|resolved| {
-                    cache
-                        .email_by_id(&resolved.id)
-                        .is_some_and(|message| message.change_id() >= changed_since)
-                });
-            }
             if ids.is_empty() {
                 // Condstore was just enabled, return highest modseq.
                 if enabled_condstore {
@@ -322,24 +413,10 @@ impl<T: SessionStream> SessionData<T> {
 
         // Process each message
         let mut batch = BatchBuilder::new();
-        // RFC 9738 requires the highest UIDs to be processed first when truncating
-        let message_limit = message_limit as usize;
-        let limited_uid = if ids.len() > message_limit {
-            let cutoff = ids.len() - message_limit;
-            ids.select_nth_unstable_by_key(cutoff, |resolved| resolved.uid);
-            ids.drain(..cutoff);
-            ids.sort_unstable_by_key(|resolved| resolved.uid);
-            ids.first().map(|resolved| resolved.uid)
-        } else {
-            ids.sort_unstable_by_key(|resolved| resolved.uid);
-            None
-        };
 
-        // Mail spec 7, ruling R33: the account's keys, once for the command,
-        // only when an attribute reads content (`needs.structure`); a FETCH
-        // of flags, sizes, dates and ids reads the cache alone, so the owner's
-        // session opened before its account was provisioned, which holds
-        // none, still reads them. A keyless read of a key account is refused.
+        // Mail spec 7, ruling R33: content reads use the account's keys.
+        // Cache-only metadata remains accessible to a stale owner session.
+        // OBJECTID is gated separately under search spec 6.2.
         let keys = if needs.structure {
             self.server
                 .za_mail_keys(&self.access_token, account_id)
@@ -584,9 +661,12 @@ impl<T: SessionStream> SessionData<T> {
                             }
                             Attribute::ObjectId => {
                                 separate(&mut output, &mut has_items);
+                                let thread_id = mapped_threads
+                                    .as_ref()
+                                    .map_or_else(|| data.thread_id(), |threads| threads[&id]);
                                 DataItem::ObjectId(ObjectId {
-                                    email_id: Some(Id::from_parts(data.thread_id(), id)),
-                                    thread_id: Some(Id::from(data.thread_id())),
+                                    email_id: Some(Id::from_parts(thread_id, id)),
+                                    thread_id: Some(Id::from(thread_id)),
                                     ..Default::default()
                                 })
                                 .serialize(&mut output);

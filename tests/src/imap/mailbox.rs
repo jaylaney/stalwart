@@ -75,16 +75,25 @@ pub async fn test(
 
     // Every command in a pipelined batch is answered, even after a failure
     imap.send_raw(concat!(
+        "_p0 STATUS \"Tofu\" (INVALID)\r\n",
         "_p1 STATUS \"Tofu\" (MESSAGES)\r\n",
         "_p2 STATUS \"Does Not Exist\" (MESSAGES)\r\n",
         "_x STATUS \"Fruit/Apple\" (MESSAGES)\r\n"
     ))
     .await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
+    let replies = imap
+        .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("_p1 OK")
-        .assert_contains("_p2 NO [NONEXISTENT]")
         .assert_contains("* STATUS \"Fruit/Apple\"");
+    let tagged = replies
+        .iter()
+        .filter(|line| line.starts_with('_'))
+        .collect::<Vec<_>>();
+    let expected = ["_p0 BAD", "_p1 OK", "_p2 NO [NONEXISTENT]", "_x OK"];
+    assert_eq!(tagged.len(), expected.len(), "{replies:?}");
+    for (reply, expected) in tagged.into_iter().zip(expected) {
+        assert!(reply.starts_with(expected), "{replies:?}");
+    }
 
     // Enable IMAP4rev2
     imap.send("ENABLE IMAP4rev2").await;
