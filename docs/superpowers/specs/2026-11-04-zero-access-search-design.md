@@ -1,5 +1,10 @@
 # Zero-access mail: search and threads (release 7) design spec
 
+Historical review files and their named rounds are preserved through the
+[evidence index](../plans/2026-11-14-zero-access-search-evidence-index.md).
+Current execution evidence and limits live in the
+[qualification report](../plans/2026-11-07-zero-access-plan16-outcome.md).
+
 Date: 2026-11-04. Status: revision 38 (2026-11-14), PR 84 loader lock follow-up.
 Revision 38 keeps a warm pass's manifest read outside the shared index guard,
 then compares the authenticated observation with the resident head under a newly
@@ -230,7 +235,7 @@ R21); a consumed insert or deletion that staged nothing checkpoints
 a record between the state and the epoch, never `Initial` (5.4, 6.3,
 R27); and `Initial` rendered as `Exact(m − 1)` with kinds preserved
 (6.3, R28; revision 15 makes it `Exact(0)`). Revision 13 answered the second Fable review, of revision 12 (G1 to
-G22, saved in `2026-11-04-zero-access-search-design-fable-review.md`),
+G22, saved in [the archived Fable design review](https://github.com/jaylaney/stalwart/blob/67ca91226429945f6f1dd3a24feaaa354e889ed2/docs/superpowers/specs/2026-11-04-zero-access-search-design-fable-review.md)),
 and the seventh Codex round (R20 to R25, with R16 and R19 remaining).
 Their P1s met at one point: a merge rewrote every member of the losing
 thread, so a merge's size in bytes was the losing thread's size, and

@@ -4,14 +4,19 @@ Status: primary and independent source review confirmed the mappings and authori
 retirements on 2026-11-14. The eight new dispositions and two exact Keyless moves in
 [`tests/qualification/dispositions.json`](../../../tests/qualification/dispositions.json)
 are `unconfirmed: false`. Both IMAP and JMAP restorations passed independent source review.
-Both complete local key-mode protocol suites passed. Fresh hosted strict-rule execution
-remains pending; local suite success is not a strict-rule count claim.
+Both complete local key-mode protocol suites passed. Final head
+`82b8984aac77a2fe718eb37f8f59110bdbbf0305` subsequently passed
+[PR run 43621111083](https://github.com/jaylaney/stalwart/actions/runs/43621111083) and
+[full manual run 43621127921](https://github.com/jaylaney/stalwart/actions/runs/43621127921),
+including the manual run's Inventory and Coverage gates. PR84 merged at
+`67ca91226429945f6f1dd3a24feaaa354e889ed2`. The final hosted gate result supplies the
+strict-rule acceptance; the local suite results alone did not establish those counts.
 
 The source inspection started at `81ac842507ae098b42bd5a72996c43f882bdba03`, with the
 separately reviewed corpus-setup merge pending in the working tree. The historical inventory
 is `baseline-0.16.27.json`, measured at `5b914ddb5`. The immediate pre-replacement source is
 `070c1d3a4^` for the IMAP/JMAP variants and `e5d3e749e^` for the mail search replacements.
-The final integrated source revision and fresh results must be recorded before acceptance.
+The final integrated source and successful hosted results are recorded above and below.
 
 The hosted candidate retention job `132176748499` of run `43509717996` reported 25 inventory
 failures: one missing libtest and 24 function-step failures. All function failures said no
@@ -37,7 +42,7 @@ successor satisfies the strict execution rule.
 - The [gate schema](../../../scripts/tests/README.md#the-dispositions-file) requires named
   equivalents in the original step. `case` records document changed expectations but excuse
   nothing. Exact function moves retain the `(file, in, name)` identity shape. No baseline,
-  selector, step environment, threshold or gate algorithm changes are proposed.
+  selector, step environment, threshold or gate algorithm was changed by this repair.
 
 ## Identity and expectation ledger
 
@@ -46,20 +51,20 @@ explicit `in` value have `in: null`.
 
 | Old identity | Required step | Replacement or retained requirement | Disposition |
 |---|---|---|---|
-| `tests/src/za/mail/gates.rs`, `<impl Keyless>`, `name` | ZA steps | `tests/src/utils/za.rs`, `<impl Keyless>`, `name`; the same Bearer/WebSocket labels | Source-confirmed exact function move, commit `df9ffaf44`; fresh execution pending |
-| `tests/src/za/mail/gates.rs`, `<impl Keyless>`, `call` | ZA steps | `tests/src/utils/za.rs`, `<impl Keyless>`, `call`; the same channel request/response helper | Source-confirmed exact function move, commit `df9ffaf44`; fresh execution pending |
+| `tests/src/za/mail/gates.rs`, `<impl Keyless>`, `name` | ZA steps | `tests/src/utils/za.rs`, `<impl Keyless>`, `name`; the same Bearer/WebSocket labels | Source-confirmed exact function move, commit `df9ffaf44`; final hosted gates passed |
+| `tests/src/za/mail/gates.rs`, `<impl Keyless>`, `call` | ZA steps | `tests/src/utils/za.rs`, `<impl Keyless>`, `call`; the same channel request/response helper | Source-confirmed exact function move, commit `df9ffaf44`; final hosted gates passed |
 | `tests/src/za/mail/reads.rs::threads_are_singletons` | ZA steps | Both `reads.rs::singleton_rows_have_mapped_wire_ids` and `threads/task12.rs::case_conversation_parity` | `search-r7-persisted-singletons-mapped-wire-ids`, equivalent functions |
 | `imap::imap_tests -> za_variants::thread` | `imap-key` | `tests/src/imap/thread.rs::test` | `search-r7-imap-thread-upstream-outcomes`, equivalent sub-test call |
-| `imap::imap_tests -> za_variants::search` | `imap-key` | Restored served-metadata assertions in the original variant identity, retaining the upstream positive content search body | No excusal or mapping; source restoration reviewed, fresh execution pending |
-| `tests/src/imap/za_variants.rs::sizes_by_uid` | `imap-key` | Restored independent RFC822.SIZE readback helper with its size-sort caller | No excusal; source restoration reviewed, fresh execution pending |
+| `imap::imap_tests -> za_variants::search` | `imap-key` | Restored served-metadata assertions in the original variant identity, retaining the upstream positive content search body | No excusal or mapping; source restoration reviewed, final hosted gates passed |
+| `tests/src/imap/za_variants.rs::sizes_by_uid` | `imap-key` | Restored independent RFC822.SIZE readback helper with its size-sort caller | No excusal; source restoration reviewed, final hosted gates passed |
 | `tests/src/imap/za_variants.rs::assert_search_refused` | `imap-key` | Retire only the assertion that supported keyed content commands always return `NO [CANNOT]` with `ZA_MAIL_SEARCH_REFUSED` | `search-r7-imap-content-refusal-assertion-retired`, deleted subject |
-| `tests/src/jmap/za_variants.rs::date` | `jmap-key` | Restored support for the retained metadata oracle | No excusal; source restoration reviewed, fresh execution pending |
-| `tests/src/jmap/za_variants.rs::email_query` | `jmap-key` | Restored metadata query request helper | No excusal; source restoration reviewed, fresh execution pending |
-| `tests/src/jmap/za_variants.rs::ids` | `jmap-key` | Restored response-type and returned-ID helper | No excusal; source restoration reviewed, fresh execution pending |
-| `tests/src/jmap/za_variants.rs::load_corpus` | `jmap-key` | Restored metadata readback and exact ID completeness, after keyed content currentness | No excusal; source restoration reviewed, fresh execution pending |
-| `tests/src/jmap/za_variants.rs::query_served` | `jmap-key` | Restored corpus-derived metadata filter/sort oracle, adapting mapped threading and collapse | No excusal; source restoration reviewed, fresh execution pending |
-| `tests/src/jmap/za_variants.rs::query_options` | `jmap-key` | Restored metadata-only `receivedAt` paging alongside upstream content-sort paging | No excusal; source restoration reviewed, fresh execution pending |
-| `tests/src/jmap/za_variants.rs::query_refusals` | `jmap-key` | Restored function with an inline assertion for the surviving `cc` unsupported-sort case; only supported-content refusal cases retire | `search-r7-jmap-supported-content-refusal-cases-retired` documents cases only and cannot excuse the function; source restoration reviewed, fresh execution pending |
+| `tests/src/jmap/za_variants.rs::date` | `jmap-key` | Restored support for the retained metadata oracle | No excusal; source restoration reviewed, final hosted gates passed |
+| `tests/src/jmap/za_variants.rs::email_query` | `jmap-key` | Restored metadata query request helper | No excusal; source restoration reviewed, final hosted gates passed |
+| `tests/src/jmap/za_variants.rs::ids` | `jmap-key` | Restored response-type and returned-ID helper | No excusal; source restoration reviewed, final hosted gates passed |
+| `tests/src/jmap/za_variants.rs::load_corpus` | `jmap-key` | Restored metadata readback and exact ID completeness, after keyed content currentness | No excusal; source restoration reviewed, final hosted gates passed |
+| `tests/src/jmap/za_variants.rs::query_served` | `jmap-key` | Restored corpus-derived metadata filter/sort oracle, adapting mapped threading and collapse | No excusal; source restoration reviewed, final hosted gates passed |
+| `tests/src/jmap/za_variants.rs::query_options` | `jmap-key` | Restored metadata-only `receivedAt` paging alongside upstream content-sort paging | No excusal; source restoration reviewed, final hosted gates passed |
+| `tests/src/jmap/za_variants.rs::query_refusals` | `jmap-key` | Restored function with an inline assertion for the surviving `cc` unsupported-sort case; only supported-content refusal cases retire | `search-r7-jmap-supported-content-refusal-cases-retired` documents cases only and cannot excuse the function; source restoration reviewed, final hosted gates passed |
 | `tests/src/jmap/za_variants.rs::assert_search_refused` | `jmap-key` | Retire the helper's obsolete exact `ZA_MAIL_SEARCH_REFUSED` error-description contract; do not retire the surviving `cc` refusal | `search-r7-jmap-content-refusal-assertion-retired`, deleted subject |
 | `tests/src/za/mail/search.rs::imap_refused_keys` | ZA steps | Both `imap_served_content_keys` and `mail/differential.rs::compare_imap`: exact positive content results, sort parity, BODY- and FROM-filtered THREAD groups, unsupported CC sort and trace checks | `search-r7-imap-content-commands-served`, both equivalent functions required |
 | `tests/src/za/mail/search.rs::refused_commands` | ZA steps | Command cases are split between `imap_served_content_keys` and `mail/differential.rs::compare_imap`; the latter preserves FROM-filtered THREAD | Same two-function equivalent entry; no deleted-subject waiver |
@@ -106,8 +111,8 @@ The audit distinguishes content becoming supported from an operation that remain
 | Case | Current source and requirement | Status |
 |---|---|---|
 | IMAP `SORT (CC)` | `mail/search.rs::imap_served_content_keys` requires `NO`, the unsupported-CC message, no SORT line, and a successful subsequent NOOP. `mail/differential.rs::compare_imap` also checks it. | Retained in ZA steps; not retired with content refusals |
-| JMAP sort `cc` | `crates/jmap/src/email/query.rs::sort_comparators` still returns `unsupportedSort`. `mail/differential.rs::compare_jmap` checks both account modes, both directions, secondary sorts and collapse, with no IDs and matching refusal payloads. | ZA coverage remains; `za_variants::query_refusals` restores the inline `jmap-key` refusal assertion, with fresh execution pending |
-| JMAP object metadata | `mail/search.rs::jmap_served_content_filters_and_sorts` still checks standalone `metadataExists` and a mixed expression whose metadata leaf follows supported text. It supplies the metadata capability and expects the exact key-account refusal; ordinary controls succeed. | Retained by the source-confirmed equivalent; fresh execution pending |
+| JMAP sort `cc` | `crates/jmap/src/email/query.rs::sort_comparators` still returns `unsupportedSort`. `mail/differential.rs::compare_jmap` checks both account modes, both directions, secondary sorts and collapse, with no IDs and matching refusal payloads. | ZA coverage remains; `za_variants::query_refusals` restores the inline `jmap-key` refusal assertion; final hosted gates passed |
+| JMAP object metadata | `mail/search.rs::jmap_served_content_filters_and_sorts` still checks standalone `metadataExists` and a mixed expression whose metadata leaf follows supported text. It supplies the metadata capability and expects the exact key-account refusal; ordinary controls succeed. | Retained by the source-confirmed equivalent; final hosted gates passed |
 | Keyless mail requests | `jmap/za_variants.rs::keyless_query_refused` and `mail/gates.rs` retain the separate authorization boundary. | Not equivalents for an owner-keyed content-refusal helper |
 | Temporarily unavailable content | `mail/search.rs::unavailable_refusal` retains bounded refusal when a current content view cannot be acquired. | Separate release-7 fallback; not a reason to restore unconditional content refusal |
 
@@ -141,9 +146,9 @@ checks cannot satisfy these `jmap-key` requirements.
 The protocol writers restored the original helper identities listed above. Independent
 source reviews accepted both restorations, and the primary accepted the mapping and
 authorized subject-retirement decisions. The subsequent local runtime results below
-qualify the restored checks, while hosted strict-rule counts remain pending.
+qualify the restored checks; the final manual run supplies hosted strict-rule acceptance.
 
-## Source review and pending execution
+## Source review and completed execution
 
 On 2026-11-14, independent mapping review identified a missing FROM-filtered THREAD
 requirement in the initial IMAP equivalent. Requiring `compare_imap` alongside
@@ -154,12 +159,18 @@ source reviews also passed. After confirmation, the primary ran both complete ke
 suites sequentially from the same frozen binary: IMAP passed in 12.02 seconds and JMAP
 in 208.60 seconds. The build, formatting, workflow command check, and all 43 active gate
 self-tests passed (two existing self-tests skipped). There were no suite retries.
-The adjacent `2026-11-14-search-ci-retention-outcome.md` records commands, hashes and limits.
+The [archived local outcome](https://github.com/jaylaney/stalwart/blob/67ca91226429945f6f1dd3a24feaaa354e889ed2/docs/superpowers/plans/2026-11-14-search-ci-retention-outcome.md)
+records the commands, hashes and limits. Its pre-hosted pending status is superseded.
 
-1. Run the retained coverage net/listings/strict-rule inventory on the final candidate. Verify the
-   successors' body, last-statement and exit counts in every original step.
-2. Record the final revision, commands, initial/retry outcomes, gate reports and any remaining
-   limitations here. Existing hosted successes do not establish the new mappings.
+The final PR and full manual runs linked above completed successfully on
+`82b8984aac77a2fe718eb37f8f59110bdbbf0305`. The manual run executed Test Retention
+Gates, with Inventory and Coverage passing against the retained baseline and confirmed
+dispositions. This closes the pending hosted acceptance of the mappings and restorations;
+it does not turn earlier candidate failures into passes or supply native/multi-node
+qualification. No individual raw function-count values are inferred beyond the successful
+strict-rule gate result. The [qualification outcome](2026-11-07-zero-access-plan16-outcome.md)
+and [evidence index](2026-11-14-zero-access-search-evidence-index.md) retain the broader
+source-specific results and original reports.
 
 The initial edit of this ledger and its JSON proposals used source and retained-log inspection
 only. No builds, tests, probes or network requests ran in that editing task.

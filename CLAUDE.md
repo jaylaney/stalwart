@@ -225,63 +225,41 @@ Open follow-ups:
 
 The outcome note holds the rulings, the mutation runs and the residuals.
 
-Status, release 7 (search and threads, issue #23). Plan 16 implements the
-revision 33 design on the upstream 1.0.3 base. Tasks 1–18, the Task 19
-mutation catchers, system benchmark and diagnostic controls, and reservation
-test input correction are committed through `f4eb2ecc` on the execution branch.
-The benchmark harness exited 0 on that commit, with full-size cold and
-post-H7 Content serving unqualified at that head. Both independent whole-branch source
-reviews identified three findings, addressed by the accepted consolidated
-correction at `53062c367`. Both independent scoped reviews passed
-requirements and correctness without new findings. Focused units, the
-isolated canonical RocksDB ZA suite and the primary shipping check passed.
-The [implementation review](docs/superpowers/plans/2026-11-07-zero-access-16-search-implementation-review.md)
-is recorded at `4dde13ade`. The final matrix records four carried rows,
-completed Phases A and B, and a warning-free shipping release build.
-The first full SMTP run failed with exit 101. The permitted exact retry
-passed once, and the cause remains unknown. The final-head system
-harness completed and the post-H7 query served, with internal model
-coverage verified for 30,000 delivered IDs. That run's cold query refused
-and its linked repeat was skipped. The final-head format repeat measured
-all 15,000 default messages. The matrix accounts for 39 of 41 main rows
-locally. Docker automation and directory verification await CI.
-The later [cold-start qualification](docs/superpowers/plans/2026-11-10-zero-access-search-cold-start-outcome.md)
-records the optimized 30,000-message Rust pair after in-process cache
-eviction, with the expected results in 26.469 s and 507.458 µs. The run
-logged a teardown panic after measurement. The separate optimized OSS
-restart pair served the expected results in 23.053 s and 1.026 ms with
-matching 30,000-ID public censuses. Local cold-search qualification is
-complete at its recorded head. Those runs retained all fourteen original settings;
-the PR 84 fixes retire `ZA_SEARCH_SKIP_AFTER` because transient errors must stay
-pending. Spec revision 36 applies resident-entry cooldown (1, 2, 4, 8, 16,
-then at most 30 seconds) to failed account passes, including required loads and writes.
-The streak survives changing documents/operations and diagnostic-only updates;
-meaningful progress and explicit clearing reset it. Deferred callers share at most
-one authenticated manifest observation per second, before expensive loads, so Content
-waiters can notice remote progress within their original deadlines. One primary abort
-trace carries fixed reasons and optional document/proposed diagnostic count, never raw
-errors. Identical abort manifests are not written. Atomic abort still holds healthy
-prefixes and later work until repair; pacing is per node/resident entry. Unknown
-observations never establish a generation. Unknown failures and missing codec keys
-stay transient. Cooldown may prolong singleton returned IDs until later publication.
-Created Email IDs remain paired with each method's final state; later methods do
-not rewrite earlier response/createdIds values after a merge. The same-request
-trusted-reference exception does not make literal IDs stable across requests.
-Memory and account sizing defaults remain provisional.
-The [independent remaining-checks report](docs/superpowers/plans/2026-11-07-zero-access-16-search-remaining-checks-review.md)
-records 18 of 19 targets caught in focused fault runs, plus a T13 Content
-caller-minimum coverage gap. The exact reviewed test-only strengthening is
-integrated; the full ZA suite passed with both default and FileSystem blob
-storage. Three independent mutation campaigns now account for M1–M79 at their
-recorded heads; the [final campaign report](docs/superpowers/plans/2026-11-07-zero-access-16-search-mutations-final-review.md)
-records three survivors (M16, M23 and M48), alternate catchers and the unexecuted
-M29b codec-change variant. The [regression follow-up](docs/superpowers/plans/2026-11-11-zero-access-search-regression-followup.md)
-adds or strengthens those three tests; independent Astra review, all 18 planner
-tests and the full canonical RocksDB ZA suite passed. The new tests have no new
-mutation-run results, and M29b is a recorded campaign exception, not a passed or
-equivalent fault. Task 19 remains incomplete. Native clients, the separate
-fresh-store gate, networked-store timing and physical multi-node verification
-remain pending.
+Status, release 7 (search and threads, issue #23). PR 84 merged the search
+implementation and design revision 38 on the upstream 1.0.3 base. The final
+source head `82b8984aac77a2fe718eb37f8f59110bdbbf0305` passed the PR workflow
+and the full manual workflow, including both zero-access blob modes and the
+strict retention Inventory/Coverage gates. The
+[qualification report](docs/superpowers/plans/2026-11-07-zero-access-plan16-outcome.md)
+records current CI, source-bound benchmark and mutation results, initial failed
+attempts and unchanged retries. The
+[evidence index](docs/superpowers/plans/2026-11-14-zero-access-search-evidence-index.md)
+links the archived reviews and interim outcomes; the
+[retention ledger](docs/superpowers/plans/2026-11-14-search-ci-retention-ledger.md)
+remains the evidence target for the machine-readable qualification dispositions.
+
+Current search retry and ID contracts: `ZA_SEARCH_SKIP_AFTER` is retired and
+ignored; transient errors remain pending. Resident-entry cooldown (1, 2, 4, 8, 16,
+then at most 30 seconds) covers failed account passes, including required loads
+and writes. The streak survives changing documents/operations and diagnostic-only
+updates; meaningful progress and explicit clearing reset it. Deferred callers
+share at most one authenticated manifest observation per second, before expensive
+loads, so Content waiters can notice remote progress within their original
+deadlines. One primary abort trace carries fixed reasons and optional
+document/proposed diagnostic count, never raw errors. Identical abort manifests
+are not written. Atomic abort still holds healthy prefixes and later work until
+repair; pacing is per node/resident entry. Unknown observations never establish a
+generation. Unknown failures and missing codec keys stay transient. Cooldown may
+prolong singleton returned IDs until later publication. Created Email IDs remain
+paired with each method's final state; later methods do not rewrite earlier
+response/createdIds values after a merge. The same-request trusted-reference
+exception does not make literal IDs stable across requests.
+
+Task 19 remains incomplete. Memory/account limits are provisional; native clients,
+networked-store timing and physical multi-node verification remain pending.
+M16/M23/M48 have stronger correct-code regressions but no new fault runs; M29b
+remains unexecuted. See the qualification report for the other mutation exceptions
+and unresolved diagnostics. Green hosted CI does not close those evidence gaps.
 
 Where release 2 lives: the UID lease in `crates/common/src/za/lease.rs` (`ZA_UID_LEASE_SECS`, default 30, clamped 1..=3600; lease keys start with `store::ZA_UID_LEASE_PREFIX`, which the generic in-memory purge skips, so the asserting sweep is the only lease cleanup); the fan-out in `crates/groupware/src/calendar/fanout.rs` (`za_fan_out` takes an optional lease fence that every recipient item's write asserts): the drain's delegating merge and the PUT create pass theirs; the drain in `crates/groupware/src/calendar/drain.rs` (`ZaDrain::za_drain`, called from `handle_dav_request` in `crates/dav/src/request.rs` for every DAV request whose token holds session keys; `DRAIN_RETRY_SECS = 30` is a constant); a pass attempts at most `DRAIN_PASS_CAP` (32) items, an item that fails `DRAIN_ITEM_FAILURE_LIMIT` (3) times in a session is skipped for the session with later items of its UID waiting behind it, and a private key that does not open suspends the session's drain (the per-session state in `vault::session::ZaDrainState`, the failure bookkeeping in `vault::session::PassState`); and the lease sweep in `common::za::lease::sweep_expired_uid_leases`, called from the maintenance task's purge step (`crates/services/src/task_manager/tasks/maintenance.rs` at 1.0, after `purge_store`). The drain's delegating merge fans out to new delegates under the organizer's UID lease, passing it as the fence; new delegates are detected per instance (`Attendance`, `governing_instance`, shared with the stale-reply check): an address that did not attend the governing instance before, or whose DELEGATED-FROM gained an address.
 

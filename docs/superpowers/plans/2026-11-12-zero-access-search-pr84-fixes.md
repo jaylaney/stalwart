@@ -1,5 +1,8 @@
 # PR 84 search review fixes implementation plan
 
+Historical execution plan. For current results and remaining gaps, see the
+[search qualification report](2026-11-07-zero-access-plan16-outcome.md).
+
 > **For agentic workers:** Use superpowers:subagent-driven-development. The user authorized implementation, spec updates, commits, push, and affected CI reruns on 2026-11-12. Keep PR 84 draft.
 
 **Goal:** Address the eight PR comments and the Automation retry-observation failure.
@@ -60,4 +63,4 @@ The primary owns spec, CLAUDE.md, developer docs and this outcome/plan. Record t
 - [ ] Task 6 — source reviews, focused checks, shipping check, full ZA and ordinary JMAP/IMAP suites passed. Commit/push and new-head CI remain the publication step at this checkpoint; the PR records live status.
 
 Task 5's complete Docker-backed runtime check remains assigned to new-head CI.
-See [the outcome](2026-11-12-zero-access-search-pr84-fixes-outcome.md) for evidence and limits.
+See [the outcome](https://github.com/jaylaney/stalwart/blob/67ca91226429945f6f1dd3a24feaaa354e889ed2/docs/superpowers/plans/2026-11-12-zero-access-search-pr84-fixes-outcome.md) for evidence and limits.
