@@ -1,8 +1,11 @@
 # Zero-access calendar: JMAP calendars and browser sign-in (release 6) design spec
 
-Date: 2026-11-13. Status: revision 5. Revision 5 applies what the plan's
+Date: 2026-11-13. Status: revision 6. Revision 6 applies Jay's decision
+of 2026-11-14 on when a key account's browser sessions end (2, 4.3 to
+4.7, 7, 9.1, 9.2, 9.7 and 10 to 12): only a credential change ends
+them, and D19 is rewritten for it. Revision 5 applied what the plan's
 drafting found on 2026-11-14 (4.2 to 4.7, 5.2, 5.3, 6.1, 6.3 to 6.9, 8,
-9.1, 9.2, 9.4, 9.7 and 10 to 12) and adds four decisions: which Bearer
+9.1, 9.2, 9.4, 9.7 and 10 to 12) and added four decisions: which Bearer
 values are split (D26), token refusals that are not counted for banning
 (D27), a store error on one object of a `/set` (D28) and a paged sync at
 the sharing boundary (D29). Revision 4 corrected the spec
@@ -165,6 +168,14 @@ password and the stored vault record does. A native CalDAV client stores
 the password itself, so this is not a new class of exposure, but it is a
 new place. A token's OAuth scope limits what the server will do for it; it
 does not limit what its secret opens.
+
+**A vault write that changes no credential does not end a browser
+session.** Only a password change, a recovery and a second-factor change
+end the account's browser sessions (D19). Revoking an app password does
+not. Nor does a new recovery key, an app password's creation,
+publication or withdrawal, the self-check's repair or the first pin's
+rewrap. A person who wants every browser signed out changes the password
+or the second factor, or revokes the grants.
 
 **The operator additionally learns** that an account signs in from a
 browser client, how many grants it holds, and when each was refreshed.
@@ -394,19 +405,34 @@ sweep bound it.
 
 **D19. The binding.** One function, `za_session_binding`, computes from
 the vault record the value that a key account's OAuth tokens and its
-token record bind to. This spec calls that value the binding. The
-function returns the vault revision. A key account's credential version,
-which upstream seals into every token and checks at every use, is this
-value. The hand-off entry (4.4) and the token record store it, and every
-reader compares it with the vault record's current one. A vault write
-deletes the token record exactly when it changes the binding; today that
-is every vault write (4.7).
+token record bind to. This spec calls that value the binding. It is a
+64-bit fingerprint of the account's credentials as the vault record
+holds them: the salt, the Argon2 parameters, the password verifier and
+the second-factor secret, present or absent. It is SHA-256 over a fixed
+label under `za/v1/` and those fields in that order, each field of
+variable length preceded by its length. The value is the digest's first
+eight bytes, and 0 is replaced by 1, because upstream reads a credential
+version of 0 as unversioned. A key account's credential version, which
+upstream seals into every token and checks at every use, is this value.
+The hand-off entry (4.4) and the token record store it, and every reader
+compares it with the vault record's current one. A vault write deletes
+the token record exactly when it changes the binding (4.7).
 
-The reason for one function is that the rule it encodes is open (section
-12, decision 4). If Jay decides that sessions end only when a credential
-changes, the function returns a fingerprint of the password verifier and
-the second-factor secret instead, and no other text of this section
-changes.
+The binding changes with a password change, a recovery and a
+second-factor change, and with nothing else. A key account's browser
+sessions therefore end only when a credential changes. They survive
+every other vault write: a new recovery key, an app password's creation,
+publication, withdrawal or revocation, the self-check's repair, and the
+first pin's rewrap of the private key. Jay decided this on 2026-11-14,
+replacing his rule of 2026-11-02 that every vault write ends them. The
+reason is that the first pin's rewrap is automatic: under the old rule a
+person's first invitation to another key account signed their browser
+out.
+
+The binding is not the authentication generation. The key cache's
+generation stays the vault revision, so a vault write that leaves the
+binding unchanged still evicts resident keys, and the next request opens
+them again from the token record (4.6).
 
 A write that stores a wrap is conditional on two things in one batch:
 the record's previous bytes, and the vault record's stored bytes as the
@@ -417,9 +443,11 @@ assertion for its own companion records
 reads both records again. If the vault record's binding has changed, it
 stops. Otherwise it decides again from what it now reads and may retry,
 three attempts in all. It never stores its wraps under another binding.
-A vault write and a token-record write therefore order strictly: either
-the vault write's batch deletes what the other wrote, or the other's
-assertion fails.
+A vault write that changes the binding and a token-record write
+therefore order strictly: either the vault write's batch deletes what
+the other wrote, or the other's assertion fails and it stops. A vault
+write that leaves the binding unchanged only makes the other writer read
+again and retry.
 
 **D21.** A write that only removes entries (a grant's deletion, the
 sweep) asserts the record's previous bytes and nothing else. Such a
@@ -445,8 +473,7 @@ FoundationDB's limit on a value, and every write reads each grant it
 names from the registry.
 
 The record is not an authority for login. Upstream decides whether a
-token is valid, bound to the vault record through D19's binding, which
-is the vault revision as today (release 1; Jay kept this on 2026-11-02).
+token is valid, bound to the vault record through D19's binding.
 The record only yields keys to a token upstream already accepted.
 
 ### 4.4 Sign-in: from the password to the grant
@@ -503,9 +530,10 @@ Rules:
   not open, or one made under a binding that is no longer current,
   answers `invalid_grant`.
 - If the record write fails after the grant was created, the grant is
-  deleted. A failed vault assertion answers `invalid_grant`: the
-  password or another vault fact changed while the sign-in was in
-  flight. Any other failure answers a server error. Either way no wrap
+  deleted. A changed binding answers `invalid_grant`: the
+  password or the second factor changed while the sign-in was in
+  flight. A vault write that left the binding unchanged only makes the
+  write read again and retry (4.3). Any other failure answers a server error. Either way no wrap
   is stored and the client signs in again.
 - A consent that is refused deletes the entry. So does a confirmation
   that fails its checks after the consent token was taken.
@@ -513,7 +541,7 @@ Rules:
 - A code exchange that finds a secret on the code of an account that is
   not a key account answers `invalid_grant`. Upstream would not have
   found a code of that length. The code is spent.
-- If a vault write crosses the password step, between the password's
+- If a vault write of any kind crosses the password step, between the password's
   check and the hand-off's write, the step answers an authentication
   failure and issues no code. It is not counted against the client's
   address (D27).
@@ -561,7 +589,9 @@ The fork follows that state machine without changing it:
    lower ones. The write carries the two assertions of 4.3. If they
    fail, the fork reads the vault record and the token record again.
    - If the vault record's binding has changed, the fork stops and
-     answers `invalid_grant`.
+     answers `invalid_grant`. Only a credential change does that (D19).
+     A refresh that lost its vault assertion to any other vault write
+     goes on.
    - Otherwise it classifies again from step 2, with the record as it
      now is, three attempts in all. It writes only if the presented
      generation's entry is still in that record. MK held in memory from
@@ -626,8 +656,10 @@ and one AEAD open; no Argon2 runs.
 request is refused with 401. It is never served uncached, as a password
 login in that state is today. The reason is that a password login has
 just proved its password against the vault record, while a token proves
-only that it was once issued. A vault write that crossed the request is
-the very event that ends a token's session (4.7).
+only that it was once issued. If the vault write that crossed the
+request changed a credential, it ended the token's session (4.7). If it
+left the binding unchanged, the client's refresh succeeds, and its next
+request opens the keys again at the new generation.
 
 The lookup lives in the HTTP layer and not in `authenticate_with_keys`.
 The IMAP and POP3 logins call that function too
@@ -665,21 +697,23 @@ token is a keyed CalDAV request.
 
 ### 4.7 Ends
 
-- **A vault write.** `vault_batch_write`, which every vault write passes
-  through, deletes the token record in the batch that writes the vault
-  record, when the write changes the binding (D19). Today that is every
-  vault write: a password change, a recovery, a new recovery key, an
-  app-password creation, publication, withdrawal or revocation, a
-  second-factor change, the self-check's repair (also when the drain
-  runs it), and the first pin's rewrap of the private key. Each ends
-  every browser session of the account and destroys its wraps in one
-  commit. Upstream refuses the tokens by credential version, as before.
-  A sign-in or a refresh that obtained MK before the vault write cannot
-  store a wrap after it, because its vault assertion fails (4.3).
+- **A credential change.** `vault_batch_write`, which every vault write
+  passes through, deletes the token record in the batch that writes the
+  vault record, when the write changes the binding (D19): a password
+  change, a recovery and a second-factor change. Each ends every browser
+  session of the account and destroys its wraps in one commit. Upstream
+  refuses the tokens by credential version. A sign-in or a refresh that
+  obtained MK before the change cannot store a wrap after it: its vault
+  assertion fails, and it finds the binding changed (4.3).
 
-  One consequence needs saying. The first time a key account pins a
-  contact, which the first invitation it sends to another key account
-  does, its browser is signed out at its next request.
+  Every other vault write leaves the record and the sessions in place: a
+  new recovery key, an app password's creation, publication, withdrawal
+  or revocation, the self-check's repair (also when the drain runs it),
+  and the first pin's rewrap of the private key. Such a write still
+  raises the authentication generation, so resident keys are evicted and
+  a request that crossed it gets one 401 (D23). The first invitation a
+  key account sends to another key account pins a contact; its browser
+  stays signed in.
 - **A grant deletion.** `delete_oauth_grant` removes the grant's entries
   (D21). It reads the token record only when the grant's account is a
   key account. Upstream calls it on revocation (`/auth/revoke`), a replayed
@@ -1242,7 +1276,7 @@ is the basis of the manual checklist (9.8).
 | Recurring events: this one, this and future, all | work |
 | Tasks | work |
 | Invite a key account or an outside address; see replies | works |
-| After the first invitation to a key account | the browser is signed out once; the user signs in again (4.7) |
+| After the first invitation to a key account | the browser stays signed in (D19) |
 | Accept or decline, from the calendar and from an invitation email | works |
 | Calendars shared with the user, read and edit | work |
 | Answer for the owner of a shared calendar | works |
@@ -1325,7 +1359,9 @@ leave an ordinary account's tokens in the trace, which is no better.
   assertion, a failed write then a retry.
 - The unexpanded matcher of 6.4: several words split across components,
   phrases, prefixes, stems, each field.
-- The binding function (D19), the sync-boundary predicate (D15), the
+- The binding function (D19): it changes with each of its four inputs
+  and with nothing else, and it is never 0.
+- The sync-boundary predicate (D15), the
   rights and refusals of a placement change (5.2), and the eviction
   choice of the cap (D20).
 - The hand-off: taken once, expired, wrong secret, stale binding.
@@ -1342,7 +1378,8 @@ trace modules. They reserve the fixture families `token-*` and
   token that reads sealed data over JMAP and CalDAV; the consent path;
   refresh, a retried refresh returning the same refresh token, and a
   replayed one revoking the grant; a superseded token opening nothing;
-  every vault write ending the session and leaving no record;
+  a credential change ending the session and leaving no record, and
+  every other vault write leaving both;
   revocation removing the grant's entries; a grant destroyed through
   the registry refused at once and its entries gone after the sweep; a
   refresh whose entry is missing deleting the grant; expiry and the
@@ -1356,7 +1393,7 @@ trace modules. They reserve the fixture families `token-*` and
   successful token answer absent from the traces, for a key and an
   ordinary account (D24); the hand-off absent, checked by its exact key,
   after redemption, expiry and a refused consent; the first pin's rewrap
-  ending the session (4.7). Also: account destruction leaving no record;
+  leaving the session in place (D19). Also: account destruction leaving no record;
   an ordinary account's code with a secret answering `invalid_grant`
   (4.4); a refused token not counted against its address (D27).
 
@@ -1367,11 +1404,14 @@ trace modules. They reserve the fixture families `token-*` and
   - a password change, and separately a recovery, committed during a
     paused first issuance makes the issuance fail and leaves no record
     and no grant;
+  - a vault write that leaves the binding unchanged, committed during a
+    paused first issuance and, separately, during a paused refresh, is
+    retried: the issuance and the refresh succeed;
   - a paused refresh crossed by the same vault changes, and a refresh
     that retries a lost record write across one, answers
     `invalid_grant` and leaves no record. Its old tokens are refused.
     The grant object may remain, as any grant of the account does after
-    a vault write;
+    a credential change;
   - a refresh made to fail right after its rotation and before its
     record write, with no client retry, leaves the superseded entry in
     the record; the maintenance sweep removes it, and in a second run a
@@ -1483,8 +1523,8 @@ At least these faults, each caught by a named test:
   generation;
 - the drain hook is removed;
 - a notification destroy is let through;
-- the wrap's associated data omits the grant id; the vault commit leaves
-  the token record; a superseded refresh entry is kept; a token with an
+- the wrap's associated data omits the grant id; a credential
+  change leaves the token record; a superseded refresh entry is kept; a token with an
   unopenable secret is served keyless; the hand-off is not deleted on
   redemption;
 - the cap's eviction leaves the evicted grant; a refresh without the
@@ -1528,7 +1568,8 @@ manual gate, as the native-client checklists are.
     the grant, kind and generation the entry was made for, under the
     vault record's current binding (D19).
 64. A vault write that changes the binding deletes the token record in
-    its own batch; today every vault write does. Every write of the
+    its own batch. Only a credential change does: a password change, a
+    recovery or a second-factor change. Every write of the
     token record that stores a wrap asserts, in its own batch, the vault
     record it was made under. No wrap made under one binding is stored
     under another.
@@ -1565,6 +1606,10 @@ Amendments:
 - **Release 1 section 9**, the row "JMAP calendars capability and
   methods": superseded by section 6. The row on Bearer and OAuth logins
   on calendar paths: a token with a secret carries keys (4.6).
+- **Release 1, a key account's credential version**: it was the vault
+  revision, so every vault write ended the account's OAuth sessions
+  (kept on 2026-11-02). Superseded by D19: the credential version is the
+  binding, and only a credential change ends them.
 - **Release 1 invariant 5** stands: `Server::authenticate` returns
   keyless tokens, and keys are attached by the HTTP layer for one
   request. The Bearer arm is a second source beside Basic.
@@ -1680,7 +1725,9 @@ Silent dependencies:
   stops the build.
 - D19 relies on every vault write passing through `vault_batch_write`,
   and on a key account's credential version being computed in one
-  place.
+  place. It also relies on the four inputs of the binding being the only
+  facts of the vault record that decide a login: a fact added to that
+  set must join the fingerprint.
 - D26 relies on upstream's token header (`TOKEN_HEADER`,
   `crates/common/src/auth/oauth/token.rs`) opening every token the
   server issues and no token of another issuer.
@@ -1705,12 +1752,12 @@ Jay's decisions:
 2. Bulwark is the reference client (2026-11-13).
 3. Sharing stays on the account page; a client's share dialog gets an
    error (2026-11-13).
-4. A key account's OAuth sessions end on every vault write (2026-11-02,
-   kept here: 4.7). The plan's preflight found that the first pin's
-   rewrap is a vault write, so a browser is signed out after the first
-   invitation it sends to another key account. Whether sessions should
-   end only when the password or the second factor changes is open. D19
-   keeps the answer in one function.
+4. A key account's OAuth sessions end only when a credential changes: a
+   password change, a recovery or a second-factor change (2026-11-14;
+   D19, 4.7). This replaces the decision of 2026-11-02 that every vault
+   write ends them. The reason is that the first pin's rewrap is
+   automatic, so under the old rule a person's first invitation to
+   another key account signed their browser out.
 5. The push connection never holds keys (search spec decision 1).
 
 Calls of this spec that change what a user or an operator sees:
@@ -1759,10 +1806,11 @@ Calls of this spec that change what a user or an operator sees:
 - **6.4**: a text search without a time range holds the terms of every
   event of the account in memory for the request.
 - **3.4**: JMAP does not check a calendar's supported component set.
-- **4.7**: under decision 4, pinning a contact for the first time signs
-  the browser out.
+- **4.7**: under decision 4, changing the password or the second factor
+  signs every browser out. Revoking an app password, issuing a new
+  recovery key or pinning a contact for the first time does not.
 
-D17, D19 and D21 change nothing a user or an operator sees.
+D17 and D21 change nothing a user or an operator sees.
 
 Operator note: how long a browser stays signed in is upstream's
 refresh-token lifetime, thirty days without use by default. The release

@@ -540,12 +540,12 @@ za cases in `events.rs`:
 - `update_legacy_event_seals_it`. `plant_event(test, key_id, "default", "jmapcal-legacy.ics", .., None)` (unsealed). Update `{ "title": "Sealed canary" }`: the stored tree, serialised, does not hold "Sealed canary"; the CalDAV body holds `SUMMARY:Sealed canary`.
 
 za cases in `scheduling.rs`. Accounts: `pair(test, "scheduling")` and `key_account(test, "scheduling-noperm", <user_permissions() less Permission::CalendarSchedulingSend>)`. `OUT` is `jmapcal-scheduling-out@remote.test`, `OUT2` `jmapcal-scheduling-out2@remote.test`, `PLAIN` the suite's `plain@example.com`. `invitation(uid, attendees)` is a module-private builder: Task 30's `event(uid)` plus `participants`, the organizer as `{ "@type": "Participant", "calendarAddress": "mailto:<key>", "roles": { "owner": true, "chair": true }, "participationStatus": "accepted" }` and each attendee as `{ "@type": "Participant", "calendarAddress": "mailto:<address>", "kind": "individual", "participationStatus": "needs-action", "expectReply": true }`. `send()` is `[("sendSchedulingMessages", true)]`. The module starts with `sink().clear()` and ends with `Party::delete_items_since` for key2 and key, `clear_received_scheduling(test, &plain)`, the CalDAV deletion (with `fanout::NO_REPLY`) of every event it left, `sink().clear()` and `finish`. The first case runs first: it needs an account that has pinned nobody.
-- `first_invitation_and_the_session` (review focus 1). **[RULE]** Under a rule that ends sessions only on a credential change, assertions 3 and 4 become 200 and a granted refresh.
+- `first_invitation_and_the_session` (review focus 1; spec D19).
   1. `za_oauth_client(test, admin, "za-jmapcal-app", ZaClientKind::Application)`; `tokens = za_sign_in(.., key's name, STRONG, None)`.
   2. `za_bearer_jmap(&tokens.access, CALENDAR_JMAP_USING, ..)` with `CalendarEvent/set`, `sendSchedulingMessages: true`, create `invitation("jmapcal-sched-first", &[key2])`: status 200 and `created`; key2 holds one new inbox item.
-  3. `CalendarEvent/get` of the event with the same access token: status 401.
-  4. `za_refresh(&app, &tokens.refresh)` is `TokenResponse::Error { error: ErrorType::InvalidGrant }`.
-  5. A new `za_sign_in` works; `CalendarEvent/get` with its token: status 200, the event lists key2 as a participant with the schedule status the CalDAV body records for it.
+  3. `CalendarEvent/get` of the event with the same access token: status 200. The first pin's rewrap raised the vault revision and evicted the resident keys; the token opens them again from the token record.
+  4. `za_refresh(&app, &tokens.refresh)` is granted, and the new access token reads the event: it lists key2 as a participant with the schedule status the CalDAV body records for it.
+  5. `token_record(test, key_id)` still holds the grant; the vault revision is one higher than before step 2, and `za_session_binding` of the vault record is unchanged.
   6. `za_revoke_token`, `za_drop_oauth_client`.
 - `invite_key_outside_and_plain`. Create `invitation("jmapcal-sched-invite", &[key2, OUT, PLAIN])` with `send()`; `wait_for_queue`.
   - key2 holds exactly one new item, `METHOD:REQUEST`.
@@ -579,11 +579,11 @@ za cases in `scheduling.rs`. Accounts: `pair(test, "scheduling")` and `key_accou
 
 **Steps:**
 - [ ] 1. Write the eight `events` cases.
-- [ ] 2. Write `scheduling.rs` with its eight cases and register it (the two lines under Files). **[RULE]** `first_invitation_and_the_session` depends on the pending session rule (spec D19 and section 12, decision 4).
+- [ ] 2. Write `scheduling.rs` with its eight cases and register it (the two lines under Files).
 - [ ] 3. Run ZA. Expected: FAIL in `jmap_calendar::events` at `update_keeps_pairs_and_display_name`: no `updated` entry, the interim arm answers `notUpdated`.
 - [ ] 4. Implement the head's added step, the grouping and the update loop in `za.rs`, in the order above, replacing the interim update arm. The interim answer stays for a change of `calendarIds` (step 17) and for destroys.
 - [ ] 5. Run U-ws for `rulings_cases` and `event_set_error_table`. Expected: each passes.
-- [ ] 6. Run ZA. Expected: pass. The eight `events` cases and the eight `scheduling` cases prove the task. **[RULE]** `first_invitation_and_the_session` passes only under the rule that every vault write ends the session.
+- [ ] 6. Run ZA. Expected: pass. The eight `events` cases and the eight `scheduling` cases prove the task.
 - [ ] 7. Run JK. Expected: pass.
 - [ ] 8. The closing checks.
 - [ ] 9. Commit: `Release 6: CalendarEvent/set update and scheduling for key accounts`.
@@ -893,7 +893,7 @@ Catcher for Task 42 (spec 9.7): the drain hook is removed: `scheduling::drain_ru
 - Produces: `Keyless::call_using` (I §10). Its Bearer arm posts to `{SERVER_URL}/jmap`; its WebSocket arm sends the request as `call` does. `call` keeps the mail list.
 
 **Constraints:**
-- The Bearer token of the keyless cases is minted in process and carries no secret, so it is keyless under either session rule.
+- The Bearer token of the keyless cases is minted in process and carries no secret, so it is keyless.
 - D25: the keyless description for calendars is compared whole.
 - Invariant 66: a scheduling inbox item is never listed, opened or destroyed through JMAP. The destroy case reads the store before and after.
 - The refusals here are method errors over an authenticated channel, not authentication failures, so no `X-Forwarded-For` address is needed.

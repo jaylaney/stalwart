@@ -19,7 +19,7 @@ Spec sections 4.2 to 4.9 and the token rows of sections 8, 9 and 10. The sheet s
 
 **Interfaces:**
 - Consumes, existing in `crates/vault/src/keys.rs`: `Secret` (`:33-55`), the private `hkdf_expand` (`:118-124`), `aad` (`:188-195`), `wrap_key` (`:244-246`), `unwrap_key` (`:248-255`).
-- Produces: `za_session_binding` (I §5.1) **[RULE]**; all of I §5.2; all of I §5.3.
+- Produces: `za_session_binding` (I §5.1); all of I §5.2; all of I §5.3.
 
 **Constraints:**
 - A secret's text is decoded straight into a `Zeroizing<[u8; 32]>` (`URL_SAFE_NO_PAD.decode_slice`), never through a plain `Vec`.
@@ -31,9 +31,12 @@ Spec sections 4.2 to 4.9 and the token rows of sections 8, 9 and 10. The sheet s
 
 - [ ] **Step 1: write the failing tests.** `mk`, `s0`, `s1`, `s2`, `refresh` are `Secret::random()` unless a value is given.
 
-  `record::tests::binding_is_the_revision` **[RULE]**, on `full_record()` (revision 7):
-  - `za_session_binding(&record) == 7`; after `revision += 1`, `8`.
-  - `totp_url = None` and `verifier_hash = vec![9; 32]` leave it `8`.
+  `record::tests::binding_changes_only_with_credentials`, on `full_record()`:
+  - `za_session_binding(&record)` is not 0 and is the same on two calls.
+  - It changes, each time from the same base record, when one byte of `salt` changes, when `argon2_m_cost_kib`, `argon2_t_cost` or `argon2_p_cost` goes up by one, when one byte of `verifier_hash` changes, when `totp_url` goes from `Some` to `None`, and when one byte of the URL changes: seven values, all different from the base's and from each other.
+  - It does not change when `revision`, `state`, `password_wrap`, `recovery_wrap`, `app_wraps`, `public_key`, `private_key_wrap`, `setup_token_hash` or `setup_token_expires` changes.
+  - The framing is unambiguous: `salt = [1, 2]` with `verifier_hash = [3]` and `salt = [1]` with `verifier_hash = [2, 3]` give different values; so do `totp_url = None` and `totp_url = Some("")`.
+  - The construction is I §5.1's: for the base record the value equals the first 8 bytes, big-endian, of SHA-256 over `b"za/v1/session-binding"` and the fields as the test writes them out by hand.
 
   `keys::tests::token_labels_and_associated_data_are_fixed`, with `secret = Secret::from_bytes([9; 32])`:
   - `derive_token_wrap_key`, `derive_token_next_key` and `derive_handoff_key` equal `hkdf_expand(secret.as_bytes(), label)` for `b"za/v1/token/wrap"`, `b"za/v1/token/next"` and `b"za/v1/handoff"`.
@@ -118,7 +121,7 @@ Spec sections 4.2 to 4.9 and the token rows of sections 8, 9 and 10. The sheet s
   - `open_handoff(&value, &secret, key)` is `(7, 12, mk)`.
   - `None` for: another secret; the key id `"d"` 40 times; `value[4] ^= 1` (another account); `value[12] ^= 1` (another binding); `value[0] = 2`; `value[..84]`.
 
-- [ ] **Step 2: run them.** U-vault with the name `token`, then with `binding_is_the_revision`. Expected: the crate does not compile; the errors name `za_session_binding`, `derive_token_wrap_key` and `ZaTokenRecord`.
+- [ ] **Step 2: run them.** U-vault with the name `token`, then with `binding_changes_only_with_credentials`. Expected: the crate does not compile; the errors name `za_session_binding`, `derive_token_wrap_key` and `ZaTokenRecord`.
 
 - [ ] **Step 3: implement `za_session_binding`** (I §5.1). Its body returns `record.revision`; its doc comment says every dependent place goes through it (D19).
 
@@ -168,7 +171,8 @@ Catchers for Task 42: "the wrap's associated data omits the grant id" is `token_
 - The stored value is one byte `TOKEN_RECORD_VERSION` followed by `Archiver::with_compression(record.clone(), Compression::None)`, as the vault record is stored (`vault.rs:205-212`). The read is a checked decode, never the unchecked access (`vault.rs:123-128`).
 - A value that does not decode, or whose version is not 1, reads as `record: None` with `raw` kept. It raises no error and no trace: the store's own deserialization errors would carry the stored bytes.
 - A write that stores a wrap asserts the vault record's bytes and field 153's previous bytes (invariant 64). With `vault_cas: None`, `token_write_store` returns `StoreEvent::UnexpectedError` with its text of I §5.6, writing nothing, unless every grant and entry of `record` is in `previous.record` unchanged (invariant 69).
-- A vault write that changes the binding deletes the token record in its own batch (invariant 64). **[RULE]**
+- A vault write that changes the binding deletes the token record in its own batch (invariant 64): a password change, a recovery or a second-factor change, and no other vault write (spec D19).
+- An existing za assertion that a key account's OAuth token or grant ends after a vault write that changes no credential (a new recovery key, an app-password write, the self-check's repair, a first pin) changes to "still served", with a comment citing spec D19. Find them before Step 10 with `git grep -n -i 'invalid_grant\|TokenExpired\|oauth' tests/src/za`, and list each in the task report. None is changed silently.
 - `vault_delete_store` is not touched: it removes pending records only.
 
 - [ ] **Step 1: write the failing unit tests.** Each runs on `EphemeralStore::open()` with account 5.
@@ -181,9 +185,10 @@ Catchers for Task 42: "the wrap's associated data omits the grant id" is `token_
   - A second write on the stale (absent) read is an assertion failure and the stored record is unchanged.
   - A write of the empty `ZaTokenRecord::new(1)` with `None` on the fresh read leaves the field absent.
 
-  `record_write_loses_to_vault_write` **[RULE]**:
-  - A record written under the vault read `before`; then `vault_write_store` at `revision + 1` on `before`: field 153 is absent.
-  - A write with `Some(before.cas)` on the fresh read is an assertion failure; the field stays absent.
+  `record_write_loses_to_vault_write`:
+  - A record written under the vault read `before`; then `vault_write_store` on `before` of the same record at `revision + 1`, a vault write that leaves the binding unchanged: field 153 still holds the record (spec D19).
+  - A write of the token record with `Some(before.cas)` on a fresh read of field 153 is an assertion failure and the stored record is unchanged: a writer that read the vault before a vault write cannot store after it without reading again.
+  - Then `vault_write_store` with `verifier_hash` changed, a credential change: field 153 is absent.
 
   `removal_write_asserts_the_record_alone`:
   - A record of grants 9 and 10 written under the vault read `before`; then field 150 set raw to `[VAULT_RECORD_VERSION, 0xff]`, with no vault write.
@@ -201,9 +206,10 @@ Catchers for Task 42: "the wrap's associated data omits the grant id" is `token_
 
   In `crates/common/src/auth/vault.rs`, module `tests`, with `[1, 0xde, 0xad]` planted raw in field 153:
 
-  `vault_write_clears_the_token_record` **[RULE]**:
-  - After `vault_commit_store(.., previous: None, ..)`: absent.
-  - Planted again; after a commit on the fresh read: absent.
+  `credential_change_clears_the_token_record`:
+  - After `vault_commit_store(.., previous: None, ..)`: absent (a first vault write has no earlier binding).
+  - Planted again; after a commit on the fresh read that changes only `revision`: still `[1, 0xde, 0xad]`. The same after a commit that changes `recovery_wrap`, `app_wraps`, `public_key` or `private_key_wrap`.
+  - After a commit that changes `verifier_hash`: absent. Planted again each time, the same after a change of `salt`, of an Argon2 parameter and of `totp_url`.
 
   `a_lost_vault_write_keeps_the_token_record`:
   - Two commits, the second on the read `stale`; the plant; a third commit on `stale` is an assertion failure and field 153 still holds `[1, 0xde, 0xad]`. The ephemeral store applies whatever precedes a failed assertion, so this fails if the clear is placed before one.
@@ -214,9 +220,9 @@ Catchers for Task 42: "the wrap's associated data omits the grant id" is `token_
 
 - [ ] **Step 4: implement the store functions and `za_token_read`** (I §5.4). `tokens_key` is `ValueKey::property(account_id, Collection::Principal, 0, PrincipalField::ZeroAccessTokens)`. The batch selects the account, `Collection::Principal` and document 0, then, in this order: the vault assertion (`AssertValue::Hash(vault_cas)`, only with `Some`), the assertion of field 153 (`previous.assertion()`), the set, or the clear when `record` is `None` or empty.
 
-- [ ] **Step 5 [RULE]: delete the record in the vault write.** In `vault_batch_write`, after the last assertion (`:230`) and before the first set (`:231`), add `batch.clear(PrincipalField::ZeroAccessTokens)` when `previous` is `None` or `za_session_binding(&previous.record) != za_session_binding(record)`. Extend the function's comment (`:194-196`) to name the token record and spec 4.7.
+- [ ] **Step 5: delete the record in the vault write.** In `vault_batch_write`, after the last assertion (`:230`) and before the first set (`:231`), add `batch.clear(PrincipalField::ZeroAccessTokens)` when `previous` is `None` or `za_session_binding(&previous.record) != za_session_binding(record)`. Extend the function's comment (`:194-196`) to name the token record and spec 4.7.
 
-- [ ] **Step 6 [RULE]: the credential version.** At `crates/common/src/auth/access_token.rs:183`, replace `read.record.revision` with `za_session_binding(&read.record)`. The `.unwrap_or(0).max(1)` stays.
+- [ ] **Step 6: the credential version.** At `crates/common/src/auth/access_token.rs:183`, replace `read.record.revision` with `za_session_binding(&read.record)`. The `.unwrap_or(0).max(1)` stays.
 
 - [ ] **Step 7: run the unit tests.** U-common with `za::tokens`, then with `auth::vault::tests`. Expected: the seven new tests pass and the existing vault tests are unchanged.
 
@@ -227,13 +233,13 @@ Catchers for Task 42: "the wrap's associated data omits the grant id" is `token_
 
 - [ ] **Step 9: write the za cases.** `tests/src/za/tokens.rs` prints `Running zero-access token tests...`, creates the key accounts `token-owner` (`OWNER`) and `token-mfa` (`MFA`) with `create_key_user_account(.., STRONG, .., &[], user_permissions())` and `test.insert_account`, runs the cases in the order below and ends with `test.wait_for_tasks()`. `PLANTED` is `[1, 0xde, 0xad]`, set with `set_raw_token_record`: the clear does not read what the field holds. `STRONG2` is `"another long passphrase with 2 numbers"`.
 
-  `pin_rewrap_ends_session` **[RULE]**, first because `OWNER` has never pinned; `lookup`, `pin` and `forget` are `pinning`'s (`tests/src/za/pinning.rs:4780-4812`):
+  `pin_rewrap_keeps_session`, first because `OWNER` has never pinned; `lookup`, `pin` and `forget` are `pinning`'s (`tests/src/za/pinning.rs:4780-4812`):
   - `wrap_mark(test, id, STRONG)` is `ZaMark::Legacy`; `PLANTED` set.
-  - `pin(OWNER, "key1@example.com", &fingerprint)` answers 200, with the fingerprint of `lookup(..).str(200, "fingerprint")`. `wrap_mark` is `Pinned` and `raw_token_record` is `None` (4.7: the first pin's rewrap is a vault write).
-  - Control: `PLANTED` set again; a pin of `MFA` answers 200; `raw_token_record` is `Some(PLANTED)` (a later pin writes field 151 alone).
+  - `pin(OWNER, "key1@example.com", &fingerprint)` answers 200, with the fingerprint of `lookup(..).str(200, "fingerprint")`. `wrap_mark` is `Pinned`, the vault revision is one higher, and `raw_token_record` is still `Some(PLANTED)` (spec D19: the first pin's rewrap is a vault write that changes no credential).
+  - A pin of `MFA` answers 200; `raw_token_record` is `Some(PLANTED)` (a later pin writes field 151 alone).
   - The field is cleared and both pins are forgotten (200 each).
 
-  `vault_writes_end_sessions` **[RULE]**. For each row: `PLANTED` set, the write made, then `raw_token_record(test, id)` is `None`. Request bodies are those of `tests/src/za/password.rs:168-173`, `:242-247`, `tests/src/za/totp.rs:230-233`, `:363-368` and `tests/src/za/app_password.rs:59-80`.
+  `credential_changes_end_sessions` and `other_vault_writes_keep_sessions`, two cases over one table. For each row: `PLANTED` set, the write made, the vault revision one higher, then `raw_token_record(test, id)` is `None` in a row of the first case and `Some(PLANTED)` in a row of the second. The first case holds the rows password, recover, second factor enrolled and second factor removed. The second holds recovery key, the four app-password rows and the self-check's repair. Request bodies are those of `tests/src/za/password.rs:168-173`, `:242-247`, `tests/src/za/totp.rs:230-233`, `:363-368` and `tests/src/za/app_password.rs:59-80`.
 
   | Row | The write |
   |---|---|
@@ -248,7 +254,7 @@ Catchers for Task 42: "the wrap's associated data omits the grant id" is `token_
   | app password, withdrawn | a second creation parked at `za_test::set_publish`; the account's registry object edited while it is parked (a private helper written as `bump_registry_revision`, `tests/src/za/app_password.rs:162-195`, is); planted; `finish()` answers 409 with `"registry write failed"` |
   | the self-check's repair | under `DrainOn::new()`: `substitute_public_key(test, id, &writer_key(), true)`, planted, `trigger_drain(OWNER, STRONG)` answers 207, and the stored public key is the original again (`tests/src/za/pinning.rs:262-272`) |
 
-  The case ends with the account at `STRONG`, no second factor, no app password and no token record.
+  The cases end with the account at `STRONG`, no second factor and no app password; the second case clears the field at its end.
 
 - [ ] **Step 10: run the suite.** ZA. Expected: the banner line of `tokens`, then the pass line. `setup` (`test_grants_die_with_the_marker`), `app_password`, `caches` and `pinning` exercise the credential version and the vault batch. Then SWAP.
 
@@ -256,7 +262,7 @@ Catchers for Task 42: "the wrap's associated data omits the grant id" is `token_
 
 - [ ] **Step 12: commit.** `Release 6: the token record's field and its deletion by a vault write`
 
-Catchers for Task 42: "the vault commit leaves the token record" is `vault_writes_end_sessions` and `vault_write_clears_the_token_record`; "a token-record write omits the vault assertion" is `record_write_loses_to_vault_write` (U-common), then Task 17's `exchange_crossed_by_password_change` (ZA).
+Catchers for Task 42: "the vault commit leaves the token record" is `credential_changes_end_sessions` and `credential_change_clears_the_token_record`; "a token-record write omits the vault assertion" is `record_write_loses_to_vault_write` (U-common), then Task 17's `exchange_crossed_by_password_change` (ZA).
 
 ---
 
@@ -276,7 +282,7 @@ Catchers for Task 42: "the vault commit leaves the token record" is `vault_write
 - Beyond the sheet, private to `tests/src/za/tokens.rs`: `minted(test, name, id, password)` returns a grant id, upstream's access token for it, the account's keys and its binding now (`za_grant_token(&test.server, name, OAuthScopes::ALL)`, `za_unlock`, `za_session_binding` of the vault record). `HOUR` is 3,600 and `MONTH` 2,592,000.
 
 **Constraints:**
-- `za_token_issue` stores wraps only under the binding it was given. A stored record of another binding is not extended: the write starts from `ZaTokenRecord::new(binding)` (invariant 64). **[RULE]**
+- `za_token_issue` stores wraps only under the binding it was given. A stored record of another binding is not extended: the write starts from `ZaTokenRecord::new(binding)` (invariant 64).
 - Its write asserts the vault record's bytes and field 153's bytes as read in the same attempt.
 - `za_token_forget_grant` reads no vault record and asserts field 153 alone (D21, invariant 69).
 - Every write reconciles first (spec 4.3): one `oauth_grant` read per grant the record names.
@@ -292,14 +298,15 @@ Catchers for Task 42: "the vault commit leaves the token record" is `vault_write
   - Its grant holds one refresh entry, generation 0 with `next` `None`, and one access entry whose `tag` is `derive_token_tag(&issued.access)`.
   - `record.open_access(id, grant, &issued.access, now())` is the keys' MK; `record.classify_refresh(id, grant, 0, &issued.refresh, now())` is `Opened { next: None, .. }`.
 
-  `issue_refuses_changed_binding` **[RULE]**:
-  - `minted` gives the binding `stale`; then `za_post("recovery-key", {username: OWNER, password: STRONG})` answers 200.
-  - `za_token_issue(.., stale, ..)` is `VaultChanged` and `raw_token_record` is `None`.
+  `issue_refuses_changed_binding`:
+  - `minted` gives the binding `stale`; then `za_post("recovery-key", {username: OWNER, password: STRONG})` answers 200, a vault write that changes no credential: `za_token_issue(.., stale, ..)` is still `Issued` and the record's `binding` is `stale`. The grant is revoked.
+  - `minted` again; then a password change to `STRONG2` answers 200: `za_token_issue(.., stale, ..)` is `VaultChanged` and `raw_token_record` is `None`. The password goes back to `STRONG`.
 
-  `open_access_needs_entry_and_binding` **[RULE]**, issued for `grant` and for `other`:
+  `open_access_needs_entry_and_binding`, issued for `grant` and for `other`:
   - `za_token_open_access(id, grant, &issued.access)` is `Some(keys)` with `generation == vault_revision(test, id)`, `account_id == id` and MK's bytes.
   - `None` for a random secret, for `(other, &issued.access)` and for `(grant, &issued.refresh)`.
-  - After a vault write (`recovery-key`, 200): `None`, the record is gone.
+  - After a vault write that changes no credential (`recovery-key`, 200): still `Some(keys)`, with `generation` one higher (spec D19: the keys are opened again at the new revision).
+  - After a password change to `STRONG2` (200): `None`, the record is gone. The password goes back to `STRONG` at the case's end.
   - The record's earlier raw bytes put back with `set_raw_token_record`: still `None`, since their binding is no longer current. Then the field is cleared.
 
   `forget_grant_asserts_the_record_alone`, issued for `g1` and `g2`:
@@ -335,7 +342,7 @@ Catchers for Task 42: "the vault commit leaves the token record" is `vault_write
 - [ ] **Step 3: add the two hooks of I §9** to `crates/common/src/za/test_hooks.rs` in the file's style (`set_slot`, `take_for`, `wait`, `take_flag`), each with a table line that repeats its place: `TOKEN_EXCHANGE_PAUSE` in `za_token_issue` after the binding check and before the batch; `TOKEN_FORGET_FAIL_ONCE` at the head of `za_token_forget_grant`.
 
 - [ ] **Step 4: implement `za_token_issue`.** Each of at most three attempts runs these steps in order; an attempt ends early with the result shown.
-  1. Read the vault record (`vault_read_usable_store`). None, or `za_session_binding(&read.record) != binding`: `VaultChanged`. **[RULE]**
+  1. Read the vault record (`vault_read_usable_store`). None, or `za_session_binding(&read.record) != binding`: `VaultChanged`. A vault write that left the binding unchanged passes this check, so an attempt that lost its vault assertion to one is made again.
   2. Read field 153. Start from its record when it is usable and its `binding` equals `binding`; otherwise from `ZaTokenRecord::new(binding)`.
   3. Read `oauth_grant` for `grant_id` and for every grant the record names. `grant_id` missing or of another account: a `StoreEvent::UnexpectedError` with the details `zero-access: OAuth grant not found`, the account id and the grant id, which the token endpoint answers as a server error.
   4. `reconcile(account_id, now(), &grants)`.
@@ -345,7 +352,7 @@ Catchers for Task 42: "the vault commit leaves the token record" is `vault_write
   8. `token_write_store(store, account_id, Some(vault.cas), &read, Some(&record))`. An assertion failure starts the next attempt; after the third it is returned. Any other error is returned.
   9. After the write, delete the evicted grant: `oauth_grant(evicted)`, then `delete_oauth_grant(stored, GrantDeletion::Unconditional, ..)` and `invalidate_caches`. A failure is logged with its text of I §5.6 and not returned. Return `Issued` with the two secrets of step 6.
 
-- [ ] **Step 5: implement `za_token_open_access`.** Read field 153; `record.open_access(account_id, grant_id, secret, now())`; read the vault record (`vault_read_usable_store`); require `record.binding == za_session_binding(&vault.record)` **[RULE]**; return `SessionKeys::new(account_id, vault.record.revision, mk)` in an `Arc`. Every failed condition is `Ok(None)`. It writes nothing.
+- [ ] **Step 5: implement `za_token_open_access`.** Read field 153; `record.open_access(account_id, grant_id, secret, now())`; read the vault record (`vault_read_usable_store`); require `record.binding == za_session_binding(&vault.record)`; return `SessionKeys::new(account_id, vault.record.revision, mk)` in an `Arc`. Every failed condition is `Ok(None)`. It writes nothing.
 
 - [ ] **Step 6: implement `za_token_forget_grant`.** Under `test_mode`, first: when `take_token_forget_fail(account_id)`, return a `StoreEvent::UnexpectedError` and read nothing. Then at most three attempts: read field 153; no usable record, or one that lacks the grant, returns `Ok(())` without a write; `remove_grant`; reconcile as steps 3 and 4 of `za_token_issue` do; `token_write_store(.., None, &read, Some(&record))`. An assertion failure starts the next attempt; after the third it is returned.
 
@@ -462,6 +469,7 @@ Catchers for Task 42: "the cap's eviction leaves the evicted grant" is `cap_evic
   4. `parked.finish()`.
   5. The status is 401 (D23: refused, not served uncached); `assert_nothing_cached(test, id)`; an event carries `zero-access: token keys of a superseded generation`.
   6. Control: `park_login(id, OWNER, STRONG2)` crossed by a password change back to `STRONG` answers 207. The account ends at `STRONG`.
+  7. The same with a vault write that changes no credential: a second keyed token parked at the http pause and crossed by `za_post("recovery-key", ..)`, 200. The parked request answers 401 with the same event (D23 compares generations). The same token's next request answers 200: its keys are opened again from the token record at the new revision.
 
   `mail_bearer_login_stays_refused`, as `tests/src/za/mail/login.rs:215-258` with the keyed token in the `OAUTHBEARER` and `XOAUTH2` responses:
   - IMAP, both mechanisms: `k1 NO [NOPERM] {ZA_MAIL_LOGIN_REFUSED}`.
@@ -580,7 +588,7 @@ Catchers for Task 42: "a token with an unopenable secret is served keyless" is `
   - **Interim, deleted by Task 18:** `za_refresh(&app, &t0.refresh)`, with its secret, also answers `invalid_grant` and leaves the generation, the pending flag and the record's bytes unchanged.
   - Control: the refresh token of a device-flow grant (keyless, as in `device_flow_stays_keyless`) is `Granted` through `registered`, and neither token of the answer holds `~`.
 
-  `exchange_crossed_by_password_change` **[RULE]**, on `RACE`. Hook: `TOKEN_EXCHANGE_PAUSE`.
+  `exchange_crossed_by_password_change`, on `RACE`. Hook: `TOKEN_EXCHANGE_PAUSE`.
   1. `za_authorize(&app, RACE, STRONG, None, Some(true), None)`; the code is taken.
   2. `HookParked::start(race, test_hooks::set_token_exchange_pause, za_exchange(&app, &code))`. The exchange waits in `za_token_issue`: the grant exists, the record does not.
   3. While it is parked: `raw_token_record` is `None` and `grants_of` holds one grant.
@@ -589,7 +597,9 @@ Catchers for Task 42: "a token with an unopenable secret is served keyless" is `
   6. The answer is `invalid_grant`; `raw_token_record` is `None` (no record); `grants_of` is empty (no grant); the code's hand-off is gone.
   7. A sign-in with `STRONG2` then succeeds and reads sealed data.
 
-  `exchange_crossed_by_recovery` **[RULE]**: the same steps, signing in with `STRONG2` and with step 4 replaced by `za_post("recover", {username: RACE, recovery_key, new_password: STRONG})`. The same assertions. The account ends at `STRONG`.
+  `exchange_crossed_by_recovery`: the same steps, signing in with `STRONG2` and with step 4 replaced by `za_post("recover", {username: RACE, recovery_key, new_password: STRONG})`. The same assertions. The account ends at `STRONG`.
+
+  `exchange_crossed_by_other_vault_write`, on `RACE`. Hook: `TOKEN_EXCHANGE_PAUSE`. Steps 1 to 3 as above. Step 4 is `za_post("recovery-key", {username: RACE, password: STRONG})`, 200: a vault write that changes no credential. Then `parked.finish()`: the answer is `Granted` with keyed tokens; the record holds the grant's first entries under the binding of the sign-in; the access token reads sealed data; `grants_of` holds one grant. The exchange lost its vault assertion once and wrote on its second attempt (spec 4.3). The grant is revoked.
 
   `thirty_third_sign_in_ends_the_oldest`, on `CAP`:
   1. 32 sign-ins, `tokens[0]` first.
@@ -608,7 +618,7 @@ Catchers for Task 42: "a token with an unopenable secret is served keyless" is `
 - [ ] **Step 3: run them.** ZA. Expected: FAILED in `sign_in_gives_keyed_tokens` at its first assertion: the access token has no secret.
 
 - [ ] **Step 4: implement the hand-off functions** (I §5.4). The key is `KeyValue::<()>::build_key(KV_OAUTH, [b"~", key_id.as_bytes()].concat())`.
-  - `za_handoff_put`: read the vault record; a missing record, `keys.account_id != account_id` or `record.revision != keys.generation` is the `AuthEvent::Failed` error of the constraints; `seal_handoff(keys.mk(), account_id, za_session_binding(&record), key_id)` **[RULE]**; `key_set` with `expires`; return the secret.
+  - `za_handoff_put`: read the vault record; a missing record, `keys.account_id != account_id` or `record.revision != keys.generation` is the `AuthEvent::Failed` error of the constraints; `seal_handoff(keys.mk(), account_id, za_session_binding(&record), key_id)`; `key_set` with `expires`; return the secret.
   - `za_handoff_take`: `key_get`; when an entry was found, `key_delete` whatever follows; `open_handoff(&value, secret, key_id)`.
   - `za_handoff_delete`: `key_delete`, its result ignored.
 
@@ -620,7 +630,7 @@ Catchers for Task 42: "a token with an unopenable secret is served keyless" is `
   - `confirm_consent`, in this order:
     1. `split_code(token)`; its 40 characters go to `take_pending_consent`. A token that is not taken returns as today and deletes nothing.
     2. Once the token was taken: with `ZaSuffix::Secret`, `za_handoff_take`; otherwise `za_handoff_delete`. A hand-off of another account counts as missing.
-    3. For a taken hand-off, read the vault record (`za_vault_record`), require `za_session_binding(&read.record) == handoff.binding` **[RULE]**, and build `SessionKeys::new(account_id, read.record.revision, handoff.mk)`. A missing record or a mismatch counts as a missing hand-off.
+    3. For a taken hand-off, read the vault record (`za_vault_record`), require `za_session_binding(&read.record) == handoff.binding`, and build `SessionKeys::new(account_id, read.record.revision, handoff.mk)`. A missing record or a mismatch counts as a missing hand-off.
     4. Pass the keys, or `None`, to `issue_auth_code`. Both returns after the token was taken (`:903-904`, `:910-913`) leave no entry: step 2 removed it.
   - `approve_device` takes no keys from `login`; a comment cites D9.
 
@@ -646,9 +656,9 @@ Catchers for Task 42: "a token with an unopenable secret is served keyless" is `
   - In `refresh_token_grant`, immediately before `rotate_oauth_grant` (`:484`) and after every upstream check: when `self.account(token_info.account_id)` (it fails closed) is a key account, call `za_token_refresh_precheck(token_info.account_id, presented.id, &za_split_bearer(refresh_token).1)`. `Refused` returns `TokenResponse::error(ErrorType::InvalidGrant)`. `Keyless`, and every ordinary account, goes on as upstream does.
   - `Keyed` also returns `invalid_grant`, in this task only, with the comment "Task 18 replaces this arm with the keyed refresh". A keyed grant therefore never refreshes into a keyless pair, at any commit.
 
-- [ ] **Step 9: the comment in `tests/src/za/app_password.rs:686-707`.** State that from release 6 this exchange yields a keyed grant and a token record (spec 9.6), that the `revoke` at the case's end is a vault write and deletes it **[RULE]**, and that the emptiness check exempts field 153 while the account exists. No assertion changes.
+- [ ] **Step 9: the comment in `tests/src/za/app_password.rs:686-707`.** State that from release 6 this exchange yields a keyed grant and a token record (spec 9.6), that the `revoke` at the case's end is a vault write that changes no credential, so the record stays until its grant or the account goes (spec D19), and that the emptiness check exempts field 153 while the account exists. No assertion changes.
 
-- [ ] **Step 10: run the suites.** ZA: the `tokens` module prints the twelve case names; `app_password` (`oauth_sign_in_refuses_vault_app_password`), `mail::gates` (`tests/src/za/mail/gates.rs:1985-2100`), `tracing` and `sweep` pass through the changed functions. SYS.
+- [ ] **Step 10: run the suites.** ZA: the `tokens` module prints the thirteen case names; `app_password` (`oauth_sign_in_refuses_vault_app_password`), `mail::gates` (`tests/src/za/mail/gates.rs:1985-2100`), `tracing` and `sweep` pass through the changed functions. SYS.
 
 - [ ] **Step 11: the closing checks.**
 
@@ -677,7 +687,7 @@ Catchers for Task 42: "the hand-off is not deleted on redemption" is `handoff_go
 - Upstream's state machine is followed, not changed: `rotate_oauth_grant` and `StoredOAuthGrant::rotation` are not touched. Upstream accepts two generations: the stored one, whose presentation while a rotation is pending is a retry and returns the same next token, and the one after it, whose presentation rotates. Anything older revokes the grant.
 - A keyed grant never becomes a keyless one: when the keys are lost the grant is deleted.
 - A refresh whose generation was superseded while it was in flight answers `invalid_grant` and changes nothing: no grant is deleted and no entry is written.
-- The write carries both assertions. After an assertion loss the vault record and the token record are read again; a changed binding stops the refresh **[RULE]**. Otherwise it classifies again from the record as it now is, three attempts in all. MK held from an earlier read is never used to put back an entry the record no longer holds: every attempt takes MK from that attempt's own record.
+- The write carries both assertions. After an assertion loss the vault record and the token record are read again; a changed binding stops the refresh. Otherwise it classifies again from the record as it now is, three attempts in all. MK held from an earlier read is never used to put back an entry the record no longer holds: every attempt takes MK from that attempt's own record.
 - No write adds a refresh entry below its grant's stored generation (invariant 67).
 - A retry returns the same refresh secret: it is opened from the presented entry's sealed next secret, never drawn again.
 
@@ -707,7 +717,7 @@ Catchers for Task 42: "the hand-off is not deleted on redemption" is `handoff_go
   - `za_token_forget_grant(id, grant)`: the entries leave and `oauth_grant` is still `Some`.
   - `za_refresh(&app, &g0)` answers `invalid_grant` and `oauth_grant` is `None` (4.5 step 2: the keys are lost, the grant ends).
 
-  `refresh_crossed_by_vault_write` **[RULE]**, on `RACE`, three runs. Each run:
+  `refresh_crossed_by_credential_change`, on `RACE`, three runs. Each run:
   1. Sign in with the account's password now: `g(0)` and an access token.
   2. `HookParked::start(race, <the run's setter>, za_refresh(&app, &g0))`.
   3. The run's vault write answers 200.
@@ -719,6 +729,8 @@ Catchers for Task 42: "the hand-off is not deleted on redemption" is `handoff_go
   | 1 | `set_token_refresh_read_pause` | the grant has rotated; before its first record read | `password`, `STRONG` to `STRONG2` |
   | 1b | `set_token_refresh_read_pause` | the same | `recover` with the recovery key, new password `STRONG` |
   | 2 | `set_token_refresh_write_pause` | MK opened and the entries built; before its batch, which then loses its vault assertion | `password`, `STRONG` to `STRONG2` |
+
+  `refresh_crossed_by_other_vault_write`, on `RACE`, two runs, one with each setter. Each is the run above with step 3 replaced by `za_post("recovery-key", {username: RACE, password})`, 200, a vault write that changes no credential. The answer is `Granted`; `generations` is `[0, 1]`; the new access token answers 200 and the new refresh token is granted in turn; the access token issued before the vault write answers 200 too, its keys opened again at the new revision. In the second run the batch lost its vault assertion once and the refresh wrote on its second attempt.
 
   After run 2 the password is changed back: the account ends at `STRONG`.
 
@@ -754,8 +766,8 @@ Catchers for Task 42: "the hand-off is not deleted on redemption" is `handoff_go
 - [ ] **Step 3: add the three hooks of I §9** to `crates/common/src/za/test_hooks.rs` in the file's style, each with a table line that repeats its place.
 
 - [ ] **Step 4: implement `za_token_refresh`.** Under `test_mode` it starts with `token_refresh_read_pause_point(account_id)`. Each of at most three attempts runs these steps in order.
-  1. Read the vault record (`vault_read_usable_store`). None: `VaultChanged`. Its binding differs from the first attempt's: `VaultChanged`. **[RULE]**
-  2. Read field 153. No usable record: `Lost`. `record.binding` differs from the vault record's binding: `VaultChanged`. **[RULE]**
+  1. Read the vault record (`vault_read_usable_store`). None: `VaultChanged`. Its binding differs from the first attempt's: `VaultChanged`.
+  2. Read field 153. No usable record: `Lost`. `record.binding` differs from the vault record's binding: `VaultChanged`.
   3. Read `oauth_grant` for every grant the record names; `reconcile(account_id, now(), &grants)`.
   4. `classify_refresh(account_id, grant_id, presented, secret, now())`. `Superseded` and `Lost` are returned as they are; nothing is written.
   5. With `Opened { mk, next: sealed }`: the next secret is `sealed` when it is `Some`, else `Secret::random()`. `put_refresh(account_id, grant_id, &mk, Some((presented, secret)), next, &next_secret, refresh_expires)`, then `put_access(account_id, grant_id, &mk, access_expires)`.
@@ -775,13 +787,13 @@ Catchers for Task 42: "the hand-off is not deleted on redemption" is `handoff_go
   - Task 17's `Keyed` arm no longer returns: it keeps the secret of `za_split_bearer(refresh_token).1` for the next point.
   - In the `Issue` arm, after `grant_response` (`:493-502`): for a keyed refresh call `za_refresh_keyed`; an `Err(error)` returns `TokenResponse::error(error)`.
 
-- [ ] **Step 7: run the suites.** ZA: the `tokens` module prints the nine case names of this task. SYS: `tests/src/system/oidc.rs:842-944` is upstream's refresh and rotation flow, on ordinary accounts.
+- [ ] **Step 7: run the suites.** ZA: the `tokens` module prints the ten case names of this task. SYS: `tests/src/system/oidc.rs:842-944` is upstream's refresh and rotation flow, on ordinary accounts.
 
 - [ ] **Step 8: the closing checks.**
 
 - [ ] **Step 9: commit.** `Release 6: refresh of keyed grants`
 
-Catchers for Task 42: "a superseded refresh generation deletes the grant" is `retry_of_g_while_g1_completes`, run 1; "a lost record race puts back a pruned entry" is its run 2; "a token-record write omits the vault assertion", in the refresh, is `refresh_crossed_by_vault_write`, run 2.
+Catchers for Task 42: "a superseded refresh generation deletes the grant" is `retry_of_g_while_g1_completes`, run 1; "a lost record race puts back a pruned entry" is its run 2; "a token-record write omits the vault assertion", in the refresh, is `refresh_crossed_by_credential_change`, run 2.
 
 ---
 

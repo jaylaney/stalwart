@@ -379,7 +379,7 @@ The branch: for a key account `za_refuse_identity_edits` moves every create, upd
   - `inbox_ids(test, key_id)` is empty: without a `METHOD` it is no invitation;
   - the case destroys the message with `Email/set`.
 
-  `refusals::parse_by_grantee_and_keyless`. The owner makes `jmapcal-shared` and shares it with the second account at `view`, so upstream's access check passes for the grantee. **[RULE]** The owner's keyless token is minted after the share: the share pins the grantee, the first pin is a vault write, and under the pending rule a vault write ends the account's tokens. `blob` is the owner's sealed upload of the ICS.
+  `refusals::parse_by_grantee_and_keyless`. The owner makes `jmapcal-shared` and shares it with the second account at `view`, so upstream's access check passes for the grantee. `blob` is the owner's sealed upload of the ICS.
   - the grantee's `CalendarEvent/parse` of `blob` with the owner's account id is `["error", { "type": "forbidden", "description": ZA_CALENDAR_KEYLESS }, "0"]`;
   - the owner's keyless token (`za_grant_token`, `OAuthScopes::ALL`), through `za_bearer_jmap` with the same call: HTTP 200 and the same error; then `za_revoke_grant`;
   - control: the keyed owner's `CalendarEvent/parse` of `blob` has no method error;

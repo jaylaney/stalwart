@@ -5,7 +5,7 @@ This sheet belongs to [zero-access plan 17: JMAP calendars and browser sign-in](
 Every task of the plan uses the names on this sheet. Line numbers are at
 the commit that adds the plan, on `main` at `cc8b50a9b`; they were read at
 `82b8984aa`, release 7's last commit, and the one file that differs between
-the two is `tests/caldav_client/requirements.txt`. Spec sections are those of the release 6 spec, revision 5
+the two is `tests/caldav_client/requirements.txt`. Spec sections are those of the release 6 spec, revision 6
 (decisions D1 to D29, invariants 57 to 76). "dav wrapper" means `dav` keeps an item of
 the same name and visibility that calls the `groupware` one and maps the
 error, so handler bodies and `dav` unit tests change only where a task
@@ -15,9 +15,9 @@ Parameters written `server`, `token`, `resources` without a type are
 `&Server`, `&AccessToken`, `&GroupwareResources`. Ids are `u32` unless
 shown. `Archive` is `Archive<ArchiveBytes>`.
 
-**[RULE]** marks every place that depends on the pending decision about
-when a key account's OAuth sessions end (spec D19 and section 12,
-decision 4). All of them go through `za_session_binding` (section 5.1).
+The session rule (spec D19; section 12, decision 4): a key account's
+OAuth sessions end only when a credential changes. Every place that
+depends on it goes through `za_session_binding` (section 5.1).
 
 ## 1. Rules the sheet follows
 
@@ -673,28 +673,41 @@ Every step has an owner. Supported components is CalDAV's only (spec
 
 ## 5. Tokens
 
-### 5.1 `crates/vault/src/record.rs` [RULE]
+### 5.1 `crates/vault/src/record.rs`: the binding
 
 ```rust
-/// What a key account's OAuth tokens and token-record entries bind to. Never 0.
-pub fn za_session_binding(record: &VaultRecord) -> u64; // record.revision
+const LABEL_SESSION_BINDING: &[u8] = b"za/v1/session-binding";
+
+/// What a key account's OAuth tokens and token-record entries bind to (spec D19): a fingerprint of the
+/// account's credentials. SHA-256 over, in this order:
+///   1. `LABEL_SESSION_BINDING`;
+///   2. `salt`: its length as u32 big-endian, then its bytes;
+///   3. `argon2_m_cost_kib`, `argon2_t_cost`, `argon2_p_cost`: each as u32 big-endian;
+///   4. `verifier_hash`: its length as u32 big-endian, then its bytes;
+///   5. `totp_url`: the byte 0 when absent; when present the byte 1, the length as u32 big-endian and the
+///      UTF-8 bytes.
+/// The value is the digest's first 8 bytes as a big-endian u64. A value of 0 is replaced by 1: upstream reads a
+/// credential version of 0 as unversioned.
+pub fn za_session_binding(record: &VaultRecord) -> u64;
 ```
 
-Under the other rule the body returns a fingerprint of `salt`, the
-Argon2 parameters, `verifier_hash` and `totp_url`. No signature changes.
-
-Every place that depends on it:
+It reads no other field: not `revision`, `state`, a wrap, the public key
+or the setup token. So it changes with a password change, a recovery and
+a second-factor change, and with no other vault write. The binding is not
+the authentication generation: the key cache's generation and
+`SessionKeys.generation` stay the vault revision.
 
 | Place | Use |
 |---|---|
-| `crates/common/src/auth/access_token.rs:172-184` | a key account's credential version: `za_session_binding(&read.record)` in place of `read.record.revision` |
-| `vault_batch_write` (`crates/common/src/auth/vault.rs:197-239`) | clears field 153 when `previous`'s binding differs from the new record's, or `previous` is `None` |
+| `crates/common/src/auth/access_token.rs:172-184` | a key account's credential version: `za_session_binding(&read.record)` in place of `read.record.revision`; the `.unwrap_or(0).max(1)` stays |
+| `vault_batch_write` (`crates/common/src/auth/vault.rs:197-239`) | clears field 153 only when `previous` is `None` or its binding differs from the new record's |
 | `ZaTokenRecord.binding` (5.3) | the binding the entries were made under |
-| the hand-off value (5.3) | the binding at the password step |
-| `za_handoff_put`, `za_token_issue`, `za_token_refresh`, `za_token_open_access` (5.4) | each reads the vault record and compares bindings |
-| the assertion-loss loop of 5.4 | retries only while the binding is unchanged |
-| tests `tokens::vault_writes_end_sessions` and `tokens::pin_rewrap_ends_session` | expect every vault write to end the session |
-| spec 4.3, 4.6, 4.7, invariants 63 and 64, decision 4 | text |
+| the hand-off value (5.3) | the binding at the password step, stored and inside the wrap's associated data |
+| `za_token_issue`, `za_token_refresh`, `za_token_open_access` (5.4) | each reads the vault record and compares bindings |
+| the assertion-loss loop of 5.4 | a write still asserts the vault record's bytes; on a lost vault assertion the writer reads again: an unchanged binding is retried, three attempts in all, and a changed binding stops it |
+| `za_handoff_put` (5.4) | compares the vault revision with `keys.generation`, not bindings: a vault write of any kind that crosses the password step fails it once |
+| the Bearer arm (5.5, D23) | compares generations: a request crossed by any vault write answers 401; after one that left the binding unchanged the client's refresh succeeds |
+| tests | `binding_changes_only_with_credentials` (Task 13); `credential_change_clears_the_token_record`, `tokens::credential_changes_end_sessions`, `tokens::other_vault_writes_keep_sessions`, `tokens::pin_rewrap_keeps_session` (Task 14); the crossed cases of Tasks 16 to 18; `scheduling::first_invitation_and_the_session` (Task 31) |
 
 ### 5.2 `crates/vault/src/keys.rs` (additions)
 

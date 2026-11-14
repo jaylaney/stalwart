@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024 on upstream Stalwart v1.0.3 with release 7 (fork `0.4.0-beta.1`; internal crates `1.0.3`, `vault` `0.16.25`); `vault::keys` (HKDF sub-keys, `wrap_key`, XChaCha20-Poly1305) and rkyv for the token record; upstream's OAuth code (`seal_token`, `rotate_oauth_grant`, the in-memory store's code entries); upstream's JSCalendar converter in `calcard` and its JMAP calendar handlers; release 7's in-memory content part (`store::za_search::content::ContentPart`); the `tests` crate harness (`TestServer`, `DummyWebDavClient`, the JMAP helpers of `tests/src/utils/jmap.rs`, the SMTP sink, `HookParked`, `DrainOn`).
 
-**Spec:** [`docs/superpowers/specs/2026-11-13-zero-access-jmap-calendars-design.md`](../specs/2026-11-13-zero-access-jmap-calendars-design.md), revision 5 (decisions D1 to D29, invariants 57 to 76). Executors read the spec with the plan: a task names the sections it implements, and where the plan and the spec disagree the spec wins. Every name a task uses is fixed by the interface sheet; a task cites its sections and copies no signature. A name that turns out wrong is reported, not renamed.
+**Spec:** [`docs/superpowers/specs/2026-11-13-zero-access-jmap-calendars-design.md`](../specs/2026-11-13-zero-access-jmap-calendars-design.md), revision 6 (decisions D1 to D29, invariants 57 to 76). Executors read the spec with the plan: a task names the sections it implements, and where the plan and the spec disagree the spec wins. Every name a task uses is fixed by the interface sheet; a task cites its sections and copies no signature. A name that turns out wrong is reported, not renamed.
 
 **Plan files:** the plan is this file, the interface sheet [`2026-11-14-zero-access-17-jmap-calendars-interfaces.md`](2026-11-14-zero-access-17-jmap-calendars-interfaces.md) ("the sheet", cited as I §n) and six task files `2026-11-14-zero-access-17-jmap-calendars-tasks-{a,b,c,d1,d2,e}.md`, all beside it in `docs/superpowers/plans/`. [`-tasks-a`](2026-11-14-zero-access-17-jmap-calendars-tasks-a.md) holds Tasks 1 to 9, [`-tasks-b`](2026-11-14-zero-access-17-jmap-calendars-tasks-b.md) 10 to 12, [`-tasks-c`](2026-11-14-zero-access-17-jmap-calendars-tasks-c.md) 13 to 19, [`-tasks-d1`](2026-11-14-zero-access-17-jmap-calendars-tasks-d1.md) 20 to 27, [`-tasks-d2`](2026-11-14-zero-access-17-jmap-calendars-tasks-d2.md) 28 to 37, [`-tasks-e`](2026-11-14-zero-access-17-jmap-calendars-tasks-e.md) 38 to 44.
 
@@ -100,7 +100,6 @@ SHIP, TM and FMT run at the end of every task that changes a file. A task does n
 - A rerun that does not count as a failure: `webdav_tests` once for upstream's `cal_itip`; plain `jmap_tests` once for `calendar::notification`; a za run that fails only on a helper timeout while the load was above 20, once, both results recorded.
 - `DummyWebDavClient` times out at 500 ms. A request that waits on a pause or that mails goes through an in-process call or a five-second client.
 - The za suite skips every drain; a case that needs one holds `DrainOn` for its own body. `wait_for_queue` after a write that mails, never `wait_for_delivery`.
-- A keyed token or a Bearer session is made after a case's first invitation or share: the first pin rewrites the vault record. **[RULE]**
 - New za modules, in call order after `sharing_races::test` and before `sweep::test`: `tokens`, then `jmap_calendar::{pipeline, events, calendars, query, scheduling, sharing, refusals, oracle}`. `leak::test_jmap_calendars` runs after `leak::test_imip`.
 - Fixtures, all at `example.com`, password `STRONG`: the families `token-*` and `jmapcal-*`. A `jmap_calendar` module's accounts are `jmapcal-<module>` and `jmapcal-<module>-2`, both key accounts; a third key account takes a role suffix (`-reader`, `-noperm`); an ordinary account takes `-plain`. Outside parties are sink addresses `jmapcal-<module>-<role>@remote.test`. OAuth client ids are `za-token-*` and `za-jmapcal-*`. Deliberate authentication failures use `X-Forwarded-For` addresses in `10.0.60.x`.
 - `jmapcal-scheduling-nobody@example.com` is a local address with no entry, not an account.
@@ -150,36 +149,32 @@ Tasks 21 to 24, 26, 28 and 30 each serve methods that existing tests assert as r
 - The ledger is `.superpowers/sdd/2026-11-14-zero-access-17-jmap-calendars/progress.md`, git-ignored: one line per task with its commit, its review's verdict and each `Ruling:` the controller made.
 - A mutation executor runs one test row per background command and waits for it; it never batches rows.
 
-## The pending decision
+## The session rule
 
-Open (spec section 12, decision 4): whether a key account's OAuth sessions end on every vault write, or only when a credential changes.
+Decided by the project owner on 2026-11-14 (spec D19; section 12, decision 4): a key account's OAuth sessions end only when a credential changes, that is on a password change, a recovery or a second-factor change. They survive every other vault write: the first pin's rewrap, the self-check's repair, a new recovery key, and an app password's creation, publication, withdrawal or revocation.
 
-- The plan is written for the first: `za_session_binding(record)` returns the vault revision, so every vault write ends every browser session of the account.
-- Every step that depends on the answer is marked **[RULE]**. All of them go through `za_session_binding` (`crates/vault/src/record.rs`).
-- Under the second rule the function returns a fingerprint of the record's `salt`, Argon2 parameters, `verifier_hash` and `totp_url`. No signature changes.
+- `za_session_binding(record)` (`crates/vault/src/record.rs`, I §5.1) is a 64-bit fingerprint of the record's `salt`, Argon2 parameters, `verifier_hash` and `totp_url`, never 0. Every use of the rule goes through it.
+- The binding is not the authentication generation. The key cache's generation stays the vault revision: a vault write that leaves the binding unchanged still evicts resident keys, and the next request opens them again from the token record.
+- D23 stands: a Bearer request whose keys were opened at a generation that is no longer current answers 401. After a vault write that left the binding unchanged, the client's refresh succeeds.
 
-| Place | First rule (the plan) | Second rule |
+| Where | What it does | Tested by |
 |---|---|---|
-| `za_session_binding` | the vault revision | the credential fingerprint |
-| A key account's credential version (`crates/common/src/auth/access_token.rs:172-184`) | changes on every vault write | changes on a password change, a recovery and a second-factor change |
-| `vault_batch_write` (`crates/common/src/auth/vault.rs:197-239`) | clears field 153 on every vault write | clears it only when the fingerprint changes |
-| The hand-off value, `ZaTokenRecord.binding`, `za_handoff_put`, `za_token_issue`, `za_token_refresh`, `za_token_open_access`, the assertion-loss loop | compare revisions | compare fingerprints; the code is the same |
-| `vault::binding_is_the_revision` (Task 13) | the binding equals the revision | the binding changes exactly with the four fields |
-| The units `record_write_loses_to_vault_write` and `vault_write_clears_the_token_record` (Task 14) | every vault write clears the record | only a binding change clears it |
-| `tokens::vault_writes_end_sessions`, `tokens::pin_rewrap_ends_session` (Task 14) | every vault write deletes the record | a new recovery key, an app-password creation, publication, withdrawal or revocation, the self-check's repair and the first pin's rewrap keep it |
-| `tokens::issue_refuses_changed_binding`, `open_access_needs_entry_and_binding` (Task 15), `refresh_crossed_by_vault_write` (Task 18), the two crossed-exchange cases (Task 17) | any crossing vault write refuses | only a crossing credential change refuses |
-| `refusals::parse_by_grantee_and_keyless` (Task 24) and `leak::test_jmap_calendars` (Task 40) | a token is minted after the module's first share or invitation | the order is harmless |
-| `scheduling::first_invitation_and_the_session` (Task 31, review focus 1) | the next request answers 401 | the session survives |
-| The oracle (Task 38) | both sides sign in with HTTP Basic | a Bearer session would also do |
-| Mutation row J16 (Task 42), the documentation passages marked in Task 43, the checklist row "after the first invitation" (Task 43) | as written | reworded |
-
-D23 does not depend on the answer: a Bearer request whose keys were opened at a generation that is no longer current answers 401 under both rules.
+| `za_session_binding` (Task 13) | the fingerprint | `binding_changes_only_with_credentials` |
+| A key account's credential version (`crates/common/src/auth/access_token.rs:172-184`, Task 14) | is the binding | `tokens::credential_changes_end_sessions`, `tokens::other_vault_writes_keep_sessions` |
+| `vault_batch_write` (`crates/common/src/auth/vault.rs:197-239`, Task 14) | clears field 153 only when the binding changes | `credential_change_clears_the_token_record`, `record_write_loses_to_vault_write`, `tokens::pin_rewrap_keeps_session` |
+| `za_token_issue`, `za_token_open_access` (Task 15) | compare bindings; a lost vault assertion under an unchanged binding is retried | `tokens::issue_refuses_changed_binding`, `tokens::open_access_needs_entry_and_binding` |
+| The Bearer arm (Task 16) | D23 | `tokens::bearer_crossed_by_vault_write_is_refused` |
+| The code exchange (Task 17) | a crossing credential change refuses; any other crossing vault write is retried | `tokens::exchange_crossed_by_password_change`, `tokens::exchange_crossed_by_recovery`, `tokens::exchange_crossed_by_other_vault_write` |
+| The refresh (Task 18) | the same | `tokens::refresh_crossed_by_credential_change`, `tokens::refresh_crossed_by_other_vault_write` |
+| A browser's first invitation (Task 31, review focus 1) | the session survives the pin's rewrap | `scheduling::first_invitation_and_the_session` |
+| The mutation sample (Task 42) | rows J16 and J16b | |
+| The documentation and the checklist row (Task 43) | state the rule | |
 
 ## Review Focus
 
 Five conditions no task's tests would otherwise exercise, most likely to hurt a user first. Each is owned by the named test.
 
-1. **The first invitation signs the browser out.** Condition: a key account's first invitation to another key account, sent from a browser session. A person expects the invitation to be delivered and, having been signed out, to sign in again and find the event with its attendee's status. **[RULE]** Task 31, `scheduling::first_invitation_and_the_session`.
+1. **The first invitation keeps the browser signed in.** Condition: a key account's first invitation to another key account, sent from a browser session. The invitation pins the invitee's key, and the pin's rewrap is a vault write. A person expects the invitation to be delivered and the browser to stay signed in: the same token reads the event, and its refresh is granted. Task 31, `scheduling::first_invitation_and_the_session`.
 2. **A native client's dead properties across a browser move.** Input: an event a CalDAV client annotated with dead properties, moved in the browser from an unshared to a shared calendar. A person expects the native client to read its properties afterwards. Task 11, `pipeline::placement_reseals_event_container`.
 3. **A grantee's default reminders land on everyone.** Input: `useDefaultAlerts: true` on a new event in a shared calendar, written by a grantee. A person expects to know what is stored and who is reminded: the grantee's own defaults by value, an email reminder naming the grantee, and, for a grantee that set none, the defaults its entry took from the owner's at the grant. Task 36, `sharing::grantee_default_alerts`.
 4. **An edit in the browser drops what a native client wrote.** Input: an event with an `X-` property and alarm details, written over CalDAV and edited over JMAP. A person expects to lose no more than the same steps lose on an ordinary account, and to keep the token pairs, the display name and the withheld-instance record. Task 38, `oracle::round_trip_keeps_what_an_ordinary_account_keeps`.
@@ -253,7 +248,7 @@ The plan, in `docs/superpowers/plans/`, each name after the prefix `2026-11-14-z
 `crates/vault`:
 - `src/tokens.rs` (new): the token record and its entries, the suffix split, reconciliation, eviction, refresh classification, the hand-off value.
 - `src/keys.rs`: the token and hand-off key derivations and their associated data.
-- `src/record.rs`: `za_session_binding` **[RULE]**.
+- `src/record.rs`: `za_session_binding`, the fingerprint of the credentials.
 - `src/lib.rs`: the module declaration.
 - `Cargo.toml`, and the workspace's `Cargo.lock`: the base64 crate.
 

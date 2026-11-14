@@ -27,7 +27,7 @@ These tasks belong to [zero-access plan 17: JMAP calendars and browser sign-in](
 **Constraints:**
 - The oracle is the release's stopping rule (3.6): a difference it finds is fixed by routing the JMAP path through the pipeline, never by a new normalization.
 - `normalize_jscal` removes `id`, `baseEventId`, the keys of `calendarIds`, and `created` and `updated` at any depth. It removes nothing else.
-- **[RULE]** Both sides sign in with HTTP Basic. The first invitation pins the invitee's key, which is a vault write, and a Bearer session would end at that step.
+- Both sides sign in with HTTP Basic, so the comparison does not depend on a token's life.
 - Fixtures. Key accounts, each through `key_account`: `jmapcal-oracle-cd` and `jmapcal-oracle-jm` (the two sides), `jmapcal-oracle-cd-inv` and `jmapcal-oracle-jm-inv` (each side's invitee). Ordinary: `jmapcal-oracle-plain`, Step 5 only. Outside parties: `jmapcal-oracle-cd-out@remote.test` and `jmapcal-oracle-jm-out@remote.test`. The names of the two sides have equal length, so the name mapping moves no fold point.
 - The name mapping `jmapcal-oracle-cd` to `jmapcal-oracle-jm` is applied to the CalDAV side's values only.
 - Each step starts with `sink().clear()`. The module holds `DrainOn` for its run and ends with `finish(test, "oracle")`.
@@ -272,7 +272,7 @@ The task report lists every assertion of the tables above with its upstream line
 - No codec of the token record is public: the scan reads through `Server::za_token_read`. The cap rule therefore has no negative control; Task 13's `record_round_trips_and_caps` covers the caps at the codec.
 - A token secret is searched as its 32 bytes and as its 43 characters. A code is searched as its 40 characters.
 - The hand-off entry is in the in-memory store, which no scan reads: it is checked by its exact key with `handoff_exists`.
-- **[RULE]** Calendar writes of this module sign in with HTTP Basic, and its Bearer sessions are opened after its share and its first invitation.
+- Calendar writes of this module sign in with HTTP Basic. Its Bearer sessions may be opened at any point: a share or a first invitation pins a key, which ends no session (spec D19).
 - Fixtures: `pair(test, "leak")`; the OAuth client id `za-jmapcal-leak`, dropped at the end; the outside attendee `jmapcal-leak-addr-canary@remote.test`.
 - Every canary is in `EXTRA_CANARIES`, and the test asserts that each was listed and sent, as `test_imip` does (`:3210-3220`).
 
@@ -323,7 +323,7 @@ Then, in this order:
 - `secret_hits` is empty for: every access and refresh secret of both accounts, first and refreshed, as bytes and as text; both codes' 40 characters and both hand-off secrets; both accounts' MK (`za_unlock(..).mk()`).
 - `secret_hits(test, &[b"#a1b2c3", b"#c3b2a1"])` is empty.
 - For each account, `scan` reports no violation, `token_records == 1`, and at least one event and one calendar.
-- The sessions end: `za_revoke_token` answers 200 for `jmapcal-leak-2`'s refresh token; `jmapcal-leak` changes its password through `POST /api/vault/password`, as `tests/src/za/password.rs` does. A password change ends the session under either rule.
+- The sessions end: `za_revoke_token` answers 200 for `jmapcal-leak-2`'s refresh token; `jmapcal-leak` changes its password through `POST /api/vault/password`, as `tests/src/za/password.rs` does. A password change is a credential change and ends the session (spec D19).
 - For each account `raw_token_record` is `None` and a scan's `token_records` is 0. `secret_hits` over the same secrets is empty.
 
 The scan's existing rules give the rest of 9.5 for both accounts: sealed archives only, no event preferences (`check_event`), no Calendar search entry (`check_search`), each calendar record sealed (`check_calendar`).
@@ -444,7 +444,7 @@ Commands: a row names ZA, U-vault, U-groupware or U-common with the catcher's na
 
 - **ZA-short**, a follow-up only: ZA with a tests-only edit that removes the calls from `setup::test` (`tests/src/za/mod.rs:140`) through `sharing_races::test` (`:190`), so the suite goes from its setup to `tokens::test`. It is used when ZA's first failure is in a module before `tokens::test`, to reach the named catcher. The edit is reverted with the mutation.
 
-25 of the 27 rows run ZA.
+26 of the 28 rows run ZA.
 
 - [ ] **Step 1: Run the rows**
 
@@ -467,7 +467,8 @@ Commands: a row names ZA, U-vault, U-groupware or U-common with the catcher's na
 | J13 | the drain hook is removed | `crates/jmap/src/api/request.rs`: the `za_drain` insertion before `:194` is removed | `scheduling::drain_runs_from_jmap` | ZA |
 | J14 | a notification destroy is let through | `crates/jmap/src/api/za_calendar.rs`, `za_calendar_method`: `CalendarEventNotification/set` is `Served` | `refusals::every_row_of_6_11`; then `refusals::notification_destroy_leaves_the_item` | ZA |
 | J15 | the wrap's associated data omits the grant id | `crates/vault/src/keys.rs`, `token_aad`: the label is built without `grant_id` | `token_entry_binds_account_grant_kind_generation` | U-vault |
-| J16 | the vault commit leaves the token record **[RULE]** | `crates/common/src/auth/vault.rs`, `vault_batch_write`: the `batch.clear(PrincipalField::ZeroAccessTokens)` is removed | `vault_write_clears_the_token_record`; then `tokens::vault_writes_end_sessions` | U-common, ZA |
+| J16 | a credential change leaves the token record | `crates/common/src/auth/vault.rs`, `vault_batch_write`: the `batch.clear(PrincipalField::ZeroAccessTokens)` is removed | `credential_change_clears_the_token_record`; then `tokens::credential_changes_end_sessions` | U-common, ZA |
+| J16b | a vault write that changes no credential deletes the token record (D19) | the same place: the clear is made on every vault write | `credential_change_clears_the_token_record`; then `tokens::other_vault_writes_keep_sessions` | U-common, ZA |
 | J17 | a superseded refresh entry is kept | `crates/vault/src/tokens.rs`, `ZaTokenRecord::reconcile`: the rule that drops a refresh entry below the grant's stored generation is removed | `reconcile_cases`; then `tokens::interrupted_refresh_cleared_by_another_grants_write` | U-vault, ZA |
 | J18 | a token with an unopenable secret is served keyless | `crates/http/src/auth/za_bearer.rs`, `za_bearer_keys`: an entry that is missing or does not open returns `Ok(None)` | `tokens::tampered_or_foreign_secret_is_401` | ZA |
 | J19 | the hand-off is not deleted on redemption | `tokens.rs`, `za_handoff_take`: the entry is read and not deleted | `tokens::handoff_gone_after_redemption_and_expiry`. Upstream's single-use code refuses a replayed exchange, so the exact-key check is the only catcher. | ZA |
@@ -503,7 +504,7 @@ The ledger gets one line per row: its id, killed or survived, the first failure.
 
 **Constraints:**
 - Documentation only: no code or test file changes, so the closing checks have nothing to check.
-- Each passage that states when browser sessions end is written for the plan's rule and listed in the outcome note among the **[RULE]** passages, so that a later decision finds them all.
+- Each passage that states when browser sessions end states spec D19: only a password change, a recovery or a second-factor change ends them.
 - Line references in `CLAUDE.md` are checked against the head before they are written.
 - No release 6 status paragraph is added to `CLAUDE.md`: the controller adds it at merge.
 
@@ -522,7 +523,7 @@ The ledger gets one line per row: its id, killed or survived, the first failure.
 | Invariants, after the release 7 bullet (`:144-178`) | One bullet, "JMAP calendars and browser sign-in (release 6 spec section 10, 57-76)", restating each invariant in a clause with its number, then the amendments of section 10. |
 | Invariant 9 exceptions (`:179-197`) | Two more. `decode_access_token` strips a `~` suffix from every token that begins with the server's token header before it opens it (spec 4.2, D26). A successful answer of the token endpoint is untraced for every account (D24). With them, the three costs section 10 names for ordinary accounts. |
 | Where release 2 lives, `:286` | The drain is also called from `handle_jmap_request`, for a request whose token holds its own account's keys and that holds a calendar method. |
-| Merge hotspots, after the release 7 paragraphs (`:304-411`) | A paragraph "Release 6 added merge hotspots" with every insertion of spec 11's first list, and one "Release 6 silent dependencies" with every item of its second list. Among them, or added to them: the key writer of `CalendarEvent/set` repeats the head and the update grouping of upstream's handler; `za_calendar_set` repeats the head of `calendar/set.rs`; `za_itip_fails_write` names every `ItipError` variant; the split of a token relies on `TOKEN_HEADER`; D15's paged form relies on the fields of an intermediate state (Task 22); the recipient rule of `za_apply_default_alerts_by_value` repeats `alerts.rs:472-489`; the query branch relies on no key account's event carrying `EVENT_HIDE_ATTENDEES`; the place of each **[RULE]** use of `za_session_binding` (the header's table). |
+| Merge hotspots, after the release 7 paragraphs (`:304-411`) | A paragraph "Release 6 added merge hotspots" with every insertion of spec 11's first list, and one "Release 6 silent dependencies" with every item of its second list. Among them, or added to them: the key writer of `CalendarEvent/set` repeats the head and the update grouping of upstream's handler; `za_calendar_set` repeats the head of `calendar/set.rs`; `za_itip_fails_write` names every `ItipError` variant; the split of a token relies on `TOKEN_HEADER`; D15's paged form relies on the fields of an intermediate state (Task 22); the recipient rule of `za_apply_default_alerts_by_value` repeats `alerts.rs:472-489`; the query branch relies on no key account's event carrying `EVENT_HIDE_ATTENDEES`; the place of each use of `za_session_binding` (the header's table). |
 | The za suite paragraph, `:419` | The modules `tokens` and `jmap_calendar::{pipeline, events, calendars, query, scheduling, sharing, refusals, oracle}` after `sharing_races::test`; `leak::test_jmap_calendars` after `leak::test_imip`; the fixture rule of the header's suite rules, and the `token-*` and `jmapcal-*` allocations, by module, as the tasks made them. |
 | Release 4 calendar sharing, `:426-434` | A grantee reads and writes a shared key calendar through JMAP under the rules CalDAV applies; `shareWith` stays refused; a shared calendar's colour is in each principal's sealed bundle, and a new grantee's entry starts as a copy of the owner's (D14). |
 
@@ -531,7 +532,7 @@ The ledger gets one line per row: its id, killed or survived, the first failure.
 | Place | What it must now say |
 |---|---|
 | The command list, `:14-26` | Key-mode `jmap_tests` runs the calendar block. |
-| "Operating zero-access accounts", `:31-37` | Browser sign-in: an OAuth token of the authorization-code flow carries the account's keys; a keyed token is about 45 characters longer; the device-code flow and the mail protocols' bearer logins stay keyless (D9); a token whose entry is gone answers 401, which is not counted for banning (D7). **[RULE]** Every vault write ends every browser session of the account, among them the first pin's rewrap. The token record (field 153) and the daily sweep that bounds an expired, superseded or registry-destroyed entry (D8). At most 32 browser sign-ins of an account hold keys at once (D20). How long a browser stays signed in is upstream's refresh-token lifetime, thirty days without use by default; the release adds no setting. |
+| "Operating zero-access accounts", `:31-37` | Browser sign-in: an OAuth token of the authorization-code flow carries the account's keys; a keyed token is about 45 characters longer; the device-code flow and the mail protocols' bearer logins stay keyless (D9); a token whose entry is gone answers 401, which is not counted for banning (D7). Only a credential change ends the account's browser sessions: a password change, a recovery or a second-factor change (D19). Revoking an app password, a new recovery key, the self-check's repair and the first pin's rewrap do not; each still evicts resident keys, which the next request opens again from the token record. The token record (field 153) and the daily sweep that bounds an expired, superseded or registry-destroyed entry (D8). At most 32 browser sign-ins of an account hold keys at once (D20). How long a browser stays signed in is upstream's refresh-token lifetime, thirty days without use by default; the release adds no setting. |
 | The key-cache bullet, `:36` | The cache also holds Bearer entries, under the same idle and age limits. |
 | A new section "## Browser sign-in and JMAP calendars", before "## Merging upstream" (`:186`) | What is served and what stays refused (spec 6.2 and 6.11 as two short lists); that the release ships no client; the pointer to `docs/zero-access/client-jmap.md`; that text search of events is matched in memory per request and what `query::text_query_cost` measured; that a store error on one object of a `/set` leaves the earlier objects committed (D3). |
 | "Sharing key calendars", `:287-289` | The sentence about "seven calendar-method refusals" goes. Key-mode JMAP must reach `za_variants::calendars`, which runs upstream's calendar bodies and the variants. |
@@ -543,7 +544,7 @@ In the form of `client-caldav.md`. Sections:
 - **What this is**: the manual gate of spec 9.8 for the reference client, Bulwark Webmail 1.21.2, static edition. It qualifies the server; the release ships, hosts and configures no client.
 - **Setup**: serving the static edition from a local server; the OAuth client and Application registration it needs and the server's CORS setting, as steps on a local machine; the accounts: a key account without a second factor, one with, a second key account as grantee and invitee, an outside address at a local SMTP sink.
 - **Recording**: the date, the client's version, the server's commit, and one result per row.
-- **Checks**: every row of spec section 7's table, in its order, each with the action and the expected result. The row "after the first invitation to a key account" expects one sign-out and a working second sign-in **[RULE]**.
+- **Checks**: every row of spec section 7's table, in its order, each with the action and the expected result. The row "after the first invitation to a key account" expects the browser to stay signed in (D19).
 - **Assumptions to confirm on a running instance**: the five facts of spec 1.3, each with how to observe it.
 
 - [ ] **Step 4: The smaller files**
@@ -551,7 +552,7 @@ In the form of `client-caldav.md`. Sections:
 - `docs/zero-access/manual-checklist.md`: a section "## JMAP calendars and browser sign-in (release 6)" after "## Search and threads (release 7)" (`:98`), naming the spec and `client-jmap.md`. Native status: pending.
 - `docs/zero-access/calendar-sharing-api.md:153-154`: "JMAP calendars are served to an owner and to a grantee; `shareWith` stays refused for key accounts." A sentence on D14: each principal's colour of a shared calendar is sealed in its own entry.
 - `README.md:29-31`: JMAP calendars leave the list of what is deferred or refused. Granting a share through JMAP joins it.
-- `CHANGELOG-fork.md`, "## Unreleased": browser sign-in carries keys; JMAP calendars for key accounts, with what stays refused; a keyed token whose entry is gone is refused (D7); default alerts are applied by value (D11); destroying a calendar through JMAP sends cancellations (D16); at most 32 keyed sign-ins (D20); the token endpoint's successful answers leave the traces for every account (D24); **[RULE]** sessions end on every vault write.
+- `CHANGELOG-fork.md`, "## Unreleased": browser sign-in carries keys; JMAP calendars for key accounts, with what stays refused; a keyed token whose entry is gone is refused (D7); default alerts are applied by value (D11); destroying a calendar through JMAP sends cancellations (D16); at most 32 keyed sign-ins (D20); the token endpoint's successful answers leave the traces for every account (D24); browser sessions end only on a password change, a recovery or a second-factor change (D19).
 
 - [ ] **Step 5: The outcome note**
 
@@ -559,7 +560,7 @@ In the form of `client-caldav.md`. Sections:
 
 - **Where things stand**: the branch, its base, every commit by task. Task 44 adds each suite's result and time.
 - **What changed and why**: one paragraph per task group, naming the spec sections.
-- **The pending decision**: the rule the code implements, and the list of **[RULE]** places in code, tests and documentation.
+- **The session rule**: spec D19 as decided on 2026-11-14, and where it is implemented and tested (the header's table).
 - **Rulings**: every `Ruling:` line of the ledger.
 - **Review focus**: the result of each of the five tests; for the fifth, the count of opened events and the time.
 - **Mutation runs (plan 17)**: Task 42's table with the observed lines, the follow-up runs, the survivors or "No mutation survived", the kill checks, and why D21 has no row.
@@ -632,7 +633,7 @@ The outcome note's "Where things stand" gets one line per row: command, result, 
 
 One reviewer at the top tier, with a clean context and this brief:
 
-- **Read**: the spec, revision 5; the plan's header, the interface sheet and the six task files; `CLAUDE.md`; the outcome note (rulings, adjusted assertions, mutation table, residuals); and `git diff <base>...HEAD`, where the base is the branch's merge base with `origin/main`.
+- **Read**: the spec, revision 6; the plan's header, the interface sheet and the six task files; `CLAUDE.md`; the outcome note (rulings, adjusted assertions, mutation table, residuals); and `git diff <base>...HEAD`, where the base is the branch's merge base with `origin/main`.
 - **Run nothing.** The matrix of Step 1 ran on this head; its results are in the outcome note.
 - **Look for**:
   1. a place where JMAP and CalDAV differ for a key account in anything spec 3.2 does not list as an input, and a JMAP write that stores plaintext CalDAV would have sealed (3.6);
