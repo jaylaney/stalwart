@@ -1,8 +1,13 @@
 # Zero-access calendar: JMAP calendars and browser sign-in (release 6) design spec
 
-Date: 2026-11-13. Status: revision 4. Revision 4 corrects the spec
+Date: 2026-11-13. Status: revision 5. Revision 5 applies what the plan's
+drafting found on 2026-11-14 (4.2 to 4.7, 5.2, 5.3, 6.1, 6.3 to 6.9, 8,
+9.1, 9.2, 9.4, 9.7 and 10 to 12) and adds four decisions: which Bearer
+values are split (D26), token refusals that are not counted for banning
+(D27), a store error on one object of a `/set` (D28) and a paged sync at
+the sharing boundary (D29). Revision 4 corrected the spec
 against the plan's preflight of 2026-11-14 (2, 3.1 to 3.4, 4.2 to 4.7,
-5.1 to 5.4, 6.1, 6.4 to 6.10 and 7 to 13) and adds nine decisions:
+5.1 to 5.4, 6.1, 6.4 to 6.10 and 7 to 13) and added nine decisions:
 who owns each step of a write (D17), where the scheduling status is
 resolved (D18), what a token binds to (D19), the cap on keyed grants
 (D20), what a removal asserts (D21), the refresh without a secret (D22),
@@ -39,7 +44,7 @@ key domain, `SENT-BY` placement and the second run are those of the release
 (`2026-11-04-zero-access-search-design.md`), cited by release. Every
 invariant of those specs (1 to 56) holds except where section 10 amends one
 by name. Jay's decisions are stated as decided. Decisions of this spec are
-marked **D1** to **D25**, each with its reason; section 12 lists the ones
+marked **D1** to **D29**, each with its reason; section 12 lists the ones
 Jay should check.
 
 This spec adds four terms:
@@ -345,10 +350,16 @@ introspection endpoints, and the mail protocols' bearer mechanisms)
 accepts the longer string. Two callers read the secret: the HTTP layer's
 Bearer arm (4.6) and the refresh grant (4.5).
 
-The strip applies to every account's token, since the account is not
-known before the token is opened (section 10 records the exception). A
-suffix on an ordinary account's token is refused by the HTTP layer (4.6)
-and ignored by the other consumers. Introspection reports upstream's
+**D26.** The strip applies to every token that begins with the server's
+own token header, for every account, since the account is not known
+before the token is opened (section 10 records the exception). Any other
+Bearer value, such as an external directory's token, is passed through
+unchanged, whatever characters it holds. The reason is that RFC 6750
+lets another issuer's token hold `~`, and such a token belongs to an
+ordinary account.
+
+A suffix on an ordinary account's token of this server is refused by the
+HTTP layer (4.6) and ignored by the other consumers. Introspection reports upstream's
 state only: a keyed token whose entry is gone still introspects as
 active.
 
@@ -358,6 +369,8 @@ without revealing it, and a key that seals the next refresh secret. The
 wrap is the primitive the app-password wrap uses (`wrap_key`,
 `crates/vault`). Its associated data binds the account id, the grant id,
 the kind (access or refresh) and, for a refresh wrap, the generation.
+The hand-off's wrap (4.4) binds the account id, the code or consent
+token it is stored under, and the binding (D19).
 
 ### 4.3 The token record
 
@@ -373,6 +386,11 @@ keyed grant. It holds:
     issued), and the expiry of the refresh token;
   - at most four **access entries**: the secret's tag, the MK wrap and
     the access token's expiry.
+
+An entry's expiry is computed when the entry is written. On a retried
+refresh the next generation's entry can therefore carry an expiry later
+than its token's, by the retry's delay. The token's own expiry and the
+sweep bound it.
 
 **D19. The binding.** One function, `za_session_binding`, computes from
 the vault record the value that a key account's OAuth tokens and its
@@ -445,8 +463,10 @@ only after the second.
 and returns them. The hand-off entry is written where the code or the
 consent token is created (`issue_auth_code`, `request_consent`), before
 that code or token is stored, so neither ever exists without its entry.
-The entry is MK wrapped under a key derived from a fresh 32-byte secret,
-with the binding (D19). It is stored in the in-memory store under
+The entry is MK wrapped under a key derived from a fresh 32-byte secret.
+The binding (D19) is stored with the wrap and is part of its associated
+data, so a writer of the in-memory store cannot change it. The entry is
+stored in the in-memory store under
 upstream's OAuth prefix, a `~` and the 40-character code, with the code's
 expiry; the task that purges upstream's codes purges it too. The secret
 is appended to the code the client receives, with no separator, so the
@@ -490,6 +510,13 @@ Rules:
 - A consent that is refused deletes the entry. So does a confirmation
   that fails its checks after the consent token was taken.
 - A sign-in past the cap of D20 evicts the least recently used grant.
+- A code exchange that finds a secret on the code of an account that is
+  not a key account answers `invalid_grant`. Upstream would not have
+  found a code of that length. The code is spent.
+- If a vault write crosses the password step, between the password's
+  check and the hand-off's write, the step answers an authentication
+  failure and issues no code. It is not counted against the client's
+  address (D27).
 
 ### 4.5 Refresh
 
@@ -613,11 +640,20 @@ served as a keyless token. A client that refreshes on 401 then gets a
 new access token with a new entry, where a keyless answer would leave it
 holding a token that reads nothing.
 
+**D27.** A refusal by the fork is traced as an authentication failure
+with a fixed reason and is not counted against the client's address for
+banning. That covers an entry that is missing or does not open, a
+malformed secret, a secret on a token that cannot carry one, and a stale
+generation (D23). The reason is that such a client holds a token
+upstream accepted: one whose entry was dropped by the cap of four gets
+one 401 and refreshes. A wrong password is counted as before.
+
 D7 is decided at a cache miss. A node that has a token's keys cached
 serves it until that cache entry ends, at most the token's remaining
 life, even if the record's entry was dropped by the cap of four. A
 grant's deletion evicts the cached entry at once. A suffix on an
-ordinary account's token is refused with 401.
+ordinary account's token is refused with 401. That is a token of this
+server; a Bearer value that is not one is not split (D26).
 
 A token without a secret is a keyless token, as today: an API key, a
 device-flow token, a master-user token. Search spec 6.2's table applies
@@ -645,7 +681,8 @@ token is a keyed CalDAV request.
   contact, which the first invitation it sends to another key account
   does, its browser is signed out at its next request.
 - **A grant deletion.** `delete_oauth_grant` removes the grant's entries
-  (D21). Upstream calls it on revocation (`/auth/revoke`), a replayed
+  (D21). It reads the token record only when the grant's account is a
+  key account. Upstream calls it on revocation (`/auth/revoke`), a replayed
   refresh token, a client mismatch, when it prunes idle or excess grants
   and when an account's registry password changes. The fork calls it for
   the eviction of D20. A failed removal of entries is logged and never
@@ -680,7 +717,9 @@ insertion in upstream's registry code.
 The sweep finds the records through the registry's account list, with
 one point read per account. Property keys are ordered by account, so no
 range scan finds one field across accounts. A failure on one account is
-logged and the sweep goes on. Its writes follow D21.
+logged and the sweep goes on. Its writes follow D21. A record that does
+not decode is left as it is: it may be a record of a later format. A
+sign-in or a refresh writes over it.
 
 ### 4.8 What stays keyless
 
@@ -802,6 +841,12 @@ are computed over its new calendars. CalDAV's requests name one source
 and one target; the function takes the full sets, of which CalDAV's are
 the smallest case.
 
+For JMAP the content counts as changed when the tree that upstream's
+shaping produces differs from the stored one. Upstream stamps `updated`
+on an owner's update, so most JMAP moves ask `ModifyItems` as well. The
+two share levels cannot tell the difference: `edit` holds every right a
+placement can ask and `view` none.
+
 ### 5.3 One commit per object
 
 **D3.** For a key account, a `/set` call runs the pipeline once per
@@ -817,6 +862,14 @@ lease, delivers items to recipients before its own commit and retries
 once after rewrapping. One object's failure must not strand another's
 delivered invitations. JMAP defines each object of a `/set` as its own
 atomic unit, so per-object commits conform.
+
+**D28.** A store error on one object does not fail the method. That
+object and every later object of the call report the set error
+`forbidden` with a fixed description (section 8) and are not attempted.
+The objects already committed keep their answers, and `newState`
+reflects them. An error before the first object fails the method, as
+upstream. The reason is D3: with one commit per object, a failed method
+would hide from the client what the call had already committed.
 
 ### 5.4 Scheduling
 
@@ -874,8 +927,12 @@ the method's own access check:
   access to the account. Each calendar is then resolved through
   `za_calendar_context` with the grantee's keys and the grant ring, as on
   CalDAV. No owner session is manufactured.
-- **Anyone else**, and any keyless token, gets the method error
-  `forbidden` with a fixed keyless description (D25).
+- **A caller with no access to the account** gets upstream's own answer
+  from the method's access check, `accountNotFound`. The fork's refusal
+  applies only after that check passes.
+- **Anyone else the check admits**, and any keyless token or
+  impersonation, gets the method error `forbidden` with a fixed keyless
+  description (D25).
 
 **D25.** The keyless description for calendars is a text of its own,
 parallel to mail's: "Calendars in this account are encrypted at rest and
@@ -922,6 +979,9 @@ CalDAV read does.
   CalDAV.
 - An inline attachment's link is served as upstream forms it; its blob is
   not downloadable (6.11).
+- A read that asks for no property needing the stored content is
+  answered from the cache without a read context, as `/query` and
+  `/changes` are (6.4, 6.8).
 
 ### 6.4 `CalendarEvent/query`
 
@@ -955,6 +1015,9 @@ CalDAV read does.
     planning are the index's code. A condition of several words
     therefore matches when one word is in the master and another in an
     override, and a phrase matches wherever the index would find it.
+    How a phrase matches on a field the index holds without positions
+    is whatever the stored index answers; the two-account case of 9.2
+    decides it.
     The conditions' results are combined by the filter's AND, OR and
     NOT, with the function upstream combines the index's results with.
 
@@ -971,6 +1034,9 @@ CalDAV read does.
 
   A key account has no calendar search documents, so nothing is indexed.
   A text query without a time range opens every event of the account.
+  The query holds the terms of its candidate events in memory for the
+  request and charges no memory budget for them. Both are accepted
+  costs (Jay, 2026-11-14).
 
   Three differences from an ordinary account remain. An ordinary
   account's index lags its writes; the matcher is always current. An
@@ -1022,6 +1088,16 @@ an email alert's recipient is the writer's account name. The event's
 former alarm components are removed from the tree, not only unlinked, so
 none is stored as an orphan.
 
+A grantee's entry of a shared calendar is a copy of the owner's, made at
+the grant, default alerts included. A grantee that set none therefore
+writes the defaults the owner had at the grant, and the owner's later
+changes do not reach it.
+
+The `/set` answer reports `useDefaultAlerts: false` and does not carry
+the alerts the server wrote. A client learns them from its next
+`CalendarEvent/get`. Returning them would need an insertion in upstream's
+server-set code, which the release does not make (Jay, 2026-11-14).
+
 Destroying an event runs the pipeline's delete with the event's domain,
 so cancellations and declines go through the fan-out. Destroying one
 occurrence through its synthetic id is upstream's conversion to an
@@ -1042,7 +1118,8 @@ cannot parse a blob in the sharer's account. The method writes nothing.
 the caller, so the name and description are the caller's sealed personal
 values. `shareWith` and `myRights` come from the stored grants, which are
 visible by design. A grantee's list holds the calendars its fresh
-context admits, as CalDAV's listing does.
+context admits, as CalDAV's listing does. `Calendar/query` lists ids
+from the cache, as upstream does, and opens nothing.
 
 `Calendar/set`:
 
@@ -1052,7 +1129,9 @@ context admits, as CalDAV's listing does.
   stay in the clear, as release 1 decided.
 - **Update** edits the caller's own entry through the calendar's context
   and reseals it (`seal_calendar_changes`). A grantee changes only its
-  own entry. The handler never adds a preference entry: a grantee's
+  own entry, and only at the `edit` level: a grantee at the `view` level
+  is refused with `forbidden`, as CalDAV's PROPPATCH refuses it. The
+  handler never adds a preference entry: a grantee's
   entry exists from the grant, and a caller with no stored entry is
   refused.
 - **Destroy** runs the pipeline's collection delete (D16). Upstream's
@@ -1069,7 +1148,8 @@ has a colour field that is always written empty
 (`seal_personal_entry`). Release 6 fills it: each principal's colour of
 a shared calendar is sealed in its own bundle, the conversion carries
 the owner's colour across, and a bundle written before this release
-reads as no colour. Without this the owner of a shared calendar loses
+reads as no colour. A new grantee's entry starts with the owner's
+colour, because a grant copies the owner's entry. Without this the owner of a shared calendar loses
 its colour when sharing and gets an error on setting one from a JMAP
 client.
 
@@ -1093,6 +1173,21 @@ for a sharer's calendars. This is the JMAP form of the 403
 calendars. A JMAP state and a CalDAV sync token are the same change id,
 so the comparison is the same.
 
+**D29. A paged sync.** The predicate is applied to the state the sync
+started from, with the same comparison on every page. A page of a sync
+that started from an initial state is never refused. Upstream's
+intermediate state holds the first and the last change id of the range
+its first page read, and a count. It does not record how the sync
+started. A later page therefore compares the state's first change id
+with the log's first retained change id. Equal means the sync started
+from an initial state, and the page is served. Otherwise the start lies
+below that first change id, and the page is checked as the change id
+before it. The reason is that CalDAV's paged token carries its start and
+never checks an initial sync, paged or not, while JMAP's state has to be
+read for the same answer. The plan confirms this reading against the
+code before it relies on it, and stops if the two starts cannot be told
+apart (Jay, 2026-11-14).
+
 ### 6.9 `ParticipantIdentity`
 
 `/get` and `/changes` are served. The identities are the account's own
@@ -1103,6 +1198,7 @@ account's registry name, as upstream does.
 `/set` serves `onSuccessSetIsDefault`. A create, update or destroy is
 refused with `forbidden`: an identity's name is free text that would be
 stored in the clear, and the reference client only switches the default.
+The refusal's description is fixed (section 8).
 
 ### 6.10 The session and principal objects
 
@@ -1175,10 +1271,26 @@ The pipeline's neutral errors map to JMAP as follows.
 | More recipients than the cap, or a scheduling error CalDAV refuses the write for | set error `invalidProperties` on `participants`, with upstream's description |
 | The UID lease is busy, a create lost its fence, or a commit failed its assertion after the retry | set error `forbidden` with upstream's "modified by another process, try again" description, as upstream's `reject_uncommitted` gives |
 | Quota | upstream's `overQuota`, from upstream's pre-check or from the commit |
-| A keyless token, a non-grantee | method error `forbidden` (6.1) |
-| A store error | the method fails, as upstream |
+| A keyless token, an impersonation, a caller the access check admits without keys of its own | method error `forbidden` (6.1) |
+| A caller with no access to the account | upstream's `accountNotFound`, from the method's access check (6.1) |
+| A store error on an object of a `/set` | set error `forbidden` with the fixed description below, for that object and every later one (D28) |
+| A store error before the first object of a `/set`, or in a read | the method fails, as upstream |
 
 An object that fails does not undo the objects before it (D3).
+
+Fixed descriptions, where upstream's own check does not answer first:
+
+- a store error on an object (D28): "The server could not complete this
+  change, try again."
+- `shareWith`: "Calendar sharing is managed on the account page."
+- `isDraft: true`: "Drafts are not available for zero-access accounts."
+- a participant-visibility flag set true: "This property is not
+  available for zero-access accounts."
+- a link with a `blobId`, on `links`: "Event attachments are not
+  available for zero-access accounts."
+- an identity create, update or destroy: "Participant identities in
+  this account cannot be created, changed or destroyed; only the default
+  identity can be switched."
 
 Traces of the new paths carry account, grant and document ids, counts
 and fixed reasons. They never carry a token, a token secret, a code, a
@@ -1200,9 +1312,12 @@ leave an ordinary account's tokens in the trace, which is no better.
 
 - The token split, the derivations and the wrap's associated data: an
   entry does not open under another account, grant, kind or generation.
+  A value without the server's token header is not split (D26). A
+  hand-off does not open under another binding.
 - The record codec, its caps and its reconciliation: expired entries,
   a grant that is gone, a refresh entry below the grant's stored
-  generation.
+  generation. A write that only removes entries succeeds whatever the
+  vault record holds and cannot add an entry (D21).
 - The refresh steps of 4.5 against upstream's rotation outcomes: rotate,
   retry, replay, the three classifications of step 2, a lost race on the
   record that finds the presented generation superseded, a failed vault
@@ -1240,11 +1355,14 @@ trace modules. They reserve the fixture families `token-*` and
   successful token answer absent from the traces, for a key and an
   ordinary account (D24); the hand-off absent, checked by its exact key,
   after redemption, expiry and a refused consent; the first pin's rewrap
-  ending the session (4.7).
+  ending the session (4.7). Also: account destruction leaving no record;
+  an ordinary account's code with a secret answering `invalid_grant`
+  (4.4); a refused token not counted against its address (D27).
 
   Test hooks (test mode only) pause the code exchange after its last
   version check, and a refresh before its record read and before its
-  write. With them:
+  write. Two more fail once: a refresh's record write, and the removal
+  of a grant's entries. With them:
   - a password change, and separately a recovery, committed during a
     paused first issuance makes the issuance fail and leaves no record
     and no grant;
@@ -1282,8 +1400,9 @@ trace modules. They reserve the fixture families `token-*` and
   account, among them recurring events whose master and override hold
   different words in the same field. Once the ordinary account's index
   is current it runs the same unexpanded queries against both: single
-  words, several words in one condition, quoted phrases, and the
-  negation of each. Both accounts must return the same events. For the
+  words, several words in one condition, quoted phrases (among them a
+  phrase in both word orders on a field the index holds without
+  positions), and the negation of each. Both accounts must return the same events. For the
   single conditions and the flat ANDs among them, the expanded form
   must still match on the selected occurrence's own component. For the
   negated ones the expanded form must answer `invalidArguments`:
@@ -1310,8 +1429,8 @@ first step that differs with both projections.
 ### 9.4 Upstream's JMAP calendar tests in key mode
 
 Key-mode `jmap_tests` skips the calendar modules today. From release 6
-it runs upstream's `calendar::calendars`, `event`, `instance`, `alarm`
-and `identity` bodies with key accounts wherever the rulings leave their
+it runs upstream's `calendar::calendars`, `instance` and `alarm` bodies
+with key accounts wherever the rulings leave their
 assertions true, and a variant in `tests/src/jmap/za_variants.rs` where
 they do not. Expected variants: `notification` (refused), `acl` (the
 grant made through the share endpoints), `availability` (empty), and
@@ -1321,7 +1440,8 @@ default alerts by reference or `CalendarEvent/copy`. Also `identity`
 upstream's UID rule (3.3), and in `acl` the grantee's destroy of a
 shared calendar (6.7). `instance` runs upstream's body, since 6.5 leaves
 occurrence patches to upstream. The plan lists each changed assertion
-with the ruling that changes it.
+with the ruling that changes it. The variants take the prefix
+`calendar_`.
 
 ### 9.5 Leak coverage
 
@@ -1368,10 +1488,13 @@ At least these faults, each caught by a named test:
   redemption;
 - the cap's eviction leaves the evicted grant; a refresh without the
   secret of a keyed grant rotates it; a Bearer request at a stale
-  generation is served; a successful token answer is traced; a write
-  that only removes entries asserts the vault record;
+  generation is served; a successful token answer is traced;
 - the unexpanded matcher's document is built from the stored tree; a
   placement change asks for a right CalDAV's `MOVE` does not.
+
+D21 has no fault in the sample. A removal reads no vault record, so the
+fault could only be made by adding a read, and nothing would make that
+read stale. The unit tests of 9.1 cover it.
 
 ### 9.8 Manual checklist: the reference client
 
@@ -1428,6 +1551,13 @@ manual gate, as the native-client checklists are.
     uncached (D23).
 73. A successful answer of the token endpoint is never traced, for any
     account (D24).
+74. Only a Bearer value that begins with the server's token header is
+    split at `~`. Any other value reaches upstream unchanged (D26).
+75. For a key account a store error on an object of a `/set` is
+    answered on that object and every later one. It never fails the
+    method once the first object was reached (D28).
+76. A page of a sync that started from an initial state is never
+    refused at a sharing boundary (D29).
 
 Amendments:
 
@@ -1453,9 +1583,13 @@ Amendments:
 - **The rule that ordinary accounts take upstream's paths unchanged**
   (release 1 section 12) gains two exceptions. Both apply to every
   account, ordinary ones included. `decode_access_token` strips a `~`
-  suffix from every token before it opens it (4.2), because the account
-  is not known until the token is open. The token endpoint's successful
-  answers are untraced (D24).
+  suffix from every token that begins with the server's token header
+  before it opens it (D26), because the account is not known until the
+  token is open. The token endpoint's successful answers are untraced
+  (D24). Three costs also fall on ordinary accounts: one cached account
+  read at a code exchange, at a refresh and at a grant's deletion; one
+  in-memory delete at a consent confirmation that carries no secret; one
+  cached classification read in each calendar method.
 
 ## 11. Merge hotspots and silent dependencies
 
@@ -1480,7 +1614,7 @@ New fork insertions in upstream files:
 - `crates/services/src/task_manager/tasks/maintenance.rs`: the sweep.
 - `crates/jmap/src/api/request.rs` (admission, the drain hook),
   `crates/jmap/src/api/session.rs`, `crates/jmap/src/principal/get.rs`,
-  `crates/jmap/src/changes/get.rs`; one branch each at the head of the
+  `crates/jmap/src/changes/get.rs` and `changes/query.rs`; one branch each at the head of the
   two `/set` handlers in `crates/jmap/src/calendar/` and
   `crates/jmap/src/calendar_event/`, whose key writers are child modules
   that reuse upstream's private helpers; replacement points in the two
@@ -1546,6 +1680,20 @@ Silent dependencies:
 - D19 relies on every vault write passing through `vault_batch_write`,
   and on a key account's credential version being computed in one
   place.
+- D26 relies on upstream's token header (`TOKEN_HEADER`,
+  `crates/common/src/auth/oauth/token.rs`) opening every token the
+  server issues and no token of another issuer.
+- D29 relies on what an intermediate state holds: the first and the last
+  change id of the range its first page read, and a count
+  (`crates/jmap/src/changes/page.rs`). A change there needs a re-read of
+  6.8.
+- The query branch of 6.4 relies on no key account's event carrying
+  the hide-attendees flag, which 6.5 refuses. Upstream's check for such
+  events sends an attendee condition to the search store.
+- D11's email recipient repeats upstream's private rule for a default
+  alert's recipient (`crates/groupware/src/calendar/alerts.rs`).
+- The key writer of `Calendar/set` repeats the head of upstream's
+  handler, as the writer of `CalendarEvent/set` does.
 
 ## 12. Decisions, and what Jay should check
 
@@ -1596,6 +1744,19 @@ Calls of this spec that change what a user or an operator sees:
 - **D24**: the token endpoint's successful answers leave the traces, for
   every account.
 - **D25**: a keyless calendar method names calendars in its error.
+- **D26**: a Bearer value of another issuer is never split, whatever it
+  holds.
+- **D27**: a token the fork refuses is not counted against the client's
+  address.
+- **D28**: a store error during a `/set` is reported on the objects it
+  stopped, not as a failed method.
+- **D29**: a paged first sync of a shared calendar is never refused
+  part-way.
+- **6.7**: a grantee at the `view` level cannot rename or recolour its
+  own entry of a shared calendar from a JMAP client.
+- **D11**: the `/set` answer does not carry the alerts the server wrote.
+- **6.4**: a text search without a time range holds the terms of every
+  event of the account in memory for the request.
 - **3.4**: JMAP does not check a calendar's supported component set.
 - **4.7**: under decision 4, pinning a contact for the first time signs
   the browser out.
