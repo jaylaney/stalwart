@@ -1,6 +1,11 @@
 # Zero-access calendar: JMAP calendars and browser sign-in (release 6) design spec
 
-Date: 2026-11-13. Status: revision 2, for approval. Revision 2 answers
+Date: 2026-11-13. Status: revision 3, for approval. Revision 3 answers
+the re-review of revision 2 (findings 4 to 6 of the same file): how a
+superseded refresh entry is retired when the grant advances and the
+record's write does not follow (2, 4.3, 4.5, 4.7, 9, 10; finding 4), the
+paused-refresh test (9.2; finding 5), and the expanded form of negated
+queries (9.2; finding 6). Revision 2 answered
 Jay's codex review of revision 1
 (`2026-11-13-zero-access-jmap-calendars-design-codex-review.md`): the vault
 assertion on every write of the token record (4.3 to 4.5, 4.7, 9, 10;
@@ -127,8 +132,9 @@ own token-encryption key: upstream's tokens are sealed under a key the
 server holds, and their payload names the account, grant and generation,
 so a wrap keyed by anything in the payload would be open to the operator.
 That is why the fork adds a secret of its own (4.1). An entry can outlive
-its token, after the token expires or its grant is destroyed through the
-registry, by at most one maintenance interval (4.7).
+its token by at most one maintenance interval, in three cases: the token
+expired, its grant was destroyed through the registry, or the grant
+advanced past it and the record's own write did not follow (4.5, 4.7).
 
 **New for a short time: the hand-off.** Between the password step and the
 code exchange, MK is stored wrapped under a secret that travels inside the
@@ -333,8 +339,13 @@ and a token-record write therefore order strictly: either the vault
 write's batch deletes what the other wrote, or the other's assertion
 fails.
 
-Every write also drops entries that have expired, grants that hold no
-live entry and grants that no longer exist.
+Every write also reconciles the record with the grants it names, at the
+cost of one registry read per grant. It drops:
+
+- entries that have expired;
+- grants that hold no live entry, and grants that no longer exist;
+- every refresh entry below its grant's stored generation. Upstream
+  treats such a generation as a replay, so nothing may open under it.
 
 The record is not an authority for login. Upstream decides whether a
 token is valid, bound to the vault revision as today (release 1; Jay kept
@@ -442,9 +453,20 @@ The fork follows that state machine without changing it:
    server error. The grant has rotated, so the client's retry is
    upstream's retry case and step 3 finds or creates the same entry.
 
-A superseded refresh token therefore opens nothing: its entry and the
-link that led from it are gone once its successor is used, and no later
-write restores them.
+A superseded refresh token opens nothing once the refresh that
+superseded it has written the record: its entry and the link that led
+from it are gone, and no later write restores them.
+
+The grant's advance and the record's write are two writes, and the
+second can fail or never run. If the grant advances to a generation and
+the process stops, or the write fails and the client never retries, the
+entry below that generation is still in the record. It is removed by
+whichever comes first: the client's retry (step 6), any later write of
+the record, or the sweep. Each drops every refresh entry below its
+grant's stored generation (4.3, 4.7). Until then the superseded secret
+and the stored record together still open MK, for at most one
+maintenance interval. Upstream refuses the superseded token itself at
+once, and revokes the grant if it is presented.
 
 The second case of step 2 is more lenient than upstream is to the same
 request arriving a moment later, which upstream calls a replay and
@@ -510,11 +532,18 @@ token is a keyed CalDAV request.
 - **Account destruction.** The record goes with the principal's
   properties.
 
-**D8.** The sweep removes expired entries and the entries of grants that
-no longer exist. With it, an expired token, or the token of a grant
-destroyed through the registry, opens nothing after the next maintenance
-run. Without it an idle account's entries would stay until its next
-sign-in or refresh. The fork adds no hook to the registry's writer for
+- **An interrupted refresh.** A refresh entry below its grant's stored
+  generation, left behind when the record's write did not follow the
+  grant's advance (4.5), is removed by the next write of the record or
+  the next sweep.
+
+**D8.** The sweep reconciles every token record as a write does (4.3):
+it removes expired entries, the entries of grants that no longer exist,
+and refresh entries below their grant's stored generation. With it, an
+expired token, a superseded refresh token whose successor's write was
+interrupted, or the token of a grant destroyed through the registry,
+opens nothing after the next maintenance run. Without it an idle
+account's entries would stay until its next sign-in or refresh. The fork adds no hook to the registry's writer for
 the destroy case: the sweep bounds it, and the hook would be a new
 insertion in upstream's registry code.
 
@@ -927,7 +956,9 @@ to CalDAV ones.
 
 - The token split, the derivations and the wrap's associated data: an
   entry does not open under another account, grant, kind or generation.
-- The record codec, its pruning and its caps.
+- The record codec, its caps and its reconciliation: expired entries,
+  a grant that is gone, a refresh entry below the grant's stored
+  generation.
 - The refresh steps of 4.5 against upstream's rotation outcomes: rotate,
   retry, replay, the three classifications of step 2, a lost race on the
   record that finds the presented generation superseded, a failed vault
@@ -963,8 +994,15 @@ trace modules. They reserve the fixture families `token-*` and
   - a password change, and separately a recovery, committed during a
     paused first issuance makes the issuance fail and leaves no record
     and no grant;
-  - the same for a paused refresh, and for a refresh that retries a
-    lost record write across the vault change;
+  - a paused refresh crossed by the same vault changes, and a refresh
+    that retries a lost record write across one, answers
+    `invalid_grant` and leaves no record. Its old tokens are refused.
+    The grant object may remain, as any grant of the account does after
+    a vault write;
+  - a refresh made to fail right after its rotation and before its
+    record write, with no client retry, leaves the superseded entry in
+    the record; the maintenance sweep removes it, and in a second run a
+    write of the record for another grant removes it;
   - a retry of generation `g`, paused while its successor `g+1`
     completes a refresh, answers `invalid_grant`, leaves the grant and
     the successor's tokens usable, and leaves generation `g` absent
@@ -986,9 +1024,11 @@ trace modules. They reserve the fixture families `token-*` and
   different words in the same field. Once the ordinary account's index
   is current it runs the same unexpanded queries against both: single
   words, several words in one condition, quoted phrases, and the
-  negation of each. Both accounts must return the same events. The
-  expanded form of each query must still match on the selected
-  occurrence's own component.
+  negation of each. Both accounts must return the same events. For the
+  single conditions and the flat ANDs among them, the expanded form
+  must still match on the selected occurrence's own component. For the
+  negated ones the expanded form must answer `invalidArguments`:
+  upstream refuses `NOT` and `OR` when expanding.
 - **`jmap_calendar::scheduling`**: invitations, updates, cancellations
   and replies to and from a key account, an outside address and a plain
   local account; `sendSchedulingMessages` false and absent; pins and
@@ -1050,7 +1090,8 @@ At least these faults, each caught by a named test:
   unexpanded matcher reads one component at a time;
 - a token-record write omits the vault assertion; a superseded refresh
   generation deletes the grant; a lost record race puts back a pruned
-  entry;
+  entry; the sweep keeps a refresh entry below its grant's stored
+  generation;
 - the drain hook is removed;
 - a notification destroy is let through;
 - the wrap's associated data omits the grant id; the vault commit leaves
@@ -1095,6 +1136,8 @@ manual gate, as the native-client checklists are.
 65. A token that carries a secret is served with keys or refused.
 66. A scheduling inbox item is never listed, opened or destroyed through
     JMAP.
+67. A refresh entry below its grant's stored generation is removed by
+    the next write of the record or the next sweep. No write adds one.
 
 Amendments:
 
@@ -1178,6 +1221,10 @@ Silent dependencies:
 - 4.5 relies on upstream's retry case returning without a registry
   write and on no lock being held from the rotation to the fork's
   record write. The classification in step 2 exists for that gap.
+- The reconciliation of 4.3 reads `OAuthGrant.generation` as upstream's
+  rotation means it: the last generation a client proved it received,
+  below which every presentation is a replay. A change to that meaning
+  needs a re-read of 4.3, 4.5 and the sweep.
 - 4.6 relies on the HTTP layer being the only caller that reads the
   token record. `authenticate_with_keys` is shared with the IMAP and
   POP3 logins.
@@ -1212,7 +1259,8 @@ Calls of this spec that change what a user or an operator sees:
 - **D8**: the maintenance sweep of expired token entries. A grant
   destroyed from an "authorized apps" screen is refused at once, but its
   wrap stays at rest until the next sweep. The alternative is a hook in
-  upstream's registry writer.
+  upstream's registry writer. The same sweep bounds a superseded entry
+  left behind when a refresh is interrupted between its two writes.
 - **4.5**: a refresh whose key entry is lost ends the grant, so the
   person signs in again. A refresh that only lost a race to a newer one
   is refused without ending the grant.
