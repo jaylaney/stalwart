@@ -46,6 +46,7 @@ use trc::{
 };
 use types::{blob::BlobId, blob_hash::BlobHash, collection::Collection, field::EmailField};
 use utils::hash128::Hash128;
+use vault::session::SessionKeys;
 
 pub mod cache_idle;
 pub mod delivery;
@@ -327,12 +328,22 @@ pub async fn open_message(
     document_id: u32,
 ) -> (MetadataRow, Vec<u8>) {
     let keys = za_unlock(test, account_id, password).await;
-    let private_key = test.server.za_private_key(&keys).await.unwrap();
+    open_message_with_keys(test, &keys, document_id).await
+}
+
+/// Authenticate and open this document using the borrowed keys' account identity.
+async fn open_message_with_keys(
+    test: &TestServer,
+    keys: &SessionKeys,
+    document_id: u32,
+) -> (MetadataRow, Vec<u8>) {
+    let account_id = keys.account_id;
+    let private_key = test.server.za_private_key(keys).await.unwrap();
     let stub = stored_metadata(test, account_id, document_id).await;
-    let metadata = open_stub(&stub, &keys, Some(private_key), account_id)
+    let metadata = open_stub(&stub, keys, Some(private_key), account_id)
         .unwrap_or_else(|err| panic!("the stub does not open: {err}"));
     let blob = stored_blob(test, &stub.unarchive().unwrap().blob_hash()).await;
-    let raw = open_mail_blob(&blob, &keys, Some(private_key), account_id)
+    let raw = open_mail_blob(&blob, keys, Some(private_key), account_id)
         .unwrap_or_else(|err| panic!("the blob does not open: {err}"));
     (metadata, raw.to_vec())
 }

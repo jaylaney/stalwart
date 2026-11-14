@@ -5,8 +5,8 @@
  */
 
 use super::{
-    key_mail_account, message_ids, message_with, new_message, open_message, stored_blob,
-    stored_hash,
+    key_mail_account, message_ids, message_with, new_message, open_message, open_message_with_keys,
+    stored_blob, stored_hash,
 };
 use crate::{
     store::deflate_test_resource,
@@ -17,8 +17,8 @@ use crate::{
         smtp::SmtpConnection,
         za::{
             finish_bulk_delivery_indexing, raise_bulk_lmtp_rates, restore_bulk_lmtp_rates,
-            search_config_guard, search_manifest, search_pass_request, wait_for_delivery,
-            za_index_current,
+            search_config_guard, search_manifest, search_pass_request,
+            wait_for_delivery_with_poll_interval, za_index_current, za_unlock,
         },
     },
     za::{STRONG, user_permissions},
@@ -36,7 +36,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     io::Cursor,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use store::{
     write::now,
@@ -50,6 +50,7 @@ const HEADERLESS_MBOX_ORDINALS: [usize; 3] = [292, 555, 595];
 const LMTP_PARSE_REFUSAL: &str = "550 5.7.7 Failed to parse message.";
 const SENDER: &str = "sender@example.org";
 const PAGE: usize = 400;
+const CORPUS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const K_ROOT: usize = BASE + 7;
 const K2_ROOT: usize = BASE + 8;
 const K1: usize = BASE + 10;
@@ -148,27 +149,156 @@ async fn observed<T>(step: DiagnosticStep, future: impl Future<Output = T>) -> T
     result
 }
 
+// Setup observers are sequential: their containing phase/batch timers do not tick.
+async fn observed_setup<T>(step: DiagnosticStep, future: impl Future<Output = T>) -> T {
+    let result = observe_pending(future, Duration::from_secs(10), || {
+        println!(
+            "differential: pending {} elapsed={:?}",
+            step.label,
+            step.started.elapsed()
+        );
+    })
+    .await;
+    step.finish();
+    result
+}
+
+async fn observe_pending<T>(
+    future: impl Future<Output = T>,
+    heartbeat_interval: Duration,
+    mut heartbeat: impl FnMut(),
+) -> T {
+    tokio::pin!(future);
+    let mut timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + heartbeat_interval,
+        heartbeat_interval,
+    );
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut future => return result,
+            _ = timer.tick() => heartbeat(),
+        }
+    }
+}
+
+// Keep the observer's controls in the canonical suite, without another test selector.
+// A heartbeat must not replace pending work, delay ready work, or outlive cancellation.
+async fn check_setup_observer() {
+    use std::{cell::Cell, task::Poll};
+
+    struct OnDrop<'a>(&'a Cell<usize>);
+
+    impl Drop for OnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    let ready = observe_pending(async { 7 }, Duration::from_secs(3600), || {
+        panic!("ready work must not wait for a heartbeat")
+    });
+    tokio::pin!(ready);
+    // Probe the observer independently of Tokio select!/channel cooperative yielding.
+    assert_eq!(
+        futures::poll!(tokio::task::unconstrained(&mut ready)),
+        Poll::Ready(7)
+    );
+
+    let started = Cell::new(0);
+    let dropped = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let (complete, completion) = tokio::sync::oneshot::channel();
+    let (heartbeat_seen, mut heartbeat) = tokio::sync::mpsc::unbounded_channel();
+    let mut pending = Box::pin(observe_pending(
+        async {
+            started.set(started.get() + 1);
+            let _life = OnDrop(&dropped);
+            completion.await.unwrap()
+        },
+        Duration::from_millis(1),
+        || {
+            heartbeats.set(heartbeats.get() + 1);
+            heartbeat_seen.send(()).unwrap();
+        },
+    ));
+    assert!(futures::poll!(tokio::task::unconstrained(&mut pending)).is_pending());
+    // Wait for an actual heartbeat rather than assuming a short sleep ran it.
+    tokio::select! {
+        result = &mut pending => panic!("pending work completed before release: {result}"),
+        beat = heartbeat.recv() => assert_eq!(beat, Some(())),
+    }
+    assert_eq!((started.get(), dropped.get()), (1, 0));
+    let before_completion = heartbeats.get();
+    complete.send(19).unwrap();
+    assert_eq!(
+        futures::poll!(tokio::task::unconstrained(&mut pending)),
+        Poll::Ready(19)
+    );
+    assert_eq!(heartbeats.get(), before_completion);
+    assert_eq!((started.get(), dropped.get()), (1, 1));
+    drop(pending);
+
+    let dropped = Cell::new(0);
+    let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+    let mut cancelled = Box::pin(observe_pending(
+        async {
+            let _life = OnDrop(&dropped);
+            receiver.await.unwrap();
+        },
+        Duration::from_secs(3600),
+        || panic!("cancelled work must not retain its observer"),
+    ));
+    assert!(futures::poll!(tokio::task::unconstrained(&mut cancelled)).is_pending());
+    drop(cancelled);
+    assert_eq!(dropped.get(), 1);
+    assert!(sender.send(()).is_err());
+}
+
 pub async fn test(test: &mut TestServer) {
+    check_setup_observer().await;
     println!("differential: paired corpus");
-    let key = key_mail_account(test, "keymail64@example.com", STRONG).await;
-    let admin = test.account("admin@example.com").clone();
-    let plain = admin
-        .create_user_account(
-            "plainmail58@example.com",
-            STRONG,
-            "Ordinary differential",
-            &[],
-            user_permissions(),
-        )
+    let setup = DiagnosticStep::phase("setup", "paired");
+    let (key, plain, admin) =
+        observed_setup(DiagnosticStep::phase("account_setup", "paired"), async {
+            let key = key_mail_account(test, "keymail64@example.com", STRONG).await;
+            let admin = test.account("admin@example.com").clone();
+            let plain = admin
+                .create_user_account(
+                    "plainmail58@example.com",
+                    STRONG,
+                    "Ordinary differential",
+                    &[],
+                    user_permissions(),
+                )
+                .await;
+            (key, plain, admin)
+        })
         .await;
+    let preparation = DiagnosticStep::phase("corpus_build", "paired");
     let corpus = corpus();
     // Validate the actual matrix input before the long delivery setup.
     let _ = first_terms(&corpus[0]);
-    let saved_rates = raise_bulk_lmtp_rates(test).await;
+    preparation.finish();
+    let saved_rates = observed_setup(
+        DiagnosticStep::phase("raise_lmtp_rates", "paired"),
+        raise_bulk_lmtp_rates(test),
+    )
+    .await;
     let (key_docs, plain_docs, expected_received_at) =
         deliver_corpus(test, &key, &plain, &corpus).await;
-    restore_bulk_lmtp_rates(test, saved_rates).await;
-    finish_bulk_delivery_indexing(test, &key).await;
+    observed_setup(
+        DiagnosticStep::phase("restore_lmtp_rates", "paired"),
+        restore_bulk_lmtp_rates(test, saved_rates),
+    )
+    .await;
+    observed_setup(
+        DiagnosticStep::phase("bulk_indexing", "key"),
+        finish_bulk_delivery_indexing(test, &key),
+    )
+    .await;
+    setup.finish();
     observed(
         DiagnosticStep::phase("currentness", "key"),
         za_index_current(&key),
@@ -381,6 +511,7 @@ async fn deliver_corpus(
     plain: &Account,
     corpus: &[Vec<u8>],
 ) -> (Vec<u32>, Vec<u32>, Vec<u64>) {
+    let delivery = DiagnosticStep::phase("corpus_delivery", "paired");
     let mut received_at = Vec::with_capacity(TOTAL);
     let mut paired_docs = (Vec::new(), Vec::new());
     let mut seen = (BTreeSet::new(), BTreeSet::new());
@@ -388,86 +519,132 @@ async fn deliver_corpus(
     let mut accepted_lmtp = [0; 2];
     let mut accepted_imap = 0;
     for (batch, messages) in corpus.chunks(48).enumerate() {
-        // The normal SMTP/LMTP session limit is ten transactions.
-        for transactions in messages.chunks(8) {
-            let mut lmtp = SmtpConnection::connect().await;
-            assert!(
-                lmtp.lhlo()
-                    .await
-                    .iter()
-                    .any(|line| line.contains("CHUNKING"))
-            );
-            for raw in transactions {
-                let before_refusal = if HEADERLESS_MBOX_ORDINALS.contains(&ordinal) {
-                    wait_for_delivery(test).await;
-                    Some([
-                        message_ids(test, key.id().document_id()).await,
-                        message_ids(test, plain.id().document_id()).await,
-                    ])
-                } else {
-                    None
-                };
-                lmtp.mail_from(SENDER, 2).await;
-                lmtp.rcpt_to(key.name(), 2).await;
-                lmtp.rcpt_to(plain.name(), 2).await;
-                let arrival = before_refusal.is_none().then(|| {
-                    let timestamp = now();
-                    let guard = PairedReceivedAtGuard::new(
-                        SENDER,
-                        [
-                            (key.name(), key.id().document_id()),
-                            (plain.name(), plain.id().document_id()),
-                        ],
-                        timestamp,
-                    );
-                    (timestamp, guard)
-                });
-                // Count both final replies here so a mismatch names the corpus ordinal.
-                let replies = lmtp.bdat_last_bytes(raw, 2, u8::MAX).await;
-                if let Some(before) = before_refusal {
-                    assert_eq!(replies, [LMTP_PARSE_REFUSAL; 2], "corpus ordinal {ordinal}");
-                    wait_for_delivery(test).await;
-                    for (account, docs) in [key, plain].into_iter().zip(&before) {
-                        assert_eq!(&message_ids(test, account.id().document_id()).await, docs);
-                    }
-                    received_at
-                        .push(append_headerless_pair(test, [key, plain], &before, raw).await);
-                    accepted_imap += 1;
-                    println!(
-                        "differential: corpus ordinal {ordinal} refused by both LMTP recipients and stored by both IMAP APPENDs"
-                    );
-                } else {
-                    assert_eq!(
-                        replies
+        let batch_started = Instant::now();
+        let mut barrier_elapsed = Duration::ZERO;
+        observed_setup(
+            DiagnosticStep::new(format!(
+                "phase=corpus_delivery mode=paired batch={} items={}",
+                batch + 1,
+                messages.len()
+            )),
+            async {
+                // The normal SMTP/LMTP session limit is ten transactions.
+                for transactions in messages.chunks(8) {
+                    let mut lmtp = SmtpConnection::connect().await;
+                    assert!(
+                        lmtp.lhlo()
+                            .await
                             .iter()
-                            .filter(|line| line.starts_with("250 "))
-                            .count(),
-                        2,
-                        "corpus ordinal {ordinal}: {replies:?}"
+                            .any(|line| line.contains("CHUNKING"))
                     );
-                    accepted_lmtp[usize::from(ordinal >= BASE)] += 1;
-                    // LMTP acknowledges queuing. Drain each pair before the
-                    // next message can start its ordinary threading lookup.
-                    wait_for_delivery(test).await;
-                    let (timestamp, guard) = arrival.unwrap();
-                    guard.assert_used();
-                    received_at.push(timestamp);
+                    for raw in transactions {
+                        let before_refusal = if HEADERLESS_MBOX_ORDINALS.contains(&ordinal) {
+                            barrier_elapsed += corpus_delivery_barrier(test).await;
+                            Some([
+                                message_ids(test, key.id().document_id()).await,
+                                message_ids(test, plain.id().document_id()).await,
+                            ])
+                        } else {
+                            None
+                        };
+                        lmtp.mail_from(SENDER, 2).await;
+                        lmtp.rcpt_to(key.name(), 2).await;
+                        lmtp.rcpt_to(plain.name(), 2).await;
+                        let arrival = before_refusal.is_none().then(|| {
+                            let timestamp = now();
+                            let guard = PairedReceivedAtGuard::new(
+                                SENDER,
+                                [
+                                    (key.name(), key.id().document_id()),
+                                    (plain.name(), plain.id().document_id()),
+                                ],
+                                timestamp,
+                            );
+                            (timestamp, guard)
+                        });
+                        // Count both final replies here so a mismatch names the corpus ordinal.
+                        let replies = lmtp.bdat_last_bytes(raw, 2, u8::MAX).await;
+                        if let Some(before) = before_refusal {
+                            assert_eq!(replies, [LMTP_PARSE_REFUSAL; 2], "corpus ordinal {ordinal}");
+                            barrier_elapsed += corpus_delivery_barrier(test).await;
+                            for (account, docs) in [key, plain].into_iter().zip(&before) {
+                                assert_eq!(&message_ids(test, account.id().document_id()).await, docs);
+                            }
+                            received_at
+                                .push(append_headerless_pair(test, [key, plain], &before, raw).await);
+                            accepted_imap += 1;
+                            println!(
+                                "differential: corpus ordinal {ordinal} refused by both LMTP recipients and stored by both IMAP APPENDs"
+                            );
+                        } else {
+                            assert_eq!(
+                                replies
+                                    .iter()
+                                    .filter(|line| line.starts_with("250 "))
+                                    .count(),
+                                2,
+                                "corpus ordinal {ordinal}: {replies:?}"
+                            );
+                            accepted_lmtp[usize::from(ordinal >= BASE)] += 1;
+                            // LMTP acknowledges queuing. Drain each pair before the
+                            // next message can start its ordinary threading lookup.
+                            barrier_elapsed += corpus_delivery_barrier(test).await;
+                            let (timestamp, guard) = arrival.unwrap();
+                            guard.assert_used();
+                            received_at.push(timestamp);
+                        }
+                        ordinal += 1;
+                    }
+                    lmtp.quit().await;
                 }
-                ordinal += 1;
-            }
-            lmtp.quit().await;
-        }
-        wait_for_delivery(test).await;
-        let (key_docs, key_hashes) =
-            identify_deliveries(test, key, true, &mut seen.0, messages, batch).await;
-        let (plain_docs, plain_hashes) =
-            identify_deliveries(test, plain, false, &mut seen.1, messages, batch).await;
+                barrier_elapsed += corpus_delivery_barrier(test).await;
+            },
+        )
+        .await;
+        let verification_started = Instant::now();
+        let (key_docs, key_hashes) = observed_setup(
+            DiagnosticStep::new(format!(
+                "phase=stored_mime mode=key batch={} items={}",
+                batch + 1,
+                messages.len()
+            )),
+            identify_deliveries(test, key, true, &mut seen.0, messages, batch),
+        )
+        .await;
+        let (plain_docs, plain_hashes) = observed_setup(
+            DiagnosticStep::new(format!(
+                "phase=stored_mime mode=plain batch={} items={}",
+                batch + 1,
+                messages.len()
+            )),
+            identify_deliveries(test, plain, false, &mut seen.1, messages, batch),
+        )
+        .await;
         assert_eq!(
             key_hashes, plain_hashes,
             "paired stored MIME digests in batch {batch}"
         );
         paired_docs.0.extend(key_docs);
         paired_docs.1.extend(plain_docs);
+        println!(
+            concat!(
+                "differential: batch_complete batch={} batches={} completed_pairs={ordinal} ",
+                "total={total} key_count={} plain_count={} fallback_pairs={accepted_imap} ",
+                "delivery_barrier_elapsed={barrier_elapsed:?} verification_elapsed={:?} ",
+                "batch_elapsed={:?} elapsed={:?}"
+            ),
+            batch + 1,
+            corpus.len().div_ceil(48),
+            paired_docs.0.len(),
+            paired_docs.1.len(),
+            verification_started.elapsed(),
+            batch_started.elapsed(),
+            delivery.started.elapsed(),
+            ordinal = ordinal,
+            total = TOTAL,
+            accepted_imap = accepted_imap,
+            barrier_elapsed = barrier_elapsed,
+        );
     }
     assert_eq!((paired_docs.0.len(), paired_docs.1.len()), (TOTAL, TOTAL));
     assert_eq!(ordinal, TOTAL);
@@ -481,7 +658,14 @@ async fn deliver_corpus(
         accepted_lmtp[0], accepted_lmtp[1]
     );
     assert_eq!(received_at.len(), TOTAL);
+    delivery.finish();
     (paired_docs.0, paired_docs.1, received_at)
+}
+
+async fn corpus_delivery_barrier(test: &TestServer) -> Duration {
+    let started = Instant::now();
+    wait_for_delivery_with_poll_interval(test, CORPUS_POLL_INTERVAL).await;
+    started.elapsed()
 }
 
 /// LMTP declines these known headerless records. IMAP accepts the original
@@ -561,11 +745,18 @@ async fn identify_deliveries(
         "delivery count for {} in batch {batch}",
         account.name()
     );
+    // One fresh unlock for this validated batch only. Every document still
+    // authenticates its own stored stub and opens its full stored MIME blob.
+    let keys = if keyed {
+        Some(za_unlock(test, id, account.secret()).await)
+    } else {
+        None
+    };
     let mut matched = vec![None; messages.len()];
     for doc in added {
         assert!(seen.insert(doc));
-        let raw = if keyed {
-            open_message(test, id, account.secret(), doc).await.1
+        let raw = if let Some(keys) = &keys {
+            open_message_with_keys(test, keys, doc).await.1
         } else {
             stored_blob(test, &stored_hash(test, id, doc).await).await
         };
