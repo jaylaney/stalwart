@@ -62,6 +62,27 @@ This spec adds four terms:
 - **The reference client.** Bulwark Webmail 1.21.2, static edition
   (1.3).
 
+## Implementation and review routing
+
+Jay set these assignments on 2026-11-14. They apply to every task in
+[plan 17](../plans/2026-11-14-zero-access-17-jmap-calendars.md), including
+tests, documentation and fixes after review. The controller briefs,
+adjudicates and integrates; implementation and review use separate agents.
+
+| Role | Model | Reasoning effort |
+|---|---|---|
+| Implementer | Sol (`gpt-6.1-sol`) | `high` |
+| Focused task reviewer | Astra (`gpt-6-astra`) | `high` |
+| Reviewer of identity, authorization, persistence, ordering or concurrency contracts | Astra (`gpt-6-astra`) | `xhigh` |
+| Final whole-branch reviewer (Task 44) | Astra (`gpt-6-astra`) | `xhigh` |
+
+Each dispatch sets the model and effort explicitly. Reviewers are
+independent of the implementer and read only. The final whole-branch
+review uses a fresh Astra agent with a clean context. Fixes go back to a
+Sol implementer and then to a separate Astra reviewer under the same
+effort rules. If a required route is unavailable, report the limitation;
+do not silently substitute another model or lower the effort.
+
 ## 1. Purpose
 
 A key account's calendar works from a standard JMAP calendar client in a

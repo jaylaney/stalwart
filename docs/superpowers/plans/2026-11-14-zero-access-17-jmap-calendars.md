@@ -138,14 +138,15 @@ Tasks 21 to 24, 26, 28 and 30 each serve methods that existing tests assert as r
 ## Execution
 
 - Subagent-driven development. The controller briefs, adjudicates and integrates; it writes no code.
-- Every task is implemented by an Opus agent and reviewed by a separate Opus agent that reads the diff against the task and the spec.
+- Every task, including tests, documentation and review fixes, is implemented by Sol (`gpt-6.1-sol`, `high`) and reviewed by a separate Astra agent (`gpt-6-astra`) that reads the diff against the task and the spec. Astra uses `high` for focused task reviews and `xhigh` for reviews of identity, authorization, persistence, ordering or concurrency contracts, following the spec's [implementation and review routing](../specs/2026-11-13-zero-access-jmap-calendars-design.md#implementation-and-review-routing).
+- Each dispatch sets the model and effort explicitly. If a required route is unavailable, report the limitation; do not silently substitute another model or lower the effort.
 - A reviewer of a round whose implementer ran the suites reads only: it runs no cargo command.
 - An implementer is briefed with three things: this header, its task from the group file, and the sheet sections the task cites. The sheet is committed beside the plan. The implementer is also told where the spec and the other task files are, and reads them when its task names a section or a task. The brief adds one line, "deliver at the scope of the brief; don't widen it", and no instruction to verify or double-check.
 - A reviewer gets the same three things, the diff and the spec sections the task names. Its brief carries no severity filter: every finding comes back with a confidence and a severity, and the controller filters.
 - A task that finds the sheet wrong stops and reports. The controller rules (`Ruling:` in the ledger) and corrects the sheet in a commit of its own before the task goes on.
 - Tasks run in number order.
 - Group A changes no file under `tests/`; each of Tasks 2 to 8 ends with `git status --short tests/` printing nothing.
-- No top-tier review runs during execution. The plan ends with one whole-branch review at the top tier (Task 44), which the project owner authorized for this plan on 2026-11-14. A second pass at the top tier runs only on the project owner's word.
+- The plan ends with one whole-branch review by a fresh Astra agent (`gpt-6-astra`, `xhigh`) with a clean context (Task 44), which the project owner authorized for this plan on 2026-11-14. A second whole-branch pass runs only on the project owner's word; this does not restrict the focused Astra reviews of tasks and fixes.
 - The ledger is `.superpowers/sdd/2026-11-14-zero-access-17-jmap-calendars/progress.md`, git-ignored: one line per task with its commit, its review's verdict and each `Ruling:` the controller made.
 - A mutation executor runs one test row per background command and waits for it; it never batches rows.
 

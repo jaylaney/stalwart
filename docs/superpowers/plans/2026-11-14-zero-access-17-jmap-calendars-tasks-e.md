@@ -581,7 +581,7 @@ In the form of `client-caldav.md`. Sections:
 
 ### Task 44: The final test matrix and the whole-branch review
 
-**Implementer:** opus. **Reviewer:** the whole-branch review of Step 3, at the top tier.
+**Implementer:** Sol (`gpt-6.1-sol`, `high`). **Reviewer:** Astra (`gpt-6-astra`, `xhigh`) for the whole-branch review of Step 3.
 
 **Spec:** the release's qualification: 3.6, 9, 10.
 
@@ -596,7 +596,7 @@ In the form of `client-caldav.md`. Sections:
 **Constraints:**
 - Each row is recorded with its command, result and wall time.
 - A rerun the header's suite rules allow is taken once. Any other failure stops the matrix and is a finding.
-- The whole-branch review runs once, at the top tier, as the project owner authorized on 2026-11-14. It reads only. A second pass needs the project owner's word.
+- The whole-branch review runs once, using Astra (`gpt-6-astra`, `xhigh`), as the project owner authorized on 2026-11-14. It reads only. A second whole-branch pass needs the project owner's word; focused Astra reviews of fixes follow the header's effort rules.
 - Nothing is pushed and no workflow is dispatched without the project owner's word.
 
 - [ ] **Step 1: Run the matrix on the head**
@@ -631,7 +631,7 @@ The outcome note's "Where things stand" gets one line per row: command, result, 
 
 - [ ] **Step 3: Dispatch the whole-branch review**
 
-One reviewer at the top tier, with a clean context and this brief:
+One fresh, independent Astra reviewer (`gpt-6-astra`, `xhigh`), with a clean context and this brief:
 
 - **Read**: the spec, revision 6; the plan's header, the interface sheet and the six task files; `CLAUDE.md`; the outcome note (rulings, adjusted assertions, mutation table, residuals); and `git diff <base>...HEAD`, where the base is the branch's merge base with `origin/main`.
 - **Run nothing.** The matrix of Step 1 ran on this head; its results are in the outcome note.
@@ -650,7 +650,7 @@ One reviewer at the top tier, with a clean context and this brief:
 
 - [ ] **Step 4: Adjudicate and fix**
 
-The controller rules on every finding (`Ruling:` in the ledger): fixed, recorded as a residual, deferred, or rejected with its reason. A fix goes to an Opus implementer with a brief of its own and is reviewed by a separate Opus agent.
+The controller rules on every finding (`Ruling:` in the ledger): fixed, recorded as a residual, deferred, or rejected with its reason. A fix goes to a Sol implementer (`gpt-6.1-sol`, `high`) with a brief of its own and is reviewed by a separate Astra agent (`gpt-6-astra`, `high`, or `xhigh` for identity, authorization, persistence, ordering or concurrency contracts).
 
 - [ ] **Step 5: Run again what the fixes touch**
 
