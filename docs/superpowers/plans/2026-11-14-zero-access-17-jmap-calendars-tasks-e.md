@@ -367,7 +367,7 @@ Run:
 python3 -I - <<'EOF'
 import json, re, subprocess
 base = json.load(open("tests/qualification/baseline-0.16.27.json"))
-changed = set(subprocess.run(["git", "diff", "--name-only", "origin/release7-search...HEAD", "--", "tests/src"],
+changed = set(subprocess.run(["git", "diff", "--name-only", "origin/main...HEAD", "--", "tests/src"],
                              capture_output=True, text=True, check=True).stdout.split())
 missing = [(f["file"], f["name"], sorted(f["executed"])) for f in base["helpers"]["functions"]
            if f["file"] in changed and f.get("executed")
@@ -376,11 +376,11 @@ print("\n".join(map(str, missing)) or "every retained function is still defined"
 EOF
 ```
 
-Expected: `every retained function is still defined`. A function the list reports is restored in place by the task that removed it. After pull request 84 merges, the base in the command is `origin/main`.
+Expected: `every retained function is still defined`. A function the list reports is restored in place by the task that removed it.
 
 - [ ] **Step 2: Run WK, IK and JK**
 
-Expected: each passes. WK proves the move on the head: no assertion under `tests/src/webdav/` changed in this release (`git diff origin/release7-search...HEAD --stat -- tests/src/webdav` prints nothing).
+Expected: each passes. WK proves the move on the head: no assertion under `tests/src/webdav/` changed in this release (`git diff origin/main...HEAD --stat -- tests/src/webdav` prints nothing).
 
 - [ ] **Step 3: Decide the CI rerun of key-mode JMAP**
 
@@ -632,7 +632,7 @@ The outcome note's "Where things stand" gets one line per row: command, result, 
 
 One reviewer at the top tier, with a clean context and this brief:
 
-- **Read**: the spec, revision 5; the plan's header, the interface sheet and the six task files; `CLAUDE.md`; the outcome note (rulings, adjusted assertions, mutation table, residuals); and `git diff <base>...HEAD`, where the base is the branch's merge base with `origin/release7-search`, or with `origin/main` once pull request 84 has merged.
+- **Read**: the spec, revision 5; the plan's header, the interface sheet and the six task files; `CLAUDE.md`; the outcome note (rulings, adjusted assertions, mutation table, residuals); and `git diff <base>...HEAD`, where the base is the branch's merge base with `origin/main`.
 - **Run nothing.** The matrix of Step 1 ran on this head; its results are in the outcome note.
 - **Look for**:
   1. a place where JMAP and CalDAV differ for a key account in anything spec 3.2 does not list as an input, and a JMAP write that stores plaintext CalDAV would have sealed (3.6);

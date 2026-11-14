@@ -127,14 +127,14 @@ Tasks 21 to 24, 26, 28 and 30 each serve methods that existing tests assert as r
 
 ## Base and rebasing
 
-- The plan is committed on `za-jmap-calendars-design`, which sits on `origin/release7-search` (pull request 84) at `82b8984aa`. The work branch `release6-jmap-calendars` is cut from it.
-- Line numbers in the plan and the sheet are at the commit that adds the plan; no file under `crates/`, `tests/`, `scripts/` or `.github/` differs between it and `82b8984aa`.
-- Pull request 84 is still changing. The work branch is rebased onto `origin/release7-search` at five points and nowhere else: before Task 1, after Task 9, after Task 19, after Task 37 and before Task 44. Never during a task, and never between a task's implementation and its review.
-- A rebase is `git fetch origin release7-search` then `git rebase origin/release7-search`. If the base did not move, nothing is done. After a rebase that changed anything: SHIP, TM and one ZA run pass before the next task starts, and the ledger records the new base commit and the new commit of every finished task.
-- Files both branches change, where a conflict or a silent semantic change is to be expected: `crates/jmap/src/api/request.rs`, `crates/jmap/src/changes/{get,mod}.rs`, `crates/jmap/Cargo.toml`, `crates/types/src/field.rs`, `crates/vault/src/keys.rs`, `crates/common/src/za/{mod,test_hooks}.rs`, `crates/common/src/auth/vault.rs`, `tests/src/za/{mod,leak,websocket}.rs`, `tests/src/utils/{za,cleanup,storage}.rs`, `tests/src/jmap/za_variants.rs`, `tests/qualification/dispositions.json`, `.github/workflows/test.yml`, `scripts/tests/ci_steps.py`, `CLAUDE.md`, `docs/README-dev.md` and `docs/zero-access/manual-checklist.md`.
+- The plan is committed on `za-jmap-calendars-design`, which sits on `origin/main` at `cc8b50a9b`. Release 7 (pull request 84) merged into `main` on 2026-11-14 at `82b8984aa`, the commit the plan's line numbers were read at. The work branch `release6-jmap-calendars` is cut from the plan's branch.
+- Line numbers in the plan and the sheet are at the commit that adds the plan. Between `82b8984aa` and `cc8b50a9b` one file differs, `tests/caldav_client/requirements.txt`, which no task cites by line.
+- `main` is the base, and other work lands on it. The work branch is rebased onto `origin/main` at five points and nowhere else: before Task 1, after Task 9, after Task 19, after Task 37 and before Task 44. Never during a task, and never between a task's implementation and its review.
+- A rebase is `git fetch origin main` then `git rebase origin/main`. If the base did not move, nothing is done. After a rebase that changed anything: SHIP, TM and one ZA run pass before the next task starts, and the ledger records the new base commit and the new commit of every finished task.
+- Files that release 7 changed and this plan changes too, where a later change on `main` is most likely to conflict or to change meaning silently: `crates/jmap/src/api/request.rs`, `crates/jmap/src/changes/{get,mod}.rs`, `crates/jmap/Cargo.toml`, `crates/types/src/field.rs`, `crates/vault/src/keys.rs`, `crates/common/src/za/{mod,test_hooks}.rs`, `crates/common/src/auth/vault.rs`, `tests/src/za/{mod,leak,websocket}.rs`, `tests/src/utils/{za,cleanup,storage}.rs`, `tests/src/jmap/za_variants.rs`, `tests/qualification/dispositions.json`, `.github/workflows/test.yml`, `scripts/tests/ci_steps.py`, `CLAUDE.md`, `docs/README-dev.md` and `docs/zero-access/manual-checklist.md`.
 - A change on the base to `crates/store/src/za_search/content.rs` or `crates/store/src/search/leaf.rs` needs a re-read of Task 25, which calls them without changing them.
 - A conflict in a file of the list is resolved by the agent that owns the task whose lines conflict, and reviewed as that task's diff.
-- When pull request 84 merges, the work branch moves onto `main`: `git fetch origin` then `git rebase --onto origin/main <the last release7-search commit the branch was based on>`. From then on `main` is the base of every later rebase, and the release's pull request targets `main`.
+- The release's pull request targets `main`.
 
 ## Execution
 

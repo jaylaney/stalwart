@@ -3,8 +3,9 @@
 This sheet belongs to [zero-access plan 17: JMAP calendars and browser sign-in](2026-11-14-zero-access-17-jmap-calendars.md); its tasks cite it as "I §n" and copy no signature from it.
 
 Every task of the plan uses the names on this sheet. Line numbers are at
-the commit that adds the plan; no file under `crates/`, `tests/`,
-`scripts/` or `.github/` differs between it and `82b8984aa`. Spec sections are those of the release 6 spec, revision 5
+the commit that adds the plan, on `main` at `cc8b50a9b`; they were read at
+`82b8984aa`, release 7's last commit, and the one file that differs between
+the two is `tests/caldav_client/requirements.txt`. Spec sections are those of the release 6 spec, revision 5
 (decisions D1 to D29, invariants 57 to 76). "dav wrapper" means `dav` keeps an item of
 the same name and visibility that calls the `groupware` one and maps the
 error, so handler bodies and `dav` unit tests change only where a task
