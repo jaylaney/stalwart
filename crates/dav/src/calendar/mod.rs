@@ -40,6 +40,7 @@ use groupware::{
         alarm::ExpandAlarm,
         alerts::{DefaultAlertsResolver, DefaultAlertsView, ICalendarDefaultAlerts},
         compare::{ComparisonScope, RecurrenceComponents},
+        pipeline::error::ZaPipelineError,
         privacy::{EventPrivacy, EventViewer, ICalendarPrivacy, PrivacyDenied},
         user::{ICalendarUserData, UserDataError, UserDataView},
     },
@@ -758,6 +759,38 @@ impl ItipPrecondition for ItipError {
     }
 }
 
+impl From<ZaPipelineError> for DavError {
+    fn from(error: ZaPipelineError) -> Self {
+        match error {
+            ZaPipelineError::Forbidden(_)
+            | ZaPipelineError::UidConflict { href: None }
+            | ZaPipelineError::SchedulingDenied(_) => Self::Code(StatusCode::FORBIDDEN),
+            ZaPipelineError::LinkedEvent => Self::Code(StatusCode::CONFLICT),
+            ZaPipelineError::NotFound => Self::Code(StatusCode::NOT_FOUND),
+            ZaPipelineError::Busy(_) => Self::Code(StatusCode::SERVICE_UNAVAILABLE),
+            ZaPipelineError::UidConflict { href: Some(href) } => DavErrorCondition::new(
+                StatusCode::FORBIDDEN,
+                CalCondition::NoUidConflict(href.into()),
+            )
+            .into(),
+            ZaPipelineError::TooManyRecipients => DavErrorCondition::new(
+                StatusCode::PRECONDITION_FAILED,
+                CalCondition::MaxAttendeesPerInstance,
+            )
+            .into(),
+            ZaPipelineError::Scheduling(error) => match error.failed_precondition() {
+                Some(condition) => {
+                    DavErrorCondition::new(StatusCode::PRECONDITION_FAILED, condition)
+                        .with_details(error.to_string())
+                        .into()
+                }
+                None => Self::Code(StatusCode::PRECONDITION_FAILED),
+            },
+            ZaPipelineError::Store(error) => Self::Internal(error),
+        }
+    }
+}
+
 /// Mutation adapters always resolve fresh state; response memos are read-only.
 pub(crate) fn za_calendar_error(
     error: groupware::calendar::sharing::resolve::ZaCalendarError,
@@ -922,4 +955,148 @@ pub async fn za_test_move_event(
         crate::DavError::Parse(_) => hyper::StatusCode::BAD_REQUEST,
         crate::DavError::Internal(_) => hyper::StatusCode::INTERNAL_SERVER_ERROR,
     })
+}
+
+#[cfg(test)]
+mod pipeline_error_tests {
+    use super::{CalCondition, DavError, ItipError, ItipPrecondition, StatusCode};
+    use calcard::icalendar::{ICalendarMethod, ICalendarProperty};
+    use dav_proto::schema::response::Condition;
+    use groupware::calendar::pipeline::error::{
+        ZaBusy, ZaPipelineError, ZaRefusal, za_itip_fails_write,
+    };
+    use trc::{EventType, SecurityEvent, StoreEvent};
+
+    #[test]
+    fn pipeline_errors_map_to_todays_answers() {
+        for refusal in [
+            ZaRefusal::NoKeys,
+            ZaRefusal::Context,
+            ZaRefusal::SharedCopy,
+            ZaRefusal::LinkedMove,
+        ] {
+            assert!(matches!(
+                DavError::from(ZaPipelineError::Forbidden(refusal)),
+                DavError::Code(StatusCode::FORBIDDEN)
+            ));
+        }
+        assert!(matches!(
+            DavError::from(ZaPipelineError::LinkedEvent),
+            DavError::Code(StatusCode::CONFLICT)
+        ));
+        assert!(matches!(
+            DavError::from(ZaPipelineError::NotFound),
+            DavError::Code(StatusCode::NOT_FOUND)
+        ));
+        for busy in [ZaBusy::LeaseBusy, ZaBusy::CreateLost] {
+            assert!(matches!(
+                DavError::from(ZaPipelineError::Busy(busy)),
+                DavError::Code(StatusCode::SERVICE_UNAVAILABLE)
+            ));
+        }
+
+        let href = "/dav/cal/a/b/c.ics";
+        let DavError::Condition(uid_conflict) = DavError::from(ZaPipelineError::UidConflict {
+            href: Some(href.to_owned()),
+        }) else {
+            panic!("expected a UID conflict condition");
+        };
+        assert_eq!(uid_conflict.code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            uid_conflict.condition,
+            Condition::Cal(CalCondition::NoUidConflict(href.into()))
+        );
+        assert_eq!(uid_conflict.details, None);
+        assert!(matches!(
+            DavError::from(ZaPipelineError::UidConflict { href: None }),
+            DavError::Code(StatusCode::FORBIDDEN)
+        ));
+
+        let DavError::Condition(too_many) = DavError::from(ZaPipelineError::TooManyRecipients)
+        else {
+            panic!("expected an attendee limit condition");
+        };
+        assert_eq!(too_many.code, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            too_many.condition,
+            Condition::Cal(CalCondition::MaxAttendeesPerInstance)
+        );
+        assert_eq!(too_many.details, None);
+
+        let DavError::Condition(scheduling) =
+            DavError::from(ZaPipelineError::Scheduling(ItipError::MultipleOrganizer))
+        else {
+            panic!("expected a scheduling condition");
+        };
+        assert_eq!(scheduling.code, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            scheduling.condition,
+            Condition::Cal(CalCondition::SameOrganizerInAllComponents)
+        );
+        assert_eq!(
+            scheduling.details,
+            Some(ItipError::MultipleOrganizer.to_string())
+        );
+        assert!(matches!(
+            DavError::from(ZaPipelineError::SchedulingDenied("denied")),
+            DavError::Code(StatusCode::FORBIDDEN)
+        ));
+
+        assert!(matches!(
+            DavError::from(ZaPipelineError::Store(StoreEvent::AssertValueFailed.into_err())),
+            DavError::Internal(error) if error.is_assertion_failure()
+        ));
+        assert!(matches!(
+            DavError::from(ZaPipelineError::Store(SecurityEvent::Unauthorized.into_err())),
+            DavError::Internal(error)
+                if error.matches(EventType::Security(SecurityEvent::Unauthorized))
+        ));
+    }
+
+    #[test]
+    fn itip_precondition_classes_agree() {
+        let errors = [
+            ItipError::NoSchedulingInfo,
+            ItipError::OtherSchedulingAgent,
+            ItipError::NotOrganizer,
+            ItipError::NotOrganizerNorAttendee,
+            ItipError::NothingToSend,
+            ItipError::MissingUid,
+            ItipError::MultipleUid,
+            ItipError::MultipleOrganizer,
+            ItipError::MultipleObjectTypes,
+            ItipError::MultipleObjectInstances,
+            ItipError::CannotModifyProperty(ICalendarProperty::Summary),
+            ItipError::CannotModifyInstance,
+            ItipError::CannotModifyAddress,
+            ItipError::OrganizerMismatch,
+            ItipError::MissingMethod,
+            ItipError::InvalidComponentType,
+            ItipError::OutOfSequence,
+            ItipError::OrganizerIsLocalAddress,
+            ItipError::SenderIsNotOrganizerNorAttendee,
+            ItipError::SenderIsNotOrganizer,
+            ItipError::SenderIsNotParticipant(String::new()),
+            ItipError::UnknownParticipant(String::new()),
+            ItipError::UnsupportedMethod(ICalendarMethod::Publish),
+            ItipError::ICalendarParseError,
+            ItipError::EventNotFound,
+            ItipError::EventTooLarge,
+            ItipError::QuotaExceeded,
+            ItipError::NoDefaultCalendar,
+            ItipError::AutoAddDisabled,
+            ItipError::TooManyRecipients,
+        ];
+        let mut fails_write_count = 0;
+        for error in &errors {
+            let fails_write = za_itip_fails_write(error);
+            assert_eq!(
+                fails_write,
+                error.failed_precondition().is_some(),
+                "{error:?}"
+            );
+            fails_write_count += usize::from(fails_write);
+        }
+        assert_eq!(fails_write_count, 17);
+    }
 }

@@ -23,6 +23,7 @@ pub mod notification;
 pub mod overlap;
 pub mod participants;
 pub mod pinning;
+pub mod pipeline;
 pub mod privacy;
 pub mod rights;
 pub mod schedule;

@@ -11,7 +11,7 @@ These tasks belong to [zero-access plan 17: JMAP calendars and browser sign-in](
 - Create: `crates/groupware/src/calendar/pipeline/mod.rs`,
   `crates/groupware/src/calendar/pipeline/error.rs`.
 - Modify: `crates/groupware/src/calendar/mod.rs:24-25` (`pub mod pipeline;`
-  between `participants` and `pinning`); `crates/dav/src/calendar/mod.rs`
+  after `pinning`, in rustfmt order); `crates/dav/src/calendar/mod.rs`
   (the `From` impl after `impl ItipPrecondition for ItipError`,
   `:736-759`; a test module `pipeline_error_tests` at the end of the
   file); `crates/dav/Cargo.toml:30`; `crates/jmap/Cargo.toml:54`.
