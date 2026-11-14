@@ -1,9 +1,9 @@
 # Search CI curve-profile candidate outcome
 
-Status: accepted as the test-build timeout correction after the hosted comparison.
-It is not yet integrated into remote PR84. The owner authorized the correction and
-PR85 integration, with PR84 held out of main until combined CI is green. The
-remaining hosted failure is the separate test-retention Inventory gate.
+Status: accepted as the test-build timeout correction after the hosted comparison
+and integrated with PR85 into PR84's branch. PR84 remains out of main until combined
+CI is green. The previous candidate's separate Inventory gate failure led to the
+retention repair and fresh verification described in the 2026-11-14 outcome.
 
 ## Evidence motivating the experiment
 
@@ -122,9 +122,11 @@ These results precede the new protocol metadata-retention restorations and do no
 qualify those pending edits. Combined evidence is retained in the sibling ignored
 ledger `2026-11-13-pr84-search-ci-combined`.
 
-Finish the retention repair and its independent review/validation, then integrate
-the correction/diagnostic and PR85 onto release7-search and run the required CI
-on the exact combined source. PR84 remains open until that CI is green.
+The retention repair subsequently passed independent review and both complete
+local key-mode protocol suites. PR85's actual merge was incorporated without
+further file changes, and the combined correction was published to release7-search.
+The final CI and strict retention counts remain pending. PR84 stays open until
+that CI is green; current run links are recorded on the PR.
 
 Evidence is retained under `.superpowers/sdd/2026-11-13-search-ci-curve-profile/`
 in the diagnostic checkout. Agents deliberately inherited the parent route because

@@ -42,5 +42,6 @@
 - [x] Commit the evidenced correction; preserve the original diagnostic run and failed CI evidence.
 - [x] Merge PR85 into release7-search using its expected head, then integrate the fix/diagnostic without losing either side's fixture behavior.
 - [x] A separate agent reviews the complete combined follow-up diff; root verifies any fixes and relevant local tests.
-- [ ] Push the final combined source head and inspect all required CI jobs, including default/filesystem ZA, retention and fresh-store.
+- [x] Publish the combined source and start PR CI plus the manual retention run.
+- [ ] Verify all required CI jobs, including default/filesystem ZA, retention and fresh-store, on the final combined source.
 - [ ] Merge PR84 into main only after combined CI is green; otherwise keep it open and report the precise outstanding gate.
