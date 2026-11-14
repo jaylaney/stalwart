@@ -1,12 +1,51 @@
 # Release 6 JMAP calendars design review
 
-Latest review: 2026-11-14, spec revision 2 at
+Latest review: 2026-11-14, spec revision 3 at
+`9d6a9f40011382216741cefb1dcb6265e1106f68`, branch `za-jmap-calendars-design`.
+
+No open review findings remain. Findings 1–3 remain resolved in the design; revision 3
+addresses finding 4 through an explicit bounded-retention contract and resolves findings 5–6.
+No new actionable finding was identified in the revised contracts. This is a static design
+assessment, not evidence that the feature is implemented or qualified.
+
+## Revision 3 disposition
+
+The following anchors refer to revision 3 of
+[the design](2026-11-13-zero-access-jmap-calendars-design.md).
+
+| Finding | Status | Current evidence |
+|---|---|---|
+| 4. Interrupted refresh retains a superseded wrap | Addressed by documented bounded retention and reconciliation | Lines 134–137 and 456–469 explicitly allow the wrap to remain for up to one maintenance interval. Lines 342–348 and 535–545 require ordinary writes and the sweep to remove refresh entries below the grant's stored generation. Proposed tests at 1002–1005 cover cleanup without a client retry; invariant 67 at 1139–1140 records the obligation. |
+| 5. Paused-refresh test demands grant deletion | Resolved in design | Lines 997–1001 require refusal and an absent token record while allowing the unusable grant object to remain. Initial-issuance cleanup remains separately required at 994–996. |
+| 6. Expanded negative-query test contradicts admission | Resolved in design | Lines 1027–1031 limit successful expanded matching to supported single conditions and flat AND filters and require `invalidArguments` for negated variants. |
+
+The retention in finding 4 is an explicit residual in revision 3: after an interrupted refresh,
+the superseded secret and the current stored record can still open MK until reconciliation.
+The spec now requires cleanup independent of a client retry and states the maintenance bound;
+it no longer promises immediate destruction for that interruption.
+
+The token reviewer and primary checked the new pruning threshold against
+`crates/common/src/auth/oauth/grant.rs:82–102,454–482`: generations below the stored generation
+are replayed, while the current generation and its pending successor remain eligible. The
+revised refresh test agrees with vault/cache behavior at
+`crates/common/src/auth/vault.rs:527–536,784–790`. The primary also verified the expanded-filter
+expectations against `crates/jmap/src/calendar_event/query.rs:102–116`.
+
+The revision changes the spec and incorporates the previous report; product source under
+`crates/` is unchanged. The earlier vault-fence, concurrent-refresh and event-level matching
+corrections remain in the spec. Section 13's preflight and the planned automated/manual gates
+remain future work. No builds, tests, servers, or runtime probes ran. This review changes only
+this report; the spec is unchanged. The reviewer retained the inherited route and capability-tier
+limitation documented below.
+
+## Revision 2 review — historical record
+
+Reviewed: 2026-11-14, spec revision 2 at
 `fdcc7766d8d74e5fc429a4b8dd6884b32f47a4c6`, branch `za-jmap-calendars-design`.
 
-All three revision-1 findings are resolved in the design. The rereview found one further
-token-retirement issue (P2) and two acceptance-test contradictions (P3). These are static
-findings; no implementation or runtime qualification is implied. The original review is
-retained below as history.
+At revision 2, all three revision-1 findings were resolved in the design. That rereview recorded
+one further token-retirement issue (P2) and two acceptance-test contradictions (P3), all addressed
+in revision 3 as described above. The original findings and their revision-2 anchors follow.
 
 ## Revision 2 disposition of prior findings
 
@@ -21,7 +60,8 @@ Line references in this section and findings 4–6 refer to revision 2 of
 
 ## 4. [P2] Retire superseded refresh wraps after an interrupted publication
 
-**Status:** open. **Spec anchors:** section 4.5, lines 441–447; section 4.7, lines 513–519.
+**Status:** addressed in revision 3 by documented bounded retention and reconciliation.
+**Original spec anchors:** section 4.5, lines 441–447; section 4.7, lines 513–519.
 
 The concurrency correction protects successful token-record writes, but grant advancement and
 wrap retirement still occur in separate writes. The supported failure path does not guarantee
@@ -55,7 +95,8 @@ verify that the old wrap disappears within the chosen contract's bound.
 
 ## 5. [P3] Align the paused-refresh test with the grant-cleanup rule
 
-**Status:** open. **Spec anchors:** section 9.2, lines 963–967; section 4.5, lines 434–435.
+**Status:** resolved in revision 3.
+**Original spec anchors:** section 9.2, lines 963–967; section 4.5, lines 434–435.
 
 The first test requires a paused code exchange to leave no token record and no grant, then
 says the same for a paused refresh. Initial issuance explicitly deletes its new grant on a
@@ -76,7 +117,8 @@ the token-record absence and authentication refusal.
 
 ## 6. [P3] Exclude negated filters from expanded matching assertions
 
-**Status:** open. **Spec anchors:** section 9.2, lines 987–991; section 6.4, lines 716–718.
+**Status:** resolved in revision 3.
+**Original spec anchors:** section 9.2, lines 987–991; section 6.4, lines 716–718.
 
 The revised differential test includes negated queries, then requires the expanded form of
 "each query" to match the selected occurrence's component. Expanded negation is expressly

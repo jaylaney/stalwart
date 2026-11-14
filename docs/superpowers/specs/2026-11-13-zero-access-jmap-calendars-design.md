@@ -1,6 +1,8 @@
 # Zero-access calendar: JMAP calendars and browser sign-in (release 6) design spec
 
-Date: 2026-11-13. Status: revision 3, for approval. Revision 3 answers
+Date: 2026-11-13. Status: revision 3. Jay gave the go-ahead to plan from
+it on 2026-11-14, after the codex pass on revision 3 left no open
+finding. Revision 3 answers
 the re-review of revision 2 (findings 4 to 6 of the same file): how a
 superseded refresh entry is retired when the grant advances and the
 record's write does not follow (2, 4.3, 4.5, 4.7, 9, 10; finding 4), the
