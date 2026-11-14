@@ -213,7 +213,23 @@ async fn build_search_store(typ: SearchStoreType, _path: &str) -> SearchStore {
 ///   retry is due later is skipped with `skip_not_due`, entries included. The
 ///   index queue has no permanent failure: a failed partition is retried.
 pub async fn wait_for_tasks(server: &Server, skip_not_due: bool, skip_permanent_failures: bool) {
-    let mut count = 0;
+    wait_for_tasks_with_poll_interval(
+        server,
+        skip_not_due,
+        skip_permanent_failures,
+        std::time::Duration::from_millis(200),
+    )
+    .await;
+}
+
+/// The same persisted task/search-queue drain with a caller-selected polling cadence.
+pub async fn wait_for_tasks_with_poll_interval(
+    server: &Server,
+    skip_not_due: bool,
+    skip_permanent_failures: bool,
+    poll_interval: std::time::Duration,
+) {
+    let mut last_report = std::time::Instant::now();
     loop {
         let mut has_index_tasks = None;
         server
@@ -249,20 +265,19 @@ pub async fn wait_for_tasks(server: &Server, skip_not_due: bool, skip_permanent_
         let pending_index = pending_search_index_partitions(server, skip_not_due).await;
 
         if let Some(task) = has_index_tasks {
-            count += 1;
-            if count % 10 == 0 {
+            if last_report.elapsed() >= std::time::Duration::from_secs(2) {
                 println!("Waiting for pending task {:?}...", task);
+                last_report = std::time::Instant::now();
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         } else if !pending_index.is_empty() {
-            count += 1;
-            if count % 10 == 0 {
+            if last_report.elapsed() >= std::time::Duration::from_secs(2) {
                 println!("Waiting for search index partitions {:?}...", pending_index);
+                last_report = std::time::Instant::now();
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         } else {
             break;
         }
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
