@@ -36,6 +36,7 @@ pub mod store;
 pub mod subscribe;
 pub mod thread;
 pub mod uidbatches;
+pub mod za_search;
 
 trait FromModSeq {
     fn from_modseq(modseq: u64) -> Self;

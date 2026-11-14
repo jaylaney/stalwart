@@ -16,8 +16,8 @@ use ::vault::{
     ZA_MARKER,
     keys::{
         AAD_PASSWORD, AAD_PRIVATE_KEY, AAD_RECOVERY, Secret, aad, app_aad, derive_app_kek,
-        derive_kek, derive_recovery_kek, derive_verifier_hash, generate_keypair, unwrap_key,
-        wrap_key,
+        derive_kek, derive_recovery_kek, derive_search_key, derive_verifier_hash, generate_keypair,
+        unwrap_key, wrap_key,
     },
     record::{AppWrap, VaultRecord, VaultState, WrapState},
     recovery::RecoveryKey,
@@ -29,10 +29,11 @@ use common::{
         AccessToken, AuthRequest, BuildAccessToken,
         authentication::Authenticated,
         credential::AppPassword,
-        vault::{VaultRead, za_argon2_params, za_derive_root},
+        vault::{VaultRead, ZaVaultExtra, za_argon2_params, za_derive_root},
     },
     cache::invalidate::CacheInvalidationBuilder,
     ipc::CacheInvalidation,
+    za::search::setup::za_setup_manifest,
 };
 use directory::{
     Credentials,
@@ -63,8 +64,8 @@ use store::{
 use subtle::ConstantTimeEq;
 use trc::AddContext;
 use types::{
-    collection::Collection,
-    field::{EmailField, Field},
+    collection::{Collection, SyncCollection},
+    field::{EmailField, Field, PrincipalField},
     id::Id,
 };
 
@@ -489,6 +490,7 @@ async fn za_commit(
     previous: Option<&VaultRead>,
     expected_revision: Option<u64>,
     now: i64,
+    extra: Option<ZaVaultExtra>,
 ) -> trc::Result<Result<(), HttpResponse>> {
     if let Some(expected) = expected_revision
         && previous.map(|p| p.record.revision) != Some(expected)
@@ -497,7 +499,7 @@ async fn za_commit(
     }
     za_prune(server, record, account_id, now).await?;
     match server
-        .za_vault_commit(account_id, record, previous, None)
+        .za_vault_commit(account_id, record, previous, None, extra)
         .await
     {
         Ok(()) => Ok(Ok(())),
@@ -805,6 +807,7 @@ async fn za_setup_token(server: &Server, request: SetupTokenRequest) -> trc::Res
         previous.as_ref(),
         None,
         now,
+        None,
     )
     .await?
     {
@@ -1121,6 +1124,15 @@ async fn za_setup(
 
     // Generate everything (spec 3). Nothing comes from an admin-supplied password.
     let mk = Secret::random();
+    let indexed_to = server
+        .store()
+        .get_last_change_id(account_id, SyncCollection::Email.into())
+        .await?
+        .unwrap_or(0);
+    let extra = ZaVaultExtra {
+        field: PrincipalField::ZeroAccessSearch,
+        value: za_setup_manifest(&derive_search_key(&mk), indexed_to),
+    };
     let mut record = read.record.clone();
     za_set_password(&mut record, account_id, &mk, &request.password).await?;
     let recovery = za_set_recovery(&mut record, account_id, &mk);
@@ -1132,8 +1144,16 @@ async fn za_setup(
     record.setup_token_expires = 0;
 
     // Single use: a concurrent duplicate loses the revision check.
-    if let Err(response) =
-        za_commit(server, account_id, &mut record, Some(&read), None, now).await?
+    if let Err(response) = za_commit(
+        server,
+        account_id,
+        &mut record,
+        Some(&read),
+        None,
+        now,
+        Some(extra),
+    )
+    .await?
     {
         return Ok(response);
     }
@@ -1183,6 +1203,7 @@ async fn za_password(
         Some(&read),
         Some(verified.keys.generation),
         now() as i64,
+        None,
     )
     .await?
     {
@@ -1244,6 +1265,7 @@ async fn za_recover(
         Some(&read),
         None,
         now() as i64,
+        None,
     )
     .await?
     {
@@ -1288,6 +1310,7 @@ async fn za_recovery_key(
         Some(&read),
         Some(verified.keys.generation),
         now() as i64,
+        None,
     )
     .await?
     {
@@ -1386,6 +1409,7 @@ async fn za_app_password(
         Some(&read),
         Some(verified.keys.generation),
         created,
+        None,
     )
     .await?
     {
@@ -1460,6 +1484,7 @@ async fn za_publish(
             Some(&read),
             None,
             now() as i64,
+            None,
         )
         .await?
         .is_ok()
@@ -1503,6 +1528,7 @@ async fn za_withdraw_pending(
                 Some(&read),
                 None,
                 now() as i64,
+                None,
             )
             .await?
             .is_ok()
@@ -1651,6 +1677,7 @@ async fn za_app_password_revoke(
         Some(&read),
         Some(verified.keys.generation),
         now() as i64,
+        None,
     )
     .await?
     {
@@ -1747,6 +1774,7 @@ async fn za_totp(
         Some(&read),
         Some(verified.keys.generation),
         now() as i64,
+        None,
     )
     .await?
     {

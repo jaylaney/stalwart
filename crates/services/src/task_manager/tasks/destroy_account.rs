@@ -211,6 +211,7 @@ async fn destroy_account(server: &Server, task: &TaskDestroyAccount) -> trc::Res
     }
 
     // Unlink all accounts's blobs
+    server.za_search_destroy(account_id, false).await?;
     destroy_account_blobs(server, account_id).await?;
 
     server

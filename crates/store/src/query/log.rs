@@ -15,6 +15,7 @@ use crate::{
             ITEM_UPDATES, PRESENCE_EXTENDED, zigzag_decode,
         },
     },
+    za_search::Checkpoint,
 };
 use ahash::AHashMap;
 use trc::AddContext;
@@ -76,6 +77,17 @@ pub struct Changes {
     item_index: AHashMap<u64, usize>,
     discarded: Option<Vec<bool>>,
     live: usize,
+}
+
+/// Whole records in ascending change-id order, without folding across records.
+#[derive(Debug, Default)]
+pub struct ZaChangeRecords {
+    pub records: Vec<(u64, Vec<Change>)>,
+    pub truncated: bool,
+    /// The truncation marker replaced the partial record being resumed.
+    pub resumed_record_lost: bool,
+    /// The truncation marker's change id, if one was encountered.
+    pub first_retained: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -181,6 +193,120 @@ impl Store {
         changelog.finalize();
 
         Ok(changelog)
+    }
+
+    /// Resume a partial record inclusively so its caller can apply its own position.
+    pub async fn za_changes_records(
+        &self,
+        account_id: u32,
+        collection: SyncCollection,
+        from: Option<Checkpoint>,
+        max_records: usize,
+    ) -> trc::Result<ZaChangeRecords> {
+        self.read_za_change_records(account_id, collection, from, u64::MAX, max_records)
+            .await
+    }
+
+    /// Read the records in (from_exclusive, to_inclusive].
+    pub async fn za_changes_records_range(
+        &self,
+        account_id: u32,
+        collection: SyncCollection,
+        from_exclusive: u64,
+        to_inclusive: u64,
+    ) -> trc::Result<ZaChangeRecords> {
+        self.read_za_change_records(
+            account_id,
+            collection,
+            Some(Checkpoint {
+                change_id: from_exclusive,
+                position: u32::MAX,
+                complete: true,
+            }),
+            to_inclusive,
+            usize::MAX,
+        )
+        .await
+    }
+
+    async fn read_za_change_records(
+        &self,
+        account_id: u32,
+        collection: SyncCollection,
+        from: Option<Checkpoint>,
+        to_inclusive: u64,
+        max_records: usize,
+    ) -> trc::Result<ZaChangeRecords> {
+        let from_change_id = from.map_or(0, |checkpoint| checkpoint.change_id);
+        let exclusive = from.is_some_and(|checkpoint| checkpoint.complete);
+        let mut result = ZaChangeRecords::default();
+        if max_records == 0 || from_change_id > to_inclusive {
+            return Ok(result);
+        }
+
+        let is_share_log = collection == SyncCollection::ShareNotification;
+        let collection = LogCollection::Sync(collection);
+        let is_prefixed = collection.is_prefixed();
+        self.iterate(
+            IterateParams::new(
+                collection.log_key(account_id, from_change_id),
+                collection.log_key(account_id, to_inclusive),
+            )
+            .ascending(),
+            |key, value| {
+                let change_id = key.deserialize_be_u64(key.len() - U64_LEN)?;
+                if exclusive && change_id == from_change_id {
+                    return Ok(true);
+                }
+                if value.is_empty() {
+                    result.truncated = true;
+                    result.first_retained = Some(change_id);
+                    result.resumed_record_lost |= from.is_some() && change_id == from_change_id;
+                    return Ok(true);
+                }
+                let mut record = Changes::default();
+                if is_share_log {
+                    record.push_share_notification(change_id);
+                } else {
+                    record.deserialize(value, is_prefixed).ok_or_else(|| {
+                        trc::Error::corrupted_key(key, value.into(), trc::location!())
+                    })?;
+                }
+                record.finalize();
+                result.records.push((change_id, record.changes));
+                Ok(result.records.len() < max_records)
+            },
+        )
+        .await
+        .caused_by(trc::location!())?;
+        Ok(result)
+    }
+
+    /// Return the marker only when the oldest key is a truncation marker.
+    pub async fn za_log_first_retained(
+        &self,
+        account_id: u32,
+        collection: SyncCollection,
+    ) -> trc::Result<Option<u64>> {
+        let collection = LogCollection::Sync(collection);
+        let mut first_retained = None;
+        self.iterate(
+            IterateParams::new(
+                collection.log_key(account_id, 0),
+                collection.log_key(account_id, u64::MAX),
+            )
+            .ascending()
+            .only_first(),
+            |key, value| {
+                if value.is_empty() {
+                    first_retained = Some(key.deserialize_be_u64(key.len() - U64_LEN)?);
+                }
+                Ok(false)
+            },
+        )
+        .await
+        .caused_by(trc::location!())?;
+        Ok(first_retained)
     }
 
     pub async fn vanished<T: DeserializeVanished>(
@@ -675,3 +801,7 @@ impl DeserializeVanished for String {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/store/src/query/log/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "log_za_tests.rs"]
+mod za_tests;

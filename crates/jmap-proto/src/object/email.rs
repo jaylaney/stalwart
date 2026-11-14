@@ -14,6 +14,7 @@ use crate::{
     request::{
         MaybeInvalid,
         deserialize::{CowStr, DeserializeArguments},
+        reference::TrustedEmailTarget,
     },
     types::date::UTCDate,
 };
@@ -564,11 +565,30 @@ impl FromStr for EmailProperty {
 
 #[derive(Debug, Clone, Default)]
 pub struct EmailGetArguments {
+    /// Original ID-list positions; never populated by deserialization.
+    pub trusted_ids: ahash::AHashMap<usize, TrustedEmailTarget>,
     pub body_properties: Option<Vec<MaybeInvalid<EmailProperty>>>,
     pub fetch_text_body_values: Option<bool>,
     pub fetch_html_body_values: Option<bool>,
     pub fetch_all_body_values: Option<bool>,
     pub max_body_value_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EmailSetArguments {
+    /// Each vector follows the generated update/destroy input occurrences.
+    pub trusted_updates: Vec<TrustedEmailTarget>,
+    pub trusted_destroy: Vec<TrustedEmailTarget>,
+}
+
+impl<'de> DeserializeArguments<'de> for EmailSetArguments {
+    fn deserialize_argument<A>(&mut self, _key: &str, map: &mut A) -> Result<(), A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let _ = map.next_value::<serde::de::IgnoredAny>()?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -673,7 +693,7 @@ impl JmapObject for Email {
 
     type GetArguments = EmailGetArguments;
 
-    type SetArguments<'de> = ();
+    type SetArguments<'de> = EmailSetArguments;
 
     type QueryArguments = EmailQueryArguments;
 

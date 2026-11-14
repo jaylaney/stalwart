@@ -7669,6 +7669,7 @@ dependencies = [
  "utils",
  "x509-parser",
  "xxhash-rust",
+ "zeroize",
  "zstd",
 ]
 

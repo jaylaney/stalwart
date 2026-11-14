@@ -156,10 +156,17 @@ impl ImapConnection {
     }
 
     pub async fn send(&mut self, text: &str) {
-        //let c = println!("-> {}{:?}", std::str::from_utf8(self.tag).unwrap(), text);
+        self.send_bytes(text.as_bytes()).await;
+    }
+
+    pub async fn send_bytes(&mut self, command: &[u8]) {
         self.writer.write_all(self.tag).await.unwrap();
-        self.writer.write_all(text.as_bytes()).await.unwrap();
+        self.writer.write_all(command).await.unwrap();
         self.writer.write_all(b"\r\n").await.unwrap();
+    }
+
+    pub fn last_response_bytes(&self) -> &[u8] {
+        &self.last_raw
     }
 
     pub async fn send_untagged(&mut self, text: &str) {

@@ -107,8 +107,185 @@ pub trait MailDelivery: Sync + Send {
     ) -> impl Future<Output = LocalDeliveryResult> + Send;
 }
 
+#[cfg(feature = "test_mode")]
+pub mod test_received_at {
+    use super::IngestRecipient;
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    struct Pair {
+        token: Arc<()>,
+        sender: String,
+        recipients: [(String, u32); 2],
+        timestamp: u64,
+        uses: [u32; 2],
+        mismatched: bool,
+    }
+
+    static ACTIVE: Mutex<Option<Pair>> = Mutex::new(None);
+
+    fn active() -> MutexGuard<'static, Option<Pair>> {
+        ACTIVE.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Applies only to one ordered test fixture's paired local delivery.
+    /// This guard does not hold the mutex while the delivery runs.
+    #[must_use = "dropping the guard clears the paired arrival timestamp"]
+    pub struct PairedReceivedAtGuard {
+        token: Arc<()>,
+    }
+
+    impl PairedReceivedAtGuard {
+        pub fn new(sender: &str, recipients: [(&str, u32); 2], timestamp: u64) -> Self {
+            assert_ne!(recipients[0].0, recipients[1].0);
+            assert_ne!(recipients[0].1, recipients[1].1);
+            let mut active = active();
+            assert!(
+                active.is_none(),
+                "a paired arrival timestamp is already armed"
+            );
+            let token = Arc::new(());
+            *active = Some(Pair {
+                token: token.clone(),
+                sender: sender.to_owned(),
+                recipients: recipients.map(|(address, id)| (address.to_owned(), id)),
+                timestamp,
+                uses: [0; 2],
+                mismatched: false,
+            });
+            Self { token }
+        }
+
+        pub fn assert_used(&self) {
+            let (uses, mismatched) = {
+                let active = active();
+                let pair = active
+                    .as_ref()
+                    .filter(|pair| Arc::ptr_eq(&pair.token, &self.token))
+                    .expect("the paired arrival guard is active");
+                (pair.uses, pair.mismatched)
+            };
+            assert!(
+                !mismatched,
+                "paired arrival timestamp recipient scope mismatch"
+            );
+            assert_eq!(uses, [1, 1], "paired arrival timestamp uses");
+        }
+    }
+
+    impl Drop for PairedReceivedAtGuard {
+        fn drop(&mut self) {
+            let mut active = active();
+            if active
+                .as_ref()
+                .is_some_and(|pair| Arc::ptr_eq(&pair.token, &self.token))
+            {
+                *active = None;
+            }
+        }
+    }
+
+    pub(super) fn delivery_token(sender: &str, recipients: &[IngestRecipient]) -> Option<Arc<()>> {
+        let mut active = active();
+        let Some(pair) = active.as_mut().filter(|pair| pair.sender == sender) else {
+            return None;
+        };
+        let matches = pair.recipients.each_ref().map(|(address, _)| {
+            recipients
+                .iter()
+                .filter(|rcpt| rcpt.address == *address)
+                .count()
+        });
+        if matches == [0, 0] {
+            return None;
+        }
+        if recipients.len() == 2 && matches == [1, 1] {
+            Some(pair.token.clone())
+        } else {
+            pair.mismatched = true;
+            None
+        }
+    }
+
+    pub(super) fn received_at(token: &Arc<()>, address: &str, account_id: u32) -> Option<u64> {
+        let mut active = active();
+        // A delivery resumed after guard teardown cannot use the next
+        // transaction's timestamp, even if its envelope matches again.
+        let pair = active
+            .as_mut()
+            .filter(|pair| Arc::ptr_eq(&pair.token, token))?;
+        let index = pair
+            .recipients
+            .iter()
+            .position(|(expected, _)| expected == address)?;
+        if pair.recipients[index].1 != account_id {
+            pair.mismatched = true;
+            return None;
+        }
+        pair.uses[index] = pair.uses[index].saturating_add(1);
+        Some(pair.timestamp)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn paired_received_at_scope_and_restoration() {
+            let recipient = |address: &str| IngestRecipient {
+                address: address.to_owned(),
+                orcpt: None,
+                spam_percentage: None,
+            };
+            let recipients = [recipient("a@example.test"), recipient("b@example.test")];
+            let arm = || {
+                PairedReceivedAtGuard::new(
+                    "sender@example.test",
+                    [("a@example.test", 1), ("b@example.test", 2)],
+                    123,
+                )
+            };
+            let guard = arm();
+            assert!(delivery_token("other@example.test", &recipients).is_none());
+            assert!(
+                delivery_token("sender@example.test", &[recipient("other@example.test")]).is_none()
+            );
+            let token = delivery_token("sender@example.test", &recipients).unwrap();
+            assert_eq!(received_at(&token, "a@example.test", 1), Some(123));
+            assert_eq!(received_at(&token, "b@example.test", 2), Some(123));
+            guard.assert_used();
+            drop(guard);
+            assert!(delivery_token("sender@example.test", &recipients).is_none());
+
+            let guard = arm();
+            assert_eq!(received_at(&token, "a@example.test", 1), None);
+            assert!(delivery_token("sender@example.test", &recipients[..1]).is_none());
+            let token = delivery_token("sender@example.test", &recipients).unwrap();
+            assert_eq!(received_at(&token, "b@example.test", 1), None);
+            assert_eq!(received_at(&token, "a@example.test", 1), Some(123));
+            assert_eq!(received_at(&token, "a@example.test", 1), Some(123));
+            let state = active();
+            assert!(state.as_ref().unwrap().mismatched);
+            assert_eq!(state.as_ref().unwrap().uses, [2, 0]);
+            drop(state);
+            drop(guard);
+
+            assert!(
+                std::panic::catch_unwind(|| {
+                    let _guard = arm();
+                    panic!("exercise the paired guard's unwind cleanup");
+                })
+                .is_err()
+            );
+            assert!(active().is_none());
+        }
+    }
+}
+
 impl MailDelivery for Server {
     async fn deliver_message(&self, message: IngestMessage) -> LocalDeliveryResult {
+        #[cfg(feature = "test_mode")]
+        let paired_received_at =
+            test_received_at::delivery_token(&message.sender_address, &message.recipients);
         // Read message
         let raw_message = match self
             .get_blob(message.message_blob.as_slice(), 0..usize::MAX)
@@ -219,6 +396,11 @@ impl MailDelivery for Server {
                                 access_token: &access_token,
                                 mailbox_ids: vec![INBOX_ID],
                                 keywords: vec![],
+                                #[cfg(feature = "test_mode")]
+                                received_at: paired_received_at.as_ref().and_then(|token| {
+                                    test_received_at::received_at(token, &rcpt.address, account_id)
+                                }),
+                                #[cfg(not(feature = "test_mode"))]
                                 received_at: None,
                                 source: IngestSource::Smtp {
                                     deliver_to: &rcpt.address,

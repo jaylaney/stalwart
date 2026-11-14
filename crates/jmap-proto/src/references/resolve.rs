@@ -36,7 +36,19 @@ impl Response<'_> {
     pub fn resolve_references(&self, request: &mut RequestMethod) -> trc::Result<()> {
         match request {
             RequestMethod::Get(request) => match request {
-                GetRequestMethod::Email(request) => request.resolve_references(self)?,
+                GetRequestMethod::Email(request) => {
+                    request.arguments.trusted_ids.clear();
+                    if let Some(MaybeResultReference::Value(ids)) = &request.ids {
+                        for (position, id) in ids.iter().enumerate() {
+                            if let MaybeIdReference::Reference(name) = id
+                                && let Some(target) = self.trusted_email_ids.get(name)
+                            {
+                                request.arguments.trusted_ids.insert(position, *target);
+                            }
+                        }
+                    }
+                    request.resolve_references(self)?;
+                }
                 GetRequestMethod::Mailbox(request) => request.resolve_references(self)?,
                 GetRequestMethod::Thread(request) => request.resolve_references(self)?,
                 GetRequestMethod::Identity(request) => request.resolve_references(self)?,
@@ -71,6 +83,40 @@ impl Response<'_> {
                     request.resolve_references(self, 1, false)?
                 }
                 SetRequestMethod::EmailSubmission(request) => {
+                    use crate::object::email_submission::EmailSubmissionProperty;
+                    request.arguments.trusted_email_ids.clear();
+                    if let Some(create) = &request.create {
+                        let mut seen = ahash::AHashSet::new();
+                        for (name, object) in create {
+                            if !seen.insert(name) {
+                                // Duplicate creation names cannot identify an occurrence.
+                                request.arguments.trusted_email_ids.remove(name);
+                                continue;
+                            }
+                            if let Value::Object(object) = object {
+                                let mut trusted = AHashMap::new();
+                                for (position, (property, value)) in
+                                    object.as_vec().iter().enumerate()
+                                {
+                                    if matches!(
+                                        property,
+                                        Key::Property(EmailSubmissionProperty::EmailId)
+                                    ) && let Value::Element(value) = value
+                                        && let Some(reference) = value.as_id_ref()
+                                        && let Some(target) = self.trusted_email_ids.get(reference)
+                                    {
+                                        trusted.insert(position, *target);
+                                    }
+                                }
+                                if !trusted.is_empty() {
+                                    request
+                                        .arguments
+                                        .trusted_email_ids
+                                        .insert(name.clone(), trusted);
+                                }
+                            }
+                        }
+                    }
                     request.resolve_references(self, 1, false)?
                 }
                 SetRequestMethod::PushSubscription(request) => {

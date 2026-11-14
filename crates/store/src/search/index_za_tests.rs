@@ -258,3 +258,55 @@ fn accounted_input_bytes_counts_values_logs_and_merges() {
 }
 
 const ZA_OVERHEAD: usize = 64;
+
+#[cfg(feature = "test_mode")]
+#[test]
+fn za_bench_term_bytes_counts_positions() {
+    let mut document = IndexDocument::new(SearchIndex::Email)
+        .with_account_id(1)
+        .with_document_id(7);
+    document.index_text(
+        EmailSearchField::Subject,
+        "quarterly budget review",
+        Language::English,
+    );
+    document.index_text(
+        EmailSearchField::Body,
+        "the budget review is on thursday the review is long",
+        Language::English,
+    );
+    let (with, without) = document.za_bench_term_bytes();
+    assert!(!without.is_empty());
+    assert!(
+        with.len() > without.len(),
+        "positions add bytes: {} vs {}",
+        with.len(),
+        without.len()
+    );
+
+    let mut big = IndexDocument::new(SearchIndex::Email)
+        .with_account_id(1)
+        .with_document_id(8);
+    let body = (0..4000)
+        .map(|i| format!("w{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    big.index_text(EmailSearchField::Body, &body, Language::English);
+    let stored = AccountIndexer::default()
+        .index_document(big.clone_for_test(), 8)
+        .encode()
+        .into_document();
+    let (raw, _) = big.za_bench_term_bytes();
+    assert!(
+        raw.len() > stored.len(),
+        "the stored form is compressed: {} vs raw {}",
+        stored.len(),
+        raw.len()
+    );
+    let mut scratch = Vec::new();
+    assert_eq!(
+        crate::search::codec::read_document(&stored, &mut scratch),
+        Some(raw.as_slice()),
+        "the accessor returns the payload without the storage marker",
+    );
+}

@@ -149,6 +149,8 @@ pub(crate) async fn reindex_account(server: &Server, account_id: u32) -> trc::Re
         queue.queued(server).await?;
     }
 
+    server.za_search_reset(account_id).await?;
+
     for (document_type, cache) in [
         (SearchIndex::Calendar, &calendars),
         (SearchIndex::Contacts, &contacts),

@@ -277,7 +277,7 @@ impl<T: JmapObject> SetResponse<T> {
                 && let Some(Value::Element(id)) = obj.get(&Key::Property(T::ID_PROPERTY))
                 && let Some(id) = id.as_any_id()
             {
-                response.created_ids.insert(user_id.clone(), id);
+                response.push_created_id(user_id.clone(), id);
             }
         }
     }

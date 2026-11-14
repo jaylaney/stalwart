@@ -131,6 +131,10 @@ rpath = false
 [profile.test.package.argon2]
 opt-level = 3
 
+# Avoid unoptimized scalar arithmetic in full-workload tests.
+[profile.test.package.curve25519-dalek]
+opt-level = 3
+
 [profile.bench]
 opt-level = 3
 debug = false

@@ -13,7 +13,7 @@ use crate::{
     request::{
         MaybeInvalid,
         deserialize::{CowStr, DeserializeArguments},
-        reference::MaybeIdReference,
+        reference::{MaybeIdReference, TrustedEmailTarget},
     },
     types::date::UTCDate,
 };
@@ -308,6 +308,8 @@ impl Displayed {
 
 #[derive(Debug, Clone, Default)]
 pub struct EmailSubmissionSetArguments<'x> {
+    /// Creation name, then original property position. Neither is numeric-ID trust.
+    pub trusted_email_ids: ahash::AHashMap<String, ahash::AHashMap<usize, TrustedEmailTarget>>,
     pub on_success_update_email:
         Option<VecMap<MaybeIdReference<Id>, Value<'x, EmailProperty, EmailValue>>>,
     pub on_success_destroy_email: Option<Vec<MaybeIdReference<Id>>>,

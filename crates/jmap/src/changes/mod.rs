@@ -8,6 +8,7 @@ pub mod get;
 pub mod page;
 pub mod query;
 pub mod state;
+pub mod za;
 
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]

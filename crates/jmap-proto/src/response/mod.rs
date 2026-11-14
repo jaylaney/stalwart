@@ -54,7 +54,7 @@ use crate::{
         thread::Thread,
         vacation_response::VacationResponse,
     },
-    request::{Call, method::MethodName},
+    request::{Call, method::MethodName, reference::TrustedEmailTarget},
 };
 use ahash::AHashMap;
 use jmap_tools::{Null, Value};
@@ -174,6 +174,9 @@ pub struct Response<'x> {
     #[serde(rename = "createdIds")]
     #[serde(skip_serializing_if = "crate::method::ahash_is_empty")]
     pub created_ids: AHashMap<String, AnyId>,
+
+    #[serde(skip)]
+    pub(crate) trusted_email_ids: AHashMap<String, TrustedEmailTarget>,
 }
 
 impl<'x> Response<'x> {
@@ -185,6 +188,7 @@ impl<'x> Response<'x> {
         Response {
             session_state,
             created_ids,
+            trusted_email_ids: AHashMap::new(),
             method_responses: Vec::with_capacity(capacity),
         }
     }
@@ -210,7 +214,47 @@ impl<'x> Response<'x> {
         });
     }
 
+    /// Called only after the keyed Email method completed, using its final IDs.
+    pub fn trust_email_creations(&mut self, created: &SetResponse<Email>) {
+        if let Some(account_id) = created.account_id {
+            self.trust_email_objects(account_id.document_id(), created.created.iter());
+        }
+    }
+
+    pub fn trust_email_imports(&mut self, created: &ImportEmailResponse) {
+        self.trust_email_objects(created.account_id.document_id(), created.created.iter());
+    }
+
+    fn trust_email_objects<'a>(
+        &mut self,
+        account_id: u32,
+        objects: impl Iterator<
+            Item = (
+                &'a String,
+                &'a Value<
+                    'static,
+                    crate::object::email::EmailProperty,
+                    crate::object::email::EmailValue,
+                >,
+            ),
+        >,
+    ) {
+        use crate::object::email::{EmailProperty, EmailValue};
+        for (name, object) in objects {
+            if let Value::Object(object) = object
+                && let Some(Value::Element(EmailValue::Id(id))) =
+                    object.get(&jmap_tools::Key::Property(EmailProperty::Id))
+            {
+                self.trusted_email_ids.insert(
+                    name.clone(),
+                    TrustedEmailTarget::new(account_id, id.document_id()),
+                );
+            }
+        }
+    }
+
     pub fn push_created_id(&mut self, create_id: String, id: impl Into<AnyId>) {
+        self.trusted_email_ids.remove(&create_id);
         self.created_ids.insert(create_id, id.into());
     }
 }

@@ -5,7 +5,8 @@
  */
 
 use crate::changes::state::StateManager;
-use common::Server;
+use common::{Server, auth::AccessToken};
+use email::message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error};
 use email::submission::{
     ArchivedAddress, ArchivedEnvelope, ArchivedUndoStatus, Delivered, DeliveryResults,
     DeliveryStatus, EmailSubmission,
@@ -35,6 +36,7 @@ pub trait EmailSubmissionGet: Sync + Send {
     fn email_submission_get(
         &self,
         request: GetRequest<email_submission::EmailSubmission>,
+        access_token: &AccessToken,
     ) -> impl Future<Output = trc::Result<GetResponse<email_submission::EmailSubmission>>> + Send;
 
     fn email_submission_delivery_results(
@@ -49,6 +51,7 @@ impl EmailSubmissionGet for Server {
     async fn email_submission_get(
         &self,
         mut request: GetRequest<email_submission::EmailSubmission>,
+        access_token: &AccessToken,
     ) -> trc::Result<GetResponse<email_submission::EmailSubmission>> {
         let (ids, not_found_ids) = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let properties = request.unwrap_properties(&[
@@ -64,6 +67,14 @@ impl EmailSubmissionGet for Server {
             EmailSubmissionProperty::MdnBlobIds,
         ]);
         let account_id = request.account_id.document_id();
+        let snapshot = match access_token.za_keys_for(account_id) {
+            Some(keys) => Some(
+                self.za_snapshot(account_id, keys)
+                    .await
+                    .map_err(|reason| za_no_map_error(reason, account_id))?,
+            ),
+            None => None,
+        };
         let ids = if let Some(ids) = ids {
             ids
         } else {
@@ -234,18 +245,23 @@ impl EmailSubmissionGet for Server {
                     EmailSubmissionProperty::UndoStatus => {
                         Value::Element(EmailSubmissionValue::UndoStatus(undo_status.clone()))
                     }
-                    EmailSubmissionProperty::EmailId => Value::Element(
-                        Id::from_parts(
-                            u32::from(submission.thread_id),
-                            u32::from(submission.email_id),
-                        )
-                        .into(),
-                    ),
+                    EmailSubmissionProperty::EmailId => {
+                        let document_id = u32::from(submission.email_id);
+                        let id = snapshot.as_ref().map_or_else(
+                            || Id::from_parts(u32::from(submission.thread_id), document_id),
+                            |snapshot| snapshot.map_id(document_id),
+                        );
+                        Value::Element(id.into())
+                    }
                     EmailSubmissionProperty::IdentityId => {
                         Value::Element(Id::from(u32::from(submission.identity_id)).into())
                     }
                     EmailSubmissionProperty::ThreadId => {
-                        Value::Element(Id::from(u32::from(submission.thread_id)).into())
+                        let thread_id = snapshot.as_ref().map_or_else(
+                            || u32::from(submission.thread_id),
+                            |snapshot| snapshot.thread_of(u32::from(submission.email_id)),
+                        );
+                        Value::Element(Id::from(thread_id).into())
                     }
                     EmailSubmissionProperty::Envelope => build_envelope(&submission.envelope),
                     EmailSubmissionProperty::SendAt => Value::Element(EmailSubmissionValue::Date(

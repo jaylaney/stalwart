@@ -32,6 +32,7 @@ papaya = "0.2.5"
 lru-cache = { version = "0.1.2", optional = true }
 num_cpus = { version = "1.17", optional = true }
 blake3 = "1.8"
+zeroize = "1.9"
 lz4_flex = { version = "0.14", features = ["alloc"], default-features = false }
 zstd = { version = "0.14", default-features = false }
 deadpool-postgres = { version = "0.14", optional = true }

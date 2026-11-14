@@ -190,7 +190,7 @@ impl TextWindow {
     }
 }
 
-impl Page {
+impl Page<'_> {
     fn fill_window<'x>(
         &self,
         filter: &RowFilter,

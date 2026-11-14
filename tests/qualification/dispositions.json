@@ -497,6 +497,184 @@
     }
    ],
    "evidence": "Ruling 33, disposition telemetry-metrics-call: `telemetry::telemetry_tests` no longer calls `metrics::test` and `tracing::test`, which were these helpers' only callers in `telemetry-tests` (`metrics.rs:46-48`, `:77-143`, `tracing.rs:67`; `registry_get_many` calls `registry_get` and `jmap_get_account`). Expectation ledger `telemetry::telemetry_tests`. Limited to `telemetry-tests`: every helper stays required in the other steps where it ran."
+  },
+  {
+   "id": "search-r7-snippet-refusal-selector-retired",
+   "kind": "subject_deleted",
+   "scope": "libtest",
+   "subjects": [
+    {
+     "package": "jmap",
+     "name": "email::za::tests::first_snippet_term_finds_the_marked_properties_anywhere"
+    }
+   ],
+   "unconfirmed": false,
+   "evidence": "Release 7 search design sections 9.3 and 14 supersede the unconditional keyed-content refusal. Commit e5d3e749e deletes first_snippet_term and za_refuse_snippet_terms together with this unit test in crates/jmap/src/email/za.rs. Its subject was selecting a property for that removed refusal, including punctuation and NOT, not the new snippet renderer. tests/src/za/mail/search.rs::jmap_served_content_filters_and_sorts checks the revised public snippet outcomes, but is not claimed as a unit-tests-step equivalent. See docs/superpowers/plans/2026-11-14-search-ci-retention-ledger.md. Primary and independent source review confirmed this decision on 2026-11-14; fresh strict-rule execution remains pending."
+  },
+  {
+   "id": "search-r7-imap-content-refusal-assertion-retired",
+   "kind": "subject_deleted",
+   "scope": "function",
+   "steps": [
+    "imap-key"
+   ],
+   "subjects": [
+    {
+     "file": "tests/src/imap/za_variants.rs",
+     "in": null,
+     "name": "assert_search_refused"
+    }
+   ],
+   "unconfirmed": false,
+   "evidence": "Release 7 search design section 9.3 replaces the keyed search/thread variants' unconditional NO [CANNOT] ZA_MAIL_SEARCH_REFUSED expectations with upstream outcomes; commit 070c1d3a4 removes this helper and calls tests/src/imap/{search,thread}.rs::test in both modes. The retired helper was used for supported content predicates and header sorts, not SORT (CC). The still-unsupported CC sort is retained in tests/src/za/mail/search.rs::imap_served_content_keys; the SIZE/ARRIVAL and metadata-only saved-search checks remain required in imap-key and receive no excusal. See docs/superpowers/plans/2026-11-14-search-ci-retention-ledger.md. Primary and independent source review confirmed this decision on 2026-11-14; fresh strict-rule execution remains pending."
+  },
+  {
+   "id": "search-r7-jmap-content-refusal-assertion-retired",
+   "kind": "subject_deleted",
+   "scope": "function",
+   "steps": [
+    "jmap-key"
+   ],
+   "subjects": [
+    {
+     "file": "tests/src/jmap/za_variants.rs",
+     "in": null,
+     "name": "assert_search_refused"
+    }
+   ],
+   "unconfirmed": false,
+   "evidence": "Release 7 search design sections 9.3 and 14 supersede this helper's exact unsupportedFilter/unsupportedSort description containing ZA_MAIL_SEARCH_REFUSED for supported keyed content. Commit 070c1d3a4 removes it while restoring upstream query/snippet/queryChanges outcomes. The existing cc sort remains unsupported, with the ordinary unsupportedSort description rather than the obsolete ZA_MAIL_SEARCH_REFUSED description; query_refusals and its jmap-key requirement are NOT excused by this entry. The surviving cc case and restored metadata oracles are recorded separately in docs/superpowers/plans/2026-11-14-search-ci-retention-ledger.md. Primary and independent source review confirmed this decision on 2026-11-14; fresh strict-rule execution remains pending."
+  },
+  {
+   "id": "search-r7-jmap-supported-content-refusal-cases-retired",
+   "kind": "subject_deleted",
+   "scope": "case",
+   "steps": [
+    "jmap-key"
+   ],
+   "subjects": [
+    {
+     "file": "tests/src/jmap/za_variants.rs",
+     "in": null,
+     "name": "query_refusals",
+     "case": "unconditional keyed-content refusals for supported filters and sorts, including mixed queries and filter-before-sort refusal priority; excludes the still-unsupported cc comparator"
+    }
+   ],
+   "unconfirmed": false,
+   "evidence": "Documentation only: the gate never applies scope case. Release 7 search design section 9.3 requires upstream positive outcomes for supported content. tests/src/jmap/za_variants.rs::query calls upstream_query::query and upstream_query::query_options; keyless_query_refused checks the separate keyless boundary. This entry does not waive query_refusals, cc unsupportedSort, or any metadata-only case. See docs/superpowers/plans/2026-11-14-search-ci-retention-ledger.md. Primary and independent source review confirmed this decision on 2026-11-14; fresh strict-rule execution remains pending."
+  },
+  {
+   "id": "search-r7-persisted-singletons-mapped-wire-ids",
+   "kind": "internals_replaced_equivalent",
+   "scope": "function",
+   "steps": [
+    "za-tests",
+    "za-tests-fs-blob"
+   ],
+   "subjects": [
+    {
+     "file": "tests/src/za/mail/reads.rs",
+     "in": null,
+     "name": "threads_are_singletons"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/za/mail/reads.rs",
+     "in": null,
+     "name": "singleton_rows_have_mapped_wire_ids"
+    },
+    {
+     "file": "tests/src/za/mail/threads/task12.rs",
+     "in": null,
+     "name": "case_conversation_parity"
+    }
+   ],
+   "unconfirmed": false,
+   "evidence": "Release 7 search design sections 6.2 and 9.3 keep persisted Email rows singleton but map chained messages at the wire. singleton_rows_have_mapped_wire_ids checks stored rows, exact mapped Email/get IDs and collapse; case_conversation_parity checks exact Thread/get membership and IMAP THREAD groups, including independent singleton controls. Both are required in each original ZA step, so the removed Thread/get and IMAP assertions are not hidden behind the narrower read helper. See docs/superpowers/plans/2026-11-14-search-ci-retention-ledger.md. Primary and independent source review confirmed this decision on 2026-11-14; fresh strict-rule execution remains pending."
+  },
+  {
+   "id": "search-r7-imap-thread-upstream-outcomes",
+   "kind": "internals_replaced_equivalent",
+   "scope": "sub_test_call",
+   "steps": [
+    "imap-key"
+   ],
+   "subjects": [
+    {
+     "suite": "imap::imap_tests",
+     "call": "za_variants::thread"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/imap/thread.rs",
+     "in": null,
+     "name": "test"
+    }
+   ],
+   "unconfirmed": false,
+   "evidence": "Release 7 search design section 9.3 and commit 070c1d3a4 replace the singleton/refusal variant with upstream's thread body, called in both modes by imap::imap_tests. The same Multiappend fixture now asserts joined reference groups, successful subject filtering, THREADID membership, singleton EMAILID filtering and cleanup. The equivalent must complete in imap-key. See docs/superpowers/plans/2026-11-14-search-ci-retention-ledger.md. Primary and independent source review confirmed this decision on 2026-11-14; fresh strict-rule execution remains pending."
+  },
+  {
+   "id": "search-r7-imap-content-commands-served",
+   "kind": "internals_replaced_equivalent",
+   "scope": "function",
+   "steps": [
+    "za-tests",
+    "za-tests-fs-blob"
+   ],
+   "subjects": [
+    {
+     "file": "tests/src/za/mail/search.rs",
+     "in": null,
+     "name": "imap_refused_keys"
+    },
+    {
+     "file": "tests/src/za/mail/search.rs",
+     "in": null,
+     "name": "refused_commands"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/za/mail/search.rs",
+     "in": null,
+     "name": "imap_served_content_keys"
+    },
+    {
+     "file": "tests/src/za/mail/differential.rs",
+     "in": null,
+     "name": "compare_imap"
+    }
+   ],
+   "unconfirmed": false,
+   "evidence": "Release 7 search design sections 7.2, 9.3 and 14 replace unconditional content refusals with keyed/plain result parity. Commit e5d3e749e incorporates most former command-generator cases into imap_served_content_keys: content filters and attachment keywords have exact results, supported sorts agree, BODY-filtered THREAD groups are checked, and trace-canary absence remains. The former THREAD REFERENCES UTF-8 FROM x case is covered by differential.rs::compare_imap, whose ALL/FROM/BODY loop requires nonempty ordinary results and exact projected keyed groups. Both functions must complete in each original ZA step. SORT (CC) still explicitly returns NO with no SORT result and permits NOOP in imap_served_content_keys; it is not retired. See docs/superpowers/plans/2026-11-14-search-ci-retention-ledger.md. Primary and independent source review confirmed this decision on 2026-11-14; fresh strict-rule execution remains pending."
+  },
+  {
+   "id": "search-r7-jmap-content-filters-sorts-served",
+   "kind": "internals_replaced_equivalent",
+   "scope": "function",
+   "steps": [
+    "za-tests",
+    "za-tests-fs-blob"
+   ],
+   "subjects": [
+    {
+     "file": "tests/src/za/mail/search.rs",
+     "in": null,
+     "name": "jmap_refused_filters_and_sorts"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/za/mail/search.rs",
+     "in": null,
+     "name": "jmap_served_content_filters_and_sorts"
+    }
+   ],
+   "unconfirmed": false,
+   "evidence": "Release 7 search design sections 7.1, 7.3, 9.3 and 14 change supported keyed content from refusal to positive outcomes. Commit e5d3e749e replaces the old body with exact filter results, sort parity, stale/current queryChanges, highlighted and bare snippets, and destruction checks. The standalone and mixed metadataExists cases still assert the exact key-account unsupportedFilter refusal. The cc sort was already removed from this body's list by the 1.0 upgrade expectation ledger (2026-10-27-stalwart-1-upgrade-outcome.md, za::mail::search::jmap_refused_filters_and_sorts, part 7c); it is still unsupported and is not retired by this entry. See docs/superpowers/plans/2026-11-14-search-ci-retention-ledger.md. Primary and independent source review confirmed this decision on 2026-11-14; fresh strict-rule execution remains pending."
   }
  ],
  "renames": {
@@ -591,6 +769,34 @@
    }
   ],
   "functions": [
+   {
+    "from": {
+     "file": "tests/src/za/mail/gates.rs",
+     "in": "<impl Keyless>",
+     "name": "name"
+    },
+    "to": {
+     "file": "tests/src/utils/za.rs",
+     "in": "<impl Keyless>",
+     "name": "name"
+    },
+    "unconfirmed": false,
+    "evidence": "Release 7 commit df9ffaf44 moves the Keyless channel helper from mail/gates.rs into utils/za.rs for shared use; name keeps its Bearer/WebSocket labels. This exact move preserves every baseline step requirement. See docs/superpowers/plans/2026-11-14-search-ci-retention-ledger.md. Primary and independent source review confirmed this decision on 2026-11-14; fresh strict-rule execution remains pending."
+   },
+   {
+    "from": {
+     "file": "tests/src/za/mail/gates.rs",
+     "in": "<impl Keyless>",
+     "name": "call"
+    },
+    "to": {
+     "file": "tests/src/utils/za.rs",
+     "in": "<impl Keyless>",
+     "name": "call"
+    },
+    "unconfirmed": false,
+    "evidence": "Release 7 commit df9ffaf44 moves the Keyless channel helper from mail/gates.rs into utils/za.rs for shared use; call keeps the HTTP Bearer/WebSocket request and first method-response extraction. This exact move preserves every baseline step requirement. See docs/superpowers/plans/2026-11-14-search-ci-retention-ledger.md. Primary and independent source review confirmed this decision on 2026-11-14; fresh strict-rule execution remains pending."
+   },
    {
     "from": {
      "file": "tests/src/utils/cleanup.rs",

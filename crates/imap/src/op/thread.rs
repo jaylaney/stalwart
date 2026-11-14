@@ -4,13 +4,17 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::za_search::{za_imap_content_guard, za_imap_map_guard};
 use crate::{
     core::{SelectedMailbox, Session, SessionData},
     spawn_op,
 };
 use ahash::AHashMap;
 use common::network::SessionStream;
-use email::cache::{MessageCacheFetch, email::MessageCacheAccess};
+use email::{
+    cache::{MessageCacheFetch, email::MessageCacheAccess},
+    message::za::search::view::ZaView,
+};
 use imap_proto::{
     Command, StatusResponse,
     protocol::thread::{Arguments, Response},
@@ -67,18 +71,42 @@ impl<T: SessionStream> SessionData<T> {
         self.server
             .za_assert_mail_route(&self.access_token, mailbox.id.account_id)
             .await?;
-        let cache = self
-            .server
-            .get_cached_messages(mailbox.id.account_id)
-            .await
-            .caused_by(trc::location!())?;
+        let mut saved_search = None;
+        let content_view =
+            za_imap_content_guard(self, &mailbox, &arguments.filter, &[], &mut saved_search)
+                .await?;
+        let is_content = content_view.is_some();
+        let snapshot = if is_content {
+            content_view
+        } else {
+            za_imap_map_guard(self, &mailbox, &arguments.filter, &mut saved_search, true).await?
+        };
+        let cache = match &snapshot {
+            Some(view) => view.cache.clone(),
+            None => self
+                .server
+                .get_cached_messages(mailbox.id.account_id)
+                .await
+                .caused_by(trc::location!())?,
+        };
         self.sync_view(&mailbox, &cache, None)
             .await
             .caused_by(trc::location!())?;
 
         // Run query
         let (result_set, _) = self
-            .query(arguments.filter, vec![], &mailbox, &cache, &None)
+            .query(
+                arguments.filter,
+                vec![],
+                &mailbox,
+                &cache,
+                &saved_search,
+                snapshot.as_ref(),
+                snapshot
+                    .as_ref()
+                    .filter(|_| is_content)
+                    .map(ZaView::content),
+            )
             .await?;
 
         if result_set.is_empty() {
@@ -97,7 +125,10 @@ impl<T: SessionStream> SessionData<T> {
                     && let Some(resolved) = view.map_result(document_id)
                 {
                     threads
-                        .entry(item.thread_id())
+                        .entry(snapshot.as_ref().map_or_else(
+                            || item.thread_id(),
+                            |snapshot| snapshot.thread_of(document_id),
+                        ))
                         .or_default()
                         .push(resolved.imap_id(is_uid));
                 }

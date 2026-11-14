@@ -767,11 +767,10 @@ async fn key_rcpt_after_a_chunk_is_refused(test: &TestServer, key: &Account, pla
     new_message(test, plain_id, &plain_before).await;
 }
 
-/// One IMAP session of `account`: SELECT, a FETCH of the canary header, a
-/// STORE of a keyword, an APPEND, a SEARCH on content (refused for a key
-/// account), a malformed FETCH. Returns the FETCH's answer.
+/// One IMAP session of `account`: SELECT, FETCH, STORE, APPEND, a served
+/// content SEARCH (Release 7 spec 7.2) and a malformed FETCH. Returns the
+/// FETCH's answer.
 async fn imap_session(account: &Account) -> String {
-    let is_key = account.name() == KEY;
     let mut imap = ImapConnection::connect(b"_t ").await;
     imap.authenticate(account.name(), account.secret()).await;
     imap.send_ok("SELECT INBOX").await;
@@ -783,16 +782,7 @@ async fn imap_session(account: &Account) -> String {
         .join("\n");
     imap.send_ok("STORE 1 +FLAGS ($kw-canary)").await;
     imap.append("INBOX", &canary_message()).await;
-    imap.send("SEARCH FROM search-canary").await;
-    imap.assert_read(
-        Type::Tagged,
-        if is_key {
-            ResponseType::No
-        } else {
-            ResponseType::Ok
-        },
-    )
-    .await;
+    imap.send_ok("SEARCH FROM search-canary").await;
     // Its BAD answer quotes the attribute.
     imap.send("FETCH 1 (bad-canary)").await;
     imap.assert_read(Type::Tagged, ResponseType::Bad).await;

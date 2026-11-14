@@ -4,10 +4,15 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::EmailQueryMap;
 use super::text::{push_text, strip_subject_prefix};
+use crate::email::za_search::za_resolve_condition;
 use common::{MessageStoreCache, cache::email::MessageRef};
 use compact_str::ToCompactString;
-use email::cache::email::{MessageAccess, MessageCacheAccess, SearchOperator, thread_keywords};
+use email::{
+    cache::email::{MessageAccess, MessageCacheAccess, SearchOperator, thread_keywords},
+    message::za::search::threads::za_thread_keywords,
+};
 use jmap_proto::{
     method::query::Filter,
     object::email::{EmailFilter, EmailQueryFilter},
@@ -19,6 +24,7 @@ use store::{
     ahash::AHashSet,
     roaring::RoaringBitmap,
     search::{EmailSearchField, KeyValueMatch, SearchFilter},
+    za_search::content::ContentPart,
 };
 use types::keyword::{HASATTACHMENT, HASNOATTACHMENT, Keyword};
 
@@ -215,13 +221,25 @@ impl QueryFilter {
         access: MessageAccess,
         mut metadata_matches: impl Iterator<Item = RoaringBitmap>,
         default_language: Language,
+        map: Option<EmailQueryMap<'_>>,
+        content: Option<&ContentPart>,
     ) -> trc::Result<Option<Self>> {
         let mut row = RowFilter::new(access);
         let mut residual = Vec::new();
         let mut text = Vec::new();
         let mut subtrees = 0usize;
         let mut is_empty = false;
-        let mut visible = None;
+        let mut visible: Option<RoaringBitmap> =
+            map.filter(|map| map.endpoint.is_some()).map(|map| {
+                cache
+                    .emails
+                    .iter()
+                    .filter(|message| {
+                        row.access.allows(*message) && map.contains(message.document_id())
+                    })
+                    .map(|message| message.document_id())
+                    .collect()
+            });
         let verbatim = has_empty_group(&filters);
 
         for filter in filters {
@@ -230,36 +248,69 @@ impl QueryFilter {
                 Filter::Property(EmailQueryFilter::Metadata(_)) => residual.push(
                     SearchFilter::is_in_set(metadata_matches.next().unwrap_or_default()),
                 ),
-                Filter::Property(EmailQueryFilter::Email(condition)) if top_level => {
-                    match row.absorb(condition) {
-                        Ok(Absorbed::Yes) => (),
-                        Ok(Absorbed::Contradiction) => is_empty = true,
-                        Err(condition) if is_text(&condition) => push_condition(
-                            &mut text,
-                            condition,
+                Filter::Property(EmailQueryFilter::Email(condition)) => {
+                    if let Some(map) = map
+                        && let EmailFilter::InThread(id) = &condition
+                    {
+                        let id = id.document_id();
+                        let documents = if let Some(visible) =
+                            visible.as_ref().filter(|_| map.endpoint.is_some())
+                        {
+                            visible
+                                .iter()
+                                .filter(|&document| map.thread_of(document) == id)
+                                .collect()
+                        } else {
+                            map.view.thread_members(id).into_iter().collect()
+                        };
+                        residual.push(SearchFilter::is_in_set(documents));
+                    } else if let Some(set) = content.zip(map).and_then(|(part, map)| {
+                        za_resolve_condition(
+                            &condition,
+                            part,
                             cache,
-                            &row.access,
-                            &mut visible,
-                            default_language,
-                        )?,
-                        Err(condition) => push_condition(
+                            |message| {
+                                row.access.allows(message) && map.contains(message.document_id())
+                            },
+                            |message| map.thread_of(message.document_id()),
+                        )
+                    }) {
+                        residual.push(SearchFilter::is_in_set(set));
+                    } else if top_level {
+                        match row.absorb(condition) {
+                            Ok(Absorbed::Yes) => (),
+                            Ok(Absorbed::Contradiction) => is_empty = true,
+                            Err(condition) if is_text(&condition) => push_condition(
+                                &mut text,
+                                condition,
+                                cache,
+                                &row.access,
+                                &mut visible,
+                                default_language,
+                                map,
+                            )?,
+                            Err(condition) => push_condition(
+                                &mut residual,
+                                condition,
+                                cache,
+                                &row.access,
+                                &mut visible,
+                                default_language,
+                                map,
+                            )?,
+                        }
+                    } else {
+                        push_condition(
                             &mut residual,
                             condition,
                             cache,
                             &row.access,
                             &mut visible,
                             default_language,
-                        )?,
+                            map,
+                        )?;
                     }
                 }
-                Filter::Property(EmailQueryFilter::Email(condition)) => push_condition(
-                    &mut residual,
-                    condition,
-                    cache,
-                    &row.access,
-                    &mut visible,
-                    default_language,
-                )?,
                 Filter::And if top_level => (),
                 Filter::And => {
                     subtrees += 1;
@@ -299,24 +350,21 @@ impl QueryFilter {
     }
 
     pub fn readable(&mut self, cache: &MessageStoreCache) -> RoaringBitmap {
-        match &self.row.access {
-            MessageAccess::All => cache.email_document_ids(),
-            access => self
-                .visible
-                .take()
-                .unwrap_or_else(|| readable_ids(cache, access)),
-        }
+        self.visible
+            .clone()
+            .unwrap_or_else(|| match &self.row.access {
+                MessageAccess::All => cache.email_document_ids(),
+                access => readable_ids(cache, access),
+            })
     }
 
     pub fn into_row(self) -> RowFilter {
         let QueryFilter {
             mut row, visible, ..
         } = self;
-        if matches!(row.access, MessageAccess::Mailboxes(_)) {
-            row.residual = row.residual.or(visible);
-            if row.residual.is_some() {
-                row.access = MessageAccess::All;
-            }
+        row.residual = row.residual.or(visible);
+        if row.residual.is_some() {
+            row.access = MessageAccess::All;
         }
         row
     }
@@ -413,7 +461,7 @@ fn visible_ids<'x>(
     visible: &'x mut Option<RoaringBitmap>,
 ) -> Option<&'x RoaringBitmap> {
     match access {
-        MessageAccess::All => None,
+        MessageAccess::All => visible.as_ref(),
         access => Some(visible.get_or_insert_with(|| readable_ids(cache, access))),
     }
 }
@@ -467,6 +515,7 @@ pub(super) fn push_condition(
     access: &MessageAccess,
     visible: &mut Option<RoaringBitmap>,
     default_language: Language,
+    map: Option<EmailQueryMap<'_>>,
 ) -> trc::Result<()> {
     match condition {
         EmailFilter::Text(text) => {
@@ -618,34 +667,25 @@ pub(super) fn push_condition(
                     .map(|m| m.document_id()),
             )))
         }
-        EmailFilter::AllInThreadHaveKeyword(keyword) => {
-            filters.push(SearchFilter::is_in_set(thread_keywords(
-                cache,
-                &keyword,
-                true,
-                None,
-                visible_ids(cache, access, visible),
-            )))
-        }
-        EmailFilter::SomeInThreadHaveKeyword(keyword) => {
-            filters.push(SearchFilter::is_in_set(thread_keywords(
-                cache,
-                &keyword,
-                false,
-                None,
-                visible_ids(cache, access, visible),
-            )))
-        }
-        EmailFilter::NoneInThreadHaveKeyword(keyword) => {
-            filters.push(SearchFilter::Not);
-            filters.push(SearchFilter::is_in_set(thread_keywords(
-                cache,
-                &keyword,
-                false,
-                None,
-                visible_ids(cache, access, visible),
-            )));
-            filters.push(SearchFilter::End);
+        EmailFilter::AllInThreadHaveKeyword(ref keyword)
+        | EmailFilter::SomeInThreadHaveKeyword(ref keyword)
+        | EmailFilter::NoneInThreadHaveKeyword(ref keyword) => {
+            let all = matches!(condition, EmailFilter::AllInThreadHaveKeyword(_));
+            let none = matches!(condition, EmailFilter::NoneInThreadHaveKeyword(_));
+            let visible = visible_ids(cache, access, visible);
+            let documents = match map {
+                Some(map) => za_thread_keywords(map.view, keyword, all, None, visible, |message| {
+                    map.thread_of(message.document_id())
+                }),
+                None => thread_keywords(cache, keyword, all, None, visible),
+            };
+            if none {
+                filters.push(SearchFilter::Not);
+            }
+            filters.push(SearchFilter::is_in_set(documents));
+            if none {
+                filters.push(SearchFilter::End);
+            }
         }
         EmailFilter::HasKeyword(keyword) => filters.push(SearchFilter::is_in_set(
             RoaringBitmap::from_iter(cache.with_keyword(&keyword).map(|item| item.document_id())),

@@ -15,6 +15,7 @@ pub mod imip;
 pub mod lease;
 pub mod mail;
 pub mod metadata;
+pub mod search;
 
 #[cfg(feature = "test_mode")]
 pub mod test_hooks;
@@ -29,6 +30,9 @@ pub const ZA_MAIL_KEYLESS: &str =
     "Mail in this account is encrypted at rest and is not available to this session.";
 /// Mail spec 8: the client text of a content search refused on a key account.
 pub const ZA_MAIL_SEARCH_REFUSED: &str = "Mail in this account is encrypted at rest; the server cannot search message content. Search your local copy instead.";
+/// Search spec 7.4: the client text when keyed content search is unavailable.
+pub const ZA_MAIL_SEARCH_UNAVAILABLE: &str =
+    "Search for this account is not available right now; try again shortly.";
 /// Mail spec 10: the client text of a sealed message that does not open.
 pub const ZA_MAIL_UNREADABLE: &str = "Message could not be read.";
 /// Mail spec 4: the trace details of the refused keyless mail login.
@@ -41,6 +45,14 @@ pub const ZA_TRACE_MAIL_COPY: &str = "zero-access: mail copy across accounts";
 /// Mail spec 6.3, 9: the trace details of a share refused on a key
 /// account's mailbox.
 pub const ZA_TRACE_MAIL_SHARING: &str = "zero-access: sharing refused on a key account's mailbox";
+
+/// JMAP changes pause after the first retained-bound check.
+pub async fn search_page_pause_point(account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::search_page_pause_point(account_id).await;
+    #[cfg(not(feature = "test_mode"))]
+    let _ = account_id;
+}
 
 /// Key pinning spec 6.4: `contacts/pin`'s pause point after its last event
 /// commit, before the step 5 retirement (`test_hooks::REDELIVER_CLEANUP_PAUSE`).

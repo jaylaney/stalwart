@@ -256,25 +256,21 @@ pub async fn imap_tests() {
 
     mailbox::test(&mut imap, &mut imap_check, &test).await;
     append::test(&mut imap, &mut imap_check, &test).await;
+    search::test(&mut imap, &mut imap_check, &test).await;
     if key_accounts_mode() {
         za_variants::search(&mut imap, &mut imap_check).await;
         za_variants::fetch(&mut imap, &mut imap_check).await;
     } else {
-        search::test(&mut imap, &mut imap_check, &test).await;
         fetch::test(&mut imap, &mut imap_check).await;
     }
     objectid::test(&test).await;
     if key_accounts_mode() {
-        za_variants::store(&mut imap, &test).await;
+        za_variants::store(&mut imap, &mut imap_check, &test).await;
     } else {
         store::test(&mut imap, &mut imap_check, &test).await;
     }
     copy_move::test(&mut imap, &mut imap_check).await;
-    if key_accounts_mode() {
-        za_variants::thread(&mut imap, &test).await;
-    } else {
-        thread::test(&mut imap, &mut imap_check, &test).await;
-    }
+    thread::test(&mut imap, &mut imap_check, &test).await;
     idle::test(&mut imap, &mut imap_check, false).await;
     condstore::test(&mut imap, &mut imap_check).await;
     if key_accounts_mode() {

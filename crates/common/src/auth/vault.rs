@@ -166,7 +166,7 @@ pub(crate) async fn vault_write_store(
             .ctx(trc::Key::To, record.revision)
             .caused_by(trc::location!()));
     }
-    vault_batch_write(store, account_id, record, previous, None).await
+    vault_batch_write(store, account_id, record, previous, None, None).await
 }
 
 /// The recheck's abort (mail spec 6.1): one batch on Principal document 0
@@ -191,20 +191,16 @@ pub(crate) async fn vault_delete_store(
     store.write_batch(&mut batch).await.map(|_| ())
 }
 
-/// The one vault batch, shared by the raw write (`vault_write_store`) and
-/// the commit (`vault_commit_store`), on Principal document 0: the vault
-/// assertion (the bytes `previous` read, or absence), then, with `pins`,
-/// field 151's assertion (`pins.previous.assertion()`), then the vault set,
-/// then field 151's set. Each key's assertion precedes its set (key pinning
-/// spec 4.4), and both assertions precede both sets, so a lost assertion
-/// writes nothing even on a store that applies sets as it goes (the
-/// ephemeral store does not roll back).
+/// The vault record, optional pins, and setup manifest share this Principal
+/// document 0 batch. Check every assertion before any set, including on the
+/// ephemeral store which does not roll back a batch.
 async fn vault_batch_write(
     store: &Store,
     account_id: u32,
     record: &VaultRecord,
     previous: Option<&VaultRead>,
     pins: Option<ZaPinWrite<'_>>,
+    extra: Option<ZaVaultExtra>,
 ) -> trc::Result<()> {
     // Uncompressed: the record is mostly key wraps and hashes, and the vault
     // crate stays independent of the store's compression settings.
@@ -229,9 +225,15 @@ async fn vault_batch_write(
     if let Some(pins) = &pins {
         batch.assert_value(PrincipalField::ZeroAccessPins, pins.previous.assertion());
     }
+    if let Some(extra) = &extra {
+        batch.assert_value(extra.field, AssertValue::None);
+    }
     batch.set(PrincipalField::ZeroAccessVault, value);
     if let Some(pins) = pins {
         batch.set(PrincipalField::ZeroAccessPins, pins.sealed);
+    }
+    if let Some(extra) = extra {
+        batch.set(extra.field, extra.value);
     }
     store.write_batch(&mut batch).await.map(|_| ())
 }
@@ -354,6 +356,12 @@ pub(crate) async fn pin_write_store(
     store.write_batch(&mut batch).await.map(|_| ())
 }
 
+/// A setup-only Principal field created atomically with the active vault.
+pub struct ZaVaultExtra {
+    pub field: PrincipalField,
+    pub value: Vec<u8>,
+}
+
 /// Key pinning spec 4.4-4.5: sets `record.revision` to the previous revision
 /// plus one (1 when `previous` is `None`) and writes one batch on Principal
 /// document 0, in this order: the vault assertion (the bytes `previous`
@@ -366,9 +374,10 @@ pub(crate) async fn vault_commit_store(
     record: &mut VaultRecord,
     previous: Option<&VaultRead>,
     pins: Option<ZaPinWrite<'_>>,
+    extra: Option<ZaVaultExtra>,
 ) -> trc::Result<()> {
     record.revision = previous.map_or(1, |previous| previous.record.revision + 1);
-    vault_batch_write(store, account_id, record, previous, pins).await
+    vault_batch_write(store, account_id, record, previous, pins, extra).await
 }
 
 /// One vault read, the wrap opened pinned first, then legacy (spec 4.4). A
@@ -521,8 +530,9 @@ impl Server {
         record: &mut VaultRecord,
         previous: Option<&VaultRead>,
         pins: Option<ZaPinWrite<'_>>,
+        extra: Option<ZaVaultExtra>,
     ) -> trc::Result<()> {
-        vault_commit_store(self.store(), account_id, record, previous, pins).await?;
+        vault_commit_store(self.store(), account_id, record, previous, pins, extra).await?;
         self.za_invalidate_committed(account_id).await;
         Ok(())
     }
@@ -734,7 +744,7 @@ impl Server {
                     let mut rewrapped = vault.record.clone();
                     rewrapped.private_key_wrap =
                         wrap_private_key(private_key, keys.mk(), account_id, WrapMark::Pinned);
-                    self.za_vault_commit(account_id, &mut rewrapped, Some(vault), Some(write))
+                    self.za_vault_commit(account_id, &mut rewrapped, Some(vault), Some(write), None)
                         .await
                 }
                 // The pin record alone: under a pinned wrap (the record
@@ -1278,7 +1288,7 @@ pub(crate) async fn self_check_store(
                 sealed: seal_pin_record(&next, keys.mk(), account_id),
             }
         });
-        match vault_commit_store(store, account_id, &mut record, Some(&vault), write).await {
+        match vault_commit_store(store, account_id, &mut record, Some(&vault), write, None).await {
             Ok(()) => {
                 record_private_key(keys, Some(private_key));
                 return Ok((check, true));
@@ -1652,12 +1662,12 @@ mod tests {
     async fn a_pending_record_is_deleted_only_at_its_own_revision() {
         let store = EphemeralStore::open();
         let mut record = VaultRecord::pending(vec![1; 32], 0);
-        vault_commit_store(&store, 9, &mut record, None, None)
+        vault_commit_store(&store, 9, &mut record, None, None, None)
             .await
             .unwrap();
         let read = vault_read_store(&store, 9).await.unwrap().unwrap();
         let mut rotated = read.record.clone();
-        vault_commit_store(&store, 9, &mut rotated, Some(&read), None)
+        vault_commit_store(&store, 9, &mut rotated, Some(&read), None, None)
             .await
             .unwrap();
         assert!(
@@ -2199,6 +2209,7 @@ mod tests {
                 previous: &absent,
                 sealed: seal_pin_record(&one_pin(), &mk, 5),
             }),
+            None,
         )
         .await
         .unwrap_err();
@@ -2226,6 +2237,7 @@ mod tests {
                 previous: &absent,
                 sealed: seal_pin_record(&one_pin(), &mk, 5),
             }),
+            None,
         )
         .await
         .unwrap_err();
@@ -2249,6 +2261,7 @@ mod tests {
                 previous: &current,
                 sealed: seal_pin_record(&one_pin(), &mk, 5),
             }),
+            None,
         )
         .await
         .unwrap();

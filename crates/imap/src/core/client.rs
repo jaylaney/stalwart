@@ -7,6 +7,7 @@
 use super::{MAX_CONCURRENT_OPS, SelectedAccess, SelectedMailbox, Session, SessionData, State};
 use crate::op::ImapContext;
 use common::network::{SessionResult, SessionStream};
+use email::message::za::search::ensure::ZaSearchEnsure;
 use imap_proto::{
     Command, ResponseCode, ResponseType, StatusResponse,
     receiver::{self, Request},
@@ -127,6 +128,22 @@ impl<T: SessionStream> Session<T> {
                 continue;
             }
 
+            if !matches!(
+                request.command,
+                Command::Idle | Command::Noop | Command::Logout
+            ) && let State::Authenticated { data } | State::Selected { data, .. } = &self.state
+                && let Some(keys) = data.access_token.za_keys_for(data.account_id)
+            {
+                data.server.za_search_pass_hook(data.account_id, keys).await;
+            }
+
+            // Leave later keyed commands in this iterator so each reaches
+            // its own pre-command pass and the normal admission checks.
+            let group_adjacent = !self.za_key_session();
+            let finish_before_next = !group_adjacent
+                && requests
+                    .peek()
+                    .is_some_and(|next| next.command == request.command);
             let result = match request.command {
                 Command::List | Command::Lsub => self
                     .handle_list(request, self.acquire_read_permit().await)
@@ -138,14 +155,14 @@ impl<T: SessionStream> Session<T> {
                     .map(|_| SessionResult::Continue),
                 Command::Create => self
                     .handle_create(
-                        group_requests(&mut requests, vec![request]),
+                        group_requests(&mut requests, request, group_adjacent),
                         self.acquire_write_permit().await,
                     )
                     .await
                     .map(|_| SessionResult::Continue),
                 Command::Delete => self
                     .handle_delete(
-                        group_requests(&mut requests, vec![request]),
+                        group_requests(&mut requests, request, group_adjacent),
                         self.acquire_write_permit().await,
                     )
                     .await
@@ -156,8 +173,9 @@ impl<T: SessionStream> Session<T> {
                     .map(|_| SessionResult::Continue),
                 Command::Status => self
                     .handle_status(
-                        group_requests(&mut requests, vec![request]),
+                        group_requests(&mut requests, request, group_adjacent),
                         self.acquire_read_permit().await,
+                        finish_before_next,
                     )
                     .await
                     .map(|_| SessionResult::Continue),
@@ -182,7 +200,10 @@ impl<T: SessionStream> Session<T> {
                     .await
                     .map(|_| SessionResult::Continue),
                 Command::Fetch(_) => self
-                    .handle_fetch(group_requests(&mut requests, vec![request]))
+                    .handle_fetch(
+                        group_requests(&mut requests, request, group_adjacent),
+                        finish_before_next,
+                    )
                     .await
                     .map(|_| SessionResult::Continue),
                 Command::Store(is_uid) => self
@@ -347,20 +368,22 @@ impl<T: SessionStream> Session<T> {
     }
 }
 
-pub fn group_requests(
+fn group_requests(
     requests: &mut Peekable<IntoIter<Request<Command>>>,
-    mut grouped_requests: Vec<Request<Command>>,
+    request: Request<Command>,
+    group_adjacent: bool,
 ) -> Vec<Request<Command>> {
-    let last_command = grouped_requests.last().unwrap().command;
-    loop {
-        match requests.peek() {
-            Some(request) if request.command == last_command => {
-                grouped_requests.push(requests.next().unwrap());
-            }
-            _ => break,
+    let command = request.command;
+    let mut grouped = vec![request];
+    if group_adjacent {
+        while requests
+            .peek()
+            .is_some_and(|request| request.command == command)
+        {
+            grouped.push(requests.next().unwrap());
         }
     }
-    grouped_requests
+    grouped
 }
 
 impl<T: SessionStream> Session<T> {
@@ -624,5 +647,36 @@ impl<T: SessionStream> State<T> {
 
     pub fn close_mailbox(&self) -> bool {
         matches!(self, State::Selected { .. })
+    }
+}
+
+#[cfg(test)]
+mod za_command_grouping_tests {
+    use super::*;
+
+    #[test]
+    fn keyed_dispatch_leaves_adjacent_commands_for_the_outer_hook() {
+        fn request(tag: &str, command: Command) -> Request<Command> {
+            Request {
+                tag: tag.into(),
+                command,
+                tokens: Vec::new(),
+            }
+        }
+
+        let mut pending = vec![
+            request("second", Command::Create),
+            request("next", Command::Noop),
+        ]
+        .into_iter()
+        .peekable();
+        let keyed = group_requests(&mut pending, request("first", Command::Create), false);
+        assert_eq!(keyed.len(), 1);
+        assert_eq!(pending.peek().unwrap().tag.as_str(), "second");
+
+        let ordinary = group_requests(&mut pending, request("first", Command::Create), true);
+        assert_eq!(ordinary.len(), 2);
+        assert_eq!(ordinary[1].tag.as_str(), "second");
+        assert_eq!(pending.peek().unwrap().tag.as_str(), "next");
     }
 }

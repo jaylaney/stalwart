@@ -9,6 +9,7 @@ use crate::{
     auth::{EmailAddressRef, EmailCache},
     gateway::resolver::KeyCacheKey,
     ipc::{BroadcastEvent, CacheInvalidation, PushNotification},
+    za::search::cache::EvictReason,
 };
 use ahash::AHashSet;
 use registry::{
@@ -613,6 +614,9 @@ impl Server {
                     cache.access_tokens.remove(id);
                     http_auth_accounts.insert(*id);
                     cache.za_keys.remove_account(*id);
+                    cache
+                        .za_search
+                        .remove_account(*id, EvictReason::Invalidation);
                 }
                 CacheInvalidation::GroupwareResources(id) => {
                     cache.remove_resources(*id);
@@ -640,6 +644,9 @@ impl Server {
                     // cached between the AccessToken and Account arms survives.
                     http_auth_accounts.insert(*id);
                     cache.za_keys.remove_account(*id);
+                    cache
+                        .za_search
+                        .remove_account(*id, EvictReason::Invalidation);
                     email_accounts.insert(*id);
                 }
                 CacheInvalidation::DkimSignature(id) => {

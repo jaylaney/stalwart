@@ -4,7 +4,17 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::utils::{account::Account, http::HttpRequest, server::TestServer};
+use crate::{
+    utils::{
+        account::Account,
+        http::HttpRequest,
+        imap::{ImapConnection, Type as ImapReplyType},
+        pop3::{Pop3Connection, ResponseType as Pop3Reply},
+        server::TestServer,
+        storage::wait_for_tasks_with_poll_interval,
+    },
+    za::tracing::{WsStream, ws_call},
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use calcard::{
     common::{IanaString, timezone::Tz},
@@ -15,6 +25,7 @@ use calcard::{
 };
 use common::{
     auth::vault::{RawValue, VaultRead, ZaMark, ZaVerification},
+    cache::invalidate::CacheInvalidationBuilder,
     ipc::CacheInvalidation,
     storage::{
         index::{GroupwareWrite, ObjectIndexBuilder},
@@ -22,6 +33,7 @@ use common::{
     },
     za::{
         lease::lease_key_range,
+        search::{ZaSearchConfig, cache::EvictReason},
         test_hooks::{self, Pause as HookPause},
     },
 };
@@ -34,6 +46,10 @@ use email::{
         metadata::{ExtraHeaders, MessageMetadata},
         sortkeys::MessageSortKeys,
         thread::ThreadFields,
+        za::search::{
+            ensure::is_current,
+            pass::{PassOutcome, ZaSearchPass},
+        },
     },
 };
 use groupware::{
@@ -56,19 +72,25 @@ use http::auth::authenticate::za_test::{self, Pause};
 use hyper::{Method, StatusCode};
 use mail_parser::MessageParser;
 use registry::schema::{
-    enums::TaskStoreMaintenanceType,
-    structs::{Task, TaskStatus, TaskStoreMaintenance},
+    enums::{MtaInboundThrottleKey, TaskAccountMaintenanceType, TaskStoreMaintenanceType},
+    prelude::{ObjectType, Property},
+    structs::{
+        DataRetention, MtaInboundThrottle, Task, TaskAccountMaintenance, TaskStatus,
+        TaskStoreMaintenance,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{future::Future, sync::Arc, time::Duration};
 use store::{
     Deserialize, IterateParams, Subspace, U32_LEN, U64_LEN, ValueKey,
+    query::log::Change,
     write::{
         AnyKey, Archive, ArchiveBytes, ArchiveVersion, BatchBuilder, BlobLink, BlobOp,
         IndexPropertyClass, QueueDocumentId, SearchIndex, SearchIndexClass, TaskId, TaskQueueClass,
         ValueClass, blob::BlobLinkValue, key::DeserializeBigEndian, now,
     },
+    za_search::{Checkpoint, manifest::ManifestValue},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -87,6 +109,7 @@ use tokio_rustls::{
 use types::blob_hash::{BLOB_HASH_LEN, BlobHash};
 use types::collection::{Collection, SyncCollection};
 use types::field::{CalendarEventField, CalendarNotificationField, EmailField, PrincipalField};
+use types::id::Id;
 use vault::{
     keys::{
         AAD_PRIVATE_KEY, AAD_PRIVATE_KEY_PINNED, Secret, aad, generate_keypair, unwrap_key,
@@ -415,6 +438,328 @@ pub async fn za_unlock(test: &TestServer, account_id: u32, password: &str) -> Ar
         ZaVerification::Valid(keys) => keys,
         _ => panic!("the password does not unlock account {account_id}"),
     }
+}
+
+pub async fn run_search_pass(test: &TestServer, account_id: u32, password: &str) -> PassOutcome {
+    let keys = za_unlock(test, account_id, password).await;
+    test.server.za_search_pass(account_id, &keys).await.unwrap()
+}
+
+pub async fn za_search_thread_part(
+    test: &TestServer,
+    account_id: u32,
+    password: &str,
+) -> store::za_search::thread::ThreadPart {
+    let keys = za_unlock(test, account_id, password).await;
+    let entry = test
+        .server
+        .za_search_entry(account_id, &keys)
+        .await
+        .unwrap();
+    let view = entry.read_loaded().await.unwrap();
+    view.thread.clone()
+}
+
+pub async fn manifest_bytes(test: &TestServer, account_id: u32) -> Option<Vec<u8>> {
+    test.server
+        .store()
+        .get_value::<RawValue>(ValueKey::property(
+            account_id,
+            Collection::Principal,
+            0,
+            PrincipalField::ZeroAccessSearch,
+        ))
+        .await
+        .unwrap()
+        .map(|value| value.0)
+}
+
+pub async fn write_manifest_bytes(test: &TestServer, account_id: u32, bytes: Option<Vec<u8>>) {
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::Principal)
+        .with_document(0);
+    if let Some(bytes) = bytes {
+        batch.set(PrincipalField::ZeroAccessSearch, bytes);
+    } else {
+        batch.clear(PrincipalField::ZeroAccessSearch);
+    }
+    test.server.store().write_batch(&mut batch).await.unwrap();
+}
+
+pub async fn read_manifest(test: &TestServer, account_id: u32) -> Option<ManifestValue> {
+    manifest_bytes(test, account_id)
+        .await
+        .map(|bytes| ManifestValue::decode_unverified(&bytes).unwrap())
+}
+
+/// Drop the search, key, and message caches lost when a process restarts.
+pub async fn simulate_restart(test: &TestServer, account_id: u32) {
+    test.server
+        .inner
+        .cache
+        .za_search
+        .remove_account(account_id, EvictReason::Invalidation);
+    test.server.inner.cache.za_keys.remove_account(account_id);
+    let mut changes = CacheInvalidationBuilder::default();
+    changes.invalidate(CacheInvalidation::MessageCache(account_id));
+    test.server.invalidate_caches(changes).await.unwrap();
+}
+
+/// Lose a named, committed thread blob and evict this node's search part.
+pub async fn force_loss(test: &TestServer, account_id: u32) {
+    let Some(ManifestValue::Index(manifest)) = read_manifest(test, account_id).await else {
+        panic!("loss fixture needs a search index");
+    };
+    let hash = &manifest
+        .thread_blobs
+        .first()
+        .expect("loss fixture needs a thread blob")
+        .hash;
+    test.server
+        .blob_store()
+        .delete_blobs(&[hash.as_slice()])
+        .await
+        .unwrap();
+    assert!(
+        test.server
+            .get_blob(hash.as_slice(), 0..1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    simulate_restart(test, account_id).await;
+}
+
+pub async fn lower_changes_history(admin: &Account, max: Option<u64>) {
+    admin
+        .registry_update_setting(
+            DataRetention {
+                max_changes_history: max,
+                ..Default::default()
+            },
+            &[Property::MaxChangesHistory],
+        )
+        .await;
+    admin.reload_settings().await;
+}
+
+pub async fn purge_account(test: &TestServer, admin: &Account, account: &Account) {
+    admin
+        .registry_create_object(Task::AccountMaintenance(TaskAccountMaintenance {
+            account_id: account.id(),
+            maintenance_type: TaskAccountMaintenanceType::Purge,
+            status: TaskStatus::now(),
+        }))
+        .await;
+    test.wait_for_tasks().await;
+}
+
+pub async fn principal_blob_links(test: &TestServer, account_id: u32) -> Vec<(BlobHash, usize)> {
+    let mut links = Vec::new();
+    let range = |byte, len| AnyKey {
+        subspace: Subspace::BlobLink,
+        key: vec![byte; len],
+    };
+    let suffix = [
+        account_id.to_be_bytes().as_slice(),
+        &[Collection::Principal as u8],
+        &0u32.to_be_bytes(),
+    ]
+    .concat();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(
+                range(0, 1),
+                range(u8::MAX, BLOB_HASH_LEN + U32_LEN + U64_LEN),
+            ),
+            |key, value| {
+                if key.len() == BLOB_HASH_LEN + suffix.len() && key.ends_with(&suffix) {
+                    links.push((
+                        BlobHash::try_from_hash_slice(&key[..BLOB_HASH_LEN]).unwrap(),
+                        usize::try_from(BlobLinkValue::deserialize(value)?.size).unwrap(),
+                    ));
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    links
+}
+
+pub async fn temporary_blob_hashes(test: &TestServer, account_id: u32) -> Vec<BlobHash> {
+    let range = |byte, len| AnyKey {
+        subspace: Subspace::BlobLink,
+        key: vec![byte; len],
+    };
+    let mut hashes = Vec::new();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(
+                range(0, 1),
+                range(u8::MAX, BLOB_HASH_LEN + U32_LEN + U64_LEN),
+            )
+            .no_values(),
+            |key, _| {
+                if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN
+                    && key.deserialize_be_u32(BLOB_HASH_LEN)? == account_id
+                {
+                    hashes.push(BlobHash::try_from_hash_slice(&key[..BLOB_HASH_LEN]).unwrap());
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    hashes
+}
+
+pub async fn index_holds(test: &TestServer, account_id: u32, document_id: u32) -> bool {
+    let Some(entry) = test.server.inner.cache.za_search.get(account_id) else {
+        return false;
+    };
+    entry
+        .read_loaded()
+        .await
+        .is_some_and(|index| index.thread.exists_at(document_id, u64::MAX) == Some(true))
+}
+
+/// Delete an INBOX document through POP3 without triggering a search pass.
+pub async fn pop3_delete(test: &TestServer, account: &Account, document_id: u32) {
+    let cache = test
+        .server
+        .get_cached_messages(account.id().document_id())
+        .await
+        .unwrap();
+    let mailbox = imap::core::MailboxView::build(&cache, INBOX_ID);
+    let position = mailbox
+        .live_rows_by_uid()
+        .iter()
+        .position(|row| row.id == document_id)
+        .unwrap()
+        + 1;
+    let mut pop3 = Pop3Connection::connect().await;
+    pop3.authenticate(account.name(), account.secret()).await;
+    pop3.send(&format!("DELE {position}")).await;
+    pop3.assert_read(Pop3Reply::Ok).await;
+    pop3.send("QUIT").await;
+    pop3.assert_read(Pop3Reply::Ok).await;
+}
+
+pub async fn log_records_since(
+    test: &TestServer,
+    account_id: u32,
+    collection: SyncCollection,
+    since: u64,
+) -> Vec<(u64, Vec<Change>)> {
+    test.server
+        .store()
+        .za_changes_records(
+            account_id,
+            collection,
+            (since != 0).then_some(Checkpoint {
+                change_id: since,
+                position: 0,
+                complete: true,
+            }),
+            usize::MAX,
+        )
+        .await
+        .unwrap()
+        .records
+}
+
+pub async fn email_log_tip(test: &TestServer, account: &Account) -> u64 {
+    test.server
+        .store()
+        .get_last_change_id(account.id().document_id(), SyncCollection::Email.into())
+        .await
+        .unwrap()
+        .unwrap_or_default()
+}
+
+pub async fn search_pass_request(account: &Account) {
+    let reply = account
+        .jmap_method_call(
+            "Email/get",
+            json!({"accountId": account.id_string(), "ids": []}),
+        )
+        .await;
+    assert_eq!(reply.name_at(0), "Email/get");
+    assert_eq!(reply.method_response()["list"], json!([]));
+}
+
+pub async fn search_manifest(
+    test: &TestServer,
+    account_id: u32,
+) -> store::za_search::manifest::Manifest {
+    match read_manifest(test, account_id).await {
+        Some(ManifestValue::Index(manifest)) => manifest,
+        _ => panic!("account {account_id} lacks a live search manifest"),
+    }
+}
+
+pub async fn assert_search_publication(
+    test: &TestServer,
+    account: &Account,
+    since: u64,
+    witness: u32,
+    mailboxes: &[u64],
+) {
+    use store::query::log::PartialChange;
+    let id = account.id().document_id();
+    let revision_id = search_manifest(test, id).await.newest_row.change_id;
+    let email = log_records_since(test, id, SyncCollection::Email, since).await;
+    let [(change_id, rows)] = email.as_slice() else {
+        panic!("expected one Email publication after {since}, got {email:?}");
+    };
+    assert_eq!(*change_id, revision_id);
+    let mut remainder = rows.clone();
+    for expected in std::iter::once(Change::UpdateItem(Id::from_parts(witness, witness).id()))
+        .chain(
+            mailboxes
+                .iter()
+                .map(|id| Change::UpdateContainerPartial(*id, PartialChange::PROPERTIES)),
+        )
+    {
+        let position = remainder
+            .iter()
+            .position(|row| *row == expected)
+            .unwrap_or_else(|| panic!("missing {expected:?} from {rows:?}"));
+        remainder.swap_remove(position);
+    }
+    assert!(
+        remainder.is_empty(),
+        "unexpected Email publication rows {remainder:?}"
+    );
+    assert_eq!(
+        log_records_since(test, id, SyncCollection::Thread, since).await,
+        [(
+            revision_id,
+            vec![Change::UpdateContainerPartial(
+                u64::from(witness),
+                PartialChange::PROPERTIES
+            )]
+        )],
+    );
+}
+
+pub async fn current_mailbox_ids(account: &Account) -> Vec<u64> {
+    let reply = account
+        .jmap_get("Mailbox", ["id"], Vec::<String>::new())
+        .await;
+    assert_eq!(reply.name_at(0), "Mailbox/get");
+    let ids = reply
+        .list()
+        .iter()
+        .map(|mailbox| mailbox["id"].as_str().unwrap().parse::<Id>().unwrap().id())
+        .collect::<Vec<_>>();
+    assert!(!ids.is_empty());
+    ids
 }
 
 /// Writes `ical` into the store as the event `name` in the account's
@@ -1005,10 +1350,22 @@ pub async fn wait_for_delivery(test: &TestServer) {
     test.wait_for_tasks().await;
 }
 
+/// The same task/SMTP/task barrier, using one explicit cadence for all three polls.
+pub async fn wait_for_delivery_with_poll_interval(test: &TestServer, poll_interval: Duration) {
+    wait_for_tasks_with_poll_interval(&test.server, false, false, poll_interval).await;
+    wait_for_queue_with_poll_interval(test, poll_interval).await;
+    // Ingest can queue index tasks of its own.
+    wait_for_tasks_with_poll_interval(&test.server, false, false, poll_interval).await;
+}
+
 /// Waits until the SMTP queue is empty, without waiting for tasks: the
 /// iMIP modules read outbound mail at the sink once its delivery is done.
 /// Panics after ten seconds, naming what is still queued.
 pub async fn wait_for_queue(test: &TestServer) {
+    wait_for_queue_with_poll_interval(test, Duration::from_millis(100)).await;
+}
+
+async fn wait_for_queue_with_poll_interval(test: &TestServer, poll_interval: Duration) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let queued = queued_recipients(test).await;
@@ -1019,7 +1376,7 @@ pub async fn wait_for_queue(test: &TestServer) {
             std::time::Instant::now() < deadline,
             "mail still queued for {queued:?}"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -1497,6 +1854,37 @@ impl<T> Drop for HookParked<T> {
         self.pause.release.notify_one();
     }
 }
+
+/// Temporarily override the search limits and restore the exact previous
+/// override on drop. Test suites run these cases serially.
+#[must_use = "dropping the guard restores the search configuration"]
+pub struct SearchConfigGuard(Option<ZaSearchConfig>);
+
+impl SearchConfigGuard {
+    pub fn new(config: ZaSearchConfig) -> Self {
+        let prior = test_hooks::SEARCH_CONFIG_OVERRIDE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(config);
+        Self(prior)
+    }
+}
+
+impl Drop for SearchConfigGuard {
+    fn drop(&mut self) {
+        test_hooks::set_search_config_override(self.0.take());
+    }
+}
+
+macro_rules! search_config_guard {
+    ($test:expr, $($field:ident: $value:expr),+ $(,)?) => {
+        $crate::utils::za::SearchConfigGuard::new(common::za::search::ZaSearchConfig {
+            $($field: $value,)+
+            ..$test.server.za_search_config()
+        })
+    };
+}
+pub(crate) use search_config_guard;
 
 /// Upgrade ruling 156: one of `common::za::test_hooks`' pause slots, as the
 /// test found it, restored when the guard drops (also when the test panics),
@@ -2076,12 +2464,273 @@ pub async fn za_revoke_grant(server: &common::Server, grant_id: u64) {
     server.invalidate_caches(invalidator).await.unwrap();
 }
 
+/// Give a bulk LMTP fixture room under the two default inbound rates.
+pub async fn raise_bulk_lmtp_rates(test: &mut TestServer) -> Vec<(Id, MtaInboundThrottle)> {
+    use MtaInboundThrottleKey::{Rcpt, RemoteIp, SenderDomain};
+    let admin = test.account("admin@example.com").clone();
+    let records = admin.registry_get_all::<MtaInboundThrottle>().await;
+    let mut saved = Vec::new();
+    for (description, keys) in [
+        ("Sender IP throttle", &[RemoteIp][..]),
+        (
+            "Sender address to recipient throttle",
+            &[SenderDomain, Rcpt][..],
+        ),
+    ] {
+        let mut matches = records
+            .iter()
+            .filter(|(_, throttle)| throttle.description == description);
+        let (id, throttle) = matches.next().expect("default inbound throttle");
+        assert!(matches.next().is_none());
+        assert!(throttle.enable);
+        assert_eq!(throttle.key.iter().count(), keys.len());
+        assert!(
+            keys.iter()
+                .all(|key| throttle.key.iter().any(|actual| actual == key))
+        );
+        let mut raised = throttle.clone();
+        raised.rate.count = raised.rate.count.max(20_000);
+        admin
+            .registry_update_object(
+                ObjectType::MtaInboundThrottle,
+                *id,
+                json!({"rate": raised.rate}),
+            )
+            .await;
+        assert_eq!(admin.registry_get::<MtaInboundThrottle>(*id).await, raised);
+        saved.push((*id, throttle.clone()));
+    }
+    admin.reload_settings().await;
+    test.reload_core();
+    saved
+}
+
+pub async fn restore_bulk_lmtp_rates(test: &mut TestServer, saved: Vec<(Id, MtaInboundThrottle)>) {
+    let admin = test.account("admin@example.com").clone();
+    for (id, throttle) in saved {
+        admin
+            .registry_update_object(
+                ObjectType::MtaInboundThrottle,
+                id,
+                json!({"rate": throttle.rate}),
+            )
+            .await;
+        assert_eq!(admin.registry_get::<MtaInboundThrottle>(id).await, throttle);
+    }
+    admin.reload_settings().await;
+    test.reload_core();
+}
+
+/// Bring a finished bulk-delivery fixture to its durable Email log boundary.
+/// Each empty keyed Email/get drives one normal opportunistic search pass.
+/// The caller still checks that a content query is served.
+pub async fn finish_bulk_delivery_indexing(test: &TestServer, account: &Account) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let account_id = account.id().document_id();
+    let boundary = tokio::time::timeout_at(
+        deadline,
+        test.server
+            .store()
+            .get_last_change_id(account_id, SyncCollection::Email.into()),
+    )
+    .await
+    .expect("timed out reading the bulk-delivery Email boundary")
+    .unwrap()
+    .expect("bulk delivery must leave an Email log boundary");
+    let request = json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [["Email/get", { "accountId": account.id_string(), "ids": [] }, "0"]],
+    });
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(45))
+        .build()
+        .unwrap();
+    let mut attempts = 0;
+    let mut stalled = 0;
+    let mut previous = None;
+    loop {
+        let progress = test
+            .server
+            .inner
+            .cache
+            .za_search
+            .get(account_id)
+            .and_then(|entry| {
+                let guard = entry.index.try_read().ok()?;
+                let index = guard.as_ref()?;
+                Some((
+                    is_current(index, boundary),
+                    index.scanned_to,
+                    index.manifest.revision,
+                ))
+            });
+        if let Some((true, scanned_to, revision)) = progress {
+            println!(
+                "Bulk delivery indexing reached boundary {boundary} after {attempts} keyed requests (scanned_to={scanned_to}, revision={revision})"
+            );
+            return;
+        }
+        stalled = if progress == previous { stalled + 1 } else { 0 };
+        assert!(
+            stalled <= 8,
+            "bulk delivery indexing stalled at {progress:?} after {attempts} keyed requests, target {boundary}"
+        );
+        previous = progress;
+
+        attempts += 1;
+        let reply = tokio::time::timeout_at(deadline, async {
+            client
+                .post(account.api_url())
+                .basic_auth(account.name(), Some(account.secret()))
+                .json(&request)
+                .send()
+                .await?
+                .json::<Value>()
+                .await
+        })
+        .await
+        .unwrap_or_else(|_| panic!(
+            "bulk delivery indexing timed out on request {attempts}, progress {progress:?}, target {boundary}"
+        ))
+        .unwrap_or_else(|error| panic!(
+            "bulk delivery indexing request {attempts} failed: {error}, progress {progress:?}, target {boundary}"
+        ));
+        let method = &reply["methodResponses"][0];
+        assert_eq!(
+            method[0], "Email/get",
+            "bulk delivery indexing request {attempts}: {reply}, progress {progress:?}, target {boundary}"
+        );
+        assert!(
+            method[1]["list"].as_array().is_some_and(Vec::is_empty),
+            "bulk delivery indexing request {attempts}: {reply}, progress {progress:?}, target {boundary}"
+        );
+    }
+}
+
+/// Complete pending keyed indexing with a real content query.
+pub async fn za_index_current(account: &Account) {
+    let payload = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        // Allow the default 30 s content wait, the 2 s request-triggered
+        // pass, and transport overhead in the canonical test configuration.
+        .timeout(Duration::from_secs(45))
+        .build()
+        .unwrap()
+        .post(account.api_url())
+        .basic_auth(account.name(), Some(account.secret()))
+        .json(&json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [[
+                "Email/query",
+                { "accountId": account.id_string(), "filter": { "text": "za-index-current" } },
+                "0"
+            ]],
+        }))
+        .send()
+        .await
+        .expect("keyed index currentness request failed")
+        .bytes()
+        .await
+        .unwrap();
+    let reply = crate::utils::jmap::JmapResponse(
+        serde_json::from_slice(&payload)
+            .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&payload))),
+    );
+    assert_eq!(
+        reply.name_at(0),
+        "Email/query",
+        "keyed index did not serve the request: {reply:?}"
+    );
+    assert!(
+        reply.0["methodResponses"][0][1]["ids"].is_array(),
+        "{reply:?}"
+    );
+}
+
+/// Complete pending keyed indexing on an IMAP connection with a selected mailbox.
+pub async fn imap_index_current(imap: &mut ImapConnection) {
+    imap.send("SEARCH TEXT za-index-current").await;
+    imap.assert_read(ImapReplyType::Tagged, imap_proto::ResponseType::Ok)
+        .await;
+}
+
 /// An OAuth access token of `name` with every scope (`za_grant_token`). The
 /// token holds no keys.
 pub async fn za_bearer_token(server: &common::Server, name: &str) -> String {
     za_grant_token(server, name, common::auth::oauth::scope::OAuthScopes::ALL)
         .await
         .1
+}
+
+/// The capabilities of a keyless request (`jmap_method_calls`' list, less
+/// the calendar, contact and file ones these calls do not use).
+pub(crate) const KEYLESS_JMAP_USING: &[&str] = &[
+    "urn:ietf:params:jmap:core",
+    "urn:ietf:params:jmap:mail",
+    "urn:ietf:params:jmap:submission",
+    "urn:ietf:params:jmap:vacationresponse",
+    "urn:ietf:params:jmap:sieve",
+    "urn:ietf:params:jmap:blob",
+    "urn:ietf:params:jmap:mail:share",
+];
+
+/// A keyless channel of the key account: its OAuth Bearer token over HTTP,
+/// or a WebSocket (which never holds keys, spec 3.3).
+pub(crate) enum Keyless {
+    Bearer(String),
+    WebSocket(WsStream),
+}
+
+impl Keyless {
+    pub async fn bearer(server: &common::Server, name: &str) -> Self {
+        Self::Bearer(za_bearer_token(server, name).await)
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Keyless::Bearer(_) => "Bearer",
+            Keyless::WebSocket(_) => "WebSocket",
+        }
+    }
+
+    /// One method call; its response.
+    pub async fn call(&mut self, account: &Account, method: &str, args: Value) -> Value {
+        let reply: Value = match self {
+            Keyless::Bearer(token) => reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .post(account.api_url())
+                .bearer_auth(token)
+                .body(
+                    json!({ "using": KEYLESS_JMAP_USING, "methodCalls": [[method, args, "c0"]] })
+                        .to_string(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap(),
+            Keyless::WebSocket(socket) => serde_json::from_str(
+                &ws_call(
+                    socket,
+                    &json!({
+                        "@type": "Request",
+                        "id": "1",
+                        "using": KEYLESS_JMAP_USING,
+                        "methodCalls": [[method, args, "c0"]]
+                    })
+                    .to_string(),
+                )
+                .await,
+            )
+            .unwrap(),
+        };
+        reply["methodResponses"][0].clone()
+    }
 }
 
 /// A fresh TOTP enrolment URL (a random 20-byte secret).

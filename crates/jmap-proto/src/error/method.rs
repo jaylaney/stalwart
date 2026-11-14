@@ -68,6 +68,26 @@ impl Display for MethodError {
     }
 }
 
+const CHANGE_LOG_TRUNCATED: &str = "Change log is truncated";
+const STATE_PREDATES_EPOCH: &str = "State predates the index's epoch";
+
+pub enum ChangeHistoryRefusal {
+    Truncated,
+    PredatesEpoch,
+}
+
+impl ChangeHistoryRefusal {
+    pub fn into_err(self) -> trc::Error {
+        trc::JmapEvent::CannotCalculateChanges.into_err().ctx(
+            trc::Key::Reason,
+            match self {
+                Self::Truncated => CHANGE_LOG_TRUNCATED,
+                Self::PredatesEpoch => STATE_PREDATES_EPOCH,
+            },
+        )
+    }
+}
+
 impl Serialize for MethodErrorWrapper {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -166,10 +186,13 @@ impl Serialize for MethodErrorWrapper {
                 ),
                 trc::JmapEvent::CannotCalculateChanges => (
                     "cannotCalculateChanges",
-                    concat!(
-                        "The server cannot calculate the changes ",
-                        "between the old and new states."
-                    ),
+                    match self.0.value_as_str(trc::Key::Reason) {
+                        Some(reason @ (CHANGE_LOG_TRUNCATED | STATE_PREDATES_EPOCH)) => reason,
+                        _ => concat!(
+                            "The server cannot calculate the changes ",
+                            "between the old and new states."
+                        ),
+                    },
                 ),
                 trc::JmapEvent::UnknownCapability
                 | trc::JmapEvent::NotJson
@@ -202,5 +225,39 @@ impl Serialize for MethodErrorWrapper {
             map.serialize_entry("description", description)?;
         }
         map.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn only_fixed_change_history_reasons_reach_the_client() {
+        let generic = "The server cannot calculate the changes between the old and new states.";
+        let event = trc::JmapEvent::CannotCalculateChanges;
+        for (error, description) in [
+            (
+                ChangeHistoryRefusal::Truncated.into_err(),
+                "Change log is truncated",
+            ),
+            (
+                ChangeHistoryRefusal::PredatesEpoch.into_err(),
+                "State predates the index's epoch",
+            ),
+            (event.into_err(), generic),
+            (event.into_err().details("Change log is truncated"), generic),
+            (event.into_err().details("unrelated details"), generic),
+            (
+                event.into_err().ctx(trc::Key::Reason, "unrelated reason"),
+                generic,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(MethodErrorWrapper::from(error)).unwrap(),
+                json!({"type": "cannotCalculateChanges", "description": description})
+            );
+        }
     }
 }

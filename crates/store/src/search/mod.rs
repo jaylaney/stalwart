@@ -183,6 +183,26 @@ pub struct IndexDocument {
     pub(crate) assert_absent: Option<(u32, Collection, u32, ValueClass)>,
 }
 
+#[cfg(feature = "test_mode")]
+impl IndexDocument {
+    /// Plan 16 Task 1: the raw forward-index bytes with and without position lists.
+    pub fn za_bench_term_bytes(self) -> (Vec<u8>, Vec<u8>) {
+        let mut document = term::AccountIndexer::default().index_document(self, 0);
+        let with_positions = document.encode().into_raw_bytes();
+        document.fields.clear();
+        let without_positions = document.encode().into_raw_bytes();
+        (with_positions, without_positions)
+    }
+
+    pub fn clone_for_test(&self) -> Self {
+        Self {
+            index: self.index,
+            fields: self.fields.clone(),
+            assert_absent: self.assert_absent.clone(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct QueryResults {
     results: RoaringBitmap,

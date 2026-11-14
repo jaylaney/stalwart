@@ -62,7 +62,12 @@ For each client:
 5. Forward a message with an attachment; confirm the recipient gets the attachment intact.
 6. Move a message to another folder, flag it, and delete it (expunge or empty the Trash).
 7. Create a folder and rename it.
-8. Search on the server for a word in a subject and in a body (observe the refusal, `Mail in this account is encrypted at rest; the server cannot search message content. Search your local copy instead.`, or an empty server result, and record which each client shows), then confirm the client's local search over its downloaded messages finds the message. A search on flags, size or date still works on the server.
+8. Search on the server for a word in a subject and in a body, then for a sender.
+   Confirm the matching messages appear and the client's local search agrees.
+   Release 7 searches the sealed index built during the session. Record the first
+   search's latency after a fresh login and whether the client ever shows
+   `Search for this account is not available right now; try again shortly.`
+   Confirm a server search on flags, size or date still works.
 9. IDLE push: leave the client open on the inbox and send the account a message from outside; confirm it appears without a manual refresh.
 10. Change the password through the account page; a connected client keeps running until its session closes (mail spec 4), so reconnect it with the new password and confirm mail reads again. Revoke an app password and confirm the client using it is refused at its next connection.
 11. Turn the vacation response on (through the client's vacation or ManageSieve setting, or JMAP `VacationResponse`), send the account a message from outside and confirm the sender receives the auto-reply and the message still reads in the client; turn it off and confirm no reply follows.
@@ -89,3 +94,46 @@ Record the client, the provider and their versions, and what the client shows at
 Server-side, after the run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests` passes against the same build, the SMTP queue is empty once the providers have accepted the mail, and the leak scanner's output shows the key account's items and events sealed.
 
 Native status for release 5: **pending**. No provider or native-client session was exercised by the plan 15 execution, so this checklist is not a completed acceptance record. Record any unavailable provider, device, credentials, DNS alignment or missing observation as pending.
+
+## Search and threads (release 7)
+
+See the [search design](../superpowers/specs/2026-11-04-zero-access-search-design.md)
+and [plan 16](../superpowers/plans/2026-11-07-zero-access-16-search.md).
+Use a server build containing release 7. Record its version, source commit and
+binary checksum, plus the OS, client version and protocol for each run.
+
+Clients include Apple Mail on macOS and iOS, Thunderbird, an Android mail client
+and the web client over JMAP. Use a key account on two clients for the thread
+sync checks. Where a client lacks a named server operation, record it as
+unavailable for that client.
+
+1. Search the server by subject word, body word, sender and recipient. Search
+   for a quoted phrase, a word inside a PDF attachment and a non-ASCII subject.
+   Check the results against the messages that should match.
+2. Sort by sender, subject and date on the server. For IMAP SORT, use
+   Thunderbird's server-side sorting setting.
+3. Confirm a reply and its original appear in the same conversation. Close the
+   client, deliver another reply and confirm the thread includes it after sync.
+4. Sync a second client on the same account and confirm it shows the same thread.
+5. Delete one message in the thread, then delete the rest of the thread. Check
+   both clients after each sync.
+6. Move a message in a thread to a different folder. Confirm the thread view
+   follows the move and the message is in the destination folder.
+7. Import a few thousand messages through IMAP APPEND or the client's migration
+   tool. Record the latency of the first server search and any occurrence of
+   `Search for this account is not available right now; try again shortly.`
+8. Restart the server and search again without a manual logout or login.
+   Allow the client to reconnect. Confirm the persisted index still serves
+   the matching results.
+9. Change the password through the account page, reconnect with the new
+   password and repeat the server search.
+10. Keep the web client's WebSocket open for push while it sends keyed JMAP
+    calls over HTTP. Deliver a message and verify push and the HTTP refresh.
+
+Server-side, record the results of `za::za_tests`, `imap::imap_tests` with
+`ZA_KEY_ACCOUNTS=1` and `jmap::jmap_tests` with `ZA_KEY_ACCOUNTS=1` from the
+same source revision. Record the `Mail leak scan` line's linked search blob
+and manifest counts for the key accounts. These counts come from the
+automated test server.
+
+Native status for release 7 is **pending**.

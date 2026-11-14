@@ -5,8 +5,11 @@
  */
 
 use crate::{api::query::QueryResponseBuilder, changes::state::StateManager};
-use common::Server;
-use email::submission::UndoStatus;
+use common::{Server, auth::AccessToken};
+use email::{
+    message::za::search::snapshot::{ZaSnapshotFetch, za_no_map_error},
+    submission::UndoStatus,
+};
 use jmap_proto::{
     method::query::{Filter, QueryRequest, QueryResponse},
     object::email_submission::{self, EmailSubmissionComparator, EmailSubmissionFilter},
@@ -30,6 +33,7 @@ pub trait EmailSubmissionQuery: Sync + Send {
     fn email_submission_query(
         &self,
         request: QueryRequest<email_submission::EmailSubmission>,
+        access_token: &AccessToken,
     ) -> impl Future<Output = trc::Result<QueryResponse>> + Send;
 }
 
@@ -47,8 +51,33 @@ impl EmailSubmissionQuery for Server {
     async fn email_submission_query(
         &self,
         mut request: QueryRequest<email_submission::EmailSubmission>,
+        access_token: &AccessToken,
     ) -> trc::Result<QueryResponse> {
         let account_id = request.account_id.document_id();
+        let thread_valued = request.filter.iter().any(|condition| {
+            matches!(
+                condition,
+                Filter::Property(EmailSubmissionFilter::ThreadIds(_))
+            )
+        }) || request
+            .sort
+            .as_ref()
+            .and_then(|sort| sort.first())
+            .is_some_and(|sort| matches!(sort.property, EmailSubmissionComparator::ThreadId));
+        let snapshot = if thread_valued && let Some(keys) = access_token.za_keys_for(account_id) {
+            Some(
+                self.za_snapshot(account_id, keys)
+                    .await
+                    .map_err(|reason| za_no_map_error(reason, account_id))?,
+            )
+        } else {
+            None
+        };
+        let thread_of = |submission: &Submission| {
+            snapshot.as_ref().map_or(submission.thread_id, |snapshot| {
+                snapshot.thread_of(submission.email_id)
+            })
+        };
 
         let mut submissions = Vec::with_capacity(16);
         let mut document_ids = RoaringBitmap::new();
@@ -161,7 +190,7 @@ impl EmailSubmissionQuery for Server {
                         filters.push(SearchFilter::is_in_set(RoaringBitmap::from_iter(
                             submissions
                                 .iter()
-                                .filter(|s| ids.contains(&s.thread_id))
+                                .filter(|s| ids.contains(&thread_of(s)))
                                 .map(|s| s.document_id),
                         )));
                     }
@@ -246,9 +275,9 @@ impl EmailSubmissionQuery for Server {
                     }
                     EmailSubmissionComparator::ThreadId => {
                         if comparator.is_ascending {
-                            submissions.sort_by_key(|s| s.thread_id);
+                            submissions.sort_by_key(thread_of);
                         } else {
-                            submissions.sort_by_key(|s| u32::MAX - s.thread_id);
+                            submissions.sort_by_key(|s| u32::MAX - thread_of(s));
                         }
                     }
                     EmailSubmissionComparator::SentAt => {

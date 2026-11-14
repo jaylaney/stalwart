@@ -6,7 +6,8 @@
 
 use crate::{
     jmap::mail::set::assert_email_properties,
-    utils::{dns::DnsCache, server::TestServer},
+    utils::{dns::DnsCache, server::TestServer, za::key_accounts_mode},
+    za::{STRONG, user_permissions},
 };
 use ahash::AHashMap;
 use common::auth::{AccountCache, EmailAddress};
@@ -155,15 +156,20 @@ pub async fn test(test: &TestServer) {
         .take_id();
 
     // Submission without a valid emailId or identityId should fail
-    assert!(matches!(
-        client
-            .email_submission_create(Id::new(123456).to_string(), &identity_id)
-            .await,
-        Err(Error::Set(SetError {
-            type_: SetErrorType::InvalidProperties,
-            ..
-        }))
-    ));
+    // Release 7 spec 6.2 validates a supplied keyed Email ID before the
+    // ordinary metadata lookup.
+    let expected = if key_accounts_mode() {
+        SetErrorType::NotFound
+    } else {
+        SetErrorType::InvalidProperties
+    };
+    let missing_email = client
+        .email_submission_create(Id::new(123456).to_string(), &identity_id)
+        .await;
+    assert!(
+        matches!(&missing_email, Err(Error::Set(error)) if error.type_ == expected),
+        "expected {expected:?}, got {missing_email:?}"
+    );
     assert!(matches!(
         client
             .email_submission_create(&email_id, Id::new(123456).to_string())
@@ -524,116 +530,19 @@ pub async fn test(test: &TestServer) {
             .is_none()
     );
 
-    // onSuccess actions keyed by an existing submission id act on its own email
-    let mut held = Vec::with_capacity(2);
-    for subject in ["held 1", "held 2"] {
-        let draft_id = client
-            .email_import(
-                format!("From: jdoe@example.com\r\nTo: jane_smith@remote.org\r\nSubject: {subject}\r\n\r\ntest")
-                    .into_bytes(),
-                [&mailbox_id],
-                None::<Vec<&str>>,
-                None,
-            )
-            .await
-            .unwrap()
-            .take_id();
-        let submission_id = client
-            .email_submission_create_envelope(
-                &draft_id,
-                &identity_id,
-                Address::new("jdoe@example.com")
-                    .parameter("HOLDUNTIL", Some(hold_until_date.to_string())),
-                ["jane_smith@remote.org"],
-            )
-            .await
-            .unwrap()
-            .take_id();
-        held.push((submission_id, draft_id));
+    if key_accounts_mode() {
+        test_keyed_existing_submission_actions(test, hold_until_date).await;
+    } else {
+        test_existing_submission_actions(
+            &client,
+            account.name(),
+            &identity_id,
+            [&mailbox_id, &mailbox_id_2],
+            hold_until_date,
+            false,
+        )
+        .await;
     }
-    let [(submission_id_1, draft_id_1), (submission_id_2, draft_id_2)] =
-        <[_; 2]>::try_from(held).unwrap();
-    // Email/get checks the thread prefix as well as the document ID. Find
-    // the collision by document ID and keep the full ID returned by import.
-    let submission_document_id = submission_id_1.parse::<Id>().unwrap().document_id();
-    let mut filler_id = None;
-    for _ in 0..64 {
-        let imported_id = client
-            .email_import(
-                b"From: jdoe@example.com\r\nSubject: filler\r\n\r\ntest".to_vec(),
-                [&mailbox_id_2],
-                None::<Vec<&str>>,
-                None,
-            )
-            .await
-            .unwrap()
-            .take_id();
-        if imported_id.parse::<Id>().unwrap().document_id() == submission_document_id {
-            filler_id = Some(imported_id);
-            break;
-        }
-    }
-    let filler_id =
-        filler_id.expect("No filler shares the submission document id after 64 imports");
-    assert_email_properties(&client, &filler_id, &[&mailbox_id_2], &[]).await;
-
-    let mut request = client.build();
-    let set_request = request.set_email_submission();
-    set_request
-        .update(&submission_id_1)
-        .undo_status(UndoStatus::Canceled);
-    set_request
-        .arguments()
-        .on_success_destroy_email_id(&submission_id_1);
-    request.send().await.unwrap().unwrap_method_responses();
-    assert!(
-        client
-            .email_get(&draft_id_1, None::<Vec<_>>)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_email_properties(&client, &filler_id, &[&mailbox_id_2], &[]).await;
-
-    // onSuccessUpdateEmail is skipped for a submission whose update failed
-    let mut request = client.build();
-    let set_request = request.set_email_submission();
-    set_request
-        .update(&submission_id_1)
-        .undo_status(UndoStatus::Canceled);
-    set_request
-        .update(&submission_id_2)
-        .undo_status(UndoStatus::Canceled);
-    set_request
-        .arguments()
-        .on_success_update_email_id(&submission_id_1)
-        .keyword("$draft", true);
-    set_request
-        .arguments()
-        .on_success_update_email_id(&submission_id_2)
-        .keyword("$draft", true)
-        .mailbox_id(&mailbox_id, false)
-        .mailbox_id(&mailbox_id_2, true);
-    request.send().await.unwrap().unwrap_method_responses();
-    assert_email_properties(&client, &filler_id, &[&mailbox_id_2], &[]).await;
-    assert_email_properties(&client, &draft_id_2, &[&mailbox_id_2], &["$draft"]).await;
-
-    // onSuccessDestroyEmail keyed by a destroyed submission id
-    let mut request = client.build();
-    let set_request = request.set_email_submission();
-    set_request.destroy([&submission_id_2]);
-    set_request
-        .arguments()
-        .on_success_destroy_email_id(&submission_id_2);
-    request.send().await.unwrap().unwrap_method_responses();
-    assert!(
-        client
-            .email_get(&draft_id_2, None::<Vec<_>>)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_email_properties(&client, &filler_id, &[&mailbox_id_2], &[]).await;
     smtp_settings.lock().do_stop = true;
 
     // Identities are created and destroyed as the account's addresses change
@@ -709,6 +618,220 @@ pub async fn test(test: &TestServer) {
     test.server.commit_batch(batch).await.unwrap();
 
     test.assert_is_empty().await;
+}
+
+async fn test_keyed_existing_submission_actions(test: &TestServer, hold_until_date: &str) {
+    let admin = test.account("admin@example.com");
+    let account = admin
+        .create_key_user_account(
+            "task17-key-submission@example.com",
+            STRONG,
+            "Submission collision fixture",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let client = account.jmap_client().await;
+    let identity_id = identity_id_by_email(&client, account.name())
+        .await
+        .expect("missing identity for the keyed submission fixture");
+    let mailbox_id = client
+        .mailbox_create("JMAP EmailSubmission", None::<String>, Role::None)
+        .await
+        .unwrap()
+        .take_id();
+    let mailbox_id_2 = client
+        .mailbox_create("JMAP EmailSubmission 2", None::<String>, Role::None)
+        .await
+        .unwrap()
+        .take_id();
+
+    let canceled_id = test_existing_submission_actions(
+        &client,
+        account.name(),
+        &identity_id,
+        [&mailbox_id, &mailbox_id_2],
+        hold_until_date,
+        true,
+    )
+    .await;
+
+    client.email_submission_destroy(&canceled_id).await.unwrap();
+    test.destroy_all_mailboxes(&account).await;
+    admin.destroy_account(account).await;
+    test.wait_for_tasks().await;
+}
+
+async fn test_existing_submission_actions(
+    client: &Client,
+    sender: &str,
+    identity_id: &str,
+    [mailbox_id, mailbox_id_2]: [&str; 2],
+    hold_until_date: &str,
+    seed_filler_first: bool,
+) -> String {
+    let import_filler = async || {
+        client
+            .email_import(
+                format!("From: {sender}\r\nSubject: filler\r\n\r\ntest").into_bytes(),
+                [mailbox_id_2],
+                None::<Vec<&str>>,
+                None,
+            )
+            .await
+            .unwrap()
+            .take_id()
+    };
+
+    // A fresh key account's first Email and first EmailSubmission use
+    // the same numeric ID. Give the Email ID to the unrelated filler.
+    let mut filler_id = if seed_filler_first {
+        Some(import_filler().await)
+    } else {
+        None
+    };
+
+    let mut held = Vec::with_capacity(2);
+    for subject in ["held 1", "held 2"] {
+        let draft_id = client
+            .email_import(
+                format!(
+                    "From: {sender}\r\nTo: jane_smith@remote.org\r\nSubject: {subject}\r\n\r\ntest"
+                )
+                .into_bytes(),
+                [mailbox_id],
+                None::<Vec<&str>>,
+                None,
+            )
+            .await
+            .unwrap()
+            .take_id();
+        let submission_id = client
+            .email_submission_create_envelope(
+                &draft_id,
+                identity_id,
+                Address::new(sender).parameter("HOLDUNTIL", Some(hold_until_date.to_string())),
+                ["jane_smith@remote.org"],
+            )
+            .await
+            .unwrap()
+            .take_id();
+        held.push((submission_id, draft_id));
+    }
+    let [(submission_id_1, draft_id_1), (submission_id_2, draft_id_2)] =
+        <[_; 2]>::try_from(held).unwrap();
+    // Email/get checks the thread prefix as well as the document ID. Find
+    // the collision by document ID and keep the full ID returned by import.
+    let submission_document_id = submission_id_1.parse::<Id>().unwrap().document_id();
+    if filler_id.is_none() {
+        for _ in 0..64 {
+            let imported_id = import_filler().await;
+            if imported_id.parse::<Id>().unwrap().document_id() == submission_document_id {
+                filler_id = Some(imported_id);
+                break;
+            }
+        }
+    }
+    let filler_id =
+        filler_id.expect("No filler shares the submission document id after 64 imports");
+    let filler_document_id = filler_id.parse::<Id>().unwrap().document_id();
+    let draft_document_ids =
+        [&draft_id_1, &draft_id_2].map(|id| id.parse::<Id>().unwrap().document_id());
+    assert_eq!(filler_document_id, submission_document_id);
+    assert!(!draft_document_ids.contains(&filler_document_id));
+    assert_email_properties(client, &filler_id, &[mailbox_id_2], &[]).await;
+
+    let mut request = client.build();
+    let set_request = request.set_email_submission();
+    set_request
+        .update(&submission_id_1)
+        .undo_status(UndoStatus::Canceled);
+    set_request
+        .arguments()
+        .on_success_destroy_email_id(&submission_id_1);
+    let mut response = request
+        .send()
+        .await
+        .unwrap()
+        .method_response_by_pos(0)
+        .unwrap_set_email_submission()
+        .unwrap();
+    response.updated(&submission_id_1).unwrap();
+    assert!(
+        client
+            .email_get(&draft_id_1, None::<Vec<_>>)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_email_properties(client, &filler_id, &[mailbox_id_2], &[]).await;
+
+    // onSuccessUpdateEmail is skipped for a submission whose update failed
+    let mut request = client.build();
+    let set_request = request.set_email_submission();
+    set_request
+        .update(&submission_id_1)
+        .undo_status(UndoStatus::Canceled);
+    set_request
+        .update(&submission_id_2)
+        .undo_status(UndoStatus::Canceled);
+    set_request
+        .arguments()
+        .on_success_update_email_id(&submission_id_1)
+        .keyword("$draft", true);
+    set_request
+        .arguments()
+        .on_success_update_email_id(&submission_id_2)
+        .keyword("$draft", true)
+        .mailbox_id(mailbox_id, false)
+        .mailbox_id(mailbox_id_2, true);
+    let mut response = request
+        .send()
+        .await
+        .unwrap()
+        .method_response_by_pos(0)
+        .unwrap_set_email_submission()
+        .unwrap();
+    let repeated_cancel = response.updated(&submission_id_1);
+    assert!(
+        matches!(
+            &repeated_cancel,
+            Err(Error::Set(error)) if error.type_ == SetErrorType::CannotUnsend
+        ),
+        "expected CannotUnsend for the repeated cancel, got {repeated_cancel:?}"
+    );
+    response.updated(&submission_id_2).unwrap();
+    assert_email_properties(client, &filler_id, &[mailbox_id_2], &[]).await;
+    assert_email_properties(client, &draft_id_2, &[mailbox_id_2], &["$draft"]).await;
+
+    // onSuccessDestroyEmail keyed by a destroyed submission id
+    let mut request = client.build();
+    let set_request = request.set_email_submission();
+    set_request.destroy([&submission_id_2]);
+    set_request
+        .arguments()
+        .on_success_destroy_email_id(&submission_id_2);
+    let mut response = request
+        .send()
+        .await
+        .unwrap()
+        .method_response_by_pos(0)
+        .unwrap_set_email_submission()
+        .unwrap();
+    response.destroyed(&submission_id_2).unwrap();
+    assert!(
+        client
+            .email_get(&draft_id_2, None::<Vec<_>>)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_email_properties(client, &filler_id, &[mailbox_id_2], &[]).await;
+
+    println!(
+        "Existing submission onSuccess passed: submission {submission_document_id}, filler {filler_document_id}, drafts {draft_document_ids:?}"
+    );
+    submission_id_1
 }
 
 pub fn spawn_mock_smtp_server() -> (mpsc::Receiver<MockMessage>, Arc<Mutex<MockSMTPSettings>>) {

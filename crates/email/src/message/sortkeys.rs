@@ -72,6 +72,14 @@ pub trait EmailSortKeys: Sync + Send {
         comparators: Vec<MessageComparator>,
     ) -> impl Future<Output = trc::Result<Vec<u32>>> + Send;
 
+    fn sort_email_matches(
+        &self,
+        account_id: u32,
+        cache: &MessageStoreCache,
+        results: RoaringBitmap,
+        comparators: Vec<MessageComparator>,
+    ) -> impl Future<Output = trc::Result<Vec<u32>>> + Send;
+
     fn message_sort_ranks(
         &self,
         account_id: u32,
@@ -94,6 +102,17 @@ impl EmailSortKeys for Server {
             .await
             .caused_by(trc::location!())?;
 
+        self.sort_email_matches(account_id, cache, results, comparators)
+            .await
+    }
+
+    async fn sort_email_matches(
+        &self,
+        account_id: u32,
+        cache: &MessageStoreCache,
+        results: RoaringBitmap,
+        comparators: Vec<MessageComparator>,
+    ) -> trc::Result<Vec<u32>> {
         if results.len() < 2 || comparators.is_empty() {
             return Ok(results.into_iter().collect());
         }

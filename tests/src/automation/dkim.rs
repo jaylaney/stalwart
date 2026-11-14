@@ -828,7 +828,7 @@ impl Account {
                 && let Some(failure_reason) = tasks.into_iter().find_map(|task| match task.task {
                     Task::DkimManagement(TaskDomainManagement {
                         domain_id: task_domain_id,
-                        status: TaskStatus::Retry(retry),
+                        status: TaskStatus::Retry(retry) | TaskStatus::Stalled(retry),
                     }) if task_domain_id == domain_id && retry.attempt_number >= attempts => {
                         Some(retry.failure_reason)
                     }

@@ -130,13 +130,19 @@
 //!   the calendars and before any item is read, keyed by the requesting
 //!   principal (`dav::common::propfind::za`).
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+use super::search::ZaSearchConfig;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 pub use store::za_test::{
     FORCE_COMMIT_SPLIT, Pause, set_index_chunk_pause, set_second_chunk_fail_once,
 };
+use types::blob_hash::BlobHash;
 
 /// Sets `FORCE_COMMIT_SPLIT` to `account_id` for the guard's lifetime; the
 /// drop clears it, also when the test panics.
@@ -847,4 +853,1159 @@ pub fn set_propfind_admitted_pause(pause: Option<Arc<Pause>>) {
 }
 pub async fn propfind_admitted_pause_point(reader: u32) {
     wait(take_for(&PROPFIND_ADMITTED_PAUSE, reader)).await;
+}
+
+// Zero-access search hooks. The consuming tasks place the pause points and flags.
+pub static SEARCH_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_REQUIRED_LOAD_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_MANIFEST_READ_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_CONTENT_WAIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub fn set_search_manifest_read_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_MANIFEST_READ_PAUSE, pause);
+}
+pub async fn search_manifest_read_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_MANIFEST_READ_PAUSE, account_id)).await;
+}
+pub fn set_search_required_load_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_REQUIRED_LOAD_PAUSE, pause);
+}
+pub async fn search_required_load_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_REQUIRED_LOAD_PAUSE, account_id)).await;
+}
+pub fn set_search_content_wait_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_CONTENT_WAIT_PAUSE, pause);
+}
+pub async fn search_content_wait_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_CONTENT_WAIT_PAUSE, account_id)).await;
+}
+
+struct WaitDeadline {
+    account_id: u32,
+    expired: tokio::sync::watch::Sender<bool>,
+    consumed: tokio::sync::Notify,
+    deadlines: Mutex<Vec<tokio::time::Instant>>,
+}
+static SEARCH_WAIT_DEADLINE: Mutex<Option<Arc<WaitDeadline>>> = Mutex::new(None);
+
+/// Explicit request expiry after an acknowledged wait. This seam selects the
+/// same result as timeout_at; it never wraps an owned transaction or changes
+/// the entry's retry clock. Tests also cover the real timer branch.
+pub struct SearchWaitDeadline(Arc<WaitDeadline>);
+impl SearchWaitDeadline {
+    pub fn new(account_id: u32) -> Self {
+        let mut slot = SEARCH_WAIT_DEADLINE.lock().unwrap();
+        assert!(slot.is_none());
+        let deadline = Arc::new(WaitDeadline {
+            account_id,
+            expired: tokio::sync::watch::channel(false).0,
+            consumed: tokio::sync::Notify::new(),
+            deadlines: Mutex::new(Vec::new()),
+        });
+        *slot = Some(deadline.clone());
+        Self(deadline)
+    }
+    pub fn expire(&self) {
+        self.0.expired.send_replace(true);
+    }
+    /// Keep the operation parked until its timeout branch has been selected.
+    pub async fn wait_expired(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.0.consumed.notified())
+            .await
+            .expect("the parked search wait did not consume explicit expiry");
+    }
+    pub fn deadlines(&self) -> Vec<tokio::time::Instant> {
+        self.0.deadlines.lock().unwrap().clone()
+    }
+}
+impl Drop for SearchWaitDeadline {
+    fn drop(&mut self) {
+        SEARCH_WAIT_DEADLINE.lock().unwrap().take();
+    }
+}
+pub async fn search_deadline_wait<T>(
+    account_id: u32,
+    deadline: Option<tokio::time::Instant>,
+    wait: impl std::future::Future<Output = Result<T, ()>>,
+) -> Result<T, ()> {
+    let control = SEARCH_WAIT_DEADLINE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|control| control.account_id == account_id && deadline.is_some())
+        .cloned();
+    if let Some(control) = control {
+        control.deadlines.lock().unwrap().push(deadline.unwrap());
+        let mut expired = control.expired.subscribe();
+        tokio::select! {
+            result = wait => result,
+            _ = expired.wait_for(|expired| *expired) => {
+                control.consumed.notify_one();
+                Err(())
+            },
+        }
+    } else {
+        wait.await
+    }
+}
+
+pub static SEARCH_RETRY_OBSERVATION_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_SWAP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_SNAPSHOT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_VIEW_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+static SEARCH_PAGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_SWEEP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+static SEARCH_RECOVERY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_PASS_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_DESTROY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+static SEARCH_POST_UNLINK_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+static SEARCH_REBUILD_CREATE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+static SEARCH_BLOB_TIMEOUT_ONCE: Mutex<Option<BlobTimeout>> = Mutex::new(None);
+pub static SEARCH_HOLD_EXPIRE: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_CACHE_HOLD: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_SWAP_SKIP: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_OPEN_FAIL_ALL: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_BLOB_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_OPEN_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_MANIFEST_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_DESTROY_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+pub static SEARCH_BLOB_SLOW: Mutex<Option<(u32, u64)>> = Mutex::new(None);
+pub static SEARCH_CONFIG_OVERRIDE: Mutex<Option<ZaSearchConfig>> = Mutex::new(None);
+static ZA_SEARCH_COUNTERS: std::sync::LazyLock<Mutex<HashMap<u32, (u64, u64, usize)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn set_search_commit_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_COMMIT_PAUSE, pause);
+}
+
+pub async fn search_commit_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_COMMIT_PAUSE, account_id)).await;
+}
+
+pub fn set_search_retry_observation_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_RETRY_OBSERVATION_PAUSE, pause);
+}
+
+pub async fn search_retry_observation_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_RETRY_OBSERVATION_PAUSE, account_id)).await;
+}
+
+pub fn set_search_swap_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_SWAP_PAUSE, pause);
+}
+
+pub async fn search_swap_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_SWAP_PAUSE, account_id)).await;
+}
+
+pub fn set_search_snapshot_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_SNAPSHOT_PAUSE, pause);
+}
+
+pub async fn search_snapshot_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_SNAPSHOT_PAUSE, account_id)).await;
+}
+
+pub fn set_search_view_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_VIEW_PAUSE, pause);
+}
+
+pub async fn search_view_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_VIEW_PAUSE, account_id)).await;
+}
+
+pub fn set_search_page_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_PAGE_PAUSE, pause);
+}
+
+pub(super) async fn search_page_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_PAGE_PAUSE, account_id)).await;
+}
+
+pub fn set_search_sweep_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_SWEEP_PAUSE, pause);
+}
+
+pub async fn search_sweep_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_SWEEP_PAUSE, account_id)).await;
+}
+
+/// A single request takes the slot after observing loss, before it attempts
+/// recovery. It holds no pass or loader guard while parked.
+pub fn set_search_recovery_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_RECOVERY_PAUSE, pause);
+}
+
+pub async fn search_recovery_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_RECOVERY_PAUSE, account_id)).await;
+}
+
+pub fn set_search_pass_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_PASS_PAUSE, pause);
+}
+
+pub async fn search_pass_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_PASS_PAUSE, account_id)).await;
+}
+
+pub fn set_search_destroy_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_DESTROY_PAUSE, pause);
+}
+
+pub async fn search_destroy_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_DESTROY_PAUSE, account_id)).await;
+}
+
+/// Park destruction after it has unlinked its selected inventory.
+pub fn set_search_post_unlink_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_POST_UNLINK_PAUSE, pause);
+}
+
+pub(super) async fn search_post_unlink_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_POST_UNLINK_PAUSE, account_id)).await;
+}
+
+/// Park a missing-manifest creator after preparing its batch and before CAS.
+pub fn set_search_rebuild_create_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_REBUILD_CREATE_PAUSE, pause);
+}
+
+pub async fn search_rebuild_create_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_REBUILD_CREATE_PAUSE, account_id)).await;
+}
+
+/// Account-scoped attempted work, including failed operations. The fault is
+/// one-shot, and RAII clears it even when a regression assertion fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchPassWork {
+    Manifest,
+    Open,
+    Upload,
+    Commit,
+    Mailboxes,
+}
+
+struct PassFault {
+    account_id: u32,
+    work: SearchPassWork,
+    remaining: usize,
+    consumed: bool,
+    error: Option<trc::Error>,
+}
+static SEARCH_PASS_FAULT: Mutex<Option<PassFault>> = Mutex::new(None);
+static SEARCH_PASS_COUNTS: std::sync::LazyLock<Mutex<HashMap<u32, [u64; 5]>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub struct SearchPassFaultOnce(());
+impl SearchPassFaultOnce {
+    pub fn new(account_id: u32, work: SearchPassWork, occurrence: usize) -> Self {
+        Self::with_error(
+            account_id,
+            work,
+            occurrence,
+            trc::StoreEvent::UnexpectedError.into_err(),
+        )
+    }
+
+    pub fn with_error(
+        account_id: u32,
+        work: SearchPassWork,
+        occurrence: usize,
+        error: trc::Error,
+    ) -> Self {
+        let mut slot = SEARCH_PASS_FAULT.lock().unwrap();
+        assert!(slot.is_none() && occurrence > 0);
+        *slot = Some(PassFault {
+            account_id,
+            work,
+            remaining: occurrence,
+            consumed: false,
+            error: Some(error),
+        });
+        Self(())
+    }
+    pub fn was_consumed(&self) -> bool {
+        SEARCH_PASS_FAULT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|fault| fault.consumed)
+    }
+}
+impl Drop for SearchPassFaultOnce {
+    fn drop(&mut self) {
+        *SEARCH_PASS_FAULT.lock().unwrap() = None;
+    }
+}
+pub fn take_search_pass_fault(account_id: u32, work: SearchPassWork) -> bool {
+    let mut slot = SEARCH_PASS_FAULT.lock().unwrap();
+    if let Some(fault) = slot.as_mut()
+        && fault.account_id == account_id
+        && fault.work == work
+        && !fault.consumed
+    {
+        fault.remaining -= 1;
+        if fault.remaining == 0 {
+            fault.consumed = true;
+            return true;
+        }
+    }
+    false
+}
+pub fn take_search_pass_error(account_id: u32, work: SearchPassWork) -> Option<trc::Error> {
+    if take_search_pass_fault(account_id, work) {
+        SEARCH_PASS_FAULT
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|fault| fault.error.take())
+    } else {
+        None
+    }
+}
+
+pub fn count_search_pass_work(account_id: u32, work: SearchPassWork) {
+    if let Some(counts) = SEARCH_PASS_COUNTS.lock().unwrap().get_mut(&account_id) {
+        counts[work as usize] += 1;
+    }
+}
+pub struct SearchPassCounter(u32);
+impl SearchPassCounter {
+    pub fn start(account_id: u32) -> Self {
+        assert!(
+            SEARCH_PASS_COUNTS
+                .lock()
+                .unwrap()
+                .insert(account_id, [0; 5])
+                .is_none()
+        );
+        Self(account_id)
+    }
+    pub fn counts(&self) -> [u64; 5] {
+        SEARCH_PASS_COUNTS.lock().unwrap()[&self.0]
+    }
+}
+impl Drop for SearchPassCounter {
+    fn drop(&mut self) {
+        SEARCH_PASS_COUNTS.lock().unwrap().remove(&self.0);
+    }
+}
+
+struct BlobTimeout {
+    account_id: u32,
+    hash: BlobHash,
+    consumed: bool,
+}
+
+/// Replace one matching index-blob fetch result with an S3 request timeout.
+#[must_use = "dropping the guard disarms the timeout"]
+pub struct SearchBlobTimeoutOnce(());
+
+impl SearchBlobTimeoutOnce {
+    pub fn new(account_id: u32, hash: BlobHash) -> Self {
+        let mut slot = SEARCH_BLOB_TIMEOUT_ONCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(slot.is_none(), "an index-blob timeout is already armed");
+        *slot = Some(BlobTimeout {
+            account_id,
+            hash,
+            consumed: false,
+        });
+        Self(())
+    }
+
+    pub fn was_consumed(&self) -> bool {
+        SEARCH_BLOB_TIMEOUT_ONCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|timeout| timeout.consumed)
+    }
+}
+
+impl Drop for SearchBlobTimeoutOnce {
+    fn drop(&mut self) {
+        *SEARCH_BLOB_TIMEOUT_ONCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+pub(super) fn take_search_blob_timeout(account_id: u32, hash: &BlobHash) -> bool {
+    let mut slot = SEARCH_BLOB_TIMEOUT_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(timeout) = slot.as_mut()
+        && timeout.account_id == account_id
+        && &timeout.hash == hash
+        && !timeout.consumed
+    {
+        timeout.consumed = true;
+        return true;
+    }
+    false
+}
+
+pub fn set_search_hold_expire(account_id: Option<u32>) {
+    *SEARCH_HOLD_EXPIRE.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn search_hold_expire(account_id: u32) -> bool {
+    *SEARCH_HOLD_EXPIRE.lock().unwrap_or_else(|e| e.into_inner()) == Some(account_id)
+}
+
+pub fn set_search_cache_hold(account_id: Option<u32>) {
+    *SEARCH_CACHE_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn search_cache_hold(account_id: u32) -> bool {
+    *SEARCH_CACHE_HOLD.lock().unwrap_or_else(|e| e.into_inner()) == Some(account_id)
+}
+
+pub fn set_search_swap_skip(account_id: Option<u32>) {
+    *SEARCH_SWAP_SKIP.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn search_swap_skip(account_id: u32) -> bool {
+    *SEARCH_SWAP_SKIP.lock().unwrap_or_else(|e| e.into_inner()) == Some(account_id)
+}
+
+pub fn set_search_open_fail_all(account_id: Option<u32>) {
+    *SEARCH_OPEN_FAIL_ALL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn search_open_fail_all(account_id: u32) -> bool {
+    *SEARCH_OPEN_FAIL_ALL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        == Some(account_id)
+}
+
+pub fn set_search_blob_fail_once(account_id: Option<u32>) {
+    *SEARCH_BLOB_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn take_search_blob_fail(account_id: u32) -> bool {
+    take_flag(&SEARCH_BLOB_FAIL_ONCE, account_id)
+}
+
+pub fn set_search_open_fail_once(account_id: Option<u32>) {
+    *SEARCH_OPEN_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn take_search_open_fail(account_id: u32) -> bool {
+    take_flag(&SEARCH_OPEN_FAIL_ONCE, account_id)
+}
+
+pub fn set_search_manifest_fail_once(account_id: Option<u32>) {
+    *SEARCH_MANIFEST_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn take_search_manifest_fail(account_id: u32) -> bool {
+    take_flag(&SEARCH_MANIFEST_FAIL_ONCE, account_id)
+}
+
+pub fn set_search_destroy_fail_once(account_id: Option<u32>) {
+    *SEARCH_DESTROY_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn take_search_destroy_fail(account_id: u32) -> bool {
+    take_flag(&SEARCH_DESTROY_FAIL_ONCE, account_id)
+}
+
+pub fn set_search_blob_slow(delay: Option<(u32, u64)>) {
+    *SEARCH_BLOB_SLOW.lock().unwrap_or_else(|e| e.into_inner()) = delay;
+}
+
+pub fn search_blob_slow(account_id: u32) -> Option<Duration> {
+    SEARCH_BLOB_SLOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|(id, _)| *id == account_id)
+        .map(|(_, millis)| Duration::from_millis(millis))
+}
+
+pub fn set_search_config_override(config: Option<ZaSearchConfig>) {
+    *SEARCH_CONFIG_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = config;
+}
+
+pub(super) fn search_config_override() -> Option<ZaSearchConfig> {
+    SEARCH_CONFIG_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub fn count_za_search_blob_read(account_id: u32) {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(account_id)
+        .or_default()
+        .0 += 1;
+}
+
+pub fn count_za_search_message_open(account_id: u32) {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(account_id)
+        .or_default()
+        .1 += 1;
+}
+
+pub fn note_za_search_item_aliases(account_id: u32, n: usize) {
+    let mut counters = ZA_SEARCH_COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+    let max_aliases = &mut counters.entry(account_id).or_default().2;
+    *max_aliases = (*max_aliases).max(n);
+}
+
+pub fn za_search_blob_reads(account_id: u32) -> u64 {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&account_id)
+        .map_or(0, |counters| counters.0)
+}
+
+pub fn za_search_message_opens(account_id: u32) -> u64 {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&account_id)
+        .map_or(0, |counters| counters.1)
+}
+
+pub fn za_search_max_item_aliases(account_id: u32) -> usize {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&account_id)
+        .map_or(0, |counters| counters.2)
+}
+
+pub fn reset_za_search_counters(account_id: u32) {
+    ZA_SEARCH_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&account_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn search_observation_tracks_complete_pending_and_dropped_spans() {
+        use std::{
+            future::Future,
+            panic::AssertUnwindSafe,
+            task::{Context, Waker},
+        };
+
+        const ACCOUNT: u32 = 29;
+        assert!(search_span(ACCOUNT, SearchStage::Method).is_none());
+        let unclaimed = SearchRequestObservation::arm(ACCOUNT);
+        let stale_call_id = unclaimed.call_id().to_owned();
+        assert!(claim_search_observation(ACCOUNT + 1, unclaimed.call_id()).is_none());
+        assert!(claim_search_observation(ACCOUNT, "search-cold-wrong").is_none());
+        assert!(!unclaimed.claimed());
+        unclaimed.disarm();
+        assert!(claim_search_observation(ACCOUNT, unclaimed.call_id()).is_none());
+        drop(unclaimed);
+
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _unclaimed = SearchRequestObservation::arm(ACCOUNT);
+                panic!("exercise unclaimed observation cleanup");
+            })
+            .is_err()
+        );
+
+        let observation = SearchRequestObservation::arm(ACCOUNT);
+        assert!(claim_search_observation(ACCOUNT, &stale_call_id).is_none());
+        let claimed = claim_search_observation(ACCOUNT, observation.call_id()).unwrap();
+        assert!(observation.claimed());
+        assert!(claim_search_observation(ACCOUNT, observation.call_id()).is_none());
+        let next = SearchRequestObservation::arm(ACCOUNT);
+
+        with_search_observation(Some(&claimed), async {
+            assert!(search_span(ACCOUNT + 1, SearchStage::Method).is_none());
+            note_search_count(ACCOUNT, SearchStage::ContentRetry);
+            assert_eq!(
+                observe_search_wait(ACCOUNT, SearchStage::GetSnapshot, std::future::ready(7),)
+                    .await,
+                7
+            );
+            // Explicit completion also works for synchronous spans.
+            search_span(ACCOUNT, SearchStage::GetSnapshot)
+                .unwrap()
+                .finish();
+            // Legacy RAII spans retain their count and ended elapsed time. A
+            // bare Drop is partial, since it cannot prove operation completion.
+            drop(search_span(ACCOUNT, SearchStage::ThreadOpenDecode));
+        })
+        .await;
+        let complete = observation.progress(SearchStage::GetSnapshot);
+        assert_eq!(
+            (
+                complete.started,
+                complete.completed,
+                complete.partial,
+                complete.in_flight
+            ),
+            (2, 2, 0, 0)
+        );
+        assert_eq!(observation.count(SearchStage::GetSnapshot), 2);
+        let legacy = observation
+            .timings()
+            .find(|(stage, _, _)| matches!(stage, SearchStage::GetSnapshot))
+            .unwrap();
+        assert_eq!((legacy.1, legacy.2), (complete.count, complete.elapsed));
+        assert_eq!(
+            observation.progress(SearchStage::ThreadOpenDecode).partial,
+            1
+        );
+        let event = observation.progress(SearchStage::ContentRetry);
+        assert_eq!((event.count, event.started, event.in_flight), (1, 0, 0));
+
+        // This future contains only std::future::pending, so polling its entry
+        // does not depend on Tokio cooperative readiness or a select race.
+        let mut pending = Box::pin(with_search_observation(
+            Some(&claimed),
+            observe_search_wait(
+                ACCOUNT,
+                SearchStage::GetMetadataOpen,
+                std::future::pending::<()>(),
+            ),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+        let active = observation.progress(SearchStage::GetMetadataOpen);
+        assert_eq!(
+            (
+                active.count,
+                active.started,
+                active.completed,
+                active.partial,
+                active.in_flight
+            ),
+            (1, 1, 0, 0, 1)
+        );
+        assert_eq!(active.elapsed, active.in_flight_elapsed);
+        // A client-side disarm does not discard a still-running server's data.
+        observation.disarm();
+        assert_eq!(
+            observation.progress(SearchStage::GetMetadataOpen).in_flight,
+            1
+        );
+        drop(pending);
+        let cancelled = observation.progress(SearchStage::GetMetadataOpen);
+        assert_eq!(
+            (cancelled.completed, cancelled.partial, cancelled.in_flight),
+            (0, 1, 0)
+        );
+        assert!(cancelled.elapsed >= active.elapsed);
+        assert_eq!(cancelled.in_flight_elapsed, Duration::ZERO);
+
+        let unpolled = with_search_observation(
+            Some(&claimed),
+            observe_search_wait(
+                ACCOUNT,
+                SearchStage::GetMetadataBatch,
+                std::future::ready(()),
+            ),
+        );
+        drop(unpolled);
+        assert_eq!(observation.count(SearchStage::GetMetadataBatch), 0);
+
+        let mut unwinding = Box::pin(with_search_observation(
+            Some(&claimed),
+            observe_search_wait(ACCOUNT, SearchStage::Method, async {
+                panic!("exercise active observation cleanup");
+            }),
+        ));
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = unwinding.as_mut().poll(&mut context);
+            }))
+            .is_err()
+        );
+        drop(unwinding);
+        let unwound = observation.progress(SearchStage::Method);
+        assert_eq!(
+            (
+                unwound.started,
+                unwound.completed,
+                unwound.partial,
+                unwound.in_flight
+            ),
+            (1, 0, 1, 0)
+        );
+        assert!(search_span(ACCOUNT, SearchStage::Method).is_none());
+        assert_eq!(next.count(SearchStage::Method), 0);
+        drop(observation);
+        assert!(claim_search_observation(ACCOUNT, next.call_id()).is_some());
+    }
+
+    #[test]
+    fn search_blob_failure_is_taken_once_by_its_account() {
+        set_search_blob_fail_once(Some(5));
+        assert!(!take_search_blob_fail(6));
+        assert!(take_search_blob_fail(5));
+        assert!(!take_search_blob_fail(5));
+    }
+}
+
+pub static SEARCH_COMPACTION_FORCE_ALLOWANCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub fn search_compaction_force_allowance(account_id: u32) -> bool {
+    *SEARCH_COMPACTION_FORCE_ALLOWANCE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        == Some(account_id)
+}
+
+/// Opt-in numeric accounting for the search compaction benchmark and fixtures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchContentWrite {
+    Original(u64),
+    StagedMemory(u64),
+    RetirementMemory(u64),
+    Encoded {
+        tier: u8,
+        bytes: u64,
+    },
+    Uploaded {
+        tier: u8,
+        bytes: u64,
+    },
+    Linked {
+        tier: u8,
+        bytes: u64,
+    },
+    Committed {
+        chain_length: u32,
+        full_merge: bool,
+        thread_compaction: bool,
+    },
+}
+
+#[derive(Default)]
+struct SearchWriteObservers {
+    events: Option<(u32, Vec<SearchContentWrite>)>,
+    commits: Option<(u32, Arc<AtomicU64>)>,
+}
+
+static SEARCH_CONTENT_WRITES: Mutex<SearchWriteObservers> = Mutex::new(SearchWriteObservers {
+    events: None,
+    commits: None,
+});
+
+pub fn set_search_content_writes(account_id: Option<u32>) {
+    SEARCH_CONTENT_WRITES.lock().unwrap().events = account_id.map(|id| (id, Vec::new()));
+}
+
+pub fn take_search_content_writes(account_id: u32) -> Vec<SearchContentWrite> {
+    SEARCH_CONTENT_WRITES
+        .lock()
+        .unwrap()
+        .events
+        .as_mut()
+        .filter(|(id, _)| *id == account_id)
+        .map_or_else(Vec::new, |(_, events)| std::mem::take(events))
+}
+
+pub fn note_search_content_write(account_id: u32, event: SearchContentWrite) {
+    let mut observers = SEARCH_CONTENT_WRITES.lock().unwrap();
+    if let Some((id, commits)) = &observers.commits
+        && *id == account_id
+        && matches!(event, SearchContentWrite::Committed { .. })
+    {
+        commits.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some((_, events)) = observers
+        .events
+        .as_mut()
+        .filter(|(id, _)| *id == account_id)
+    {
+        events.push(event);
+    }
+}
+
+/// Counts all writer commits for this account, including commits outside the
+/// measured request tasks. It retains no events and shares the existing hook.
+pub struct SearchCommitCounter(Arc<AtomicU64>);
+
+impl SearchCommitCounter {
+    pub fn start(account_id: u32) -> Self {
+        let mut observers = SEARCH_CONTENT_WRITES.lock().unwrap();
+        if observers.commits.is_some() {
+            drop(observers);
+            panic!("a search commit counter is active");
+        }
+        let count = Arc::new(AtomicU64::new(0));
+        observers.commits = Some((account_id, Arc::clone(&count)));
+        Self(count)
+    }
+
+    pub fn count(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for SearchCommitCounter {
+    fn drop(&mut self) {
+        SEARCH_CONTENT_WRITES.lock().unwrap().commits = None;
+    }
+}
+
+/// Request-local inclusive timings. A parent stage may include other reported
+/// stages. Legacy timings retain elapsed time for ended spans; progress also
+/// includes active spans and distinguishes explicit completion from partial drops.
+#[derive(Clone, Copy, Debug)]
+pub enum SearchStage {
+    DispatcherPrePass,
+    Method,
+    MapFlightWait,
+    MapIndexWait,
+    ResidentIndexWait,
+    ContentFlightWait,
+    ContentIndexWait,
+    PassLockWait,
+    VerifiedBlobFetch,
+    ThreadOpenDecode,
+    ThreadModelBuild,
+    ContentOpen,
+    ContentDecode,
+    Postings,
+    TombstonePreparation,
+    ExactGenerationInstall,
+    EnsureRound,
+    ContentRetry,
+    ViewRetry,
+    ContentAdmission,
+    GetSnapshot,
+    GetMetadataBatch,
+    GetMetadataOpen,
+}
+
+impl SearchStage {
+    const ALL: [Self; Self::GetMetadataOpen as usize + 1] = [
+        Self::DispatcherPrePass,
+        Self::Method,
+        Self::MapFlightWait,
+        Self::MapIndexWait,
+        Self::ResidentIndexWait,
+        Self::ContentFlightWait,
+        Self::ContentIndexWait,
+        Self::PassLockWait,
+        Self::VerifiedBlobFetch,
+        Self::ThreadOpenDecode,
+        Self::ThreadModelBuild,
+        Self::ContentOpen,
+        Self::ContentDecode,
+        Self::Postings,
+        Self::TombstonePreparation,
+        Self::ExactGenerationInstall,
+        Self::EnsureRound,
+        Self::ContentRetry,
+        Self::ViewRetry,
+        Self::ContentAdmission,
+        Self::GetSnapshot,
+        Self::GetMetadataBatch,
+        Self::GetMetadataOpen,
+    ];
+}
+
+#[derive(Default)]
+struct StageTotal {
+    count: u64,
+    started: u64,
+    completed: u64,
+    partial: u64,
+    elapsed: Duration,
+    // Sum of active start offsets from the measurement's epoch. This permits
+    // constant-space elapsed accounting without retaining an entry per span.
+    active_started_nanos: u128,
+}
+
+/// A single stage snapshot. Timings are inclusive and must not be summed across
+/// nested stages. `partial` means dropped without explicit completion, including
+/// legacy bare RAII spans; it does not establish why the span ended.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchStageProgress {
+    /// Legacy count: span starts plus instantaneous count-only events.
+    pub count: u64,
+    pub started: u64,
+    /// Explicit operation returns, including returned errors; not a success count.
+    pub completed: u64,
+    pub partial: u64,
+    pub in_flight: u64,
+    /// Ended span time plus the elapsed time of still-active spans at this sample.
+    pub elapsed: Duration,
+    pub in_flight_elapsed: Duration,
+}
+
+#[derive(Debug)]
+pub struct SearchAdmission {
+    pub reason: &'static str,
+    pub remaining: Duration,
+}
+
+pub struct SearchRequestMeasurement {
+    account_id: u32,
+    call_id: String,
+    claimed: AtomicBool,
+    started: Instant,
+    totals: [Mutex<StageTotal>; SearchStage::ALL.len()],
+    admission: OnceLock<SearchAdmission>,
+}
+
+static SEARCH_REQUEST_SERIAL: AtomicU64 = AtomicU64::new(0);
+static PENDING_SEARCH_MEASUREMENT: Mutex<Option<Arc<SearchRequestMeasurement>>> = Mutex::new(None);
+
+tokio::task_local! {
+    static SEARCH_MEASUREMENT: Arc<SearchRequestMeasurement>;
+}
+
+/// Arm a single method call. The dispatcher can claim it only once and
+/// checks both account and call ID. Dropping an unclaimed observation clears it.
+pub struct SearchRequestObservation {
+    measurement: Arc<SearchRequestMeasurement>,
+}
+
+impl SearchRequestObservation {
+    pub fn arm(account_id: u32) -> Self {
+        let serial = SEARCH_REQUEST_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let measurement = Arc::new(SearchRequestMeasurement {
+            account_id,
+            call_id: format!("search-cold-{serial}"),
+            claimed: AtomicBool::new(false),
+            started: Instant::now(),
+            totals: Default::default(),
+            admission: OnceLock::new(),
+        });
+        let mut pending = PENDING_SEARCH_MEASUREMENT.lock().unwrap();
+        if pending.is_some() {
+            drop(pending);
+            panic!("a search observation is already armed");
+        }
+        *pending = Some(Arc::clone(&measurement));
+        Self { measurement }
+    }
+
+    pub fn call_id(&self) -> &str {
+        &self.measurement.call_id
+    }
+
+    pub fn claimed(&self) -> bool {
+        self.measurement.claimed.load(Ordering::Relaxed)
+    }
+
+    pub fn count(&self, stage: SearchStage) -> u64 {
+        self.measurement.totals[stage as usize]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .count
+    }
+
+    pub fn timings(&self) -> impl Iterator<Item = (SearchStage, u64, Duration)> + '_ {
+        SearchStage::ALL.into_iter().map(|stage| {
+            let total = self.measurement.totals[stage as usize]
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (stage, total.count, total.elapsed)
+        })
+    }
+
+    pub fn progress(&self, stage: SearchStage) -> SearchStageProgress {
+        let total = self.measurement.totals[stage as usize]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Sample after locking so a newly started span cannot be newer than now.
+        let now = self.measurement.started.elapsed().as_nanos();
+        let in_flight = total.started - total.completed - total.partial;
+        let active_nanos = now * u128::from(in_flight) - total.active_started_nanos;
+        let in_flight_elapsed = Duration::from_nanos(active_nanos.min(u64::MAX as u128) as u64);
+        SearchStageProgress {
+            count: total.count,
+            started: total.started,
+            completed: total.completed,
+            partial: total.partial,
+            in_flight,
+            elapsed: total.elapsed + in_flight_elapsed,
+            in_flight_elapsed,
+        }
+    }
+
+    pub fn progress_stages(&self) -> impl Iterator<Item = (SearchStage, SearchStageProgress)> + '_ {
+        SearchStage::ALL
+            .into_iter()
+            .map(|stage| (stage, self.progress(stage)))
+    }
+
+    pub fn admission(&self) -> Option<&SearchAdmission> {
+        self.measurement.admission.get()
+    }
+    /// Clear the pending claim after the wire attempt, even when the response
+    /// never reached the dispatcher. Keep already observed timings readable.
+    pub fn disarm(&self) {
+        let mut pending = PENDING_SEARCH_MEASUREMENT.lock().unwrap();
+        if pending
+            .as_ref()
+            .is_some_and(|measurement| Arc::ptr_eq(measurement, &self.measurement))
+        {
+            *pending = None;
+        }
+    }
+}
+
+impl Drop for SearchRequestObservation {
+    fn drop(&mut self) {
+        self.disarm();
+    }
+}
+
+pub fn claim_search_observation(
+    account_id: u32,
+    call_id: &str,
+) -> Option<Arc<SearchRequestMeasurement>> {
+    if !call_id.starts_with("search-cold-") {
+        return None;
+    }
+    let mut pending = PENDING_SEARCH_MEASUREMENT.try_lock().ok()?;
+    if pending.as_ref().is_some_and(|measurement| {
+        measurement.account_id == account_id && measurement.call_id == call_id
+    }) {
+        let measurement = pending.take().unwrap();
+        measurement.claimed.store(true, Ordering::Relaxed);
+        Some(measurement)
+    } else {
+        None
+    }
+}
+
+pub async fn with_search_observation<F: std::future::Future>(
+    observation: Option<&Arc<SearchRequestMeasurement>>,
+    future: F,
+) -> F::Output {
+    match observation {
+        Some(observation) => {
+            SEARCH_MEASUREMENT
+                .scope(Arc::clone(observation), future)
+                .await
+        }
+        None => future.await,
+    }
+}
+
+fn search_measurement(account_id: u32) -> Option<Arc<SearchRequestMeasurement>> {
+    SEARCH_MEASUREMENT
+        .try_with(|measurement| {
+            (measurement.account_id == account_id).then(|| Arc::clone(measurement))
+        })
+        .ok()
+        .flatten()
+}
+
+pub struct SearchSpan {
+    measurement: Arc<SearchRequestMeasurement>,
+    stage: SearchStage,
+    started: Instant,
+    complete: bool,
+}
+
+impl SearchSpan {
+    /// Mark a span whose operation returned (including a returned error). A bare
+    /// drop remains partial because cancellation and normal scope exit cannot be
+    /// distinguished by Drop alone.
+    pub fn finish(mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for SearchSpan {
+    fn drop(&mut self) {
+        let mut total = self.measurement.totals[self.stage as usize]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        total.elapsed += self.started.elapsed();
+        total.active_started_nanos -= self
+            .started
+            .duration_since(self.measurement.started)
+            .as_nanos();
+        if self.complete {
+            total.completed += 1;
+        } else {
+            total.partial += 1;
+        }
+    }
+}
+
+pub fn search_span(account_id: u32, stage: SearchStage) -> Option<SearchSpan> {
+    let measurement = search_measurement(account_id)?;
+    let started = Instant::now();
+    {
+        let mut total = measurement.totals[stage as usize]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        total.count += 1;
+        total.started += 1;
+        total.active_started_nanos += started.duration_since(measurement.started).as_nanos();
+    }
+    Some(SearchSpan {
+        measurement,
+        stage,
+        started,
+        complete: false,
+    })
+}
+
+pub async fn observe_search_wait<F: std::future::Future>(
+    account_id: u32,
+    stage: SearchStage,
+    future: F,
+) -> F::Output {
+    let span = search_span(account_id, stage);
+    let result = future.await;
+    if let Some(span) = span {
+        span.finish();
+    }
+    result
+}
+
+pub fn note_search_count(account_id: u32, stage: SearchStage) {
+    if let Some(measurement) = search_measurement(account_id) {
+        measurement.totals[stage as usize]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .count += 1;
+    }
+}
+
+pub fn note_search_admission(
+    account_id: u32,
+    reason: impl FnOnce() -> &'static str,
+    deadline: Instant,
+) {
+    if let Some(measurement) = search_measurement(account_id) {
+        let _ = measurement.admission.set(SearchAdmission {
+            reason: reason(),
+            remaining: deadline.saturating_duration_since(Instant::now()),
+        });
+    }
 }

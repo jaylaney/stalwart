@@ -228,6 +228,7 @@ pub struct Caches {
 
     /// Resident master keys for CalDAV sessions (spec 5).
     pub za_keys: vault::cache::KeyCache,
+    pub za_search: za::search::ZaSearchCache,
     /// Per-process secret for keyed fingerprints of Authorization headers.
     pub za_fingerprint_key: vault::Zeroizing<[u8; 32]>,
     /// Bumped before every local `Account`/`AccessToken` invalidation; a

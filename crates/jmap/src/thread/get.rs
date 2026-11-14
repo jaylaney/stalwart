@@ -6,11 +6,20 @@
 
 use crate::changes::state::StateManager;
 use common::{Server, auth::AccessToken};
-use email::cache::{MessageCacheFetch, email::MessageAccess, mailbox::MailboxCacheAccess};
+use email::cache::{
+    MessageCacheFetch,
+    email::{MessageAccess, MessageCacheAccess},
+    mailbox::MailboxCacheAccess,
+};
+use email::message::za::search::{
+    snapshot::{ZaSnapshotFetch, za_no_map_error},
+    threads::za_group_by_thread,
+};
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, all_ids},
     object::thread::{Thread, ThreadProperty, ThreadValue},
     request::MaybeInvalid,
+    types::state::State,
 };
 use jmap_tools::Map;
 use std::future::Future;
@@ -33,10 +42,21 @@ impl ThreadGet for Server {
         access_token: &AccessToken,
     ) -> trc::Result<GetResponse<Thread>> {
         let account_id = request.account_id.document_id();
-        let cache = self
-            .get_cached_messages(account_id)
-            .await
-            .caused_by(trc::location!())?;
+        let snapshot = match access_token.za_keys_for(account_id) {
+            Some(keys) => Some(
+                self.za_snapshot(account_id, keys)
+                    .await
+                    .map_err(|reason| za_no_map_error(reason, account_id))?,
+            ),
+            None => None,
+        };
+        let cache = match &snapshot {
+            Some(snapshot) => snapshot.cache.clone(),
+            None => self
+                .get_cached_messages(account_id)
+                .await
+                .caused_by(trc::location!())?,
+        };
         let access = if access_token.is_shared(account_id) {
             MessageAccess::Mailboxes(cache.shared_mailboxes(access_token, Acl::ReadItems))
         } else {
@@ -45,7 +65,39 @@ impl ThreadGet for Server {
 
         let (ids, not_found_ids) = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let mut thread_map: AHashMap<u32, Vec<u32>>;
-        let ids = if let Some(ids) = ids {
+        let ids = if let Some(snapshot) = &snapshot {
+            if let Some(ids) = ids {
+                thread_map = ids
+                    .iter()
+                    .map(|id| {
+                        let thread_id = id.document_id();
+                        let mut members = snapshot.thread_members(thread_id);
+                        members.retain(|id| {
+                            cache
+                                .email_by_id(id)
+                                .is_some_and(|item| access.allows(item))
+                        });
+                        members.sort_by_cached_key(|id| {
+                            cache
+                                .email_by_id(id)
+                                .expect("retained thread member is in the pinned cache")
+                                .sort_rank()
+                        });
+                        (thread_id, members)
+                    })
+                    .collect();
+                ids
+            } else {
+                thread_map = za_group_by_thread(
+                    snapshot,
+                    cache.emails.iter().filter(|item| access.allows(*item)),
+                );
+                all_ids(
+                    thread_map.keys().copied().map(Into::into),
+                    self.core.jmap.get_max_objects,
+                )?
+            }
+        } else if let Some(ids) = ids {
             thread_map = ids
                 .iter()
                 .map(|id| (id.document_id(), Vec::new()))
@@ -79,10 +131,14 @@ impl ThreadGet for Server {
         });
         let mut response = GetResponse {
             account_id: request.account_id.into(),
-            state: self
-                .get_state(account_id, SyncCollection::Thread)
-                .await?
-                .into(),
+            state: match &snapshot {
+                Some(snapshot) => {
+                    let state = snapshot.state();
+                    State::from((state != 0).then_some(state))
+                }
+                None => self.get_state(account_id, SyncCollection::Thread).await?,
+            }
+            .into(),
             list: Vec::with_capacity(ids.len()),
             not_found: not_found_ids,
         };

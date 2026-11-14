@@ -64,6 +64,10 @@ impl MessageCacheFetch for Server {
                 LoadedCache::Built(cache) => return Ok(cache),
             },
         };
+        #[cfg(feature = "test_mode")]
+        if common::za::test_hooks::search_cache_hold(account_id) {
+            return Ok(cache);
+        }
         revalidate_messages(self, account_id, cache).await
     }
 

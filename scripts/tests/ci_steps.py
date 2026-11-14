@@ -12,6 +12,11 @@ condition, its rerun, its gate configuration and its coverage-net step. `capture
 derives each listing command from it (`listing_command`), and `coverage_net.py` each of its
 tests-crate steps (`net_command`), so the gates capture and measure what CI runs.
 
+`JOB_DIAGNOSTIC_ENV` holds CI-only panic diagnostics, checked at job and effective step
+scope. These do not change selections or failure semantics. The capture and coverage net
+retain the historical measurement environment (`BASE_ENV` plus `Step.env`); adding a CI
+diagnostic does not rewrite that qualification baseline or claim it was measured there.
+
 `check_workflow` compares the table with `.github/workflows/test.yml` and returns one line per
 difference: a step missing or renamed, a changed command (a narrowed filter, a dropped feature),
 a changed environment, a changed `if`, a changed rerun, a step that may fail without failing its
@@ -37,6 +42,8 @@ WORKFLOW = REPO / ".github" / "workflows" / "test.yml"
 
 # Every gated job sets these for all its steps.
 BASE_ENV = {"STORE": "RocksDb", "RUST_MIN_STACK": "16777216"}
+# Kept separate from the historical capture/net environment; no arbitrary extras are allowed.
+JOB_DIAGNOSTIC_ENV = {"zero-access": {"RUST_BACKTRACE": "1"}}
 SPAM_URL = ("https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.4/"
             "spam-filter-rules.json.gz")
 # The workspace unit step's features: test.yml's workflow-level variable, which the gates job's
@@ -53,7 +60,7 @@ JOBS = {
     "test": dict(when=NOT_ON_PUSH, env=BASE_ENV),
     "unit-tests": dict(when=None, env=BASE_ENV),
     "upstream-suites": dict(when=NOT_ON_PUSH, env=BASE_ENV),
-    "zero-access": dict(when=None, env=BASE_ENV),
+    "zero-access": dict(when=None, env={**BASE_ENV, **JOB_DIAGNOSTIC_ENV["zero-access"]}),
 }
 
 # The gates job, and the two commands that must run the whole net and every capture.
@@ -495,7 +502,10 @@ def check_workflow(text):
         job_env = _env(job.get("env"))
         effective = {**workflow_env, **job_env, **step_env}
         effective.pop(UNIT_FEATURES, None)
-        problems += _env_problems(where, effective, {**BASE_ENV, **step.env})
+        problems += _env_problems(where, effective, {**JOBS[step.job]["env"], **step.env})
+        for key in JOB_DIAGNOSTIC_ENV.get(step.job, {}):
+            if key in step_env:
+                problems.append(f"{where}: overrides the job diagnostic {key}")
         if "$" + UNIT_FEATURES in step.argv and (UNIT_FEATURES in job_env
                                                  or UNIT_FEATURES in step_env):
             problems.append(f"{where}: overrides the workflow-level {UNIT_FEATURES}, which the "

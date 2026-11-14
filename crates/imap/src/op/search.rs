@@ -4,11 +4,15 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::za_search::{
+    za_imap_condition, za_imap_content_guard, za_imap_map_guard, za_imap_sort, za_imap_unavailable,
+};
 use crate::{
     core::{Resolved, Row, SavedSearch, SelectedMailbox, Session, SessionData},
     spawn_op,
 };
-use common::{MessageStoreCache, network::SessionStream, za::ZA_MAIL_SEARCH_REFUSED};
+use common::{MessageStoreCache, network::SessionStream};
+use email::message::za::search::snapshot::ZaSnapshot;
 use email::{
     cache::{
         MessageCacheFetch,
@@ -17,6 +21,7 @@ use email::{
     message::{
         index::subject::search_subject_query,
         sortkeys::{EmailSortKeys, MessageCacheField, MessageComparator, MessageSortField},
+        za::search::{query::za_resolve_residual, view::ZaView},
     },
 };
 use imap_proto::{
@@ -35,6 +40,7 @@ use store::{
     roaring::RoaringBitmap,
     search::{EmailSearchField, KeyValueMatch, SearchFilter, SearchQuery},
     write::{SearchIndex, now},
+    za_search::content::ContentPart,
 };
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::watch;
@@ -142,7 +148,7 @@ impl<T: SessionStream> SessionData<T> {
         arguments: Arguments,
         mailbox: Arc<SelectedMailbox>,
         results_tx: Option<watch::Sender<Arc<Vec<Row>>>>,
-        prev_saved_search: Option<Option<Arc<Vec<Row>>>>,
+        mut prev_saved_search: Option<Option<Arc<Vec<Row>>>>,
         is_uid: bool,
         message_limit: u32,
         op_start: Instant,
@@ -153,11 +159,40 @@ impl<T: SessionStream> SessionData<T> {
         self.server
             .za_assert_mail_route(&self.access_token, mailbox.id.account_id)
             .await?;
-        let cache = self
-            .server
-            .get_cached_messages(mailbox.id.account_id)
-            .await
-            .caused_by(trc::location!())?;
+        let content_view = za_imap_content_guard(
+            self,
+            &mailbox,
+            &arguments.filter,
+            arguments.sort.as_deref().unwrap_or_default(),
+            &mut prev_saved_search,
+        )
+        .await?;
+        let is_content = content_view.is_some();
+        let unsupported_cc = arguments.sort.as_ref().is_some_and(|sorts| {
+            sorts
+                .iter()
+                .any(|comparator| matches!(comparator.sort, search::Sort::Cc))
+        });
+        let snapshot = if is_content || unsupported_cc {
+            content_view
+        } else {
+            za_imap_map_guard(
+                self,
+                &mailbox,
+                &arguments.filter,
+                &mut prev_saved_search,
+                false,
+            )
+            .await?
+        };
+        let cache = match &snapshot {
+            Some(view) => view.cache.clone(),
+            None => self
+                .server
+                .get_cached_messages(mailbox.id.account_id)
+                .await
+                .caused_by(trc::location!())?,
+        };
         self.sync_view(&mailbox, &cache, None)
             .await
             .caused_by(trc::location!())?;
@@ -171,6 +206,11 @@ impl<T: SessionStream> SessionData<T> {
                 &mailbox,
                 &cache,
                 &prev_saved_search,
+                snapshot.as_ref(),
+                snapshot
+                    .as_ref()
+                    .filter(|_| is_content)
+                    .map(ZaView::content),
             )
             .await?;
         // Sort and map ids
@@ -289,6 +329,7 @@ impl<T: SessionStream> SessionData<T> {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn query(
         &self,
         imap_filter: Vec<Filter>,
@@ -296,52 +337,58 @@ impl<T: SessionStream> SessionData<T> {
         mailbox: &SelectedMailbox,
         cache: &MessageStoreCache,
         prev_saved_search: &Option<Option<Arc<Vec<Row>>>>,
+        snapshot: Option<&ZaSnapshot>,
+        content: Option<&ContentPart>,
     ) -> trc::Result<(Vec<u32>, bool)> {
         // Mail spec 6.3, ruling R34: the callers (`search`, `thread`) check
         // the route before they read `cache`.
 
-        // Mail spec 8: a key account's search index holds the arrival time
-        // and the size only, so a filter or sort that needs a message's
-        // content is refused as a whole, not left to match nothing. Not a
-        // security event: the client must read the answer. The error holds
-        // the fixed text only, so the search term is not traced.
-        // The request is read first: an account whose request needs no
-        // content is not looked up.
-        if (imap_filter.iter().any(za_filter_needs_content)
-            || imap_comparator
-                .iter()
-                .any(|comparator| za_sort_needs_content(&comparator.sort)))
-            && self.server.za_is_key_account(mailbox.id.account_id).await?
-        {
-            return Err(trc::ImapEvent::Error
-                .into_err()
-                .details(ZA_MAIL_SEARCH_REFUSED)
-                .code(ResponseCode::Cannot));
-        }
-
         // Obtain message ids
         let mut filters = Vec::with_capacity(imap_filter.len() + 1);
-        let message_ids = mailbox.view.lock().document_ids();
+        let mut message_ids = mailbox.view.lock().document_ids();
+        if snapshot.is_some() {
+            // A selected view can already be ahead of the paired cache.
+            // Restrict its mask to this cache before complementing any set.
+            message_ids = message_ids
+                .into_iter()
+                .filter(|id| {
+                    cache
+                        .email_by_id(id)
+                        .is_some_and(|message| message.has_mailbox_id(mailbox.id.mailbox_id))
+                })
+                .collect();
+        }
 
         // Convert query
         let mut include_highest_modseq = false;
         for filter in imap_filter {
+            if let Some(set) = content.and_then(|content| za_imap_condition(&filter, content)) {
+                filters.push(SearchFilter::is_in_set(set));
+                continue;
+            }
             match filter {
                 Filter::Sequence(sequence, uid_filter) => {
-                    let resolved = if let (Sequence::SavedSearch, Some(prev_saved_search)) =
-                        (&sequence, &prev_saved_search)
+                    let bare_saved = matches!(sequence, Sequence::SavedSearch);
+                    let resolved = if sequence.is_saved_search()
+                        && (prev_saved_search.is_some() || snapshot.is_some())
                     {
-                        if let Some(prev_saved_search) = prev_saved_search {
-                            mailbox.view.lock().resolve(
-                                &sequence,
-                                true,
-                                Some(prev_saved_search.as_slice()),
-                            )
-                        } else {
-                            return Err(trc::ImapEvent::Error
-                                .into_err()
-                                .details("No saved search found."));
-                        }
+                        // SAVE captures its previous result before registering
+                        // its own channel. Mixed sets must use that capture too,
+                        // even when metadata search does not hold an index guard.
+                        // Never fall back to the watch channel with an index guard.
+                        let rows = prev_saved_search
+                            .as_ref()
+                            .and_then(Option::as_deref)
+                            .ok_or_else(|| {
+                                trc::ImapEvent::Error
+                                    .into_err()
+                                    .details("No saved search found.")
+                            })?;
+                        mailbox.view.lock().resolve(
+                            &sequence,
+                            bare_saved || uid_filter,
+                            Some(rows.as_slice()),
+                        )
                     } else {
                         mailbox.resolve(&sequence, uid_filter).await?
                     };
@@ -564,12 +611,14 @@ impl<T: SessionStream> SessionData<T> {
                 }
                 Filter::EmailId(id) => {
                     let mut matches = RoaringBitmap::new();
-                    if let Some(id) = ObjectId::decode_id(id.as_bytes())
-                        && cache
-                            .email_by_id(&id.document_id())
-                            .is_some_and(|message| message.thread_id() == id.prefix_id())
-                    {
-                        matches.insert(id.document_id());
+                    if let Some(id) = ObjectId::decode_id(id.as_bytes()) {
+                        let matched = match snapshot {
+                            Some(snapshot) => snapshot.check_id(id),
+                            None => cache.email_by_jmap_id(id).map(|_| id.document_id()),
+                        };
+                        if let Some(document_id) = matched {
+                            matches.insert(document_id);
+                        }
                     }
                     filters.push(SearchFilter::is_in_set(matches));
                 }
@@ -577,9 +626,15 @@ impl<T: SessionStream> SessionData<T> {
                     let matches = match ObjectId::decode_id(id.as_bytes())
                         .and_then(|id| u32::try_from(id.id()).ok())
                     {
-                        Some(thread_id) => RoaringBitmap::from_iter(
-                            cache.in_thread(thread_id).map(|m| m.document_id()),
-                        ),
+                        Some(thread_id) => match snapshot {
+                            Some(snapshot) => {
+                                snapshot.thread_members(thread_id).into_iter().collect()
+                            }
+                            None => cache
+                                .in_thread(thread_id)
+                                .map(|m| m.document_id())
+                                .collect(),
+                        },
                         None => RoaringBitmap::new(),
                     };
                     filters.push(SearchFilter::is_in_set(matches));
@@ -740,6 +795,12 @@ impl<T: SessionStream> SessionData<T> {
         // Convert comparators
         let mut comparators = Vec::with_capacity(imap_comparator.len());
         for comparator in imap_comparator {
+            if let Some(comparator) =
+                content.and_then(|part| za_imap_sort(part, &comparator, &message_ids))
+            {
+                comparators.push(comparator);
+                continue;
+            }
             comparators.push(match comparator.sort {
                 search::Sort::Arrival => MessageComparator::Cache {
                     field: MessageCacheField::ReceivedAt,
@@ -774,17 +835,27 @@ impl<T: SessionStream> SessionData<T> {
         }
 
         // Run query
-        self.server
-            .query_emails(
-                mailbox.id.account_id,
-                cache,
-                SearchQuery::new(SearchIndex::Email)
-                    .with_filters(filters)
-                    .with_account_id(mailbox.id.account_id)
-                    .with_mask(message_ids),
-                comparators,
-            )
-            .await
+        let query = SearchQuery::new(SearchIndex::Email).with_mask(message_ids);
+        let results = if let Some(content) = content {
+            let filters = za_resolve_residual(mailbox.id.account_id, filters, content)
+                .map_err(|_| za_imap_unavailable())?;
+            let matches = query.with_filters(filters).filter().into_bitmap();
+            self.server
+                .sort_email_matches(mailbox.id.account_id, cache, matches, comparators)
+                .await
+        } else {
+            self.server
+                .query_emails(
+                    mailbox.id.account_id,
+                    cache,
+                    query
+                        .with_filters(filters)
+                        .with_account_id(mailbox.id.account_id),
+                    comparators,
+                )
+                .await
+        };
+        results
             .map(|res| (res, include_highest_modseq))
             .caused_by(trc::location!())
     }
@@ -794,7 +865,7 @@ impl<T: SessionStream> SessionData<T> {
 /// (header values, body text, the sent date, and at 1.0 the server-set
 /// attachment keywords). The match has no wildcard, so a key added upstream
 /// fails to compile here until it is classified.
-fn za_filter_needs_content(filter: &Filter) -> bool {
+pub(super) fn za_filter_needs_content(filter: &Filter) -> bool {
     match filter {
         // 1.0 sets `$HasAttachment` and `$HasNoAttachment` from the parsed
         // message (`index/metadata.rs`); a key account's message carries
@@ -850,7 +921,7 @@ fn za_filter_needs_content(filter: &Filter) -> bool {
 }
 
 /// Mail spec 8: true when the sort key needs a message's sealed content.
-fn za_sort_needs_content(sort: &search::Sort) -> bool {
+pub(super) fn za_sort_needs_content(sort: &search::Sort) -> bool {
     match sort {
         search::Sort::Cc
         | search::Sort::Date

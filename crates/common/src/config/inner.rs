@@ -32,6 +32,7 @@ use crate::{
     manager::application::WebApplications,
     network::security::BlockedIps,
     storage::metadata::MetadataViewerCache,
+    za::search::{ZaSearchCache, ZaSearchConfig},
 };
 use ahash::{AHashMap, AHashSet};
 use arc_swap::ArcSwap;
@@ -138,6 +139,7 @@ impl Caches {
             http_auth: HttpAuthEntries::new(cache.http_auth),
             grant_revocations: GrantRevocations::default(),
             za_keys: vault::cache::KeyCache::new(vault::cache::KeyCacheConfig::from_env()),
+            za_search: ZaSearchCache::new(ZaSearchConfig::from_env()),
             za_fingerprint_key: vault::Zeroizing::new(rand::random::<[u8; 32]>()),
             account_epoch: std::sync::atomic::AtomicU64::new(0),
             za_account_page_origin: arc_swap::ArcSwapOption::from_pointee(

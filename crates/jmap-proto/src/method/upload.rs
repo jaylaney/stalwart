@@ -175,9 +175,7 @@ impl<'de> DeserializeArguments<'de> for DataSourceObject {
 impl BlobUploadResponse {
     pub fn update_created_ids(&self, response: &mut Response) {
         for (user_id, obj) in &self.created {
-            response
-                .created_ids
-                .insert(user_id.clone(), AnyId::BlobId(obj.id.clone()));
+            response.push_created_id(user_id.clone(), AnyId::BlobId(obj.id.clone()));
         }
     }
 }
