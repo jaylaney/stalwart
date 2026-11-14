@@ -1,6 +1,12 @@
 # Zero-access calendar: JMAP calendars and browser sign-in (release 6) design spec
 
-Date: 2026-11-13. Status: revision 1, for approval. Scope: release 6 of the
+Date: 2026-11-13. Status: revision 2, for approval. Revision 2 answers
+Jay's codex review of revision 1
+(`2026-11-13-zero-access-jmap-calendars-design-codex-review.md`): the vault
+assertion on every write of the token record (4.3 to 4.5, 4.7, 9, 10;
+finding 1), how a refresh reads the record against the grant's progress
+(4.5, 9; finding 2), and the event-level matcher of unexpanded text
+queries (6.4, 9.2, 11; finding 3). Scope: release 6 of the
 zero-access fork (jaylaney/stalwart), GitHub issue #22, milestone "Release 6:
 JMAP calendars and web client", item 4 of release 1 spec section 1.2. Base:
 the fork on upstream Stalwart v1.0.3 with release 7 merged (PR #84; code
@@ -317,9 +323,18 @@ keyed grant. It holds:
   - at most four **access entries**: the secret's tag, the MK wrap and
     the access token's expiry.
 
-Every write is conditional on the record's previous bytes. Every write
-also drops entries that have expired, grants that hold no live entry and
-grants that no longer exist.
+Every write is conditional on two things in one batch: the record's
+previous bytes, and the vault record's stored bytes as the writer read
+them, at the revision under which it obtained MK. `vault_commit_store`
+makes the same kind of assertion for its own companion records
+(`crates/common/src/auth/vault.rs`). A writer whose vault assertion fails
+stops. It never stores its wraps under a newer revision. A vault write
+and a token-record write therefore order strictly: either the vault
+write's batch deletes what the other wrote, or the other's assertion
+fails.
+
+Every write also drops entries that have expired, grants that hold no
+live entry and grants that no longer exist.
 
 The record is not an authority for login. Upstream decides whether a
 token is valid, bound to the vault revision as today (release 1; Jay kept
@@ -345,7 +360,9 @@ are upstream's code and the rest is the secret. The code exchange splits
 them, runs upstream's checks (client, redirect URI, PKCE, single use), takes
 and deletes the hand-off entry, opens MK, and after `issue_new_grant` has
 created the grant writes the grant's first refresh entry (generation 0)
-and access entry, each under a fresh token secret.
+and access entry, each under a fresh token secret. That write carries
+the vault assertion of 4.3: the exchange reads the vault record,
+requires its revision to equal the hand-off's, and asserts those bytes.
 
 The entry is stored rather than kept in process memory so that the two
 requests may land on different nodes of a cluster.
@@ -369,7 +386,10 @@ Rules:
   not open, or one made under a vault revision that is no longer
   current, answers `invalid_grant`.
 - If the record write fails after the grant was created, the grant is
-  deleted and the answer is a server error. The client signs in again.
+  deleted. A failed vault assertion answers `invalid_grant`: the
+  password or another vault fact changed while the sign-in was in
+  flight. Any other failure answers a server error. Either way no wrap
+  is stored and the client signs in again.
 - A consent that is refused deletes the entry.
 
 ### 4.5 Refresh
@@ -387,12 +407,21 @@ The fork follows that state machine without changing it:
    `rotate_oauth_grant` runs before the fork decides anything. A
    superseded token therefore revokes the grant exactly as upstream
    revokes it, and the grant's entries are removed with it.
-2. If the rotation issues, the fork reads the record, finds the refresh
-   entry of the presented generation and opens MK with the presented
-   secret. If the entry is missing or does not open, the fork deletes
-   the grant and answers `invalid_grant`. Upstream accepted the token,
-   but its keys cannot be carried forward, and a keyed grant never
-   becomes a keyless one.
+2. If the rotation issues, the fork reads the record and classifies the
+   presented generation against the grant's refresh entries. The grant's
+   rotation and the record's write are separate operations, so the
+   record can have moved on since upstream accepted this request.
+   - **Its entry is there and opens** with the presented secret. The
+     fork has MK and goes on.
+   - **Its entry is gone and the record holds a higher generation of the
+     grant.** A newer refresh finished while this one was in flight.
+     Upstream accepted this request before that happened, so it is not a
+     replay, but its generation is now superseded. The fork answers
+     `invalid_grant` and changes nothing: it does not delete the grant
+     and it writes no entry.
+   - **Anything else**: the grant has no entry, or the presented entry
+     does not open. The keys are lost. The fork deletes the grant and
+     answers `invalid_grant`. A keyed grant never becomes a keyless one.
 3. For the generation it issues, the fork needs that generation's refresh
    secret. If the presented entry already holds a sealed next secret,
    this is a retry or a concurrent duplicate: the fork opens it and
@@ -401,14 +430,25 @@ The fork follows that state machine without changing it:
 4. It draws a new access secret and writes its entry. Upstream's access
    token is a new string on every response, so a retry adds an entry.
 5. The record keeps the presented generation and the next one and drops
-   lower ones. The write is conditional; on a lost race the fork rereads
-   and repeats from step 3.
-6. If the write cannot be made, the answer is a server error. The grant
-   has rotated, so the client's retry is upstream's retry case and step 3
-   finds or creates the same entry.
+   lower ones. The write carries the two assertions of 4.3.
+   - If the vault assertion fails, the fork stops and answers
+     `invalid_grant`.
+   - If the record assertion fails, the fork rereads the record and
+     classifies again from step 2, with the record as it now is. It
+     writes only if the presented generation's entry is still in that
+     record. MK held in memory from the earlier read is never used to
+     put back an entry the record no longer holds.
+6. If the write cannot be made for another reason, the answer is a
+   server error. The grant has rotated, so the client's retry is
+   upstream's retry case and step 3 finds or creates the same entry.
 
 A superseded refresh token therefore opens nothing: its entry and the
-link that led from it are gone once its successor is used.
+link that led from it are gone once its successor is used, and no later
+write restores them.
+
+The second case of step 2 is more lenient than upstream is to the same
+request arriving a moment later, which upstream calls a replay and
+answers by revoking the grant.
 
 A token of a key account that carries no secret belongs to a keyless
 grant (4.8) and refreshes as upstream does, with no record access.
@@ -452,7 +492,9 @@ token is a keyed CalDAV request.
   app-password creation or revocation, second-factor change, and the
   self-check's repair therefore ends every browser session of the account
   and destroys its wraps in one commit. Upstream refuses the tokens by
-  credential version, as before.
+  credential version, as before. A sign-in or a refresh that obtained MK
+  before the vault write cannot store a wrap after it, because its vault
+  assertion fails (4.3).
 - **A grant deletion.** `delete_oauth_grant` removes the grant's entries.
   Upstream calls it on revocation (`/auth/revoke`), a replayed refresh
   token, a client mismatch and when it prunes idle or excess grants.
@@ -556,6 +598,12 @@ A JMAP update may change placement and content together. The pipeline
 runs it as one update: it resolves the contexts of the old and new
 calendars, seals the new tree in the target domain, and commits once. A
 JMAP create may name several calendars under the same rule.
+
+The commit asserts the context of every old and every new calendar. A
+create checks UID uniqueness under the lease in every calendar it names.
+A placement change checks each destination as CalDAV's `COPY` and `MOVE`
+check it. The CalDAV helpers serve one calendar per request, so the
+pipeline's entry points take the full set.
 
 ### 5.3 One commit per object
 
@@ -668,12 +716,18 @@ CalDAV read does.
   - **Expanded form.** Upstream's code, given the view. Every condition
     must match in the instance's own component, and the filter is a
     single condition or a flat AND, as upstream requires.
-  - **Unexpanded form.** Each text condition is evaluated on its own
-    and matches an event when any component of the event matches it.
-    The resulting sets are combined by the filter's AND, OR and NOT, as
-    upstream combines the index's results. This is what the index
-    answers for an ordinary account, where one document holds all of an
-    event's components.
+  - **Unexpanded form.** The event is matched as the one document the
+    index would hold for it. For each field, the matcher takes the
+    values of every scheduling component of the event, in the order
+    `build_calendar_document` indexes them
+    (`crates/groupware/src/calendar/index.rs`), joined as the index
+    joins successive values of a field, and tokenizes the result. A
+    condition is evaluated against those event-level tokens. A
+    condition of several words therefore matches when one word is in
+    the master and another in an override, and a phrase matches
+    wherever the index would find it. The conditions' results are
+    combined by the filter's AND, OR and NOT, as upstream combines the
+    index's results.
 
   A key account has no calendar search documents, so nothing is indexed.
   A text query without a time range opens every event of the account.
@@ -875,7 +929,11 @@ to CalDAV ones.
   entry does not open under another account, grant, kind or generation.
 - The record codec, its pruning and its caps.
 - The refresh steps of 4.5 against upstream's rotation outcomes: rotate,
-  retry, replay, a lost race on the record, a failed write then a retry.
+  retry, replay, the three classifications of step 2, a lost race on the
+  record that finds the presented generation superseded, a failed vault
+  assertion, a failed write then a retry.
+- The unexpanded matcher against the index's document for the same
+  event: several words split across components, phrases, each field.
 - The hand-off: taken once, expired, wrong secret, stale vault revision.
 - D11's alert replacement and the property rulings of 6.5.
 - The error mapping of section 8.
@@ -898,6 +956,22 @@ trace modules. They reserve the fixture families `token-*` and
   token staying keyless; a Bearer login to IMAP and POP3 with a keyed
   token still refused; the code exchange with no hand-off answering
   `invalid_grant`.
+
+  Test hooks (test mode only) pause the code exchange after its last
+  version check, and a refresh before its record read and before its
+  write. With them:
+  - a password change, and separately a recovery, committed during a
+    paused first issuance makes the issuance fail and leaves no record
+    and no grant;
+  - the same for a paused refresh, and for a refresh that retries a
+    lost record write across the vault change;
+  - a retry of generation `g`, paused while its successor `g+1`
+    completes a refresh, answers `invalid_grant`, leaves the grant and
+    the successor's tokens usable, and leaves generation `g` absent
+    from the record. This runs twice: with the retry paused before it
+    reads the record, and with it paused after it opened MK;
+  - a refresh whose current entry was removed from the record deletes
+    the grant.
 - **`jmap_calendar::events`**: create, update, destroy, placement and
   linking, recurrence edits through synthetic ids and overrides, tasks,
   the property rulings, per-object commits with one failing object, and
@@ -907,9 +981,14 @@ trace modules. They reserve the fixture families `token-*` and
   default, colour before and after sharing (D14), a grantee's own entry.
 - **`jmap_calendar::query`**: the filters and sorts, expansion, text
   matching in both forms with AND, OR and NOT, privacy for a grantee.
-  One case runs the same text queries against a key account and an
-  ordinary account that hold the same events, once the ordinary
-  account's index is current, and requires the same events from both.
+  One case puts the same events into a key account and an ordinary
+  account, among them recurring events whose master and override hold
+  different words in the same field. Once the ordinary account's index
+  is current it runs the same unexpanded queries against both: single
+  words, several words in one condition, quoted phrases, and the
+  negation of each. Both accounts must return the same events. The
+  expanded form of each query must still match on the selected
+  occurrence's own component.
 - **`jmap_calendar::scheduling`**: invitations, updates, cancellations
   and replies to and from a key account, an outside address and a plain
   local account; `sendSchedulingMessages` false and absent; pins and
@@ -967,7 +1046,11 @@ At least these faults, each caught by a named test:
 - the JMAP create skips the lease; skips sealing; calls
   `ItipMessages::queue`; drops the token pairs on update; drops the
   display name; skips the SEQUENCE floor;
-- a text filter reads the stored tree instead of the view;
+- a text filter reads the stored tree instead of the view; the
+  unexpanded matcher reads one component at a time;
+- a token-record write omits the vault assertion; a superseded refresh
+  generation deletes the grant; a lost record race puts back a pruned
+  entry;
 - the drain hook is removed;
 - a notification destroy is let through;
 - the wrap's associated data omits the grant id; the vault commit leaves
@@ -1005,7 +1088,10 @@ manual gate, as the native-client checklists are.
 63. The token record yields keys only to a token upstream accepted, for
     the grant, kind and generation the entry was made for, under the
     current vault revision.
-64. Every vault write deletes the token record in its own batch.
+64. Every vault write deletes the token record in its own batch, and
+    every write of the token record asserts, in its own batch, the vault
+    record it was made under. No wrap made under one vault revision is
+    stored under a later one.
 65. A token that carries a secret is served with keys or refused.
 66. A scheduling inbox item is never listed, opened or destroyed through
     JMAP.
@@ -1083,7 +1169,15 @@ Silent dependencies:
 - D12 relies on `InstanceTextFilter` covering every text condition of
   `CalendarEventFilter`, and on its fields being the ones
   `build_calendar_document` indexes. A condition or a field upstream
-  adds must be classified.
+  adds must be classified. The unexpanded matcher mirrors three things:
+  that function's choice and order of values, the joining of a field's
+  successive values in `IndexDocument::index_text`
+  (`crates/store/src/search/document.rs`), and the planning of a text
+  condition in `crates/store/src/search/leaf.rs`. A change to any of
+  them needs a re-read; the two-account query case of 9.2 is the guard.
+- 4.5 relies on upstream's retry case returning without a registry
+  write and on no lock being held from the rotation to the fork's
+  record write. The classification in step 2 exists for that gap.
 - 4.6 relies on the HTTP layer being the only caller that reads the
   token record. `authenticate_with_keys` is shared with the IMAP and
   POP3 logins.
@@ -1119,8 +1213,9 @@ Calls of this spec that change what a user or an operator sees:
   destroyed from an "authorized apps" screen is refused at once, but its
   wrap stays at rest until the next sweep. The alternative is a hook in
   upstream's registry writer.
-- **4.5**: a refresh whose key entry is missing ends the grant, so the
-  person signs in again.
+- **4.5**: a refresh whose key entry is lost ends the grant, so the
+  person signs in again. A refresh that only lost a race to a newer one
+  is refused without ending the grant.
 - **D12**: text search of a key account's events matches whole words
   and their stems, as an ordinary account's does.
 
