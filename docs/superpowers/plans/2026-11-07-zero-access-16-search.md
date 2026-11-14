@@ -7,6 +7,11 @@ implements spec revision 34. Its retry and trusted-reference contracts supersede
 this plan's original attempt-count skip rule and cross-method reference handling.
 Historical task and mutation evidence below remains tied to its recorded source.
 
+Review-file references in this plan are historical. The
+[evidence index](2026-11-14-zero-access-search-evidence-index.md) links their
+immutable originals, including the named rounds below. Current validation status
+lives in the [qualification report](2026-11-07-zero-access-plan16-outcome.md).
+
 **Plan revision 27** (2026-11-09) aligns Task 19's mutation catchers with the
 implemented paths. The residual-resolution unit directly tests M9; the metadata
 wire refusal remains a separate control. M27 injects a raw index-blob timeout
@@ -134,7 +139,7 @@ Every node in a cluster still uses the same account cap, and the one-third boot
 refusal is unchanged. Task 2's defaults and boundary assertions below follow this
 ruling. All other execution routing and mechanisms remain as reviewed.
 
-**Plan revision 2** (2026-11-07) answers the Codex review of revision 1 (`2026-11-07-zero-access-16-search-codex-review.md`, findings PL1 to PL19, all accepted) and carries Jay's rulings on B1 and E1 (spec revision 19). Each change cites its finding where it is made:
+**Plan revision 2** (2026-11-07) answers the Codex review of revision 1 ([archived Codex plan review](https://github.com/jaylaney/stalwart/blob/67ca91226429945f6f1dd3a24feaaa354e889ed2/docs/superpowers/plans/2026-11-07-zero-access-16-search-codex-review.md), findings PL1 to PL19, all accepted) and carries Jay's rulings on B1 and E1 (spec revision 19). Each change cites its finding where it is made:
 - PL1, Task 6: every index blob is checked against the BLAKE3 hash its descriptor names before it is parsed (`fetch_verified`, `LossClass::Hash`), so a stripped hidden section is loss, not silence.
 - PL2, Task 3: `current_thread` is the latest assignment, independent of revision rows, so a pass's later insert threads through what it staged earlier.
 - PL3, Tasks 10 and 11: one validated acquisition, `za_view`, takes the cache, the read guard and the content, validates exactly what it returns, and holds no guard while a pass or reload runs; Task 11's snapshot is that view (`ViewNeed::Map`); Task 10 moves to `opus`.
@@ -155,7 +160,7 @@ ruling. All other execution routing and mechanisms remain as reviewed.
 - PL18, Global Constraints: the compile gate fails with a nonzero status.
 - PL19, Task 1: the accessor calls upstream's `AccountIndexer::index_document`, and the record stop uses `R = 304`.
 
-**Plan revision 3** (2026-11-07) answers the Fable review of revision 2 (`2026-11-07-zero-access-16-search-fable-review.md`, FR1 to FR14, all accepted; it found every PL closed):
+**Plan revision 3** (2026-11-07) answers the Fable review of revision 2 ([archived Fable plan review](https://github.com/jaylaney/stalwart/blob/67ca91226429945f6f1dd3a24feaaa354e889ed2/docs/superpowers/plans/2026-11-07-zero-access-16-search-fable-review.md), FR1 to FR14, all accepted; it found every PL closed):
 - FR1, Tasks 8 and 14: a cursor's or a marker's completion is the pass's own `bookkeeping` decision (`CursorStep::{None, Advanced, Exhausted}`), written as a manifest-only pass even when nothing was staged or consumed, so a rebuild cursor whose remaining messages vanished, a finished content cursor and a finished reconciliation all leave the manifest on an idle account.
 - FR2, Task 14: revision 3 narrowed the reconciliation's `inserted_in_log` to the records the pass would consume; revision 4 reverts that (FS3): the state FR2 described cannot arise, since a reconciliation starts only from a read that met the marker, whose record is empty, so every retained record with content is above `indexed_to`; the narrowing re-opened a retained insert skipped as loss.
 - FR3, Tasks 11 and 13: a Thread method's state is the view's cache counter, never a store read after the cache (plan call D13, spec wording).
@@ -239,7 +244,7 @@ The fork diff stays narrow: new modules (`crates/store/src/za_search/`, `crates/
 
 **Tech Stack:** Rust 2024 on upstream Stalwart v1.0.3 (fork `0.4.0-beta.1`; internal crates `1.0.3`, `vault` `0.16.25`); upstream's `index_document`, `SearchQuery`/`Leaf` planner and forward-index codec (`crates/store/src/search/`), `MessageSortKeys`, `ThreadFields`, `commit_batch`, `hold_blob`/`BlobHold`, the blob codec; `vault::keys::{aad, seal, open}` (XChaCha20-Poly1305), HKDF sub-keys; `blake3` 1.8 (keyed tag, manifest hash; already a `store` dependency); `zstd` 0.14 through `store::write::compress::compress`; `roaring` bitmaps; tokio `RwLock`/`Mutex`; the `tests` crate harness (`TestServer`, `TestServerBuilder`, `SmtpConnection` on LMTP 11200, `za_unlock`, the JMAP and IMAP clients, `assert_is_empty`).
 
-**Spec:** `docs/superpowers/specs/2026-11-04-zero-access-search-design.md`, revision 23 (2026-11-08): revision 18 (`9d3457e4d`), approved by Jay on 2026-11-07 after Codex approved it under the stopping rule (`24fbd54d8`, the Codex review file beside the spec; the Fable review file `2026-11-04-zero-access-search-design-fable-review.md` holds the four Fable rounds), with the wording corrections of plan calls B1 and E1 (revision 19, ruled 2026-11-07) and D13 (revision 20, ruled 2026-11-08), the provisional benchmark memory defaults (revision 21, ruled 2026-11-08), the fixed publishing target for every accepted padding minimum (revision 22), and the write-response view and acknowledged-write floor (revision 23). Cited by section number; where this plan and the spec disagree, the spec wins. The release 1, mail (release 3), invitations, key pinning, sharing and iMIP specs bind where it cites them. Project rules: `CLAUDE.md`, `docs/README-dev.md`, the plan 3 outcome note (gate inventory), the 1.0 upgrade outcome note (hook inventory, conflict ledger), the plan 13 outcome note (the mail rulings R0–R63).
+**Spec:** `docs/superpowers/specs/2026-11-04-zero-access-search-design.md`, revision 23 (2026-11-08): revision 18 (`9d3457e4d`), approved by Jay on 2026-11-07 after Codex approved it under the stopping rule (`24fbd54d8`, [the archived Codex design review](https://github.com/jaylaney/stalwart/blob/67ca91226429945f6f1dd3a24feaaa354e889ed2/docs/superpowers/specs/2026-11-04-zero-access-search-design-codex-review.md); the [archived Fable design review](https://github.com/jaylaney/stalwart/blob/67ca91226429945f6f1dd3a24feaaa354e889ed2/docs/superpowers/specs/2026-11-04-zero-access-search-design-fable-review.md) holds the four Fable rounds), with the wording corrections of plan calls B1 and E1 (revision 19, ruled 2026-11-07) and D13 (revision 20, ruled 2026-11-08), the provisional benchmark memory defaults (revision 21, ruled 2026-11-08), the fixed publishing target for every accepted padding minimum (revision 22), and the write-response view and acknowledged-write floor (revision 23). Cited by section number; where this plan and the spec disagree, the spec wins. The release 1, mail (release 3), invitations, key pinning, sharing and iMIP specs bind where it cites them. Project rules: `CLAUDE.md`, `docs/README-dev.md`, the plan 3 outcome note (gate inventory), the 1.0 upgrade outcome note (hook inventory, conflict ledger), the plan 13 outcome note (the mail rulings R0–R63).
 
 ## Spec questions / plan calls
 

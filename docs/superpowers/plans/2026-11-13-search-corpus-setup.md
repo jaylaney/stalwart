@@ -1,5 +1,8 @@
 # Differential Corpus Setup Implementation Plan
 
+Historical execution plan. For current results and remaining gaps, see the
+[search qualification report](2026-11-07-zero-access-plan16-outcome.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. Steps use checkbox syntax for tracking.
 
 **Goal:** Speed up the complete differential corpus setup and expose its progress.
@@ -70,7 +73,7 @@ batch, and report progress without changing awaited work.
 ### Task 2: Validate, independently review, and publish
 
 **Files:**
-- Create: `docs/superpowers/plans/2026-11-13-search-corpus-setup-outcome.md`.
+- Create: [corpus setup outcome (archived after merge)](https://github.com/jaylaney/stalwart/blob/67ca91226429945f6f1dd3a24feaaa354e889ed2/docs/superpowers/plans/2026-11-13-search-corpus-setup-outcome.md).
 - Update this plan's completion boxes and the ignored task ledger.
 
 **Interfaces:**

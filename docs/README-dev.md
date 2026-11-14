@@ -46,18 +46,12 @@ loads the index into memory while the account is in use.
 
 The server reads these environment variables at startup and logs the effective
 configuration. Unset, malformed and zero values use the defaults. The memory
-and account sizing defaults remain provisional after the unoptimized system
-benchmarks on `f4eb2ecc` and `4dde13ade`. The final-head post-H7 wire query
-served and internal model coverage was verified for all 30,000 delivered
-IDs. Its cold query refused and its linked repeat was skipped. The
-final-head format repeat measured all 15,000 default messages and retained
-the existing positions and compression decisions. The later
-[cold-start qualification](superpowers/plans/2026-11-10-zero-access-search-cold-start-outcome.md)
-records a successful optimized Rust cache-eviction pair at 30,000 messages
-and the subsequent teardown panic. The separate optimized OSS run passed
-the 30,000-message process-restart gate with matching public censuses.
-Those qualification runs retained all fourteen original settings. The PR 84
-correction removes the transient skip threshold; the sizing defaults stay unchanged.
+and account sizing defaults remain provisional. The
+[search qualification report](superpowers/plans/2026-11-07-zero-access-plan16-outcome.md)
+keeps the historical unoptimized sizing, optimized cold-cache and shipping restart
+results separate, with their source revisions and unresolved anomalies. Those
+experiments do not qualify the defaults for all workloads. PR 84 retired the
+transient skip threshold; the sizing defaults stay unchanged.
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
@@ -156,17 +150,13 @@ upstream per-account reindex task (`Task::AccountMaintenance`, type `Reindex`).
 For a key account, the task resets the search index through its destroying
 marker so the next keyed request can rebuild.
 
-Run the ignored benchmarks by name in separate processes. Each creates its own test server. The
-[plan 16 outcome note](superpowers/plans/2026-11-07-zero-access-plan16-outcome.md)
-records the benchmark figures and qualification status. The final matrix
-includes four carried rows, completed Phases A and B, and a warning-free
-shipping release build on the source-identical review-record head. The
-first full SMTP attempt exited 101. The permitted exact retry passed
-once, with the cause still unknown. Docker automation and directory
-verification await CI. Both final-head benchmarks completed, bringing the
-matrix to 39 of 41 main rows accounted for locally. Remaining mutation checks,
-native clients, the separate fresh-store gate, networked-store timing
-and physical multi-node verification remain pending.
+Run the ignored benchmarks by name in separate processes. Each creates its own test server.
+The [plan 16 qualification report](superpowers/plans/2026-11-07-zero-access-plan16-outcome.md)
+records the final passing hosted workflows and the head-specific local evidence.
+Task 19 remains incomplete: mutation exceptions, native clients, networked-store
+timing, physical multi-node verification and provisional sizing remain open. The
+[evidence index](superpowers/plans/2026-11-14-zero-access-search-evidence-index.md)
+links the detailed historical reviews and execution reports.
 
 ```sh
 STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::search_bench::format -- --exact --ignored --nocapture

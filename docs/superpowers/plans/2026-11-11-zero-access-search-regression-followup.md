@@ -1,10 +1,13 @@
 # Search regression follow-up: M16, M23 and M48
 
+Historical execution plan. For current results and remaining gaps, see the
+[search qualification report](2026-11-07-zero-access-plan16-outcome.md).
+
 Date: 2026-11-11. Base: `bae62db6f08af27b1058c148a2fbe292f18635e9`,
 branch `release7-search`, plan 16 revision 27 / design revision 33.
 
 This follow-up adds normal regression tests for the three survivors recorded in
-the [final mutation report](2026-11-07-zero-access-16-search-mutations-final-review.md).
+the [final mutation report](https://github.com/jaylaney/stalwart/blob/67ca91226429945f6f1dd3a24feaaa354e889ed2/docs/superpowers/plans/2026-11-07-zero-access-16-search-mutations-final-review.md).
 The historical campaign results are unchanged. No deliberate faulty variant was
 prepared or executed in this follow-up; correct-code passes are not new mutation kills.
 
