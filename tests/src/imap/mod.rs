@@ -258,6 +258,7 @@ pub async fn imap_tests() {
     append::test(&mut imap, &mut imap_check, &test).await;
     search::test(&mut imap, &mut imap_check, &test).await;
     if key_accounts_mode() {
+        za_variants::search(&mut imap, &mut imap_check).await;
         za_variants::fetch(&mut imap, &mut imap_check).await;
     } else {
         fetch::test(&mut imap, &mut imap_check).await;

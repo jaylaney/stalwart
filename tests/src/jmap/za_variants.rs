@@ -123,10 +123,213 @@ fn account_by_id(test: &TestServer, account_id: u32) -> &Account {
         .unwrap_or_else(|| panic!("no test account with id {account_id}"))
 }
 
+fn date(timestamp: i64) -> String {
+    DateTime::from_timestamp(timestamp).to_rfc3339()
+}
+
+/// One message of the query corpus, as Email/get reads it with the owner's
+/// keys.
+struct CorpusMessage {
+    received_at: i64,
+    size: u64,
+    keywords: AHashSet<String>,
+    mailboxes: AHashSet<String>,
+    thread_id: String,
+}
+
+impl CorpusMessage {
+    /// 1.0 stores a keyword in lower case (`Keyword::other`), so the corpus
+    /// is matched case-insensitively.
+    fn has_keyword(&self, keyword: &str) -> bool {
+        self.keywords.contains(&keyword.to_ascii_lowercase())
+    }
+
+    fn thread_has_keyword(
+        &self,
+        corpus: &AHashMap<String, CorpusMessage>,
+        keyword: &str,
+        all: bool,
+    ) -> bool {
+        let mut members = corpus.values().filter(|m| m.thread_id == self.thread_id);
+        if all {
+            members.all(|m| m.has_keyword(keyword))
+        } else {
+            members.any(|m| m.has_keyword(keyword))
+        }
+    }
+}
+
+/// Every imported message, read independently of the metadata queries below.
+/// The query inventory must account for the complete cached document inventory;
+/// each Email/get chunk must return precisely its requested IDs.
+async fn load_corpus(test: &TestServer, account: &Account) -> AHashMap<String, CorpusMessage> {
+    let cached = test
+        .server
+        .get_cached_messages(account.id().document_id())
+        .await
+        .unwrap();
+    let documents = cached
+        .emails
+        .iter()
+        .map(|message| message.document_id())
+        .collect::<AHashSet<_>>();
+    // mail/query.rs::create selects 978 artwork records in 100 year groups.
+    assert_eq!(documents.len(), 978, "complete upstream query corpus");
+    let reply = email_query(
+        account,
+        None,
+        json!([{ "property": "receivedAt" }]),
+        json!({ "calculateTotal": true }),
+    )
+    .await;
+    let all = ids(&reply, "corpus inventory");
+    assert_eq!(all.len(), documents.len(), "{reply:?}");
+    assert_eq!(reply.0["methodResponses"][0][1]["total"], all.len());
+    assert_eq!(
+        all.iter()
+            .map(|id| Id::from_str(id).unwrap().document_id())
+            .collect::<AHashSet<_>>(),
+        documents,
+        "the query inventory must cover every imported document"
+    );
+
+    let mut corpus = AHashMap::default();
+    let mut message_ids = AHashSet::new();
+    let mut year_threads = AHashMap::default();
+    let mut thread_years = AHashMap::default();
+    for chunk in all.chunks(100) {
+        let reply = account
+            .jmap_method_call(
+                "Email/get",
+                json!({
+                    "accountId": account.id_string(),
+                    "ids": chunk,
+                    "properties": [
+                        "id", "receivedAt", "size", "keywords", "mailboxIds", "threadId",
+                        "messageId", "subject", "references",
+                    ],
+                }),
+            )
+            .await;
+        assert_eq!(reply.name_at(0), "Email/get", "{reply:?}");
+        assert_eq!(reply.not_found().count(), 0, "{reply:?}");
+        assert_eq!(reply.list().len(), chunk.len(), "{reply:?}");
+        assert_eq!(
+            reply
+                .list()
+                .iter()
+                .map(|email| email.text_field("id"))
+                .collect::<AHashSet<_>>(),
+            chunk.iter().map(String::as_str).collect::<AHashSet<_>>(),
+            "{reply:?}"
+        );
+        for item in reply.list() {
+            let keys = |field: &str| {
+                item[field]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<AHashSet<_>>()
+            };
+            let received_at = DateTime::parse_rfc3339(item.text_field("receivedAt"))
+                .unwrap()
+                .to_timestamp();
+            let thread_id = item.text_field("threadId").to_string();
+            // The fixture uses the artwork year for receivedAt, Subject,
+            // References and one mailbox. Independently validate the mapped
+            // partition: all of a year, and no other year, belongs to a thread.
+            assert_eq!(item["subject"], format!("Year {received_at}"));
+            assert_eq!(item["references"], json!([received_at.to_string()]));
+            assert_eq!(item["messageId"].as_array().unwrap().len(), 1);
+            assert!(message_ids.insert(item["messageId"][0].as_str().unwrap().to_string()));
+            if let Some(previous) = year_threads.insert(received_at, thread_id.clone()) {
+                assert_eq!(previous, thread_id, "split fixture year {received_at}");
+            }
+            if let Some(previous) = thread_years.insert(thread_id.clone(), received_at) {
+                assert_eq!(previous, received_at, "merged distinct fixture years");
+            }
+            let mailboxes = keys("mailboxIds");
+            assert!(mailboxes.contains(&Id::new(received_at as u64).to_string()));
+            assert_eq!(mailboxes.len(), 2);
+            assert!(
+                corpus
+                    .insert(
+                        item.text_field("id").to_string(),
+                        CorpusMessage {
+                            received_at,
+                            size: item["size"].as_u64().unwrap(),
+                            keywords: keys("keywords"),
+                            mailboxes,
+                            thread_id,
+                        },
+                    )
+                    .is_none(),
+                "duplicate corpus id: {item}"
+            );
+        }
+    }
+    assert_eq!(corpus.len(), all.len());
+    assert_eq!(message_ids.len(), all.len());
+    assert_eq!(year_threads.len(), 100);
+    assert_eq!(thread_years.len(), 100);
+    corpus
+}
+
+/// `Email/query` of `filter` (or none) sorted by `sort`, with
+/// `collapseThreads` and any extra arguments.
+async fn email_query(
+    account: &Account,
+    filter: Option<Value>,
+    sort: Value,
+    extra: Value,
+) -> JmapResponse {
+    let mut args = json!({ "accountId": account.id_string(), "sort": sort });
+    if let Some(filter) = filter {
+        args["filter"] = filter;
+    }
+    if let Value::Object(extra) = extra {
+        for (key, value) in extra {
+            args[key] = value;
+        }
+    }
+    account.jmap_method_call("Email/query", args).await
+}
+
+fn ids(reply: &JmapResponse, context: &str) -> Vec<String> {
+    assert_eq!(reply.name_at(0), "Email/query", "{context}: {reply:?}");
+    reply.ids().map(String::from).collect()
+}
+
+/// The receivedAt-only order is (arrival, document id); descending reverses
+/// that order. Collapse retains its first matching member of each mapped thread.
+fn received_order(
+    corpus: &AHashMap<String, CorpusMessage>,
+    mut matching: Vec<String>,
+    ascending: bool,
+    collapse: bool,
+) -> Vec<String> {
+    matching.sort_unstable_by_key(|id| {
+        (
+            corpus[id].received_at,
+            Id::from_str(id).unwrap().document_id(),
+        )
+    });
+    if !ascending {
+        matching.reverse();
+    }
+    if collapse {
+        let mut seen = AHashSet::new();
+        matching.retain(|id| seen.insert(corpus[id].thread_id.as_str()));
+    }
+    matching
+}
+
 /// `mail::query::test` in key mode: upstream's corpus, assertions and
 /// options, with the index made current by a keyed content request in place
-/// of the queue wait; a keyless token is refused on `Email/query` and
-/// `SearchSnippet/get` (release 7 spec 6.2).
+/// of the queue wait, plus the independent served-metadata corpus oracle.
+/// A keyless token is refused on `Email/query` and `SearchSnippet/get`
+/// (release 7 spec 6.2).
 pub async fn query(test: &TestServer) {
     println!("Running key-account Email Query tests...");
     let server = test.server.clone();
@@ -165,46 +368,14 @@ pub async fn query(test: &TestServer) {
         test.wait_for_tasks().await;
     }
     za_index_current(account).await;
-    let ids = account
-        .jmap_method_call("Email/query", json!({ "accountId": account.id_string() }))
-        .await;
-    assert_eq!(ids.name_at(0), "Email/query", "{ids:?}");
-    let ids = ids.ids().collect::<Vec<_>>();
-    let mut threads = AHashSet::new();
-    for chunk in ids.chunks(100) {
-        let reply = account
-            .jmap_method_call(
-                "Email/get",
-                json!({
-                    "accountId": account.id_string(),
-                    "ids": chunk,
-                    "properties": ["id", "threadId"],
-                }),
-            )
-            .await;
-        assert_eq!(reply.name_at(0), "Email/get", "{reply:?}");
-        assert_eq!(
-            reply
-                .list()
-                .iter()
-                .map(|email| email.text_field("id"))
-                .collect::<AHashSet<_>>(),
-            chunk.iter().copied().collect::<AHashSet<_>>(),
-            "{reply:?}"
-        );
-        threads.extend(
-            reply
-                .list()
-                .iter()
-                .map(|email| email.text_field("threadId").to_string()),
-        );
-    }
-    // MAX_THREADS in mail/query.rs. The cached rows hold singleton ids.
-    assert_eq!(threads.len(), 100);
+    let corpus = load_corpus(test, account).await;
+    query_refusals(account).await;
+    query_served(account, &corpus).await;
+    query_options(account, &corpus).await;
 
     upstream_query::query(&client, true).await;
     upstream_query::query_options(&client).await;
-    keyless_query_refused(test, account, ids[0]).await;
+    keyless_query_refused(test, account, corpus.keys().next().unwrap()).await;
 
     println!("Deleting all messages...");
     let mut request = client.build();
@@ -220,6 +391,348 @@ pub async fn query(test: &TestServer) {
 
     test.destroy_all_mailboxes(account).await;
     test.assert_is_empty().await;
+}
+
+/// `cc` is still an unsupported sort for both account modes. The content
+/// filters and other content sorts are served and checked by upstream's cases.
+async fn query_refusals(account: &Account) {
+    let reply = email_query(account, None, json!([{ "property": "cc" }]), json!({})).await;
+    assert_eq!(reply.name_at(0), "error", "{reply:?}");
+    assert_eq!(reply.error_type_at(0), Some("unsupportedSort"), "{reply:?}");
+    assert!(
+        reply.0["methodResponses"][0][1]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("cc")),
+        "{reply:?}"
+    );
+}
+
+/// The served filters, each against the corpus, in `receivedAt` order, and
+/// the served sorts.
+async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage>) {
+    type Matcher<'a> = Box<dyn Fn(&CorpusMessage) -> bool + 'a>;
+    let and = |conditions: Vec<Value>| json!({ "operator": "AND", "conditions": conditions });
+    let has = |keyword: &'static str| move |m: &CorpusMessage| m.has_keyword(keyword);
+    let mailbox_1768 = Id::new(1768u64).to_string();
+    let others = [1991u64, 1870, 2011, 1951, 1902, 1808, 1963]
+        .into_iter()
+        .map(|id| Id::new(id).to_string())
+        .collect::<Vec<_>>();
+    let mut sizes = corpus.values().map(|m| m.size).collect::<Vec<_>>();
+    sizes.sort_unstable();
+    let median = sizes[sizes.len() / 2];
+    let some_thread = corpus
+        .values()
+        .find(|m| m.received_at == 1768)
+        .unwrap()
+        .thread_id
+        .clone();
+    assert!(
+        corpus
+            .values()
+            .filter(|m| m.thread_id == some_thread)
+            .count()
+            > 1
+    );
+
+    let cases: Vec<(&str, Value, Matcher<'_>)> = vec![
+        (
+            "after",
+            json!({ "after": date(1850) }),
+            Box::new(|m| m.received_at >= 1850),
+        ),
+        (
+            "before",
+            json!({ "before": date(1800) }),
+            Box::new(|m| m.received_at < 1800),
+        ),
+        (
+            "after and before",
+            and(vec![
+                json!({ "after": date(1970) }),
+                json!({ "before": date(1972) }),
+            ]),
+            Box::new(|m| (1970..1972).contains(&m.received_at)),
+        ),
+        (
+            "hasKeyword",
+            json!({ "hasKeyword": "N0" }),
+            Box::new(has("N0")),
+        ),
+        (
+            "notKeyword",
+            json!({ "notKeyword": "artist" }),
+            Box::new(|m| !m.has_keyword("artist")),
+        ),
+        (
+            "NOT hasKeyword",
+            json!({ "operator": "NOT", "conditions": [{ "hasKeyword": "N0" }] }),
+            Box::new(|m| !m.has_keyword("N0")),
+        ),
+        (
+            "OR hasKeyword",
+            json!({ "operator": "OR", "conditions": [
+                { "hasKeyword": "Bronze" }, { "hasKeyword": "artist" }
+            ] }),
+            Box::new(|m| m.has_keyword("Bronze") || m.has_keyword("artist")),
+        ),
+        (
+            "inMailbox",
+            json!({ "inMailbox": &mailbox_1768 }),
+            Box::new({
+                let mailbox = mailbox_1768.clone();
+                move |m| m.mailboxes.contains(&mailbox)
+            }),
+        ),
+        (
+            "inMailboxOtherThan",
+            json!({ "inMailboxOtherThan": &others }),
+            Box::new({
+                let others = others.clone();
+                move |m| m.mailboxes.iter().any(|id| !others.contains(id))
+            }),
+        ),
+        (
+            "allInThreadHaveKeyword",
+            and(vec![
+                json!({ "allInThreadHaveKeyword": "N" }),
+                json!({ "before": date(1800) }),
+            ]),
+            Box::new(|m| m.thread_has_keyword(corpus, "N", true) && m.received_at < 1800),
+        ),
+        (
+            "noneInThreadHaveKeyword",
+            and(vec![
+                json!({ "noneInThreadHaveKeyword": "N" }),
+                json!({ "after": date(1995) }),
+            ]),
+            Box::new(|m| !m.thread_has_keyword(corpus, "N", false) && m.received_at >= 1995),
+        ),
+        (
+            "someInThreadHaveKeyword",
+            and(vec![
+                json!({ "someInThreadHaveKeyword": "Bronze" }),
+                json!({ "before": date(1878) }),
+            ]),
+            Box::new(|m| m.thread_has_keyword(corpus, "Bronze", false) && m.received_at < 1878),
+        ),
+        (
+            "hasKeyword in a range",
+            and(vec![
+                json!({ "after": date(1786) }),
+                json!({ "before": date(1840) }),
+                json!({ "hasKeyword": "T" }),
+            ]),
+            Box::new(|m| m.has_keyword("T") && (1786..1840).contains(&m.received_at)),
+        ),
+        (
+            "minSize",
+            json!({ "minSize": median }),
+            Box::new(move |m| m.size >= median),
+        ),
+        (
+            "maxSize",
+            json!({ "maxSize": median }),
+            Box::new(move |m| m.size < median),
+        ),
+        (
+            "inThread",
+            json!({ "inThread": &some_thread }),
+            Box::new({
+                let thread = some_thread.clone();
+                move |m| m.thread_id == thread
+            }),
+        ),
+    ];
+    for (name, filter, matches) in cases {
+        let mut expected = corpus
+            .iter()
+            .filter(|(_, m)| matches(m))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert!(!expected.is_empty(), "{name}: the corpus has no match");
+        for ascending in [true, false] {
+            for collapse in [false, true] {
+                let reply = email_query(
+                    account,
+                    Some(filter.clone()),
+                    json!([{ "property": "receivedAt", "isAscending": ascending }]),
+                    json!({ "collapseThreads": collapse }),
+                )
+                .await;
+                assert_eq!(
+                    ids(&reply, name),
+                    received_order(corpus, expected.clone(), ascending, collapse),
+                    "{name} (ascending {ascending}, collapseThreads {collapse})"
+                );
+            }
+        }
+    }
+
+    // Size comes from Email/get, independently of the query's sort result.
+    let all = corpus.keys().cloned().collect::<AHashSet<_>>();
+    for ascending in [true, false] {
+        let reply = email_query(
+            account,
+            None,
+            json!([{ "property": "size", "isAscending": ascending }]),
+            json!({}),
+        )
+        .await;
+        let found = ids(&reply, "size");
+        assert_eq!(found.len(), corpus.len());
+        assert_eq!(found.iter().cloned().collect::<AHashSet<_>>(), all);
+        assert!(
+            found.windows(2).all(|w| if ascending {
+                corpus[&w[0]].size <= corpus[&w[1]].size
+            } else {
+                corpus[&w[0]].size >= corpus[&w[1]].size
+            }),
+            "not in size order (ascending {ascending})"
+        );
+    }
+
+    // Thread-keyword ordering uses all mapped members, while hasKeyword
+    // uses the message itself. Both are checked against readback metadata.
+    for (thread_property, keyword, filter, from, to, match_all) in [
+        (
+            "allInThreadHaveKeyword",
+            "N",
+            json!({ "before": date(1800) }),
+            0,
+            1800,
+            true,
+        ),
+        (
+            "someInThreadHaveKeyword",
+            "Bronze",
+            and(vec![
+                json!({ "after": date(1875) }),
+                json!({ "before": date(1878) }),
+            ]),
+            1875,
+            1878,
+            false,
+        ),
+    ] {
+        let expected = corpus
+            .iter()
+            .filter(|(_, m)| (from..to).contains(&m.received_at))
+            .map(|(id, _)| id.clone())
+            .collect::<AHashSet<_>>();
+        for ascending in [true, false] {
+            for property in [thread_property, "hasKeyword"] {
+                let reply = email_query(
+                    account,
+                    Some(filter.clone()),
+                    json!([
+                        { "property": property, "keyword": keyword, "isAscending": ascending },
+                        { "property": "receivedAt" },
+                    ]),
+                    json!({}),
+                )
+                .await;
+                let found = ids(&reply, property);
+                assert_eq!(found.len(), expected.len());
+                assert_eq!(
+                    found.iter().cloned().collect::<AHashSet<_>>(),
+                    expected,
+                    "{property} {keyword} membership"
+                );
+                let order = found
+                    .iter()
+                    .map(|id| {
+                        let m = &corpus[id];
+                        let has = if property == "hasKeyword" {
+                            m.has_keyword(keyword)
+                        } else {
+                            m.thread_has_keyword(corpus, keyword, match_all)
+                        };
+                        // Ascending sorts false before true; receivedAt is
+                        // ascending in both directions of the first comparator.
+                        (if ascending { has } else { !has }, m.received_at)
+                    })
+                    .collect::<Vec<_>>();
+                assert!(order.iter().any(|(has, _)| *has));
+                assert!(order.iter().any(|(has, _)| !*has));
+                assert!(
+                    order.windows(2).all(|w| w[0] <= w[1]),
+                    "{property} {keyword} (ascending {ascending}): not in keyword/receivedAt order"
+                );
+            }
+        }
+    }
+}
+
+/// Upstream's paging options (position, anchor, anchor offset, limit, with
+/// and without collapsed threads), on the `receivedAt` order.
+async fn query_options(account: &Account, corpus: &AHashMap<String, CorpusMessage>) {
+    let sort = json!([{ "property": "receivedAt" }]);
+    for collapse in [false, true] {
+        let all = received_order(corpus, corpus.keys().cloned().collect(), true, collapse);
+        let complete = email_query(
+            account,
+            None,
+            sort.clone(),
+            json!({ "collapseThreads": collapse }),
+        )
+        .await;
+        assert_eq!(ids(&complete, "all"), all, "collapseThreads {collapse}");
+        let len = all.len();
+        // The mapped corpus has 100 threads; keep an interior anchor in
+        // collapsed mode and the old position-100 anchor without collapse.
+        let anchor = if collapse { len / 2 } else { 100 };
+        let slice = |from: usize, to: usize| all[from..to.min(len)].to_vec();
+        let cases = [
+            (json!({ "position": 0, "limit": 10 }), slice(0, 10)),
+            (json!({ "position": 10, "limit": 10 }), slice(10, 20)),
+            (json!({ "position": -10 }), slice(len - 10, len)),
+            (
+                json!({ "position": -20, "limit": 10 }),
+                slice(len - 20, len - 10),
+            ),
+            (json!({ "position": -100000, "limit": 1 }), slice(0, 1)),
+            (
+                json!({ "position": -1, "limit": 100000 }),
+                slice(len - 1, len),
+            ),
+            (
+                json!({ "anchor": &all[anchor], "anchorOffset": 0, "limit": 10 }),
+                slice(anchor, anchor + 10),
+            ),
+            (
+                json!({ "anchor": &all[anchor], "anchorOffset": 10, "limit": 10 }),
+                slice(anchor + 10, anchor + 20),
+            ),
+            (
+                json!({ "anchor": &all[anchor], "anchorOffset": -10, "limit": 10 }),
+                slice(anchor - 10, anchor),
+            ),
+            (
+                json!({ "anchor": &all[0], "anchorOffset": -10, "limit": 10 }),
+                slice(0, 10),
+            ),
+            (
+                json!({ "anchor": &all[len - 1], "anchorOffset": 10, "limit": 10 }),
+                vec![],
+            ),
+            (
+                json!({ "anchor": &all[len - 3], "anchorOffset": 0 }),
+                slice(len - 3, len),
+            ),
+        ];
+        for (options, expected) in cases {
+            let mut extra = options.clone();
+            extra["collapseThreads"] = json!(collapse);
+            let reply = email_query(account, None, sort.clone(), extra).await;
+            assert_eq!(
+                ids(&reply, &options.to_string()),
+                expected,
+                "{options} (collapseThreads {collapse})"
+            );
+        }
+    }
 }
 
 async fn keyless_query_refused(test: &TestServer, account: &Account, email_id: &str) {

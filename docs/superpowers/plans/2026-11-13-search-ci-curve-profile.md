@@ -32,7 +32,7 @@
 - [x] Independent reviewer checks the exact configuration diff and preservation contract.
 - [x] Root checks formatting/diff, captures compile flags/source/binary identity, runs vault units and the whole canonical ZA suite serially.
 - [x] Compare the first-Get fixed-stage output with the retained default-profile control; label the local observation and its limits.
-- [ ] Obtain hosted evidence and either promote the candidate with the supporting measurements or reject it without claiming a fix.
+- [x] Obtain hosted evidence and either promote the candidate with the supporting measurements or reject it without claiming a fix.
 
 ### Task 2: Integrate and qualify the combined branch
 

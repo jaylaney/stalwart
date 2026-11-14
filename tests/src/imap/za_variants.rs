@@ -34,6 +34,157 @@ async fn assert_noperm(imap: &mut ImapConnection, command: &str) {
         .assert_contains(ZA_MAIL_KEYLESS);
 }
 
+/// The `RFC822.SIZE` of every message of the selected mailbox, by UID.
+async fn sizes_by_uid(imap: &mut ImapConnection) -> Vec<(u32, u64)> {
+    imap.send("UID FETCH 1:* (UID RFC822.SIZE)").await;
+    let mut sizes = imap
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .iter()
+        .filter(|line| line.starts_with("* ") && line.contains(" FETCH ("))
+        .map(|line| {
+            let field = |name: &str| {
+                line.split_once(name)
+                    .and_then(|(_, rest)| rest.split([' ', ')']).next())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("no {name} in {line}"))
+            };
+            (field("UID ") as u32, field("RFC822.SIZE "))
+        })
+        .collect::<Vec<_>>();
+    sizes.sort_unstable();
+    sizes
+}
+
+/// Metadata checks retained alongside `search::test` in key mode. Both
+/// connections still select `append::test`'s ten-message INBOX; UID `n`
+/// carries `Flag_00<n - 1>`. The upstream body covers content searches,
+/// while this supplement preserves the flag-only SAVE and metadata sorts.
+pub async fn search(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
+    println!("Running key-account metadata SEARCH tests...");
+
+    // Save the flag-only matches (UIDs 1, 3, 4 and 6), independently of
+    // the content-based saved search exercised by the upstream body.
+    imap_check
+        .send(concat!(
+            "UID SEARCH RETURN (SAVE ALL) OR OR KEYWORD Flag_000 KEYWORD Flag_002 ",
+            "OR KEYWORD Flag_003 KEYWORD Flag_005"
+        ))
+        .await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("1,3:4,6");
+    imap_check.send("UID SEARCH NOT $").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* SEARCH 2 5 7 8 9 10");
+
+    // Of UIDs 1 to 6 only 1 and 2 are between 1000 and 2000 bytes.
+    imap_check
+        .send("UID SEARCH $ LARGER 1000 SMALLER 2000")
+        .await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* SEARCH 1");
+    imap_check.send("UID SEARCH RETURN (MIN MAX) NOT $").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("MIN 2 MAX 10");
+
+    // ALL retains every saved flag match even when MIN and MAX are requested.
+    imap_check
+        .send(concat!(
+            "UID SEARCH RETURN (SAVE MIN MAX ALL) OR OR KEYWORD Flag_000 KEYWORD Flag_002 ",
+            "OR KEYWORD Flag_003 KEYWORD Flag_005"
+        ))
+        .await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("MIN 1 MAX 6 ALL 1,3:4,6");
+    imap_check.send("UID SEARCH $").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* SEARCH 1 3 4 6");
+
+    // COUNT retains every saved flag match even when MIN is requested.
+    imap_check
+        .send(concat!(
+            "UID SEARCH RETURN (SAVE MIN COUNT) OR OR KEYWORD Flag_000 KEYWORD Flag_002 ",
+            "OR KEYWORD Flag_003 KEYWORD Flag_005"
+        ))
+        .await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("COUNT 4 MIN 1");
+    imap_check.send("UID SEARCH $").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* SEARCH 1 3 4 6");
+
+    // Saved search with only MIN and MAX saves the extremes.
+    imap_check
+        .send(concat!(
+            "UID SEARCH RETURN (SAVE MIN MAX) OR OR KEYWORD Flag_000 KEYWORD Flag_002 ",
+            "OR KEYWORD Flag_003 KEYWORD Flag_005"
+        ))
+        .await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("MIN 1 MAX 6");
+    imap_check.send("UID SEARCH $").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* SEARCH 1 6");
+
+    // Saved search with MIN and MAX on a single match saves it once.
+    imap_check
+        .send("UID SEARCH RETURN (SAVE MIN MAX) UID 8")
+        .await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("MIN 8 MAX 8");
+    imap_check.send("UID SEARCH $").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* SEARCH 8");
+
+    // SIZE has an independent FETCH oracle, including the UID tie-break.
+    let mut by_size = sizes_by_uid(imap_check).await;
+    assert_eq!(
+        by_size.iter().map(|(uid, _)| *uid).collect::<Vec<_>>(),
+        (1..=10).collect::<Vec<_>>(),
+        "Missing or duplicate RFC822.SIZE results: {by_size:?}"
+    );
+    by_size.sort_by_key(|(uid, size)| (*size, *uid));
+    let expected = by_size
+        .iter()
+        .map(|(uid, _)| uid.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    imap_check.send("UID SORT (SIZE) UTF-8 ALL").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals(&format!("* SORT {expected}"));
+    imap.send("UID SORT RETURN (COUNT ALL) (ARRIVAL) UTF-8 ALL")
+        .await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("COUNT 10 ALL");
+}
+
 /// `fetch::test` in key mode, with sealed-row attachment flags.
 pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     println!("Running key-account FETCH tests...");

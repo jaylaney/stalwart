@@ -1,8 +1,9 @@
 # Search CI curve-profile candidate outcome
 
-Status: controlled candidate, not yet accepted as the hosted timeout fix or
-integrated into PR84. The owner authorized the evidence-backed correction and
-PR85 integration, with PR84 held out of main until combined CI is green.
+Status: accepted as the test-build timeout correction after the hosted comparison.
+It is not yet integrated into remote PR84. The owner authorized the correction and
+PR85 integration, with PR84 held out of main until combined CI is green. The
+remaining hosted failure is the separate test-retention Inventory gate.
 
 ## Evidence motivating the experiment
 
@@ -16,8 +17,8 @@ retained in the ignored diagnostic ledger's hosted directory.
 The separate instrumented local control passed its complete ZA suite and
 recorded 537.977 ms for the request, including 515.672 ms for 400 metadata opens.
 Source inspection places the scalar-multiplication implementation in the pinned
-curve25519-dalek dependency. Hosted control run 43497837906 remains in progress;
-its server-stage log is not yet available to the API.
+curve25519-dalek dependency. The completed hosted comparison below now isolates
+the slow stage and confirms the candidate against the unchanged request deadline.
 
 ## Candidate and local validation
 
@@ -66,23 +67,63 @@ Control frozen integration binary:
 Candidate frozen integration binary:
 `6bb6f1b653071e087b9388489a686113a33df85a0e468eefab9c02bf3370b2f7`.
 
-## Remaining decision and integration
+## Hosted comparison and acceptance
 
 The [instrumented hosted control](https://github.com/jaylaney/stalwart/actions/runs/43497837906)
 at `5dfc21fc5abbe34ca930e27f6cbffdf90a5ad4c0` and the
 [hosted candidate](https://github.com/jaylaney/stalwart/actions/runs/43509717996)
-at `ef6e0470512693b9a4930cd610e77e38ea05c0dc` remain pending. Their source differs
-only in the test-package override and documentation. The candidate was published
-to run this controlled comparison; no hosted success or fix is claimed yet.
+at `ef6e0470512693b9a4930cd610e77e38ea05c0dc` have finished. Their source differs
+only in the test-package override and documentation.
 
-Compare the unchanged selected request's stage counters and timings on the hosted
-runner. Local acceleration alone is not hosted attribution, and this test-profile
-setting is not a shipping performance change. If the hosted
-comparison does not support this correction, reconsider it without changing the
-deadline or shrinking the workload.
+The control's two default-store attempts and first filesystem attempt timed out
+at the selected request. At unwind, they had completed 251, 251 and 253 of the
+400 metadata opens, with another open in flight; metadata opening accounted for
+5.617, 5.628 and 5.643 seconds inclusive. Snapshot work took about 0.2 ms and the
+completed metadata batch read about 1.4-1.6 ms. These sampled unwind durations
+include work after client expiry; they are not final request-completion timings.
+The control job was cancelled during its filesystem retry, so that fourth
+invocation supplies no result.
 
-After acceptance, integrate the correction/diagnostic and reviewed PR85 onto
-release7-search, review their combined fixture edits and run the required checks
+The candidate passed both complete ZA storage-mode steps on their first attempts:
+
+| Hosted mode | First keyed 400-message Get | 400 completed metadata opens | Full suite |
+| --- | ---: | ---: | ---: |
+| Default | 557.602 ms | 514.318 ms | 3,166.02 s |
+| Filesystem blob store | 553.350 ms | 509.592 ms | 3,028.26 s |
+
+Both observations were claimed, with all 400 opens and required stages completed,
+no partial/in-flight required work, all 183 comparison forms, the documented K
+deviation and cleanup. The same five-second client remains in use. This supports
+the scoped curve test-profile correction; it is not a shipping performance claim.
+
+The candidate run is still **not green overall**: its Inventory gate reports one
+deleted libtest and 24 absent function-step records. The affected coverage-net
+steps and Coverage gate passed. The net's SMTP queue retry case failed its first
+attempt and passed the existing retry. Unit/upstream/protocol suites, product,
+fresh-store restart and independent CalDAV jobs passed. The inventory failures
+include exact moves, approved changed expectations and metadata checks that need
+restoration; see `2026-11-14-search-ci-retention.md`. No baseline/gate/coverage
+threshold reduction is accepted.
+
+## Combined preparation and remaining integration
+
+The local combined tree includes reviewed PR85 `cc5de6a55`, the correction and
+diagnostics, and the cadence assertion that checks production reservation before
+the manual test gate. A fresh independent review approved the entire follow-up
+diff against `9b1df344b` without findings. Its complete canonical ZA suite passed
+in 1,428.06 s (wrapper 1,433.69 s): 3,258 pairs, all 68 batches, all 183 forms,
+expected K deviation, G5 and cleanup. Setup took 373.166 s and the selected Get
+283.610 ms. The build passed in 208.64 s; formatting/diff checks passed.
+
+All nine recorded source hashes and the frozen binary were reverified against the
+run. Binary SHA-256: `7c198fa52de45be4a7d31938a2dc1f260326ed5fe31b9ea2606ddc4881d327ff`.
+Log SHA-256: `a67c63f53e2ffb39b8c7d03b21f803a74c0af30ce4be6671f3917e675ee47d67`.
+These results precede the new protocol metadata-retention restorations and do not
+qualify those pending edits. Combined evidence is retained in the sibling ignored
+ledger `2026-11-13-pr84-search-ci-combined`.
+
+Finish the retention repair and its independent review/validation, then integrate
+the correction/diagnostic and PR85 onto release7-search and run the required CI
 on the exact combined source. PR84 remains open until that CI is green.
 
 Evidence is retained under `.superpowers/sdd/2026-11-13-search-ci-curve-profile/`
