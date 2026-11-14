@@ -1093,9 +1093,10 @@ the grant, default alerts included. A grantee that set none therefore
 writes the defaults the owner had at the grant, and the owner's later
 changes do not reach it.
 
-The `/set` answer reports `useDefaultAlerts: false` and does not carry
-the alerts the server wrote. A client learns them from its next
-`CalendarEvent/get`. Returning them would need an insertion in upstream's
+The `/set` answer is upstream's, computed from the object as the client
+sent it. It does not carry the alerts the server wrote, and it reports
+`useDefaultAlerts: false` only when the client omitted the flag. A client
+learns the alerts from its next `CalendarEvent/get`. Returning them would need an insertion in upstream's
 server-set code, which the release does not make (Jay, 2026-11-14).
 
 Destroying an event runs the pipeline's delete with the event's domain,
