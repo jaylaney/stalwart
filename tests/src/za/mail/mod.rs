@@ -56,6 +56,7 @@ pub mod gates;
 pub mod gateway;
 pub mod index;
 pub mod login;
+pub mod pass_load;
 pub mod reads;
 pub mod search;
 pub mod threads;

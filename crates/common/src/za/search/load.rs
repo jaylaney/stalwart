@@ -1280,9 +1280,12 @@ impl Server {
         if crate::za::test_hooks::take_search_manifest_fail(account_id) {
             return Err(LoadFailure::Transient(TransientClass::Store).into());
         }
-        self.za_search_read_manifest_raw(account_id)
-            .await
-            .map_err(|_| LoadFailure::Transient(TransientClass::Store))?
+        let raw = self.za_search_read_manifest_raw(account_id).await;
+        // Park a captured store result, so tests can publish a newer resident
+        // head while this read is still pending at its caller.
+        #[cfg(feature = "test_mode")]
+        crate::za::test_hooks::search_manifest_read_pause_point(account_id).await;
+        raw.map_err(|_| LoadFailure::Transient(TransientClass::Store))?
             .map(
                 |bytes| match classify_manifest(ManifestValue::decode(&bytes, key)) {
                     Ok(value) => Ok((bytes, value)),
@@ -1373,17 +1376,22 @@ impl Server {
         keys: &SessionKeys,
         observed: &mut Option<Manifest>,
     ) -> Result<(Vec<u8>, Manifest), ObservedLoadError> {
-        {
+        let warm = observe_wait!(entry.account_id, MapIndexWait, entry.index.read()).is_some();
+        if warm {
+            let (bytes, manifest) = self
+                .read_search_index_manifest(entry.account_id, keys.swk())
+                .await?;
+            // Manifest I/O must not pin the resident head. Validate against
+            // the current head after the read before accepting its observation
+            // or letting a superseded snapshot settle the retry episode.
             let guard = observe_wait!(entry.account_id, MapIndexWait, entry.index.read());
-            if let Some(index) = guard.as_ref() {
-                let (bytes, manifest) = self
-                    .read_search_index_manifest(entry.account_id, keys.swk())
-                    .await?;
+            if guard
+                .as_ref()
+                .is_some_and(|index| index.manifest_bytes_hash == manifest_hash(&bytes))
+            {
                 *observed = Some(manifest.clone());
                 entry.defer_open_retry(&manifest, std::time::Instant::now());
-                if index.manifest_bytes_hash == manifest_hash(&bytes) {
-                    return Ok((bytes, manifest));
-                }
+                return Ok((bytes, manifest));
             }
         }
         // Never apply the snapshot obtained before waiting for exclusive access:

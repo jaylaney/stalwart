@@ -858,8 +858,15 @@ pub async fn propfind_admitted_pause_point(reader: u32) {
 // Zero-access search hooks. The consuming tasks place the pause points and flags.
 pub static SEARCH_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_REQUIRED_LOAD_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SEARCH_MANIFEST_READ_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static SEARCH_CONTENT_WAIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
+pub fn set_search_manifest_read_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SEARCH_MANIFEST_READ_PAUSE, pause);
+}
+pub async fn search_manifest_read_pause_point(account_id: u32) {
+    wait(take_for(&SEARCH_MANIFEST_READ_PAUSE, account_id)).await;
+}
 pub fn set_search_required_load_pause(pause: Option<Arc<Pause>>) {
     set_slot(&SEARCH_REQUIRED_LOAD_PAUSE, pause);
 }

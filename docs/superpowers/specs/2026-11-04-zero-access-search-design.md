@@ -1,6 +1,10 @@
 # Zero-access mail: search and threads (release 7) design spec
 
-Date: 2026-11-04. Status: revision 37 (2026-11-13), PR 84 retry settlement follow-up.
+Date: 2026-11-04. Status: revision 38 (2026-11-14), PR 84 loader lock follow-up.
+Revision 38 keeps a warm pass's manifest read outside the shared index guard,
+then compares the authenticated observation with the resident head under a newly
+acquired guard. A mismatching or missing resident head takes the existing freshly
+authenticated exclusive reload path. Stored formats and retry semantics are unchanged.
 Revision 37 distinguishes caller deadline expiry from an observed backend fault,
 preserves the current failure through its own acknowledged abort metadata write,
 and adds bounded backend/operation classification to the existing safe abort trace.
@@ -1237,7 +1241,12 @@ retain their existing availability policy.
 The pass lock serializes admission **before** required Thread loading. An unchanged
 authenticated resident head is usable under a shared index guard: a pinned served
 view must not prevent a new pass from reaching its publication/swap boundary merely
-because admission wants to inspect that same head. A cold or moved target that needs
+because admission wants to inspect that same head. The warm manifest read itself
+does not hold that guard. After the read, the pass reacquires shared access and
+compares against the current resident head before accepting the observation or
+settling its retry basis; a mismatch after a resident change during I/O invalidates
+the shortcut.
+A cold or moved target that needs
 exclusive installation is authenticated again after obtaining the write guard, so a
 read-to-write transition cannot apply a stale observation. During a delay, callers
 share at most one authenticated manifest observation per second on the resident

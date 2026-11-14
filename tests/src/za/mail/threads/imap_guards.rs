@@ -65,9 +65,18 @@ pub(super) async fn test(test: &mut TestServer) {
     .await;
     run_search_pass(test, key.id().document_id(), key.secret()).await;
 
-    metadata_without_map(test, &key, root_id, reply_id).await;
+    for with_keys in [true, false] {
+        metadata_without_map(test, &key, root_id, reply_id, with_keys).await;
+    }
     metadata_saved_search(test, &key).await;
-    for kind in [OutputKind::Rows, OutputKind::Empty, OutputKind::Vanished] {
+    for kind in [
+        OutputKind::Rows,
+        OutputKind::Saved,
+        OutputKind::Limited,
+        OutputKind::Changed,
+        OutputKind::Empty,
+        OutputKind::Vanished,
+    ] {
         fetch_releases_map_before_output(test, &key, root_id, reply_id, kind).await;
     }
     test.destroy_all_mailboxes(&key).await;
@@ -112,14 +121,20 @@ async fn session<T: SessionStream>(
     test: &TestServer,
     key: &Account,
     stream: T,
+    with_keys: bool,
 ) -> (Arc<SessionData<T>>, Arc<SelectedMailbox>) {
     let account_id = key.id().document_id();
-    let keys = za_unlock(test, account_id, key.secret()).await;
+    let access_token = AccessToken::from_permissions(account_id, []);
+    let access_token = if with_keys {
+        access_token.with_session_keys(za_unlock(test, account_id, key.secret()).await)
+    } else {
+        access_token
+    };
     let cache = test.server.get_cached_messages(account_id).await.unwrap();
     let (_, stream_tx) = tokio::io::split(stream);
     let data = Arc::new(SessionData {
         account_id,
-        access_token: AccessToken::from_permissions(account_id, []).with_session_keys(keys),
+        access_token,
         server: test.server.clone(),
         session_id: 0,
         mailboxes: Default::default(),
@@ -141,8 +156,18 @@ async fn session<T: SessionStream>(
     (data, mailbox)
 }
 
-async fn metadata_without_map(test: &TestServer, key: &Account, root: u32, reply: u32) {
-    let (data, mailbox) = session(test, key, NullIo::default()).await;
+async fn metadata_without_map(
+    test: &TestServer,
+    key: &Account,
+    root: u32,
+    reply: u32,
+    with_keys: bool,
+) {
+    // An owner's connection opened before provisioning can remain keyless.
+    // Its metadata commands keep working, but it must not expose singleton
+    // identities or content when the validated map cannot be read.
+    let (data, mailbox) = session(test, key, NullIo::default(), with_keys).await;
+    let identity_refusal = if with_keys { "UNAVAILABLE" } else { "NOPERM" };
     for (sort, identity) in [
         (
             None,
@@ -175,7 +200,7 @@ async fn metadata_without_map(test: &TestServer, key: &Account, root: u32, reply
         ),
     ] {
         // Removing metadata's no-map fast path must make this request fail.
-        // The following identity request must still encounter the unavailable map.
+        // Identity requests must still require keys and a validated map.
         let _failure = ManifestFailure::arm(key.id().document_id());
         let (response, _) = data
             .search(
@@ -213,10 +238,10 @@ async fn metadata_without_map(test: &TestServer, key: &Account, root: u32, reply
                 Instant::now(),
             )
             .await
-            .expect_err("identity SEARCH must refuse the unavailable map");
+            .expect_err("identity SEARCH must require keys and an available map");
         assert_eq!(
             error.value_as_str(trc::Key::Code),
-            Some("UNAVAILABLE"),
+            Some(identity_refusal),
             "{error:?}"
         );
     }
@@ -228,17 +253,73 @@ async fn metadata_without_map(test: &TestServer, key: &Account, root: u32, reply
                 algorithm: thread::Algorithm::References,
                 filter: vec![search::Filter::All],
             },
-            mailbox,
+            mailbox.clone(),
             true,
             Instant::now(),
         )
         .await
-        .expect_err("THREAD grouping must refuse the unavailable map");
+        .expect_err("THREAD grouping must require keys and an available map");
     assert_eq!(
         error.value_as_str(trc::Key::Code),
-        Some("UNAVAILABLE"),
+        Some(identity_refusal),
         "{error:?}"
     );
+    if !with_keys {
+        for (filter, sort) in [
+            (vec![search::Filter::Body("root".into())], None),
+            (
+                vec![search::Filter::All],
+                Some(vec![search::Comparator {
+                    sort: search::Sort::Subject,
+                    ascending: true,
+                }]),
+            ),
+        ] {
+            let error = data
+                .search(
+                    search::Arguments {
+                        tag: "keyless-content".into(),
+                        is_esearch: false,
+                        sort,
+                        result_options: vec![],
+                        filter,
+                    },
+                    mailbox.clone(),
+                    None,
+                    None,
+                    true,
+                    100,
+                    Instant::now(),
+                )
+                .await
+                .expect_err("keyless content SEARCH/SORT must still refuse");
+            assert_eq!(error.value_as_str(trc::Key::Code), Some("CANNOT"));
+        }
+        for attribute in [fetch::Attribute::ObjectId, fetch::Attribute::Body] {
+            let error = data
+                .fetch(
+                    fetch::Arguments {
+                        tag: "keyless-fetch".into(),
+                        sequence_set: Sequence::number(1),
+                        attributes: vec![attribute],
+                        changed_since: None,
+                        include_vanished: false,
+                    },
+                    mailbox.clone(),
+                    None,
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    100,
+                    Instant::now(),
+                )
+                .await
+                .expect_err("keyless FETCH must refuse identities and content");
+            assert_eq!(error.value_as_str(trc::Key::Code), Some("NOPERM"));
+        }
+    }
 }
 
 struct ManifestFailure;
@@ -259,6 +340,9 @@ impl Drop for ManifestFailure {
 #[derive(Clone, Copy, Debug)]
 enum OutputKind {
     Rows,
+    Saved,
+    Limited,
+    Changed,
     Empty,
     Vanished,
 }
@@ -272,11 +356,49 @@ async fn fetch_releases_map_before_output(
 ) {
     let account_id = key.id().document_id();
     let output = OutputPause::new();
-    let (data, mailbox) = session(test, key, PausedOutput(output.0.clone())).await;
+    let (data, mailbox) = session(test, key, PausedOutput(output.0.clone()), true).await;
     let rows = mailbox.view.lock().live_rows_by_uid();
+    let root_uid = rows.iter().find(|row| row.id == root).unwrap().uid;
     let reply_uid = rows.iter().find(|row| row.id == reply).unwrap().uid;
+    assert_eq!((root_uid, reply_uid), (1, 2));
+    let sequence_set = match kind {
+        OutputKind::Saved => {
+            // Populate $ through the real SEARCH SAVE path. It selects the
+            // root alone, so reusing the default reply or all rows is visible.
+            let (results_tx, _results_rx) = tokio::sync::watch::channel(Arc::new(Vec::new()));
+            data.search(
+                search::Arguments {
+                    tag: "save-root".into(),
+                    is_esearch: false,
+                    sort: None,
+                    result_options: vec![search::ResultOption::Save],
+                    filter: vec![search::Filter::Sequence(Sequence::number(1), true)],
+                },
+                mailbox.clone(),
+                Some(results_tx),
+                None,
+                true,
+                100,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+            Sequence::SavedSearch
+        }
+        OutputKind::Limited | OutputKind::Changed => Sequence::range(Some(1), Some(2)),
+        _ => Sequence::number(reply_uid),
+    };
     let changed_since = match kind {
-        OutputKind::Rows => None,
+        OutputKind::Rows | OutputKind::Saved | OutputKind::Limited => None,
+        OutputKind::Changed => {
+            let cache = test.server.get_cached_messages(account_id).await.unwrap();
+            let root_change = cache.email_by_id(&root).unwrap().change_id();
+            let reply_change = cache.email_by_id(&reply).unwrap().change_id();
+            assert!(root_change < reply_change);
+            // The two deliveries have distinct commits. Select both UIDs but
+            // return only the later reply, not merely any nonempty result.
+            Some(reply_change)
+        }
         OutputKind::Empty => Some(u64::MAX),
         OutputKind::Vanished => {
             pop3_delete(test, key, reply).await;
@@ -288,7 +410,7 @@ async fn fetch_releases_map_before_output(
         data.fetch(
             fetch::Arguments {
                 tag: "paused".into(),
-                sequence_set: Sequence::number(reply_uid),
+                sequence_set,
                 attributes: vec![fetch::Attribute::ObjectId],
                 changed_since,
                 include_vanished: matches!(kind, OutputKind::Vanished),
@@ -300,7 +422,11 @@ async fn fetch_releases_map_before_output(
             false,
             matches!(kind, OutputKind::Empty),
             false,
-            100,
+            if matches!(kind, OutputKind::Limited) {
+                1
+            } else {
+                100
+            },
             Instant::now(),
         )
         .await
@@ -356,21 +482,53 @@ async fn fetch_releases_map_before_output(
     );
 
     output.release();
-    tokio::time::timeout(DEADLINE, fetch)
+    let status = tokio::time::timeout(DEADLINE, fetch)
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(status.rtype, ResponseType::Ok, "{kind:?}: {status:?}");
+    let status = status.into_bytes();
+    let status = String::from_utf8_lossy(&status);
     let bytes = output.0.bytes.lock().unwrap();
     let response = String::from_utf8_lossy(&bytes);
-    match kind {
-        OutputKind::Rows => assert!(
-            response.contains(&format!(
-                "EMAILID {} THREADID {}",
+    let returned = response
+        .lines()
+        .filter(|line| line.contains(" FETCH ("))
+        .map(|line| {
+            let field = |name: &str| {
+                line.split_once(name)
+                    .unwrap_or_else(|| panic!("missing {name} in {line}"))
+                    .1
+                    .split([' ', ')'])
+                    .next()
+                    .unwrap()
+                    .to_string()
+            };
+            (field("UID "), field("EMAILID "), field("THREADID "))
+        })
+        .collect::<Vec<_>>();
+    // Expected selection comes from the fixture, never the selection or map
+    // helpers being tested. Equality also rejects extra or duplicate FETCH rows.
+    let expected = match kind {
+        OutputKind::Saved => vec![(
+            "1".to_string(),
+            mapped(root, root),
+            Id::from(root).to_string(),
+        )],
+        OutputKind::Rows | OutputKind::Limited | OutputKind::Changed => {
+            vec![(
+                "2".to_string(),
                 mapped(root, reply),
-                Id::from(root)
-            )),
-            "{response}"
-        ),
+                Id::from(root).to_string(),
+            )]
+        }
+        OutputKind::Empty | OutputKind::Vanished => vec![],
+    };
+    assert_eq!(returned, expected, "{kind:?}: {response}");
+    match kind {
+        OutputKind::Rows | OutputKind::Saved => {}
+        OutputKind::Limited => assert!(status.contains("[MESSAGELIMIT 1 2]"), "{status}"),
+        OutputKind::Changed => assert!(response.contains("MODSEQ ("), "{response}"),
         OutputKind::Empty => assert!(response.contains("HIGHESTMODSEQ"), "{response}"),
         OutputKind::Vanished => assert!(
             response.contains(&format!("VANISHED (EARLIER) {reply_uid}")),

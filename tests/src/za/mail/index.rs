@@ -253,6 +253,7 @@ pub async fn pr84_retry_followup_tests(test: &mut TestServer) {
     use store::{Deserialize, write::serialize::RawValue};
     use types::field::EmailField;
 
+    super::pass_load::test(test).await;
     println!("PR84 retry pacing, unchanged abort writes and malformed outer metadata");
     let key = key_mail_account(test, "keymail-pr84-retry@example.com", "Pr84-Retry!").await;
     let id = account_id(&key);
@@ -935,11 +936,34 @@ async fn case_pr84_abort_bookkeeping(test: &mut TestServer) {
             assert!(tasks.join_next().await.unwrap().unwrap_err().is_cancelled());
             swap.release.notify_one();
             let counts = counter.counts();
-            // The real 30-second probe delay remains; pin only the shared
-            // observation cadence to make the no-work assertion deterministic.
-            entry.set_retry_observation_for_test(schedule.1);
+            let blob_reads = za_search_blob_reads(id);
+            // Force a real authenticated observation of the committed abort.
+            // Suppressing observation would miss a settlement that retained the
+            // old basis and mistakes its own bookkeeping for remote progress.
+            let observation_started = Instant::now();
+            entry.set_retry_observation_for_test(observation_started);
             assert_eq!(deferred_retry(test, id, &keys, class).await, schedule.1);
-            assert_eq!(counter.counts(), counts);
+            let observed = entry.retry_schedule().unwrap();
+            assert_eq!(
+                (observed.0, observed.1),
+                (schedule.0, schedule.1),
+                "observing acknowledged bookkeeping must retain the primary class and deadline"
+            );
+            assert!(observed.2 > observation_started);
+            let observed_counts = counter.counts();
+            assert_eq!(
+                observed_counts[SearchPassWork::Manifest as usize],
+                counts[SearchPassWork::Manifest as usize] + 1,
+                "the due caller must authenticate exactly one manifest"
+            );
+            assert_eq!(
+                &observed_counts[1..],
+                &counts[1..],
+                "observing own-abort bookkeeping must not admit another probe"
+            );
+            assert_eq!(za_search_blob_reads(id), blob_reads);
+            assert_eq!(index(test, id).await, after);
+            assert_eq!(principal_blob_links(test, id).await, links);
             assert!(!index_holds(test, id, prefix).await);
             let events = traces.finish().await;
             let aborts = events
@@ -951,6 +975,25 @@ async fn case_pr84_abort_bookkeeping(test: &mut TestServer) {
             assert_eq!(aborts.len(), 1);
             assert_eq!(aborts[0].reason, class.as_str());
             if let Some(fault) = fault {
+                assert!(fault.was_consumed());
+            }
+            // A class/deadline snapshot alone cannot see a reset streak. Admit
+            // one more actual failure: it must retain the long delay, rather
+            // than restarting at one second after settlement or observation.
+            expire_open_retry(test, id);
+            let next_fault =
+                (!absent).then(|| SearchPassFaultOnce::new(id, SearchPassWork::Open, 2));
+            assert_eq!(
+                test.server.za_search_pass(id, &keys).await.unwrap(),
+                PassOutcome::Aborted(class)
+            );
+            let next_schedule = entry.retry_schedule().unwrap();
+            assert_eq!(next_schedule.0, class);
+            assert!(
+                next_schedule.1 > Instant::now() + Duration::from_secs(20),
+                "settlement and its authenticated observation must retain the failure streak"
+            );
+            if let Some(fault) = next_fault {
                 assert!(fault.was_consumed());
             }
             if absent {
@@ -1080,6 +1123,126 @@ async fn pr84_loader_deadlines(
             assert!(entry.retry_schedule().unwrap().1 > Instant::now() + Duration::from_secs(20));
         }
     }
+}
+
+async fn pr84_observer_timeout(
+    test: &TestServer,
+    id: u32,
+    keys: &std::sync::Arc<vault::session::SessionKeys>,
+    basis: &Manifest,
+) {
+    use crate::utils::za::PauseSlotGuard;
+    use common::za::{
+        search::trace::ZA_SEARCH_ABORTED,
+        test_hooks::{
+            Pause, SEARCH_RETRY_OBSERVATION_PAUSE, SearchPassCounter,
+            set_search_retry_observation_pause,
+        },
+    };
+
+    replace_retry_manifest(test, id, keys, basis).await;
+    simulate_restart(test, id).await;
+    let entry = test.server.za_search_entry(id, keys).await.unwrap();
+    seed_expired_retry(&entry, basis);
+    set_search_blob_fail_once(Some(id));
+    assert_eq!(
+        test.server.za_search_pass(id, keys).await.unwrap(),
+        PassOutcome::Aborted(TransientClass::BlobStore)
+    );
+    let schedule = entry.retry_schedule().unwrap();
+    assert!(schedule.1 > Instant::now() + Duration::from_secs(20));
+    let committed = index(test, id).await;
+    let blob_reads = za_search_blob_reads(id);
+    let counter = SearchPassCounter::start(id);
+    let traces = Traced::start(&[ZA_SEARCH_EVENT_TYPE]);
+    let _slot = PauseSlotGuard::new(&SEARCH_RETRY_OBSERVATION_PAUSE);
+    let pause = std::sync::Arc::new(Pause::new(id));
+    set_search_retry_observation_pause(Some(pause.clone()));
+    let server = test.server.clone();
+    let waiter_keys = keys.clone();
+    let waiter_entry = entry.clone();
+
+    // Only this request uses paused Tokio time. Server tasks and the retry
+    // episode's std::time::Instant clock remain on the real runtime/clock.
+    // No SearchWaitDeadline is installed: removing timeout_at from pass_wait
+    // must leave this request parked until the outer test watchdog fails.
+    let reserved = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let observation_started = Instant::now();
+                waiter_entry.set_retry_observation_for_test(observation_started);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                let mut request = Box::pin(server.za_search_ensure_current(
+                    id,
+                    &waiter_keys,
+                    deadline.into_std(),
+                ));
+                // A cooling entry skips Content loading; admission uses only
+                // try_read/try_lock before the observer pause. Its notification
+                // is the first pending await, so one poll must acknowledge it.
+                assert!(futures::poll!(&mut request).is_pending());
+                let arrived = pause.arrived.notified();
+                tokio::pin!(arrived);
+                assert!(
+                    futures::poll!(&mut arrived).is_ready(),
+                    "the actual observer timeout must be polled before advancing time"
+                );
+                assert!(waiter_entry.pass_lock.try_lock().is_err());
+                let reserved = waiter_entry.retry_schedule().unwrap();
+                assert_eq!((reserved.0, reserved.1), (schedule.0, schedule.1));
+                assert!(reserved.2 > observation_started);
+
+                tokio::time::advance(Duration::from_secs(60)).await;
+                let outcome = tokio::time::timeout(Duration::from_secs(1), &mut request)
+                    .await
+                    .expect("the original deadline must cancel the parked observer");
+                assert!(matches!(outcome, Err(Unavailable::NotCurrent)));
+                assert_eq!(
+                    waiter_entry.retry_schedule(),
+                    Some(reserved),
+                    "observer expiry must not clear or extend the historical retry"
+                );
+                assert!(
+                    waiter_entry.pass_lock.try_lock().is_ok(),
+                    "observer expiry must release the pass slot"
+                );
+                reserved
+            })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(entry.retry_schedule(), Some(reserved));
+    assert_eq!(
+        counter.counts(),
+        [0; 5],
+        "the expired observer must not continue its manifest read or admit a probe"
+    );
+    assert_eq!(za_search_blob_reads(id), blob_reads);
+    assert_eq!(index(test, id).await, committed);
+    // Authenticate the same head on the real runtime after cancellation. A
+    // timeout that silently corrupts the retry basis would admit work here.
+    entry.set_retry_observation_for_test(Instant::now());
+    assert_eq!(deferred_retry(test, id, keys, schedule.0).await, schedule.1);
+    assert_eq!(counter.counts(), [1, 0, 0, 0, 0]);
+    assert_eq!(za_search_blob_reads(id), blob_reads);
+    assert_eq!(index(test, id).await, committed);
+    assert!(
+        !traces
+            .finish()
+            .await
+            .iter()
+            .any(|event| event.account_id == Some(u64::from(id))
+                && event.details == ZA_SEARCH_ABORTED),
+        "caller expiry is not a new backend failure"
+    );
+    drop(counter);
+    replace_retry_manifest(test, id, keys, basis).await;
+    simulate_restart(test, id).await;
 }
 
 async fn pr84_winner_deadlines(
@@ -1218,6 +1381,7 @@ async fn case_pr84_account_pass(test: &mut TestServer) {
     let thread_hash = basis.thread_blobs[0].hash.clone();
     pr84_loader_deadlines(test, id, &keys, &basis, &thread_hash).await;
     pr84_winner_deadlines(test, id, &keys, &basis).await;
+    pr84_observer_timeout(test, id, &keys, &basis).await;
 
     // Each injected fault occurs after successful opens, including failure on
     // the second upload (a staged prefix) and the raw mailbox-enumeration Err.
