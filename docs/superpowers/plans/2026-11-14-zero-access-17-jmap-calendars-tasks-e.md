@@ -633,8 +633,8 @@ The outcome note's "Where things stand" gets one line per row: command, result, 
 
 One fresh, independent Astra reviewer (`gpt-6-astra`, `xhigh`), with a clean context and this brief:
 
-- **Read**: the spec, revision 6; the plan's header, the interface sheet and the six task files; `CLAUDE.md`; the outcome note (rulings, adjusted assertions, mutation table, residuals); and `git diff <base>...HEAD`, where the base is the branch's merge base with `origin/main`.
-- **Run nothing.** The matrix of Step 1 ran on this head; its results are in the outcome note.
+- **Read**: the spec, revision 6; the plan's header, the interface sheet and the six task files; `AGENTS.md` and `CLAUDE.md`; and `git diff <base>..<head>`, with both refs pinned and the base the branch's merge base with `origin/main`. The controller supplies the accepted contract and a validation-only extract of Step 1's commands, results and tested head. The initial brief includes no implementer report, prior finding list, task-review conclusions or outcome-note rulings.
+- **Run nothing.** The matrix of Step 1 ran on this head; its results are in the validation extract.
 - **Look for**:
   1. a place where JMAP and CalDAV differ for a key account in anything spec 3.2 does not list as an input, and a JMAP write that stores plaintext CalDAV would have sealed (3.6);
   2. each invariant 57 to 76 against the code that carries it (74 to 76 are revision 5's: D26, D28 and D29), with an input that would break it;
@@ -646,7 +646,7 @@ One fresh, independent Astra reviewer (`gpt-6-astra`, `xhigh`), with a clean con
   8. a test that would pass on wrong behaviour, an assertion changed without its spec section, a retained test function that no longer runs in its step;
   9. a use of the session rule that does not go through `za_session_binding`.
 - **Report every finding**, each with its file and line, what happens, the input or interleaving that shows it, a confidence (high, medium or low) and a severity (critical, important or minor). Do not filter, merge or rank findings away, and do not fix anything.
-- **Not findings**: what spec 3.3 and 3.4 record as accepted, and the residuals the outcome note lists. Inherited upstream behaviour is reported as such, in one line.
+- **Accepted contract**: spec 3.3 and 3.4 record accepted limits. Inherited upstream behaviour is reported as such, in one line. Report findings independently; the controller compares them with prior rulings and residuals during Step 4.
 
 - [ ] **Step 4: Adjudicate and fix**
 

@@ -1242,6 +1242,15 @@ The shared commit:
    the last successful commit's
    `last_change_id(owner, SyncCollection::Calendar)`.
 
+The invalidation builder contains only `AccessToken` entries. At the
+plan's base, `invalidate_caches` can return an error only while expanding
+`Role` entries (`crates/common/src/cache/invalidate.rs:471-489`); the
+AccessToken-only path ends in `Ok(())` (:532-536). Keep that input scope.
+Before adding a fallible postcommit operation, the pipeline result and
+JMAP consumers must preserve the committed change id and successful
+object answer under D3/D28. The existing precommit failure hook does not
+cover such a future postcommit failure.
+
 **Constraints:**
 - `za_delete_event` passes the `content` archive it was given to
   `delete_za_at`. For a key account that is the stored, sealed archive

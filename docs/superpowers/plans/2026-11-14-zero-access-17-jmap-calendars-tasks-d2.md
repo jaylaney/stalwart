@@ -289,7 +289,7 @@ Create, per object, in request order:
 2. U `:292-295`: `uid_privacy_conflict()`.
 3. U `:296-305`: `metadata.extract(MetadataPatches::for_create(), &mut object)`. `Err(e)`: `e`. `Ok(Some(_))`: `forbidden` with `crate::api::metadata::ZA_METADATA_REFUSED`.
 4. U `:1651-1661`: `client_values`, `has_version`, `omitted_flags`, from the object as the client sent it.
-5. F: `za_take_rulings(&mut object, true, None)`.
+5. F: `za_take_rulings(&mut object, true)`.
 6. U `:1662-1665`: `CalendarEvent::default()`, `CalendarEventContent::default()`, `JSCalendar::new_event()`.
 7. U `:1679-1693`: `update_calendar_event(cache, personal_id, PatchTarget { write: EventWrite::Create, id: None, is_origin: None }, object, &mut event, &mut content, &mut group)`.
 8. U `:1694-1698`: the calendar-count limit.
@@ -330,9 +330,9 @@ Interim arms (this task only): every update of the request is answered `not_upda
 | `useDefaultAlerts` true, false or null | true | taken out of the object; `use_default_alerts` is whether it was true |
 | `useDefaultAlerts` with any other value | true | left in the object; upstream answers "Invalid value." |
 | any of the five | false | untouched; upstream's instance validator refuses them with its own text |
-| a blob id for which `stored.is_none_or(\|(a, d)\| !blob_id.is_embedded_in(a, d))` | both | `invalidProperties`, property `links`, "Event attachments are not available for zero-access accounts." |
+| any link with a `blobId`, including one embedded in the event being updated | both | `invalidProperties`, property `links`, "Event attachments are not available for zero-access accounts." |
 
-Blob ids are found as upstream finds them: `BlobProperties::from_patch(object, <the predicate above>)` is not empty.
+Blob ids are found as upstream finds them: `BlobProperties::from_patch(object, |_| true)` is not empty.
 
 **Error mapping** (spec 8; the pipeline rows are `za_event_set_error`):
 
@@ -361,12 +361,12 @@ An object that fails does not undo the objects before it.
 
 `jmap` unit, in `calendar_event/set/za.rs`:
 - `rulings_cases`.
-  - For each of `isDraft`, `mayInviteSelf`, `mayInviteOthers`, `hideAttendees`: `true` with `base` true is `invalidProperties` whose `properties` is that one name; `false` and `null` pass, stay in the object, and give `use_default_alerts == false`; `true` with `base` false and `stored == Some((1, 2))` passes.
+  - For each of `isDraft`, `mayInviteSelf`, `mayInviteOthers`, `hideAttendees`: `true` with `base` true is `invalidProperties` whose `properties` is that one name; `false` and `null` pass, stay in the object, and give `use_default_alerts == false`; `true` with `base` false passes.
   - `useDefaultAlerts` as `true`, `false`, `null` with `base` true: taken out of the object; `use_default_alerts` is `true`, `false`, `false`.
   - `useDefaultAlerts` as the string "yes" with `base` true: passes and stays in the object.
   - `useDefaultAlerts: true` with `base` false: passes and stays in the object.
-  - A `links` entry whose `blobId` is an upload: `invalidProperties` on `links`, with `base` true and false, with and without `stored`.
-  - A `blobId` embedded in `(1, 2)`: accepted with `stored == Some((1, 2))`; refused with `Some((1, 3))` and with `None`.
+  - A `links` entry whose `blobId` is an upload: `invalidProperties` on `links`, with `base` true and false.
+  - A `blobId` embedded in `(1, 2)`: refused with `base` true and false, including when updating event 2 in account 1.
 - `event_set_error_table`, each answer compared as JSON.
   - `Forbidden(Context)`, `Forbidden(LinkedMove)`, `LinkedEvent`: `{ "type": "forbidden" }`.
   - `NotFound`: type `notFound`.
@@ -490,7 +490,7 @@ Per event of `updates.pending`:
 7. U `:536-552`: `plan_instances(&new_content.data, &mut response)`.
 8. U `:554-556`: `personal_id`, `ownership`, `was_origin`.
 9. U `:568-581`, owner's form for every caller: the tree is cloned, `previous_event` is taken out of `new_content`, `detach_iana_timezones`, `into_jscalendar`. (`:557-567` and `:576-579` are not taken: there are no preferences.)
-10. F: `za_take_rulings` on the base patch (`base` true, `stored` `Some((account_id, document_id))`), and on each instance update's patch (`base` false, same `stored`). The base patch's ruling is kept.
+10. F: `za_take_rulings` on the base patch (`base` true), and on each instance update's patch (`base` false). The base patch's ruling is kept.
 11. U `:582-598`: `tracked_before`, `track_instance_values`. `blob_properties` is empty.
 12. U `:599-609`, `:613-619`: `is_restricted`, `per_user_changes`, `before_group`. (`:610-612`: no hidden participants; the flag is never set.)
 13. U `:621-634`: `apply_instances`, with `use_default_alerts: false` in `InstanceMetadata`.

@@ -1067,11 +1067,11 @@ pub(super) async fn za_calendar_event_set(server: &Server, request: SetRequest<'
     access_token: &AccessToken, using: CapabilityIds) -> trc::Result<SetResponse<CalendarEvent>>;
 pub(super) struct ZaRulings { pub use_default_alerts: bool }
 /// Spec 6.5. With `base`: refuses `isDraft: true` and a true `mayInviteSelf`, `mayInviteOthers` or `hideAttendees`,
-/// and takes `useDefaultAlerts` out of the object. For every patch: refuses a link with a `blobId` that is not
-/// embedded in `stored` (owner id, document id).
-pub(super) fn za_take_rulings(object: &mut EventValue<'_>, base: bool, stored: Option<(u32, u32)>)
+/// and takes `useDefaultAlerts` out of the object. For every patch: refuses every link with a `blobId`,
+/// including one embedded in the event being updated.
+pub(super) fn za_take_rulings(object: &mut EventValue<'_>, base: bool)
     -> Result<ZaRulings, SetError<JSCalendarProperty<Id>>>;
-/// The table of 2.2. `Err` is the method's failure.
+/// The table of 2.2. The caller handles `Err` per object under D28 (§7.5), preserving committed answers.
 pub(super) fn za_event_set_error(error: ZaPipelineError, uid: Option<&str>)
     -> Result<SetError<JSCalendarProperty<Id>>, trc::Error>;
 

@@ -123,7 +123,7 @@ Spec sections 4.2 to 4.9 and the token rows of sections 8, 9 and 10. The sheet s
 
 - [ ] **Step 2: run them.** U-vault with the name `token`, then with `binding_changes_only_with_credentials`. Expected: the crate does not compile; the errors name `za_session_binding`, `derive_token_wrap_key` and `ZaTokenRecord`.
 
-- [ ] **Step 3: implement `za_session_binding`** (I §5.1). Its body returns `record.revision`; its doc comment says every dependent place goes through it (D19).
+- [ ] **Step 3: implement `za_session_binding`** (I §5.1). Compute the credential fingerprint exactly as the sheet specifies, including field framing, the first-eight-byte big-endian result and the zero-to-one rule. Read no other vault field; every dependent place goes through this function (D19).
 
 - [ ] **Step 4: implement the additions of I §5.2.** The associated-data functions call `aad` as `app_aad` does. The hand-off's purpose is `handoff/{binding}/{key_id}`.
 
@@ -523,7 +523,7 @@ Catchers for Task 42: "a token with an unopenable secret is served keyless" is `
 - The hand-off secret is appended to the code or the consent token with no separator and is stored nowhere (invariant 61). MK leaves process memory only inside the hand-off's wrap (invariant 62).
 - The entry is deleted when the code is redeemed, when a consent is refused, and when a confirmation fails after its consent token was taken. No hand-off outlives its code.
 - `za_handoff_put` at a stale revision returns `AuthEvent::Failed` with its text of I §5.6. The password step then answers the authentication error without `authentication_failure`: the password was right.
-- If the record write fails after the grant was created, the grant is deleted. A failed vault assertion answers `invalid_grant`; any other failure is a server error. No wrap is stored in either case.
+- A lost vault assertion is retried under an unchanged binding, with at most three attempts in all (Task 15, spec 4.3). A changed binding answers `invalid_grant`; exhausted retries and other failures answer a server error. If issuance fails after the grant was created, the grant is deleted and no wrap is retained (spec 4.4).
 - The device flow calls the same login function and drops the keys (D9). `issue_new_grant` decides by the hand-off it was passed, never by the account.
 - `OAuthCode` is a stored rkyv struct: its layout does not change. Upstream's checks of the client, the redirect URI, PKCE and single use run unchanged and first, on the code's 40 characters. `take_pending_consent` accepts exactly 40 characters.
 - An ordinary account's sign-in writes no hand-off and gets no suffix. It pays one cached account read at a code exchange and at a refresh, and one in-memory delete at a consent confirmation that carries no secret. A secret on its code answers `invalid_grant`.
