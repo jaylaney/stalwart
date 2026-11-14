@@ -1366,7 +1366,8 @@ async fn case_pr84_account_pass(test: &mut TestServer) {
     assert!(entry.read_loaded().await.is_none());
     let retry_at = extend_retry_window(test, id);
     let sentinel = SearchBlobTimeoutOnce::new(id, thread_hash.clone());
-    entry.set_retry_observation_for_test(Instant::now());
+    let observation_due = Instant::now();
+    entry.set_retry_observation_for_test(observation_due);
     let before = counter.counts();
     let blob_reads = za_search_blob_reads(id);
     assert_eq!(
@@ -1374,6 +1375,11 @@ async fn case_pr84_account_pass(test: &mut TestServer) {
         retry_at
     );
     let after = counter.counts();
+    assert!(
+        entry.retry_schedule().unwrap().2 >= observation_due + Duration::from_secs(1),
+        "the due retry reserves the next shared observation slot"
+    );
+    // Install a future observation time for the following suppression checks.
     entry.set_retry_observation_for_test(retry_at);
     assert_eq!(
         after[SearchPassWork::Manifest as usize],
@@ -1386,7 +1392,7 @@ async fn case_pr84_account_pass(test: &mut TestServer) {
     assert_eq!(
         counter.counts(),
         after,
-        "all callers share the observation cadence"
+        "the explicit future observation time suppresses all four callers"
     );
     assert_eq!(za_search_blob_reads(id), blob_reads);
     assert!(!sentinel.was_consumed());
