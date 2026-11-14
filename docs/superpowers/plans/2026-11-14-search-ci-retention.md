@@ -42,8 +42,9 @@ filtering, sorting or pagination. Restore those checks before confirming mapping
   sequentially; retain exact source/binary/log evidence.
 - [ ] Run the hosted retention net and strict-rule gate on the final combined
   source to prove the mappings.
-- [ ] Integrate PR85 and the correction into release7-search, commit/push the
-  reviewed combined changes, and keep PR84 unmerged until combined CI is green.
+- [x] Integrate PR85's actual merge and commit the reviewed combined correction.
+- [ ] Publish the final combined source and verify hosted CI; keep PR84 unmerged
+  until combined CI is green.
 
 The existing combined local ZA result remains valid for its recorded source:
 1,428.06 seconds, 183 forms, expected K deviation, G5 and cleanup. The additional

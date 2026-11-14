@@ -58,3 +58,10 @@ The earlier combined canonical ZA run passed in 1,428.06 seconds with all 183 fo
 the expected K deviation, G5 and cleanup. Its source predates these protocol-only
 additions and remains recorded separately. The complete combined source must pass
 hosted CI and the retention gate before PR84 merges into main.
+
+PR85 was merged into release7-search at
+`3be429208eb801b45fe08ec530b388375b6888c7`, after rechecking its expected head and
+base. Incorporating that actual merge into the prepared branch made no file
+changes. The retained source/binary receipts therefore still describe the tested
+code. The final combined-head CI and retention counts remain pending; current
+run links are recorded on PR84.

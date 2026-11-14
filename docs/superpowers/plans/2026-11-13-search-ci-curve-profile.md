@@ -39,8 +39,8 @@
 **Files:** Combined PR84/PR85 tree; any merge resolution limited to actual conflicting fixture edits.
 **Interfaces:** Consume reviewed evidenced fix and PR85 head cc5de6a55; produce release7-search with both contracts and exact-source validation.
 
-- [ ] Commit the evidenced correction; preserve the original diagnostic run and failed CI evidence.
-- [ ] Merge PR85 into release7-search using its expected head, then integrate the fix/diagnostic without losing either side's fixture behavior.
-- [ ] A separate agent reviews the complete combined follow-up diff; root verifies any fixes and relevant local tests.
+- [x] Commit the evidenced correction; preserve the original diagnostic run and failed CI evidence.
+- [x] Merge PR85 into release7-search using its expected head, then integrate the fix/diagnostic without losing either side's fixture behavior.
+- [x] A separate agent reviews the complete combined follow-up diff; root verifies any fixes and relevant local tests.
 - [ ] Push the final combined source head and inspect all required CI jobs, including default/filesystem ZA, retention and fresh-store.
 - [ ] Merge PR84 into main only after combined CI is green; otherwise keep it open and report the precise outstanding gate.
