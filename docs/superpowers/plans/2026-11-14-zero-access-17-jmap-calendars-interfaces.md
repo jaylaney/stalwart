@@ -735,7 +735,7 @@ the authentication generation: the key cache's generation and
 | the hand-off value (5.3) | the binding at the password step, stored and inside the wrap's associated data |
 | `za_token_issue`, `za_token_refresh`, `za_token_open_access` (5.4) | each reads the vault record and compares bindings |
 | the assertion-loss loop of 5.4 | a write still asserts the vault record's bytes; on a lost vault assertion the writer reads again: an unchanged binding is retried, three attempts in all, and a changed binding stops it |
-| `za_handoff_put` (5.4) | compares the vault revision with `keys.generation`, not bindings: a vault write of any kind that crosses the password step fails it once |
+| `za_handoff_put` (5.4) | compares the vault revision with `keys.generation`, not bindings, then asserts the original vault bytes after storing the hand-off and before returning its secret: a crossing vault write of any kind fails sign-in; the provisional entry is deleted best-effort and no code or consent token is issued |
 | the Bearer arm (5.5, D23) | compares generations: a request crossed by any vault write answers 401; after one that left the binding unchanged the client's refresh succeeds |
 | tests | `binding_changes_only_with_credentials` (Task 13); `credential_change_clears_the_token_record`, `tokens::credential_changes_end_sessions`, `tokens::other_vault_writes_keep_sessions`, `tokens::pin_rewrap_keeps_session` (Task 14); the crossed cases of Tasks 16 to 18; `scheduling::first_invitation_and_the_session` (Task 31) |
 
@@ -888,8 +888,11 @@ impl Server {
     /// D8: the registry's account list, one point read each, reconcile, write asserting the record alone.
     /// A failure on one account is logged. Returns the records changed.
     pub async fn za_token_sweep(&self) -> trc::Result<usize>;
-    /// Reads the vault record, requires its revision to equal `keys.generation`, and stores the hand-off under
-    /// `KV_OAUTH ‖ '~' ‖ key_id` with `expires` seconds. Returns the secret to append.
+    /// Reads the vault record and requires its revision to equal `keys.generation`. Stores the hand-off under
+    /// `KV_OAUTH ‖ '~' ‖ key_id` with `expires` seconds, then asserts the original vault bytes in one assertion-only
+    /// data-store batch. Returns the secret only after success. On failure deletes the provisional entry best-effort:
+    /// an assertion failure is the fixed sign-in Auth Failed; another store error propagates. No retry, code/token
+    /// publication on failure, or persistent mutation in the assertion-only batch.
     pub async fn za_handoff_put(&self, key_id: &str, account_id: u32, keys: &SessionKeys, expires: u64)
         -> trc::Result<Secret>;
     /// Gets and deletes the entry. `None` when it is missing or does not open.
@@ -984,8 +987,20 @@ pub fn za_split_bearer(token: &str) -> (&str, ZaSuffix);
 - `za_token_forget_grant` reconciles, three attempts, and reads no vault
   record. `za_token_sweep` leaves a record that does not decode and skips
   a lost assertion silently.
-- `za_handoff_put` at a stale revision returns `AuthEvent::Failed`; the
-  password step answers it without `authentication_failure`.
+- `za_handoff_put` at a stale revision, or after losing its post-store
+  vault assertion, returns `AuthEvent::Failed`; the password step answers
+  it without `authentication_failure`. After `key_set`, one batch on the
+  account's Principal document 0 asserts `ZeroAccessVault` with
+  `AssertValue::Hash(read.cas)`. It sets and clears nothing. An ordinary
+  follow-up read is insufficient: a backend may reuse a read snapshot.
+  Never retry this hand-off under newer vault bytes. A cleanup failure
+  cannot turn the refusal into success; an expiring encrypted orphan may
+  remain, with neither its secret nor matching code/token published.
+- The D6 fence adds one assertion-only data-store batch per keyed
+  hand-off: one for a direct code sign-in, two across pending consent and
+  its confirmation. A post-store failure adds one attempted in-memory
+  delete. Ordinary accounts, Bearer requests and refresh pay no added
+  cost from this fence.
 - `confirm_consent` reads the vault record, compares bindings through
   `za_session_binding` and builds `SessionKeys` at that read's revision.
 - Entry expiries are computed from `now()` when the entry is written.
@@ -1271,10 +1286,12 @@ called from `crates/common/src/za/tokens.rs`:
 
 ```rust
 pub static TOKEN_EXCHANGE_PAUSE: Mutex<Option<Arc<Pause>>>;      // za_token_issue: after the binding check, before the batch
+pub static TOKEN_HANDOFF_WRITE_PAUSE: Mutex<Option<Arc<Pause>>>; // za_handoff_put: after the revision check and seal, immediately before key_set (Task 17)
 pub static TOKEN_REFRESH_READ_PAUSE: Mutex<Option<Arc<Pause>>>;  // za_token_refresh: before its first record read
 pub static TOKEN_REFRESH_WRITE_PAUSE: Mutex<Option<Arc<Pause>>>; // za_token_refresh: after MK opened and the entries built, before the batch
 pub static TOKEN_REFRESH_WRITE_FAIL_ONCE: Mutex<Option<u32>>;    // za_token_refresh: the batch is not written and a store error returns
 pub fn set_token_exchange_pause(p: Option<Arc<Pause>>);        pub async fn token_exchange_pause_point(account_id: u32);
+pub fn set_token_handoff_write_pause(p: Option<Arc<Pause>>);   pub async fn token_handoff_write_pause_point(account_id: u32);
 pub fn set_token_refresh_read_pause(p: Option<Arc<Pause>>);    pub async fn token_refresh_read_pause_point(account_id: u32);
 pub fn set_token_refresh_write_pause(p: Option<Arc<Pause>>);   pub async fn token_refresh_write_pause_point(account_id: u32);
 pub fn set_token_refresh_write_fail_once(account_id: Option<u32>); pub fn take_token_refresh_write_fail(account_id: u32) -> bool;
@@ -1284,7 +1301,7 @@ The Bearer case crossed by a vault write uses the existing http pause
 (`za_test::PAUSE`, `crates/http/src/auth/authenticate.rs:209-210`), which
 now sits between `za_bearer_keys` and the generation fence.
 
-### 9.1 The fifth token hook
+### 9.1 The grant-removal hook
 
 ```rust
 pub static TOKEN_FORGET_FAIL_ONCE: Mutex<Option<u32>>; // za_token_forget_grant: at its head, `StoreEvent::UnexpectedError` with no fixed details returns and nothing is read

@@ -505,6 +505,7 @@ Catchers for Task 42: "a token with an unopenable secret is served keyless" is `
 
 **Files:**
 - Modify `crates/common/src/za/tokens.rs`: the three hand-off functions and the precheck.
+- Modify `crates/common/src/za/test_hooks.rs`: the account-scoped `TOKEN_HANDOFF_WRITE_PAUSE` of I §9.
 - Create `crates/http/src/auth/oauth/za_token.rs`; modify `crates/http/src/auth/oauth/mod.rs:13-18` (`mod za_token;`).
 - Modify `crates/http/src/auth/oauth/auth.rs`: `LoginAccount` (`:600-609`), `authenticate_login` (`:611-686`), the `ConsentHandler` trait (`:712-740`), `authorize_code` (`:773-844`), `request_consent` (`:846-879`), `confirm_consent` (`:881-915`), `issue_auth_code` (`:949-985`), `approve_device` (`:1052-1058`).
 - Modify `crates/http/src/auth/oauth/token.rs`: `authorization_code_grant` (`:272-337`), `device_code_grant` (`:380-390`), `refresh_token_grant` (before `:484`), `issue_new_grant` (`:510-582`), `NewGrantRequest` (`:627-636`).
@@ -522,8 +523,8 @@ Catchers for Task 42: "a token with an unopenable secret is served keyless" is `
 - The hand-off entry is written before the code or the consent token it belongs to is stored. It carries the code's expiry, `oauth_expiry_auth_code`.
 - The hand-off secret is appended to the code or the consent token with no separator and is stored nowhere (invariant 61). MK leaves process memory only inside the hand-off's wrap (invariant 62).
 - The entry is deleted when the code is redeemed, when a consent is refused, and when a confirmation fails after its consent token was taken. No hand-off outlives its code.
-- `za_handoff_put` at a stale revision returns `AuthEvent::Failed` with its text of I §5.6. The password step then answers the authentication error without `authentication_failure`: the password was right.
-- A lost vault assertion is retried under an unchanged binding, with at most three attempts in all (Task 15, spec 4.3). A changed binding answers `invalid_grant`; exhausted retries and other failures answer a server error. If issuance fails after the grant was created, the grant is deleted and no wrap is retained (spec 4.4).
+- `za_handoff_put` at a stale revision, or after losing its post-store vault assertion, returns `AuthEvent::Failed` with its text of I §5.6. The password step then answers the authentication error without `authentication_failure`: the password was right. The hand-off is provisional until the assertion-only batch succeeds; failure publishes no code, consent token or secret. This fence preserves D6's interval through the hand-off write, rather than ending it at the preceding read.
+- A lost vault assertion during first token issuance is retried under an unchanged binding, with at most three attempts in all (Task 15, spec 4.3). A changed binding answers `invalid_grant`; exhausted retries and other failures answer a server error. If issuance fails after the grant was created, the grant is deleted and no wrap is retained (spec 4.4). The earlier hand-off fence has no retry.
 - The device flow calls the same login function and drops the keys (D9). `issue_new_grant` decides by the hand-off it was passed, never by the account.
 - `OAuthCode` is a stored rkyv struct: its layout does not change. Upstream's checks of the client, the redirect URI, PKCE and single use run unchanged and first, on the code's 40 characters. `take_pending_consent` accepts exactly 40 characters.
 - An ordinary account's sign-in writes no hand-off and gets no suffix. It pays one cached account read at a code exchange and at a refresh, and one in-memory delete at a consent confirmation that carries no secret. A secret on its code answers `invalid_grant`.
@@ -618,7 +619,7 @@ Catchers for Task 42: "a token with an unopenable secret is served keyless" is `
 - [ ] **Step 3: run them.** ZA. Expected: FAILED in `sign_in_gives_keyed_tokens` at its first assertion: the access token has no secret.
 
 - [ ] **Step 4: implement the hand-off functions** (I §5.4). The key is `KeyValue::<()>::build_key(KV_OAUTH, [b"~", key_id.as_bytes()].concat())`.
-  - `za_handoff_put`: read the vault record; a missing record, `keys.account_id != account_id` or `record.revision != keys.generation` is the `AuthEvent::Failed` error of the constraints; `seal_handoff(keys.mk(), account_id, za_session_binding(&record), key_id)`; `key_set` with `expires`; return the secret.
+  - `za_handoff_put`: read the vault record; a missing record, `keys.account_id != account_id` or `record.revision != keys.generation` is the `AuthEvent::Failed` error of the constraints; `seal_handoff(keys.mk(), account_id, za_session_binding(&record), key_id)`; the test-mode pause of I §9 immediately before `key_set`; `key_set` with `expires`. Then validate the original vault bytes in one `BatchBuilder` on this account's Principal document 0, containing only `assert_value(PrincipalField::ZeroAccessVault, AssertValue::Hash(read.cas))`, through `self.store().write_batch`. Return the secret only after that succeeds. On assertion failure, attempt `za_handoff_delete`, drop the secret and return the fixed sign-in `AuthEvent::Failed`; on another fence error attempt the same cleanup and propagate that error. A cleanup failure never overrides the original failure or permits success. Do not retry, use an ordinary follow-up read, mutate the vault/token record, or invalidate caches for this assertion-only batch. Its cost is stated in I §5.7.
   - `za_handoff_take`: `key_get`; when an entry was found, `key_delete` whatever follows; `open_handoff(&value, secret, key_id)`.
   - `za_handoff_delete`: `key_delete`, its result ignored.
 
@@ -658,7 +659,13 @@ Catchers for Task 42: "a token with an unopenable secret is served keyless" is `
 
 - [ ] **Step 9: the comment in `tests/src/za/app_password.rs:686-707`.** State that from release 6 this exchange yields a keyed grant and a token record (spec 9.6), that the `revoke` at the case's end is a vault write that changes no credential, so the record stays until its grant or the account goes (spec D19), and that the emptiness check exempts field 153 while the account exists. No assertion changes.
 
-- [ ] **Step 10: run the suites.** ZA: the `tokens` module prints the thirteen case names; `app_password` (`oauth_sign_in_refuses_vault_app_password`), `mail::gates` (`tests/src/za/mail/gates.rs:1985-2100`), `tracing` and `sweep` pass through the changed functions. SYS.
+- [ ] **Step 9a: the D6 crossing regressions.** Write these cases before implementing the post-store fence. Reuse `RACE`, `za_unlock`, `HookParked`, and the endpoint helpers; run them before `put_sign_in_canaries` and the existing exchange races. Every case leaves the fixture at `STRONG`, updates its recovery key when rotated, clears the hook, and leaves no grant or token record.
+  - `handoff_crossed_by_password_change`: unlock the account, choose a fixed 40-character test key, and park a direct `za_handoff_put` with `TOKEN_HANDOFF_WRITE_PAUSE`. Change the password through the real endpoint and await success before releasing. Require the fixed sign-in `AuthEvent::Failed`, no returned secret, and absence of the hand-off at its exact key. Restore the password through the endpoint.
+  - `handoff_crossed_by_other_vault_write`: the same, rotating the recovery key instead. Require the vault revision to increase while `za_session_binding` stays equal, then the same refusal and exact-key cleanup. This catches an incorrect binding-only comparison or retry.
+  - `sign_in_crossed_by_vault_write_issues_no_code`: park a public `za_authorize` with `consent: Some(true)` at the same hook, rotate the recovery key, and release. Require the authentication-failure response, with no authenticated location or consent token; assert no grant or token record. This checks the public no-code outcome, which a direct helper call cannot establish.
+  - With the other sign-in changes implemented but the post-store assertion-only fence absent, run ZA once as the D6 behavioral RED. Expected: `handoff_crossed_by_password_change` returns a secret instead of the required authentication failure. Record the failure, then add the fence before the final GREEN. This temporary incomplete implementation is not committed.
+
+- [ ] **Step 10: run the suites.** ZA: the `tokens` module prints the sixteen case names; `app_password` (`oauth_sign_in_refuses_vault_app_password`), `mail::gates` (`tests/src/za/mail/gates.rs:1985-2100`), `tracing` and `sweep` pass through the changed functions. SYS.
 
 - [ ] **Step 11: the closing checks.**
 
