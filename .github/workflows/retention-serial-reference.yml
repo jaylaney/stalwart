@@ -1,0 +1,210 @@
+# Temporary serial qualification of the exact nominal candidate revision.
+name: Retention Serial Reference
+'on':
+  push:
+    branches:
+    - codex/retention-serial-reference
+permissions:
+  contents: read
+env:
+  UNIT_TEST_FEATURES: common/test_mode common/enterprise coordinator/enterprise dav/test_mode directory/enterprise directory/sqlite dns-update/test_provider email/test_mode email/enterprise groupware/test_mode jmap/test_mode jmap/enterprise managesieve/enterprise services/test_mode services/enterprise smtp/test_mode smtp/enterprise spam-filter/test_mode spam-filter/enterprise store/test_mode store/enterprise store/rocks store/sqlite trc/enterprise utils/test_mode vault/test_mode
+  SOURCE_SHA: 9b966c97ff291fbc45aa1eeca888a6d2f6186e03
+jobs:
+  serial:
+    name: Corrected Serial · Test Retention Gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      STORE: RocksDb
+      RUST_MIN_STACK: '16777216'
+      RUSTUP_TOOLCHAIN: 1.99.1
+      RETENTION_TIMEOUT_MINUTES: '350'
+      RETENTION_TARGET: x86_64-unknown-linux-gnu
+      CARGO_TARGET_DIR: "/mnt/target"
+      CARGO_HOME: "/mnt/retention-ci/.cargo"
+      CARGO_TERM_COLOR: never
+      GIT_OPTIONAL_LOCKS: '0'
+      GATES: "/mnt/gates"
+      TMPDIR: "/mnt/gates/tmp"
+      LISTING_TARGET_DIR: "/mnt/listing-target"
+    steps:
+    - name: Set the work deadline and prepare retention directories
+      id: prepare
+      shell: bash
+      run: |
+        # Leave the final 12 minutes for settlement, diagnostics and bounded uploads.
+        printf 'RETENTION_DEADLINE_EPOCH=%s\n' \
+          "$(( $(date +%s) + (RETENTION_TIMEOUT_MINUTES - 12) * 60 ))" >> "$GITHUB_ENV"
+        sudo mkdir -p "$GATES" "$CARGO_TARGET_DIR" "$LISTING_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+        sudo chown "$(id -u):$(id -g)" \
+          "$GATES" "$CARGO_TARGET_DIR" "$LISTING_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+        for target in "$CARGO_TARGET_DIR" "$LISTING_TARGET_DIR"; do
+          probe=$(mktemp "$target/.retention-write.XXXXXX")
+          rm -- "$probe"
+        done
+        df -h "$GATES" "$CARGO_TARGET_DIR" "$LISTING_TARGET_DIR"
+    - name: Checkout exact source revision
+      uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+        ref: "${{ env.SOURCE_SHA }}"
+    - name: Verify the pinned source tree
+      shell: bash
+      run: |
+        test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+        git diff --exit-code HEAD --
+    - name: Install pinned coverage tools
+      id: tools
+      shell: bash
+      run: bash scripts/tests/retention_ci_setup.sh install-tools instrumented
+    - name: Normalize checkout mtimes
+      id: normalize
+      shell: bash
+      run: python3 -I scripts/tests/retention_artifacts.py normalize-checkout
+    - name: Fetch and materialize dependencies
+      id: fetch
+      shell: bash
+      run: bash scripts/tests/retention_ci_setup.sh fetch
+    - name: Run complete serial coverage net
+      id: build
+      shell: bash
+      run: |
+        target="$CARGO_TARGET_DIR"
+        printf '%s\n' 'Before measured phase' | tee -a "$GITHUB_STEP_SUMMARY"
+        df -B1 "$GATES" "$target" | tee -a "$GITHUB_STEP_SUMMARY"
+        du -sb "$target" | tee -a "$GITHUB_STEP_SUMMARY"
+        status=0
+        time python3 -I scripts/tests/coverage_net.py --out "$GATES/reports/net" \
+          --deadline-epoch "$RETENTION_DEADLINE_EPOCH" || status=$?
+        printf '%s\n' 'After measured phase' | tee -a "$GITHUB_STEP_SUMMARY"
+        df -B1 "$GATES" "$target" | tee -a "$GITHUB_STEP_SUMMARY"
+        du -sb "$target" | tee -a "$GITHUB_STEP_SUMMARY"
+        exit "$status"
+    - name: Capture all CI step listings
+      id: capture
+      shell: bash
+      run: |
+        target="$CARGO_TARGET_DIR"
+        printf '%s\n' 'Before measured phase' | tee -a "$GITHUB_STEP_SUMMARY"
+        df -B1 "$GATES" "$target" | tee -a "$GITHUB_STEP_SUMMARY"
+        du -sb "$target" | tee -a "$GITHUB_STEP_SUMMARY"
+        status=0
+        time env GITHUB_SHA="$SOURCE_SHA" python3 -I scripts/tests/capture_listings.py --out "$GATES/reports/listings" \
+          --deadline-epoch "$RETENTION_DEADLINE_EPOCH" || status=$?
+        printf '%s\n' 'After measured phase' | tee -a "$GITHUB_STEP_SUMMARY"
+        df -B1 "$GATES" "$target" | tee -a "$GITHUB_STEP_SUMMARY"
+        du -sb "$target" | tee -a "$GITHUB_STEP_SUMMARY"
+        exit "$status"
+      if: "${{ !cancelled() && steps.fetch.outcome == 'success' }}"
+      env:
+        CARGO_TARGET_DIR: "/mnt/listing-target"
+    - name: Prepare sources for reports
+      id: sources
+      if: "${{ !cancelled() && steps.fetch.outcome == 'success' }}"
+      shell: bash
+      run: |
+        mkdir -p "$GATES/reports/src"
+        bash scripts/tests/retention_ci_setup.sh within-budget git archive HEAD tests crates | \
+          bash scripts/tests/retention_ci_setup.sh within-budget tar -x -C "$GATES/reports/src"
+    - name: Executed functions
+      id: functions
+      if: "${{ !cancelled() && steps.sources.outcome == 'success' }}"
+      shell: bash
+      run: |
+        bash scripts/tests/retention_ci_setup.sh within-budget \
+          python3 -I tests/qualification/tools/strict_rule.py functions \
+          --exports "$GATES/reports/net/steps" --sources "$GATES/reports/src" \
+          --out "$GATES/reports/functions.json" 2>&1 | tee "$GATES/reports/functions.log"
+    - name: Inventory gate
+      id: inventory
+      if: "${{ !cancelled() && steps.functions.outcome == 'success' }}"
+      shell: bash
+      run: |
+        bash scripts/tests/retention_ci_setup.sh within-budget \
+          python3 -I scripts/tests/check_test_inventory.py \
+          --baseline tests/qualification/baseline-0.16.27.json \
+          --dispositions tests/qualification/dispositions.json \
+          --listing "$GATES/reports/listings/list" --ignored-listing "$GATES/reports/listings/ign" \
+          --executed "$GATES/reports/functions.json" 2>&1 | tee "$GATES/reports/inventory.out"
+    - name: Coverage gate
+      id: coverage
+      if: "${{ !cancelled() && steps.sources.outcome == 'success' }}"
+      shell: bash
+      run: |
+        test -s "$GATES/reports/net/merged.json"
+        bash scripts/tests/retention_ci_setup.sh within-budget \
+          python3 -I scripts/tests/check_coverage.py \
+          --baseline tests/qualification/baseline-0.16.27.json \
+          --dispositions tests/qualification/dispositions.json \
+          --merged "$GATES/reports/net/merged.json" --sources "$GATES/reports/src" \
+          --out "$GATES/reports/coverage.json" 2>&1 | tee "$GATES/reports/coverage.out"
+    - name: Record comparable serial endpoint
+      id: qualify
+      if: "${{ !cancelled() }}"
+      shell: bash
+      run: |
+        date --utc --iso-8601=seconds
+        git diff --exit-code HEAD --
+        status=0
+        for phase in COVERAGE_NET LISTINGS FUNCTIONS INVENTORY COVERAGE_GATE; do
+          declare -n outcome="$phase"_OUTCOME
+          printf '%s: %s\n' "$phase" "$outcome" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "$outcome" != success ]]; then
+            status=1
+          fi
+        done
+        exit "$status"
+      env:
+        COVERAGE_NET_OUTCOME: "${{ steps.build.outcome }}"
+        LISTINGS_OUTCOME: "${{ steps.capture.outcome }}"
+        FUNCTIONS_OUTCOME: "${{ steps.functions.outcome }}"
+        INVENTORY_OUTCOME: "${{ steps.inventory.outcome }}"
+        COVERAGE_GATE_OUTCOME: "${{ steps.coverage.outcome }}"
+    - name: Record serial comparison evidence
+      id: comparison
+      if: "${{ !cancelled() && steps.qualify.outcome == 'success' }}"
+      shell: bash
+      run: |
+        env GITHUB_SHA="$SOURCE_SHA" python3 -I scripts/tests/retention_qualification.py capture --reports "$GATES/reports" \
+          --out "$GATES/comparison" --serial
+    - name: Retain serial comparison evidence
+      if: "${{ !cancelled() && steps.comparison.outcome == 'success' }}"
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: retention-serial-reference-comparison-${{ github.run_attempt }}
+        path: "${{ env.GATES }}/comparison/"
+        if-no-files-found: error
+        retention-days: 7
+      timeout-minutes: 4
+    - name: Stage sanitized listing error receipt
+      id: capture-diagnostics
+      if: "${{ !cancelled() && steps.capture.outcome != 'success' }}"
+      timeout-minutes: 2
+      shell: bash
+      env:
+        CAPTURE_OUTCOME: "${{ steps.capture.outcome }}"
+        NET_OUTCOME: "${{ steps.build.outcome }}"
+      run: |
+        receipt="$RUNNER_TEMP/serial-listing-errors.txt"
+        {
+          printf 'Coverage net: %s\nListing capture: %s\n' "$NET_OUTCOME" "$CAPTURE_OUTCOME"
+          df -h "$GATES" "$LISTING_TARGET_DIR"
+          shopt -s nullglob
+          for listing in "$GATES"/reports/listings/{list,ign}/*.txt; do
+            printf '\n%s\n' "$listing"
+            awk '
+              /^## exit: (0|[1-9][0-9]*|deadline|timeout|not-run)$/ { print }
+              /^error(\[[A-Z0-9]+\])?: / && errors++ < 3 { print substr($0, 1, 400) }
+            ' "$listing"
+          done
+        } > "$receipt"
+        bash scripts/tests/retention_ci_setup.sh stage-logs "$RUNNER_TEMP/serial-listing-errors" "$receipt"
+    - name: Retain sanitized listing error receipt
+      if: "${{ !cancelled() && steps.capture-diagnostics.outcome == 'success' }}"
+      timeout-minutes: 4
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: retention-serial-reference-listing-errors-${{ github.run_attempt }}
+        path: "${{ runner.temp }}/serial-listing-errors/"
+        if-no-files-found: error
+        retention-days: 7
