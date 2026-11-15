@@ -19,7 +19,8 @@
 //!   (`dav::calendar::update`).
 //! - `COMMIT_PAUSE`: immediately before a key account's leased create
 //!   commits, after the fan-out and the seal
-//!   (`groupware::calendar::pipeline::uid::za_commit_create`).
+//!   (`groupware::calendar::pipeline::create::za_create_event`, and again
+//!   in `groupware::calendar::pipeline::uid::za_commit_create`).
 //! - `UPDATE_COMMIT_PAUSE`: immediately before an event PUT update commit,
 //!   after fan-out and sealing, keyed by the event owner.
 //! - `DELETE_COMMIT_PAUSE`: immediately before an event DELETE commit,

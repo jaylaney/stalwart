@@ -5,7 +5,7 @@
  */
 
 use super::{
-    CalendarComponentSupport, CalendarEventView, ZaRoles, assert_event_privacy_access,
+    CalendarComponentSupport, CalendarEventView, assert_event_privacy_access,
     assert_event_privacy_allowed, assert_is_unique_uid, serves_ical, user_data_error,
     za_refresh_event, za_roles, za_write_contexts,
 };
@@ -40,15 +40,15 @@ use groupware::{
     calendar::{
         CalendarEvent, CalendarEventContent, CalendarEventData, SupportedComponent,
         alerts::{DefaultAlerts, DefaultAlertsResolver, DefaultAlertsView, ICalendarDefaultAlerts},
-        delegation::ZaDelegationResolution,
-        fanout::{ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaSource, za_set_schedule_status},
+        fanout::{ZaFanOut, ZaFanOutKind, ZaSource, za_set_schedule_status},
         identity::ParticipantIdentityAddresses,
         itip::ItipSendStatus,
         notification::{NotificationAudience, may_have_viewers},
         pipeline::{
             ZaScheduling,
-            schedule::{za_schedule_create, za_schedule_update},
-            uid::{za_commit_create, za_lost_create_fence, za_take_uid_lease},
+            create::{ZaEventCreate, za_create_event},
+            schedule::{ZaScheduled, za_schedule_create, za_schedule_update},
+            uid::za_take_uid_lease,
         },
         privacy::EventViewer,
         rights::{EventAcl, EventChanges},
@@ -1065,29 +1065,41 @@ impl CalendarUpdateRequestHandler for Server {
             }
             // SPDX-SnippetEnd
 
-            if let (Some(keys), Some(roles)) = (&za_keys, &za_roles) {
-                return za_create_event(
+            if let (Some(keys), Some(roles), Some((lease, uid))) =
+                (&za_keys, &za_roles, za_lease.take())
+            {
+                let written = za_create_event(
                     self,
                     access_token,
                     &resources,
                     &account,
                     keys,
                     roles,
-                    ZaCreate {
+                    ZaEventCreate {
                         event,
                         content,
-                        submitted_ical,
-                        is_owner,
-                        personal_id,
-                        next_email_alarms,
-                        messages: za_messages,
-                        resolution: za_resolution,
-                        lease: za_lease.take(),
+                        next_alarms: next_email_alarms,
+                        scheduled: ZaScheduled {
+                            messages: za_messages,
+                            resolution: za_resolution,
+                        },
+                        lease,
+                        uid,
                         contexts: std::mem::take(&mut contexts),
-                        calendar_id: parent.document_id(),
                     },
                 )
-                .await;
+                .await?;
+                // A key account's content holds no preferences, so the view applies none.
+                let serves_submitted_ical = if is_owner {
+                    serves_ical(&written.ical, &submitted_ical)
+                } else {
+                    let mut view = written.ical.clone();
+                    view.apply_user_data(None, UserDataView::AlertsOnly);
+                    serves_ical(&view, &submitted_ical)
+                };
+                return Ok(HttpResponse::new(StatusCode::CREATED)
+                    .with_etag_opt(serves_submitted_ical.then_some(written.etag))
+                    .with_schedule_tag_opt(written.schedule_tag));
             }
 
             // Prepare write batch
@@ -1193,260 +1205,6 @@ fn validate_ical(ical: &ICalendar) -> crate::Result<(&str, SupportedComponent)> 
             .with_details("iCalendar must contain exactly one UID and same component types"),
         )),
     }
-}
-
-/// What a key account's PUT create carries from the handler's checks to
-/// its sealed commit.
-struct ZaCreate {
-    event: CalendarEvent,
-    content: CalendarEventContent,
-    submitted_ical: ICalendar,
-    is_owner: bool,
-    personal_id: u32,
-    next_email_alarms: groupware::calendar::schedule::EventAlarms,
-    messages: Option<Vec<ZaFanOutMessage>>,
-    resolution: Option<ZaDelegationResolution>,
-    lease: Option<(common::za::lease::ZaUidLeaseGuard, String)>,
-    contexts: Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>,
-    calendar_id: u32,
-}
-
-/// A key account's PUT create (invitations spec 5.1-5.4, key pinning spec
-/// 5.1): the document id is assigned by a reservation-only batch before the
-/// fan-out (ruling 14), which records it as a withheld entry's source; the
-/// fan-out and the insert are fenced on the UID creation lease; the event is
-/// sealed in its calendar's domain before upstream's builder; one bounded
-/// retry follows a calendar change.
-async fn za_create_event(
-    server: &Server,
-    access_token: &AccessToken,
-    resources: &common::GroupwareResources,
-    account: &common::auth::AccountCache,
-    keys: &vault::session::SessionKeys,
-    roles: &ZaRoles,
-    create: ZaCreate,
-) -> crate::Result<HttpResponse> {
-    let ZaCreate {
-        event,
-        mut content,
-        submitted_ical,
-        is_owner,
-        personal_id,
-        next_email_alarms,
-        messages,
-        resolution,
-        mut lease,
-        mut contexts,
-        calendar_id,
-    } = create;
-    let account_id = account.id;
-    let uid = lease
-        .as_ref()
-        .map(|(_, uid)| uid.clone())
-        .unwrap_or_default();
-
-    // Ruling 14: an id reserved by a committed batch is never reused.
-    let mut reservation = BatchBuilder::new();
-    let slot = reservation.reserve_document_id(account_id, Collection::CalendarEvent);
-    let document_id = match server.commit_batch(reservation).await {
-        Ok(assigned) => assigned.slot(slot),
-        Err(err) => {
-            if let Some((lease, _)) = lease.take() {
-                lease.release().await;
-            }
-            return Err(err.caused_by(trc::location!()).into());
-        }
-    };
-
-    // Spec 5.3-5.4: after every check, immediately before the sealed commit;
-    // the fan-out hands out the attendees' tokens. Fenced on the creation
-    // lease: a creator whose lease was taken over writes no item after its
-    // successor's.
-    let mut pairs = None;
-    // iMIP spec 5.4, decision 9: the fan-out's mail attempts wait for the
-    // commit.
-    let mut za_mail = common::za::imip::ZaImipPending::default();
-    if let Some(messages) = messages {
-        let fan_out = match server
-            .za_fan_out(
-                &roles.sender,
-                &roles.writer,
-                &roles.owner,
-                keys,
-                messages,
-                None,
-                &content.data.event,
-                ZaSource {
-                    document_id,
-                    uid: &uid,
-                },
-                ZaFanOutKind::Change,
-                false,
-                RecipientPolicy::new(&server.core.groupware, event.flags),
-                lease.as_ref().map(|(lease, _)| lease.lease()),
-                resolution.as_ref(),
-            )
-            .await
-        {
-            Ok(fan_out) => fan_out,
-            Err(err) if err.is_assertion_failure() => {
-                let (lease, uid) = lease.take().expect("a lost fence needs a lease");
-                let Err(error) = za_lost_create_fence(
-                    server,
-                    resources,
-                    access_token,
-                    lease,
-                    account_id,
-                    &[calendar_id],
-                    &uid,
-                )
-                .await;
-                return Err(error.into());
-            }
-            Err(err) => {
-                if let Some((lease, _)) = lease.take() {
-                    lease.release().await;
-                }
-                return Err(err.caused_by(trc::location!()).into());
-            }
-        };
-        za_set_schedule_status(&mut content.data.event, &fan_out.statuses);
-        za_set_sequences(&mut content.data.event, &fan_out.sequences);
-        pairs = fan_out.pairs;
-        za_mail = fan_out.mail;
-    }
-
-    let serves_submitted_ical = if is_owner {
-        serves_ical(&content.data.event, &submitted_ical)
-    } else {
-        let mut view = content.data.event.clone();
-        view.apply_user_data(content.preferences(personal_id), UserDataView::AlertsOnly);
-        serves_ical(&view, &submitted_ical)
-    };
-    let schedule_tag = event.schedule_tag;
-    let mut sealed = ZaEvent::new(event, content);
-    if let Err(err) = seal_event_in_domain(&mut sealed, &contexts[0].domain, pairs.as_ref()) {
-        if let Some((lease, _)) = lease.take() {
-            lease.release().await;
-        }
-        return Err(seal_error(err, account_id, document_id).into());
-    }
-
-    let timestamp = now() as i64;
-    let build = |sealed: &ZaEvent,
-                 contexts: &[groupware::calendar::sharing::resolve::ZaCalendarContext],
-                 lease: Option<&common::za::lease::ZaUidLease>|
-     -> trc::Result<(BatchBuilder, String)> {
-        let mut batch = BatchBuilder::new();
-        batch.with_account_id(account_id);
-        server.limit_disk_quota(&mut batch, account);
-        if let Some(lease) = lease {
-            lease.assert_in(&mut batch);
-        }
-        for context in contexts {
-            context.assert_in(&mut batch);
-        }
-        let (meta, content) = sealed.clone().into_parts();
-        let etag = meta
-            .insert_at(
-                content,
-                access_token.changed_by(),
-                account_id,
-                document_id,
-                None,
-                next_email_alarms.clone(),
-                timestamp,
-                &mut batch,
-            )
-            .caused_by(trc::location!())?;
-        Ok((batch, etag))
-    };
-    let (batch, mut etag) = build(
-        &sealed,
-        &contexts,
-        lease.as_ref().map(|(lease, _)| lease.lease()),
-    )?;
-    if lease.is_some() {
-        #[cfg(feature = "test_mode")]
-        common::za::test_hooks::commit_pause_point(account_id).await;
-        #[cfg(feature = "test_mode")]
-        if common::za::test_hooks::take_commit_fail(account_id) {
-            lease.take().unwrap().0.release().await;
-            za_mail.dropped();
-            return Err(trc::StoreEvent::UnexpectedError
-                .into_err()
-                .details("zero-access test hook: sender commit failure")
-                .into());
-        }
-        match server.commit_batch(batch).await {
-            Ok(_) => {
-                lease.take().unwrap().0.release().await;
-            }
-            Err(error) if error.is_assertion_failure() => {
-                if let Some(fresh) = za_refresh_event(
-                    server,
-                    access_token,
-                    account_id,
-                    calendar_id,
-                    Acl::AddItems,
-                    &contexts,
-                    &mut sealed,
-                )
-                .await?
-                {
-                    contexts = fresh;
-                    let (lease_guard, uid) = lease.take().unwrap();
-                    let (batch, retry_etag) = build(&sealed, &contexts, Some(lease_guard.lease()))?;
-                    etag = retry_etag;
-                    za_mail.on_err(
-                        za_commit_create(
-                            server,
-                            resources,
-                            access_token,
-                            batch,
-                            lease_guard,
-                            account_id,
-                            &[calendar_id],
-                            &uid,
-                        )
-                        .await
-                        .map_err(DavError::from),
-                    )?;
-                } else {
-                    let (lease, uid) = lease.take().unwrap();
-                    za_mail.dropped();
-                    let Err(error) = za_lost_create_fence(
-                        server,
-                        resources,
-                        access_token,
-                        lease,
-                        account_id,
-                        &[calendar_id],
-                        &uid,
-                    )
-                    .await;
-                    return Err(error.into());
-                }
-            }
-            Err(error) => {
-                lease.take().unwrap().0.release().await;
-                za_mail.dropped();
-                return Err(error.caused_by(trc::location!()).into());
-            }
-        }
-    } else {
-        za_mail
-            .on_err(server.commit_batch(batch).await)
-            .caused_by(trc::location!())?;
-    }
-    server.notify_task_queue();
-    // iMIP spec 5.4: reached only once the commit (or `za_commit_create`'s
-    // retry) returned `Ok`; every failure returned above.
-    za_mail.submit(server).await;
-
-    Ok(HttpResponse::new(StatusCode::CREATED)
-        .with_etag_opt(serves_submitted_ical.then_some(etag))
-        .with_schedule_tag_opt(schedule_tag))
 }
 
 #[cfg(test)]
