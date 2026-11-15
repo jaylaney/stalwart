@@ -40,15 +40,16 @@ use groupware::{
     calendar::{
         CalendarEvent, CalendarEventContent, CalendarEventData, SupportedComponent,
         alerts::{DefaultAlerts, DefaultAlertsResolver, DefaultAlertsView, ICalendarDefaultAlerts},
-        delegation::{
-            ZaDelegationResolution, ZaSelfMessages, ZaSelfOperation, za_combine_delegated,
-            za_finalize, za_resolve_delegation, za_self_create, za_self_update,
-        },
+        delegation::ZaDelegationResolution,
         fanout::{ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaSource, za_set_schedule_status},
         identity::ParticipantIdentityAddresses,
         itip::ItipSendStatus,
         notification::{NotificationAudience, may_have_viewers},
-        pipeline::uid::{za_commit_create, za_lost_create_fence, za_take_uid_lease},
+        pipeline::{
+            ZaScheduling,
+            schedule::{za_schedule_create, za_schedule_update},
+            uid::{za_commit_create, za_lost_create_fence, za_take_uid_lease},
+        },
         privacy::EventViewer,
         rights::{EventAcl, EventChanges},
         schedule::{AlarmTasks, EventAlarmScheduler, EventAlarmUsers},
@@ -60,7 +61,7 @@ use groupware::{
         user::{ICalendarUserData, UpdatedPolicy, UserDataSplit, UserDataUpdate, UserDataView},
     },
     scheduling::{
-        ItipError, ItipMessages, event_create::itip_create, event_update::itip_update,
+        ItipMessages, event_create::itip_create, event_update::itip_update,
         itip::itip_set_unreachable_status, recipient::RecipientPolicy,
     },
 };
@@ -495,52 +496,33 @@ impl CalendarUpdateRequestHandler for Server {
             let mut itip_messages = None;
             let mut za_messages = None;
             let mut za_resolution = None;
-            let itip_status = if is_user_data_only {
+            let itip_status = if is_user_data_only || za_roles.is_some() {
+                // A key account's status is resolved in the pipeline (D18).
                 ItipSendStatus::NotRequested
             } else {
                 ItipSendStatus::resolve(
                     self,
                     access_token,
-                    za_roles
-                        .as_ref()
-                        .map_or(&account_info, |roles| &roles.sender),
+                    &account_info,
                     new_content.data.event_range_end(),
-                    za_keys.is_some(),
+                    false,
                 )
             };
-            if itip_status.is_send_sealed()
-                && let Some(roles) = &za_roles
-            {
-                // Invitations spec 5.1: upstream's builders on the plaintext
-                // tree; the messages go to the fan-out.
-                let is_update = new_event.schedule_tag.is_some() && old_ical.is_some();
-                za_resolution = za_resolve_delegation(
+            if let Some(roles) = &za_roles {
+                let scheduled = za_schedule_update(
                     self,
-                    &roles.sender,
-                    &roles.writer,
-                    &roles.owner,
-                    if is_update {
-                        ZaSelfOperation::Update
-                    } else {
-                        ZaSelfOperation::Create
-                    },
-                    old_ical.as_ref(),
-                    Some(&new_content.data.event),
-                )
-                .await
-                .caused_by(trc::location!())?;
-                za_messages = za_schedule(
-                    self,
+                    access_token,
                     roles,
-                    za_resolution.as_ref(),
-                    old_ical.as_ref().filter(|_| is_update),
-                    &mut new_content.data.event,
-                    RecipientPolicy::new(&self.core.groupware, new_event.flags),
-                    &mut new_event.schedule_tag,
+                    ZaScheduling::On,
+                    old_ical.as_ref(),
+                    &mut new_event,
+                    &mut new_content,
                     account_id,
-                    Some(document_id),
-                )?;
-                itip_set_unreachable_status(&mut new_content.data.event, roles.sender.addresses());
+                    document_id,
+                )
+                .await?;
+                za_messages = scheduled.messages;
+                za_resolution = scheduled.resolution;
             } else if itip_status.is_send() {
                 let policy = RecipientPolicy::new(&self.core.groupware, new_event.flags);
                 let result = if let Some(old_ical) = old_ical
@@ -1001,41 +983,30 @@ impl CalendarUpdateRequestHandler for Server {
             let mut itip_messages = None;
             let mut za_messages = None;
             let mut za_resolution = None;
-            let itip_status = ItipSendStatus::resolve(
-                self,
-                access_token,
-                za_roles
-                    .as_ref()
-                    .map_or(&account_info, |roles| &roles.sender),
-                content.data.event_range_end(),
-                za_keys.is_some(),
-            );
-            if itip_status.is_send_sealed()
-                && let Some(roles) = &za_roles
-            {
-                za_resolution = za_resolve_delegation(
+            let itip_status = if za_roles.is_some() {
+                ItipSendStatus::NotRequested
+            } else {
+                ItipSendStatus::resolve(
                     self,
-                    &roles.sender,
-                    &roles.writer,
-                    &roles.owner,
-                    ZaSelfOperation::Create,
-                    None,
-                    Some(&content.data.event),
+                    access_token,
+                    &account_info,
+                    content.data.event_range_end(),
+                    false,
                 )
-                .await
-                .caused_by(trc::location!())?;
-                za_messages = za_schedule(
+            };
+            if let Some(roles) = &za_roles {
+                let scheduled = za_schedule_create(
                     self,
+                    access_token,
                     roles,
-                    za_resolution.as_ref(),
-                    None,
-                    &mut content.data.event,
-                    RecipientPolicy::new(&self.core.groupware, event.flags),
-                    &mut event.schedule_tag,
+                    ZaScheduling::On,
+                    &mut event,
+                    &mut content,
                     account_id,
-                    None,
-                )?;
-                itip_set_unreachable_status(&mut content.data.event, roles.sender.addresses());
+                )
+                .await?;
+                za_messages = scheduled.messages;
+                za_resolution = scheduled.resolution;
             } else if itip_status.is_send() {
                 match itip_create(
                     &mut content.data.event,
@@ -1221,132 +1192,6 @@ fn validate_ical(ical: &ICalendar) -> crate::Result<(&str, SupportedComponent)> 
             )
             .with_details("iCalendar must contain exactly one UID and same component types"),
         )),
-    }
-}
-
-/// Invitations spec 5.1 (release 2) and delegated scheduling (release 4): a
-/// key account's scheduling (`SendSealed`). Upstream's builders run on the
-/// plaintext tree, with the writer's self-delegated run beside them; the
-/// messages go to the fan-out, never to the task queue. `None` when nothing
-/// was built. `old` is `Some` for an update.
-#[allow(clippy::too_many_arguments)]
-fn za_schedule(
-    server: &Server,
-    roles: &ZaRoles,
-    resolution: Option<&ZaDelegationResolution>,
-    old: Option<&ICalendar>,
-    ical: &mut ICalendar,
-    policy: RecipientPolicy,
-    schedule_tag: &mut Option<u32>,
-    account_id: u32,
-    document_id: Option<u32>,
-) -> crate::Result<Option<Vec<ZaFanOutMessage>>> {
-    // The second run sees the pre-finalize trees.
-    let second = match resolution {
-        Some(resolution) => za_second_run(match old {
-            Some(old) => za_self_update(old, ical, &roles.writer, &roles.owner, resolution, policy),
-            None => za_self_create(ical, &roles.writer, &roles.owner, resolution, policy),
-        })?,
-        None => None,
-    };
-    let result = match old {
-        Some(old) => itip_update(ical, old, roles.sender.addresses(), policy),
-        None => itip_create(ical, roles.sender.addresses(), policy),
-    };
-    let first_built = result.is_ok();
-    let first_nothing = matches!(&result, Err(ItipError::NothingToSend));
-    let first = match result {
-        Ok(messages) => Some(messages),
-        Err(err) => {
-            if let Some(error) = za_itip_precondition(&err) {
-                return Err(error);
-            }
-            trc::event!(
-                Calendar(trc::CalendarEvent::ItipMessageError),
-                AccountId = account_id,
-                DocumentId = document_id,
-                Reason = err.to_compact_string(),
-            );
-            // Preserve the original error-arm bump exactly once.
-            if old.is_some()
-                && let Some(schedule_tag) = schedule_tag
-            {
-                *schedule_tag += 1;
-            }
-            None
-        }
-    };
-    if !first_built && second.is_none() {
-        return Ok(None);
-    }
-    if first_nothing
-        && let Some(second) = &second
-        && second.finalize()
-    {
-        za_finalize(ical, second.increments());
-    }
-    if old.is_some() {
-        let is_organizer = second.is_some()
-            || first
-                .as_ref()
-                .is_some_and(|messages| messages.iter().any(|message| message.from_organizer));
-        if is_organizer {
-            if first_built {
-                if let Some(schedule_tag) = schedule_tag {
-                    *schedule_tag += 1;
-                } else {
-                    *schedule_tag = Some(1);
-                }
-            } else if schedule_tag.is_none() {
-                *schedule_tag = Some(1);
-            }
-        }
-    } else {
-        *schedule_tag = Some(1);
-    }
-    let first = first.unwrap_or_default();
-    let messages = match resolution {
-        Some(resolution) => za_combine_delegated(first, second, resolution),
-        None => first.into_iter().map(ZaFanOutMessage::upstream).collect(),
-    };
-    if messages
-        .iter()
-        .map(ZaFanOutMessage::recipient_count)
-        .sum::<usize>()
-        >= server.core.groupware.itip_outbound_max_recipients
-    {
-        return Err(DavError::Condition(DavErrorCondition::new(
-            StatusCode::PRECONDITION_FAILED,
-            CalCondition::MaxAttendeesPerInstance,
-        )));
-    }
-    Ok(Some(messages))
-}
-
-/// A scheduling error that fails a precondition, as the 412 a PUT answers.
-fn za_itip_precondition(err: &ItipError) -> Option<DavError> {
-    err.failed_precondition().map(|failed_precondition| {
-        DavError::Condition(
-            DavErrorCondition::new(StatusCode::PRECONDITION_FAILED, failed_precondition)
-                .with_details(err.to_string()),
-        )
-    })
-}
-
-/// PR review ruling 197: the delegated second run's outcome. A failed
-/// precondition (the per-recipient split's `TooManyRecipients` among them,
-/// since upgrade ruling 93) fails the PUT with the first run's 412, before
-/// any fan-out or persistence; `NothingToSend` and the other errors without
-/// one stay a run that built nothing, as before.
-fn za_second_run(
-    result: Result<Option<ZaSelfMessages>, ItipError>,
-) -> crate::Result<Option<ZaSelfMessages>> {
-    match result {
-        Ok(second) => Ok(second),
-        Err(err) => match za_itip_precondition(&err) {
-            Some(error) => Err(error),
-            None => Ok(None),
-        },
     }
 }
 
@@ -1607,13 +1452,14 @@ async fn za_create_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use groupware::{calendar::pipeline::schedule::za_second_run, scheduling::ItipError};
 
     /// PR review ruling 197: the delegated second run's recipient limit
     /// fails the PUT with the first run's 412; the outcomes without a
     /// failed precondition stay a run that built nothing.
     #[test]
     fn second_run_fails_only_on_a_failed_precondition() {
-        match za_second_run(Err(ItipError::TooManyRecipients)) {
+        match za_second_run(Err(ItipError::TooManyRecipients)).map_err(DavError::from) {
             Err(DavError::Condition(condition)) => {
                 assert_eq!(condition.code, StatusCode::PRECONDITION_FAILED);
                 assert_eq!(
