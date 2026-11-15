@@ -356,37 +356,51 @@ def extract_snapshot(archive, directory):
     check_cargo_state(directory)
 
 
+def decompress_snapshot(archive, staged):
+    with subprocess.Popen(["zstd", "-q", "-d", "-c", "--", str(archive)], stdout=subprocess.PIPE) as decoder:
+        try:
+            with tarfile.open(fileobj=decoder.stdout, mode="r|", bufsize=COPY_SIZE) as entries:
+                extract_snapshot(entries, staged)
+            while decoder.stdout.read(COPY_SIZE):
+                pass
+        except BaseException:
+            decoder.kill()
+            raise
+        finally:
+            decoder.stdout.close()
+        if decoder.wait() != 0:
+            raise ValueError("snapshot decompression failed")
+
+
 def unpack_build(archive, target, manifest_out):
     require_external_output(manifest_out, target, "manifest output")
-    if target.is_symlink() or (target.exists() and not (target.is_dir() and not any(target.iterdir()))):
+    create_target = not target.exists()
+    if target.is_symlink() or (not create_target and not (target.is_dir() and not any(target.iterdir()))):
         raise ValueError("snapshot target must be a fresh directory")
     if manifest_out.exists() or manifest_out.is_symlink():
         raise ValueError("manifest output already exists")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=target.parent) as scratch:
-        staged = Path(scratch)
-        with subprocess.Popen(["zstd", "-q", "-d", "-c", "--", str(archive)], stdout=subprocess.PIPE) as decoder:
-            try:
-                with tarfile.open(fileobj=decoder.stdout, mode="r|", bufsize=COPY_SIZE) as entries:
-                    extract_snapshot(entries, staged)
-                while decoder.stdout.read(COPY_SIZE):
-                    pass
-            except BaseException:
-                decoder.kill()
-                raise
-            finally:
-                decoder.stdout.close()
-            if decoder.wait() != 0:
-                raise ValueError("snapshot decompression failed")
-        manifest_out.parent.mkdir(parents=True, exist_ok=True)
-        staged_target = staged / "target"
-        staged_target.mkdir()
-        os.replace(staged / COV_TARGET, staged_target / COV_TARGET)
-        with tempfile.TemporaryDirectory(dir=manifest_out.parent) as manifest_staging:
-            staged_manifest = Path(manifest_staging) / BUILD_MANIFEST
-            shutil.copyfile(staged / BUILD_MANIFEST, staged_manifest)
-            os.replace(staged_target, target)
-            os.replace(staged_manifest, manifest_out)
+    if create_target:
+        target.mkdir(parents=True)
+    try:
+        # The runner owns the target, but its parent (typically /mnt) may be read-only.
+        with tempfile.TemporaryDirectory(dir=target) as scratch:
+            staged = Path(scratch)
+            decompress_snapshot(archive, staged)
+            manifest_out.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=manifest_out.parent) as manifest_staging:
+                staged_manifest = Path(manifest_staging) / BUILD_MANIFEST
+                shutil.copyfile(staged / BUILD_MANIFEST, staged_manifest)
+                published_build = target / COV_TARGET
+                os.replace(staged / COV_TARGET, published_build)
+                try:
+                    os.replace(staged_manifest, manifest_out)
+                except BaseException:
+                    os.replace(published_build, staged / COV_TARGET)
+                    raise
+    except BaseException:
+        if create_target and not any(target.iterdir()):
+            target.rmdir()
+        raise
 
 
 def register_snapshot_commands(commands):

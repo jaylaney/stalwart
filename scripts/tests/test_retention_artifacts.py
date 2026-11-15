@@ -16,10 +16,14 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().with_name("retention_artifacts.py")
 MTIME = 1_790_000_000_123_456_789
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(SCRIPT.parent))
+from retention_artifacts import unpack_build
 
 
 def run_tool(*args, env=None):
@@ -303,6 +307,39 @@ class BuildSnapshotTests(unittest.TestCase):
         result = self.unpack()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(stale.read_text(), "keep me")
+        self.assertFalse(self.restored_manifest.exists())
+
+    def test_precreated_target_restores_under_read_only_parent(self):
+        packed = self.pack()
+        self.assertEqual(packed.returncode, 0, packed.stderr)
+        parent = self.root / "read-only-parent"
+        self.consumer = parent / "consumer"
+        self.consumer.mkdir(parents=True)
+        self.addCleanup(parent.chmod, stat.S_IMODE(parent.stat().st_mode))
+        parent.chmod(0o555)
+        if os.access(parent, os.W_OK):
+            self.skipTest("process can write to a directory with no write permission bits")
+
+        restored = self.unpack()
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual(sorted(path.name for path in self.consumer.iterdir()), ["llvm-cov-target"])
+        self.assertEqual(self.restored_manifest.read_bytes(), self.manifest.read_bytes())
+
+    def test_manifest_publication_failure_rolls_back_build(self):
+        packed = self.pack()
+        self.assertEqual(packed.returncode, 0, packed.stderr)
+        self.consumer.mkdir()
+        replace = os.replace
+
+        def fail_manifest(source, destination):
+            if destination == self.restored_manifest:
+                raise PermissionError("fixture publication failure")
+            return replace(source, destination)
+
+        with mock.patch("retention_artifacts.os.replace", side_effect=fail_manifest):
+            with self.assertRaisesRegex(PermissionError, "fixture publication failure"):
+                unpack_build(self.archive, self.consumer, self.restored_manifest)
+        self.assertEqual(list(self.consumer.iterdir()), [])
         self.assertFalse(self.restored_manifest.exists())
 
     def test_manifest_output_cannot_replace_the_target_directory(self):
