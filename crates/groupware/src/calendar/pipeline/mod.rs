@@ -8,6 +8,7 @@ pub mod admission;
 pub mod context;
 pub mod create;
 pub mod error;
+pub mod placement;
 pub mod schedule;
 pub mod uid;
 

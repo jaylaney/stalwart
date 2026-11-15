@@ -22,14 +22,13 @@ use crate::{
 use common::{
     DavName, GroupwareResources, Server,
     auth::AccessToken,
-    storage::{
-        batch::MAX_BATCH_DOCUMENTS,
-        index::PresenceFlags,
-        metadata::{StoredContainer, StoredEntry},
-    },
+    storage::{batch::MAX_BATCH_DOCUMENTS, index::PresenceFlags, metadata::StoredEntry},
 };
 use dav_proto::{Depth, RequestHeaders};
 use groupware::calendar::{
+    pipeline::placement::{
+        ZaPlacementPlan, za_placement_contexts, za_reseal_event_container, za_shared_copy_refusal,
+    },
     seal::{
         ZaContainerOf, ZaContainerScope, ZaEvent, classify_event_storage, rewrap_event, seal_error,
     },
@@ -1896,100 +1895,7 @@ async fn rename_container(
 }
 
 fn shared_copy_refusal(owner_id: u32) -> DavError {
-    trc::event!(
-        Security(trc::SecurityEvent::Unauthorized),
-        AccountId = owner_id,
-        Details = "zero-access: copy into or out of a shared calendar"
-    );
-    DavError::Code(StatusCode::FORBIDDEN)
-}
-fn linked_move_refusal(owner_id: u32) -> DavError {
-    trc::event!(
-        Security(trc::SecurityEvent::Unauthorized),
-        AccountId = owner_id,
-        Details = "zero-access: event linked into a shared calendar"
-    );
-    DavError::Code(StatusCode::FORBIDDEN)
-}
-
-/// COPY has an operation-specific 403 contract. Do not pass it through the
-/// seal/write resolver helper, whose shared-linked refusal is a PUT's 409.
-#[allow(clippy::too_many_arguments)]
-async fn za_move_contexts(
-    server: &Server,
-    token: &AccessToken,
-    owner: u32,
-    event: &CalendarEvent,
-    source: u32,
-    target: u32,
-    is_move: bool,
-    overwrite: bool,
-    is_collection: bool,
-) -> crate::Result<Vec<ZaCalendarContext>> {
-    let source_required = Bitmap::new().with_item(if is_move {
-        Acl::RemoveItems
-    } else {
-        Acl::ReadItems
-    });
-    let mut contexts = Vec::new();
-    let source_context = za_mutation_context(server, token, owner, source, source_required)
-        .await
-        .map_err(|error| super::za_calendar_error(error, owner, source))?
-        .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
-    if !event.names.iter().any(|name| name.parent_id == source) {
-        return Err(DavError::Code(StatusCode::NOT_FOUND));
-    }
-    if source_context.domain.calendar_id().is_some() {
-        if !is_move || is_collection {
-            return Err(shared_copy_refusal(owner));
-        }
-        if event.names.len() != 1 {
-            return Err(linked_move_refusal(owner));
-        }
-    }
-    contexts.push(source_context);
-    for parent in event
-        .names
-        .iter()
-        .map(|name| name.parent_id)
-        .collect::<BTreeSet<_>>()
-    {
-        if parent == source {
-            continue;
-        }
-        let context = za_mutation_context(server, token, owner, parent, source_required)
-            .await
-            .map_err(|error| super::za_calendar_error(error, owner, parent))?
-            .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
-        if context.domain.calendar_id().is_some() {
-            return Err(if is_move && !is_collection {
-                linked_move_refusal(owner)
-            } else {
-                shared_copy_refusal(owner)
-            });
-        }
-        contexts.push(context);
-    }
-    let mut required = Bitmap::new().with_item(Acl::AddItems);
-    if overwrite {
-        required = required.with_item(Acl::RemoveItems);
-    }
-    let target_context = za_mutation_context(server, token, owner, target, required)
-        .await
-        .map_err(|error| super::za_calendar_error(error, owner, target))?
-        .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
-    if target_context.domain.calendar_id().is_some() {
-        if !is_move || is_collection {
-            return Err(shared_copy_refusal(owner));
-        }
-        if event.names.len() != 1 {
-            return Err(linked_move_refusal(owner));
-        }
-    }
-    // Keep a separate target entry even for a same-calendar rename: its operation
-    // bits were freshly checked and callers have a stable destination position.
-    contexts.push(target_context);
-    Ok(contexts)
+    za_shared_copy_refusal(owner_id).into()
 }
 
 /// Raw surviving-parent fences carry no authority or collection keys: unlinking
@@ -2156,18 +2062,21 @@ async fn za_copy_move_stored_event(
     if schedule_tag.is_some() && event.schedule_tag != schedule_tag {
         return Err(DavError::Code(StatusCode::PRECONDITION_FAILED));
     }
-    let mut contexts = za_move_contexts(
+    let mut contexts = za_placement_contexts(
         server,
         token,
         owner,
-        &event,
-        source,
-        target,
-        is_move,
-        overwrite.is_some(),
-        is_collection,
+        &ZaPlacementPlan::caldav(
+            &event,
+            source,
+            target,
+            is_move,
+            overwrite.is_some(),
+            is_collection,
+        ),
     )
-    .await?;
+    .await?
+    .into_vec();
     let content_ = za_event_content(server, owner, event_id).await?;
     let content = content_
         .deserialize::<CalendarEventContent>()
@@ -2197,17 +2106,6 @@ async fn za_copy_move_stored_event(
         names_after,
         server.core.groupware.max_calendars_per_event,
     )?;
-    // The event's dead-property container (ruling 29): it follows the event
-    // into the target's key domain.
-    let container = read_container(
-        server,
-        owner,
-        Collection::CalendarEvent,
-        event_id,
-        event.metadata_kinds(),
-    )
-    .await
-    .caused_by(trc::location!())?;
     let overwritten: Option<Archive<ArchiveBytes>> = if let Some(id) = overwrite {
         server
             .store()
@@ -2269,26 +2167,20 @@ async fn za_copy_move_stored_event(
         for fence in &overwrite_fences {
             fence.assert_in(owner, &mut batch);
         }
-        if let Some(container) = container.as_ref().filter(|_| rewraps) {
-            let resealed = za_reseal_container(
-                container,
-                from,
-                ZaContainerOf::Event(&event.uid),
-                to,
-                ZaContainerScope::Event(&event.uid),
-                owner,
+        if rewraps {
+            let owner_account = server.account(owner).await.caused_by(trc::location!())?;
+            za_reseal_event_container(
+                server,
+                &owner_account,
                 event_id,
-            )?;
-            ContainerWrites::new(owner, Collection::CalendarEvent)
-                .copy(
-                    server,
-                    &resealed,
-                    event_id,
-                    Some(StoredContainer::from(container)),
-                    &mut batch,
-                )
-                .await
-                .caused_by(trc::location!())?;
+                &event.uid,
+                event.metadata_kinds(),
+                from,
+                to,
+                &mut batch,
+            )
+            .await
+            .caused_by(trc::location!())?;
         }
         let stored_event = original
             .to_unarchived::<CalendarEvent>()
@@ -2368,18 +2260,21 @@ async fn za_copy_move_stored_event(
                 }));
             }
             Err(error) if error.is_assertion_failure() && attempt == 0 => {
-                let fresh = za_move_contexts(
+                let fresh = za_placement_contexts(
                     server,
                     token,
                     owner,
-                    &event,
-                    source,
-                    target,
-                    is_move,
-                    overwrite.is_some(),
-                    is_collection,
+                    &ZaPlacementPlan::caldav(
+                        &event,
+                        source,
+                        target,
+                        is_move,
+                        overwrite.is_some(),
+                        is_collection,
+                    ),
                 )
-                .await?;
+                .await?
+                .into_vec();
                 let fresh_overwrite_fences = if let Some(stored) = &overwritten {
                     za_overwrite_fences(
                         server,
