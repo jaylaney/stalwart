@@ -10,6 +10,7 @@ pub mod pins;
 pub mod record;
 pub mod recovery;
 pub mod session;
+pub mod tokens;
 
 pub use zeroize::Zeroizing;
 
