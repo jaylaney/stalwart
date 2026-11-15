@@ -282,6 +282,7 @@ The plan, in `docs/superpowers/plans/`, each name after the prefix `2026-11-14-z
 - `src/calendar/pipeline/update.rs` (new; from `dav/src/calendar/update.rs`): the update target and commit, with placement.
 - `src/calendar/pipeline/placement.rs` (new; from `dav/src/calendar/copy_move.rs`): the placement plan, its contexts and refusals, the event container's reseal.
 - `src/calendar/pipeline/delete.rs` (new; from `dav/src/calendar/delete.rs`): the event delete, the whole-event destroy, the calendar delete.
+- `src/calendar/storage.rs`: factor the full-update enqueue step for Task 11's single-batch placement write; existing callers retain their commit-point wrapper.
 - `src/calendar/za_alerts.rs` (new): default alerts applied by value (D11).
 - `src/calendar/za_text.rs` (new): the in-memory text index of events (D12).
 - `src/calendar/sharing/resolve.rs`: `ZaSyncBoundary::refuses` (D15).

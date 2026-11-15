@@ -218,8 +218,10 @@ refusals of a placement change), 9.2 (`jmap_calendar::pipeline`).
 - Modify: `crates/groupware/src/calendar/pipeline/placement.rs`
   (`ZaPlacementPlan::jmap`, a unit test);
   `crates/groupware/src/calendar/pipeline/update.rs` (the plan path of
-  `za_commit_update`); `tests/src/za/jmap_calendar/pipeline.rs` (the
-  `update` helper, four private readers, seven cases);
+  `za_commit_update`); `crates/groupware/src/calendar/storage.rs`
+  (factor `enqueue_full_at`, preserving the existing wrapper);
+  `tests/src/za/jmap_calendar/pipeline.rs` (the `update` helper, private
+  readers and eight cases);
   `tests/src/za/jmap_calendar/mod.rs` (one `allow` goes);
   `tests/src/za/dav_seal.rs:1257,1267,1292` (`DEAD_CANARIES`,
   `dead_proppatch` and `assert_dead_round_trip` become `pub(super)`; no
@@ -239,7 +241,9 @@ refusals of a placement change), 9.2 (`jmap_calendar::pipeline`).
   helpers: `event_ics`, `put_event`, `session_token` (I §10); `Fx` and
   `create` (Task 10); `dav_seal::assert_dead_container_sealed`;
   `shared_container`, `za_post` (`tests/src/utils/za.rs`);
-  `container_is_ck`; `test_hooks::set_update_commit_pause`.
+  `container_is_ck`; `test_hooks::{set_update_commit_pause,
+  ForceCommitSplit, set_second_chunk_fail_once}`; the DAV client's
+  `sync_collection` and response `sync_token`.
 - Produces: `ZaPlacementPlan::jmap` (I §2.9) and the plan path of
   `za_commit_update` (I §2.8, §2.9): with `placement: Some(plan)` the
   commit runs the plan instead of returning Task 7's error. Private to
@@ -263,17 +267,22 @@ enters. The commit then differs from Task 7's in five places:
    with the stored row's UID. Its error returns at once; nothing was
    delivered or written.
 2. Sealing is in `contexts.to_domain()` (Task 7 already seals there).
-3. In each attempt's batch, before `update_full_at`: when the domain
+3. In each attempt's batch, before `enqueue_full_at`: when the domain
    changes, that is when
    `(from.calendar_id(), from.domain_id()) != (to.calendar_id(), to.domain_id())`
    for `contexts.from_domain()` and `contexts.to_domain()`,
    `za_reseal_event_container(server, account, document_id, uid, <the stored row's metadata kinds>, from, to, &mut batch)`.
-4. In each attempt's batch, after `update_full_at` and the alarms: one
+4. In each attempt's batch, after `enqueue_full_at` and the alarms: one
    `batch.log_calendar_vanished(parent_id, href)` for each stored name
    that `new_event.names` no longer holds (same parent and same name),
-   with `href = resources.format_item(&format!("{}/{}", calendar.path(), name))`
-   for the calendar's `resources.container_resource_path_by_id(parent_id)`.
-   A name whose calendar is not in `resources` logs nothing.
+   when `resources.container_resource_path_by_id(parent_id)` is present.
+   Find that parent's stored `Calendar.name` in this attempt's
+   `contexts.parents`; canonicalize it and the removed item name with
+   `common::storage::dav::canonical_calcard_segment`, join them with
+   `/`, and use `resources.format_item` for the href. The snapshot is
+   only the presence gate and base-path formatter. Its parent path may
+   predate a concurrent rename. A name whose calendar is not in
+   `resources` logs nothing.
 5. On an assertion loss at the first attempt:
    `fresh = za_placement_contexts(server, token, owner, &plan).await?`.
    If neither `calendars_changed(&contexts.parents, &fresh.parents)` nor
@@ -287,6 +296,16 @@ enters. The commit then differs from Task 7's in five places:
 
 Everything else is Task 7's: the pairs opened in `from_domain()`, the
 fan-out, the display name, one timestamp, both hooks, the mail guard.
+
+**One physical batch.** Factor `CalendarEvent::update_full_at` into
+`pub(crate) enqueue_full_at`, with the same arguments and return value,
+and the existing public wrapper. The helper keeps the original body
+except `commit_point()`; the wrapper calls it, takes that same commit
+point, and returns its ETag. The placement path uses the helper in each
+attempt. The no-placement path and every existing caller keep the
+wrapper. No boundary is added after the placement's alarms or logs:
+`BatchBuilder::commit_points()` finalizes this unsplit builder as one
+write. No new size refusal or global batching policy is introduced.
 
 **Constraints:**
 - The rights and the refusals come from `za_placement_contexts`, which
@@ -408,7 +427,9 @@ Each case deletes its events with `NO_REPLY` before it returns.
    The owner's PROPPATCH of `dead_proppatch(value)` at
    `{HOME}pipe-a/{uid}.ics` is 207, and `assert_dead_round_trip` holds
    there for the owner.
-2. `update(.., id, &[s], None)` is `Ok`. `assert_dead_round_trip` holds
+2. With `ForceCommitSplit` and `set_second_chunk_fail_once` armed only
+   around `update(.., id, &[s], None)`, the update is `Ok`. Drop/reset
+   both hooks before inspecting its result. `assert_dead_round_trip` holds
    at `{HOME}pipe-s/{uid}.ics` for the owner and for the grantee: the
    native client still reads what it wrote.
    `container_is_ck(shared_container(owner, Collection::CalendarEvent, id))`
@@ -460,14 +481,22 @@ For each row:
 `placement_with_content_change_commits_once`:
 1. `id = put_event(.., "pipe-a", "jmapcal-pipe-both", "before")`;
    `tip = get_last_change_id(owner, SyncCollection::Calendar)`.
-2. `update(.., id, &[b], Some(event_ics(uid, "after")))` is
-   `Ok(written)`.
+2. Add a future `ACTION:EMAIL` alarm to `event_ics(uid, "after")`, with
+   `TRIGGER:-PT10M` and the owner's address. The original event has no
+   alarm. Arm `ForceCommitSplit` and `set_second_chunk_fail_once` only
+   around `update(.., id, &[b], Some(replacement))`, then drop/reset
+   both hooks before inspecting the result. It is `Ok(written)`.
 3. `changes_after(owner, tip)` is `[written.change_id]`: one commit.
    `vanished_at(owner, written.change_id)` is
    `["{HOME}pipe-a/{uid}.ics"]`. `parents_of` is `[b]`.
 4. The owner's GET of `{HOME}pipe-b/{uid}.ics` is 200 with
    `SUMMARY:after` and without `SUMMARY:before`. `written.ical` holds
    `SUMMARY:after`.
+5. Read the document's queued task: it is `CalendarAlarmEmail`, with
+   this owner and document, pending at exactly ten minutes before the
+   fixture's future start. Setup and readback are outside the split
+   hooks. The forced-boundary run must preserve the event, alarm and
+   tombstone together, not just return success for a small batch.
 
 `placement_retry_after_grant_change` (`UPDATE_COMMIT_PAUSE`):
 1. MKCALENDAR of `pipe-g` (201), its id `g`.
@@ -480,13 +509,34 @@ For each row:
    `za_post("shares/grant", {"username": <owner>, "password": STRONG, "calendar": "pipe-g", "address": <grantee>, "level": "edit"})`
    answers 200. The grant changes `pipe-g`'s archive and its key domain;
    the grantee is pinned already, by the fixture's share.
-4. `parked.finish()` is `Ok(written)`.
+4. After the grant response, capture the Calendar tip. Arm
+   `ForceCommitSplit` and `set_second_chunk_fail_once` only around
+   `parked.finish()`, then drop/reset them before inspecting the result.
+   It is `Ok(written)`. The already-built first attempt loses its
+   calendar assertion; the retry must build an unsplit batch. The grant
+   writer runs with both hooks unset.
 5. `parents_of` is `[g]`. `za_owned_calendar_context(.., g)`'s
    `domain.calendar_id()` is `Some`, and the stored event opens in that
    domain: the retry did not store it in the domain `pipe-g` had before
    the grant. `stored.etag() == written.etag`. The grantee's GET of
    `{HOME}pipe-g/{uid}.ics` is 200 with the summary.
-6. The event and `pipe-g` are deleted.
+6. `changes_after(owner, tip)` is `[written.change_id]`, and
+   `vanished_at(owner, written.change_id)` is the source event's href.
+   The event and `pipe-g` are deleted.
+
+`placement_retry_after_source_rename` (`UPDATE_COMMIT_PAUSE`):
+1. Make a temporary unshared calendar `pipe-old`, put one event at
+   `event%20name.ics`, and park a pipeline update moving it to `pipe-b`.
+2. CalDAV MOVE the source collection to `pipe%20renamed` (201). While
+   the update remains parked, initial-sync the renamed collection,
+   assert that its event is present, and retain the returned token.
+3. Resume the update. It succeeds with the event in `pipe-b`. At the
+   returned change id, the vanished href is exactly the event under
+   `pipe%20renamed`, not `pipe-old` or a path containing a literal space.
+4. Incremental-sync `pipe%20renamed` using the token captured in step 2.
+   It returns 404 for that current event href. The collection's earlier
+   rename tombstone cannot satisfy this assertion: it predates the
+   token. Delete the moved event and temporary calendar.
 
 Steps:
 
@@ -496,14 +546,14 @@ Steps:
 - [ ] Implement `ZaPlacementPlan::jmap` by its rule.
 - [ ] Run U-groupware `jmap_plans`, then `caldav_plan`. Expected: all
   three tests pass.
-- [ ] Write `update`, the four readers and the seven cases; call the
+- [ ] Write `update`, the readers and the eight cases; call the
   cases from `test` after Task 10's, in the order above. Make the three
   items of `tests/src/za/dav_seal.rs` `pub(super)`, and remove
   `#[allow(dead_code)]` from `Pair.dav2` in `jmap_calendar/mod.rs`.
 - [ ] Run ZA. Expected: a panic in `placement_move_between_unshared`
   whose message holds `zero-access: placement change not implemented`.
-- [ ] Implement the plan path of `za_commit_update` by the five places,
-  and remove Task 7's error arm.
+- [ ] Factor `enqueue_full_at`, implement the plan path of
+  `za_commit_update` by the five places, and remove Task 7's error arm.
 - [ ] Run ZA and WK. Expected: both pass. WK runs because
   `za_commit_update` is the CalDAV PUT's commit too.
 - [ ] Kill-check the container reseal. Fault: in `pipeline/update.rs`,

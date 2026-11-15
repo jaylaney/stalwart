@@ -361,6 +361,17 @@ pub async fn za_commit_update(server, token, resources, account: &AccountCache, 
     update: ZaEventUpdate<'_>) -> Result<ZaWritten, ZaPipelineError>;
 ```
 
+For Task 11, `CalendarEvent::enqueue_full_at` is a `pub(crate)` helper
+in `calendar/storage.rs`, with the same arguments and return value as
+`update_full_at`. It contains that method's existing body except the
+terminal `batch.commit_point()`. `update_full_at` calls the helper,
+then takes its existing commit point and returns the same ETag. Every
+existing caller keeps that wrapper. Only `placement: Some(_)` uses the
+enqueue helper, on both attempts. Its context assertions, event,
+container, alarm tasks and vanished logs remain in one physical batch;
+no commit point is added at the end. Batch finalization supplies the
+single write. This adds no size refusal or store-wide behavior change.
+
 Hooks `update_commit_pause_point` and `take_update_commit_fail` move with
 the key commit. The plain commit and its own `update_commit_pause_point`
 stay at `crates/dav/src/calendar/update.rs` (`:829-862`): a test pins
@@ -477,9 +488,14 @@ wrapper for the collection paths (`copy_move.rs:2459` and eight more).
 - checks the UID in each entered calendar with `za_assert_is_unique_uid`;
 - seals in `to_domain`, and when the domain changes calls
   `za_reseal_event_container`;
-- writes one `log_calendar_vanished(calendar_id, href)` per left name,
-  `href = resources.format_item("{calendar path}/{name}")`, the form
-  `za_assert_is_unique_uid` builds (`dav/src/calendar/mod.rs:581-586`);
+- writes one `log_calendar_vanished(calendar_id, href)` per left name
+  whose parent is present in `resources`. The href uses that attempt's
+  matching `contexts.parents` stored `Calendar.name`, not the request
+  snapshot's parent path. Canonicalize both the calendar and item name
+  with `common::storage::dav::canonical_calcard_segment`, join them
+  with `/`, and pass the result to `resources.format_item`. This is the
+  cache's path spelling, fenced by the same calendar archive asserted
+  in the batch; rebuilding after a rename uses the renamed path;
 - on its retry runs `za_placement_contexts` again and rewraps if any
   calendar changed.
 
