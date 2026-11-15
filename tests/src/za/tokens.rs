@@ -165,6 +165,7 @@ pub async fn test(test: &mut TestServer) {
     refresh_crossed_by_credential_change(test, &app).await;
     refresh_crossed_by_other_vault_write(test, &app).await;
     retry_of_g_while_g1_completes(test, &app).await;
+    retry_reading_a_stale_record_keeps_the_grant(test, &app).await;
     failed_write_then_client_retry(test, &app).await;
     interrupted_refresh_cleared_by_another_grants_write(test, &app).await;
 
@@ -2205,6 +2206,52 @@ async fn retry_of_g_while_g1_completes(test: &TestServer, app: &Arc<ZaOAuthClien
             200
         );
     }
+}
+
+/// R18-1, spec 4.5 step 2: a retry of g(0) whose record snapshot predates the
+/// write that added g(1), while the registry has rotated past g(0), is
+/// superseded: it deletes no grant and writes nothing. The planted record
+/// stands for the stale read.
+async fn retry_reading_a_stale_record_keeps_the_grant(test: &TestServer, app: &Arc<ZaOAuthClient>) {
+    println!("  retry_reading_a_stale_record_keeps_the_grant");
+    let id = test.account(OWNER).id().document_id();
+    let t0 = za_sign_in(test, app, OWNER, STRONG, None).await;
+    let grant = t0.grant_id;
+    let signed_in = raw_token_record(test, id)
+        .await
+        .expect("the sign-in wrote a record");
+    assert_eq!(generations(test, id, grant).await, [0]);
+    let g1 = refresh_of(za_refresh(app, &t0.refresh).await);
+
+    let parked = HookParked::start(id, test_hooks::set_token_refresh_read_pause, {
+        let app = app.clone();
+        let g0 = t0.refresh.clone();
+        async move { za_refresh(&app, &g0).await }
+    })
+    .await;
+    let t2 = granted(za_refresh(app, &g1).await);
+    let current = raw_token_record(test, id)
+        .await
+        .expect("the refresh wrote a record");
+    set_raw_token_record(test, id, Some(&signed_in)).await;
+
+    assert_invalid_grant(parked.finish().await);
+    assert!(
+        test.server.oauth_grant(grant).await.unwrap().is_some(),
+        "the superseded retry deleted the grant"
+    );
+    assert!(
+        raw_token_record(test, id).await.as_deref() == Some(signed_in.as_slice()),
+        "the superseded retry wrote the record"
+    );
+
+    set_raw_token_record(test, id, Some(&current)).await;
+    let t3 = granted(za_refresh(app, t2.refresh_token.as_deref().unwrap()).await);
+    assert_eq!(za_bearer_session(&t3.access_token).await.0, 200);
+    assert_eq!(
+        za_revoke_token(app, t3.refresh_token.as_deref().unwrap()).await,
+        200
+    );
 }
 
 /// The refresh form through a raw client, whose answer is a server error

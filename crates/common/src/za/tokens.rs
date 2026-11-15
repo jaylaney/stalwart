@@ -407,6 +407,17 @@ impl Server {
             }
 
             let grants = self.token_grant_states(account_id, &record, None).await?;
+            // Upstream accepted this request with the grant's stored
+            // generation at `presented`, and its own rotation leaves it there.
+            // A higher one is a later rotation: this refresh is superseded,
+            // however old this attempt's record read is (spec 4.5 step 2).
+            if grants
+                .get(&grant_id)
+                .and_then(Option::as_ref)
+                .is_some_and(|state| state.generation > presented)
+            {
+                return Ok(ZaTokenRefresh::Superseded);
+            }
             let now = now();
             record.reconcile(account_id, now, &grants);
             let (mk, sealed) =
