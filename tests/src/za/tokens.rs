@@ -18,11 +18,13 @@ use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
     za::{
-        CALENDAR_JMAP_USING, Conn, Parked, VaultReply, assert_nothing_cached, code, park_login,
-        raw_token_record, set_raw_token_record, substitute_public_key, token_record, totp_url,
-        trigger_drain, vault_revision, wait_for_index_queue, wrap_mark, writer_key, za_bearer_dav,
-        za_bearer_jmap, za_bearer_session, za_grant_token, za_post, za_revoke_grant,
-        za_split_token, za_tamper_secret, za_unlock,
+        CALENDAR_JMAP_USING, Conn, HookParked, Parked, SERVER_URL, VaultReply, ZA_SIGNIN_SCOPE,
+        ZaClientKind, ZaOAuthClient, assert_nothing_cached, code, handoff_exists, oauth_expiry,
+        park_login, raw_token_record, set_raw_token_record, substitute_public_key, token_record,
+        totp_url, trigger_drain, vault_revision, wait_for_index_queue, wrap_mark, writer_key,
+        za_authorize, za_bearer_dav, za_bearer_jmap, za_bearer_session, za_confirm_consent,
+        za_drop_oauth_client, za_exchange, za_grant_token, za_oauth_client, za_post, za_refresh,
+        za_revoke_grant, za_revoke_token, za_sign_in, za_split_token, za_tamper_secret, za_unlock,
     },
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -36,7 +38,10 @@ use common::{
         tokens::{ZaIssued, ZaTokenIssue},
     },
 };
-use http::auth::authenticate::za_test;
+use http::auth::{
+    authenticate::za_test,
+    oauth::{DeviceAuthResponse, ErrorType, OAuthResponse, TokenResponse, auth::LoginResponse},
+};
 use registry::{
     schema::{
         prelude::{Object, ObjectInner, ObjectType},
@@ -48,20 +53,25 @@ use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use store::{
     ValueKey,
-    registry::write::{RegistryWrite, RegistryWriteResult},
+    registry::{
+        RegistryQuery,
+        write::{RegistryWrite, RegistryWriteResult},
+    },
     write::{BatchBuilder, now},
 };
-use trc::{AuthEvent, EventType, Key};
-use types::{collection::Collection, field::PrincipalField};
+use trc::{AuthEvent, EventType, HttpEvent, Key};
+use types::{collection::Collection, field::PrincipalField, id::Id};
 use vault::{
     keys::{Secret, derive_token_tag},
     record::za_session_binding,
     session::SessionKeys,
-    tokens::{TOKEN_RECORD_VERSION, ZaRefreshClass, append_secret},
+    tokens::{TOKEN_RECORD_VERSION, ZaRefreshClass, append_code_secret, append_secret},
 };
 
 const OWNER: &str = "token-owner@example.com";
 const MFA: &str = "token-mfa@example.com";
+const CONSENT: &str = "token-consent@example.com";
+const RACE: &str = "token-race@example.com";
 const CAP: &str = "token-cap@example.com";
 const PLAIN: &str = "token-plain@example.com";
 const CAL: &str = "/dav/cal/token-owner%40example.com/";
@@ -78,6 +88,8 @@ pub async fn test(test: &mut TestServer) {
         (OWNER, "Token Owner"),
         (MFA, "Token MFA"),
         (CAP, "Token Cap"),
+        (CONSENT, "Token Consent"),
+        (RACE, "Token Race"),
     ] {
         let account = admin
             .create_key_user_account(name, STRONG, description, &[], user_permissions())
@@ -112,6 +124,41 @@ pub async fn test(test: &mut TestServer) {
     bearer_crossed_by_vault_write_is_refused(test, owner).await;
     mail_bearer_login_stays_refused(test, owner).await;
     revocation_and_introspection_accept_the_suffix(test, owner).await;
+
+    let app =
+        Arc::new(za_oauth_client(test, &admin, "za-token-app", ZaClientKind::Application).await);
+    let registered =
+        Arc::new(za_oauth_client(test, &admin, "za-token-consent", ZaClientKind::Registered).await);
+    sign_in_gives_keyed_tokens(test, &app).await;
+    sign_in_with_second_factor(test, &app).await;
+    consent_path(test, &registered).await;
+    exchange_without_handoff_is_invalid_grant(test, &app).await;
+    ordinary_code_with_suffix_is_invalid_grant(test, &app, plain_id).await;
+    handoff_gone_after_redemption_and_expiry(test, &app).await;
+    device_flow_stays_keyless(test, &registered).await;
+    refresh_without_secret_of_keyed_grant_refused(test, &app, &registered).await;
+
+    handoff_crossed_by_password_change(test).await;
+    handoff_crossed_by_other_vault_write(test).await;
+    sign_in_crossed_by_vault_write_issues_no_code(test, &app).await;
+
+    let race = test.account(RACE).clone();
+    put_sign_in_canaries(test, &race).await;
+    exchange_crossed_by_password_change(test, &app).await;
+    exchange_crossed_by_recovery(test, &app).await;
+    exchange_crossed_by_other_vault_write(test, &app).await;
+    remove_sign_in_canaries(test, &race).await;
+
+    thirty_third_sign_in_ends_the_oldest(test, &app).await;
+    granted_answer_is_untraced(&app, test).await;
+    for client in [app, registered] {
+        za_drop_oauth_client(
+            test,
+            &admin,
+            Arc::into_inner(client).expect("OAuth requests finished"),
+        )
+        .await;
+    }
 
     wait_for_index_queue(test, plain_id, Duration::from_secs(30)).await;
     admin.destroy_account(plain).await;
@@ -893,4 +940,737 @@ async fn bump_registry_revision(test: &TestServer) {
         .await
         .unwrap();
     assert!(matches!(result, RegistryWriteResult::Success(_)));
+}
+
+fn code_of(location: &str) -> String {
+    reqwest::Url::parse(location)
+        .expect("authorization returns a redirect URL")
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .expect("redirect contains a code")
+        .1
+        .into_owned()
+}
+
+async fn grants_of(test: &TestServer, account_id: u32) -> Vec<Id> {
+    test.server
+        .registry()
+        .query(RegistryQuery::new(ObjectType::OAuthGrant).with_account(account_id))
+        .await
+        .unwrap()
+}
+
+fn authorized_code(response: LoginResponse) -> String {
+    let LoginResponse::Authenticated { location } = response else {
+        panic!("sign-in did not authorize a code");
+    };
+    code_of(&location)
+}
+
+fn consent_token(response: LoginResponse) -> String {
+    let LoginResponse::ConsentRequired { token } = response else {
+        panic!("sign-in did not request consent");
+    };
+    token
+}
+
+fn granted(response: TokenResponse) -> OAuthResponse {
+    let TokenResponse::Granted(tokens) = response else {
+        panic!("the OAuth grant was refused");
+    };
+    tokens
+}
+
+fn assert_invalid_grant(response: TokenResponse) {
+    assert!(matches!(
+        response,
+        TokenResponse::Error {
+            error: ErrorType::InvalidGrant
+        }
+    ));
+}
+
+fn assert_keyed_pair(access: &str, refresh: &str) {
+    let (upstream, secret) = za_split_token(access);
+    assert_eq!(secret.expect("the access token has no secret").len(), 43);
+    assert_eq!(access.len(), upstream.len() + 44);
+    let refresh_secret = za_split_token(refresh)
+        .1
+        .expect("the refresh token has no secret");
+    assert_eq!(refresh_secret.len(), 43);
+    assert!(
+        Some(refresh_secret) != secret,
+        "the token secrets must differ"
+    );
+}
+
+fn assert_first_entries(record: &vault::tokens::ZaTokenRecord, grant_id: u64) {
+    let grant = record.grant(grant_id).expect("the record names the grant");
+    assert_eq!(grant.refresh.len(), 1);
+    assert_eq!(grant.refresh[0].generation, 0);
+    assert_eq!(grant.access.len(), 1);
+}
+
+fn sign_in_event_path(account: &Account) -> String {
+    format!(
+        "/dav/cal/{}/default/token-signin.ics",
+        account.name().replace('@', "%40"),
+    )
+}
+
+async fn put_sign_in_canaries(test: &TestServer, account: &Account) {
+    let event = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//ZA//EN\r\n\
+                 BEGIN:VEVENT\r\nUID:token-signin\r\nDTSTAMP:20261020T100000Z\r\n\
+                 DTSTART:20261020T100000Z\r\nDTEND:20261020T110000Z\r\n\
+                 SUMMARY:sign-in canary event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    assert_eq!(
+        put(
+            account.name(),
+            STRONG,
+            sign_in_event_path(account),
+            event.to_owned()
+        )
+        .await,
+        201
+    );
+    mail::deliver(
+        test,
+        "sender@example.org",
+        account.name(),
+        &mail::message_with("sign-in canary subject", "body"),
+    )
+    .await;
+}
+
+async fn assert_sign_in_canaries(account: &Account, access: &str) {
+    let response = za_bearer_dav(account, access)
+        .request("GET", &sign_in_event_path(account), "")
+        .await;
+    assert_eq!(response.status.as_u16(), 200, "keyed CalDAV GET");
+    assert!(
+        response
+            .body
+            .is_ok_and(|body| body.contains("SUMMARY:sign-in canary event"))
+    );
+
+    let (status, response) = za_bearer_jmap(
+        access,
+        CALENDAR_JMAP_USING,
+        json!([
+            ["Email/query", { "accountId": account.id_string() }, "q"],
+            ["Email/get", {
+                "accountId": account.id_string(),
+                "#ids": { "resultOf": "q", "name": "Email/query", "path": "/ids" },
+                "properties": ["subject"],
+            }, "g"],
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let replies = &response.0["methodResponses"];
+    assert!(replies[0][0].as_str() == Some("Email/query"));
+    assert!(replies[1][0].as_str() == Some("Email/get"));
+    assert!(replies[1][1]["list"][0]["subject"].as_str() == Some("sign-in canary subject"));
+}
+
+async fn remove_sign_in_canaries(test: &TestServer, account: &Account) {
+    let basic = DummyWebDavClient::new(
+        account.id().document_id(),
+        account.name(),
+        STRONG,
+        account.name(),
+    );
+    assert_eq!(
+        basic
+            .request("DELETE", &sign_in_event_path(account), "")
+            .await
+            .status
+            .as_u16(),
+        204,
+    );
+    test.destroy_all_mailboxes(account).await;
+}
+
+async fn sign_in_gives_keyed_tokens(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  sign_in_gives_keyed_tokens");
+    let tokens = za_sign_in(test, app, OWNER, STRONG, None).await;
+    assert_keyed_pair(&tokens.access, &tokens.refresh);
+    assert!(tokens.expires_in > 0);
+    let owner = test.account(OWNER);
+    let id = owner.id().document_id();
+    put_sign_in_canaries(test, owner).await;
+    assert_sign_in_canaries(owner, &tokens.access).await;
+    assert_first_entries(&token_record(test, id).await.unwrap(), tokens.grant_id);
+    assert_eq!(za_revoke_token(app, &tokens.refresh).await, 200);
+    assert!(
+        test.server
+            .oauth_grant(tokens.grant_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(raw_token_record(test, id).await.is_none());
+    assert_eq!(za_bearer_session(&tokens.access).await.0, 401);
+    remove_sign_in_canaries(test, owner).await;
+}
+
+async fn sign_in_with_second_factor(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  sign_in_with_second_factor");
+    let url = totp_url();
+    let reply = za_post(
+        "totp",
+        &json!({
+            "username": MFA, "password": STRONG, "otp_auth": &url, "confirm": code(&url),
+        }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    assert!(matches!(
+        za_authorize(app, MFA, STRONG, None, Some(true), Some("10.0.60.8")).await,
+        LoginResponse::MfaRequired
+    ));
+
+    let tokens = za_sign_in(test, app, MFA, STRONG, Some(&code(&url))).await;
+    assert!(za_split_token(&tokens.access).1.is_some());
+    assert_eq!(za_bearer_session(&tokens.access).await.0, 200);
+    assert_eq!(za_revoke_token(app, &tokens.refresh).await, 200);
+
+    let reply = za_post(
+        "totp",
+        &json!({
+            "username": MFA, "password": STRONG, "otp_auth": null, "totp": code(&url),
+        }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+}
+
+async fn consent_path(test: &TestServer, registered: &ZaOAuthClient) {
+    println!("  consent_path");
+    let id = test.account(CONSENT).id().document_id();
+    let request = || za_authorize(registered, CONSENT, STRONG, None, None, None);
+    let opaque = consent_token(request().await);
+    assert_eq!(opaque.len(), 83);
+    assert!(handoff_exists(test, &opaque).await);
+    let code = authorized_code(za_confirm_consent(registered, &opaque, true).await);
+    assert!(!handoff_exists(test, &opaque).await);
+    assert_eq!(code.len(), 83);
+    assert!(handoff_exists(test, &code).await);
+    let first = granted(za_exchange(registered, &code).await);
+    assert!(za_split_token(&first.access_token).1.is_some());
+    assert!(!handoff_exists(test, &code).await);
+
+    let code = authorized_code(request().await);
+    let second = granted(za_exchange(registered, &code).await);
+    assert_keyed_pair(
+        &second.access_token,
+        second.refresh_token.as_deref().unwrap(),
+    );
+    for tokens in [first, second] {
+        assert_eq!(
+            za_revoke_token(registered, tokens.refresh_token.as_deref().unwrap()).await,
+            200
+        );
+    }
+
+    let opaque = consent_token(request().await);
+    assert!(handoff_exists(test, &opaque).await);
+    assert!(matches!(
+        za_confirm_consent(registered, &opaque, false).await,
+        LoginResponse::Redirect { .. }
+    ));
+    assert!(!handoff_exists(test, &opaque).await);
+
+    let opaque = consent_token(request().await);
+    assert!(handoff_exists(test, &opaque).await);
+    let code = authorized_code(za_confirm_consent(registered, &opaque[..40], true).await);
+    assert!(!handoff_exists(test, &opaque).await);
+    assert_eq!(code.len(), 40);
+    assert_invalid_grant(za_exchange(registered, &code).await);
+    assert!(grants_of(test, id).await.is_empty());
+    assert!(raw_token_record(test, id).await.is_none());
+}
+
+async fn exchange_without_handoff_is_invalid_grant(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  exchange_without_handoff_is_invalid_grant");
+    let id = test.account(OWNER).id().document_id();
+    let authorize = || za_authorize(app, OWNER, STRONG, None, Some(true), None);
+    let code = authorized_code(authorize().await);
+    assert!(handoff_exists(test, &code).await);
+    assert_invalid_grant(za_exchange(app, &code[..40]).await);
+    assert!(!handoff_exists(test, &code).await);
+    assert_invalid_grant(za_exchange(app, &code).await);
+
+    let code = authorized_code(authorize().await);
+    assert!(handoff_exists(test, &code).await);
+    let mut wrong = code[..40].to_owned();
+    append_code_secret(&mut wrong, &Secret::random());
+    assert_invalid_grant(za_exchange(app, &wrong).await);
+    assert!(!handoff_exists(test, &code).await);
+    assert!(grants_of(test, id).await.is_empty());
+    assert!(raw_token_record(test, id).await.is_none());
+}
+
+async fn ordinary_code_with_suffix_is_invalid_grant(
+    test: &TestServer,
+    app: &ZaOAuthClient,
+    plain_id: u32,
+) {
+    println!("  ordinary_code_with_suffix_is_invalid_grant");
+    let mut code = authorized_code(za_authorize(app, PLAIN, STRONG, None, Some(true), None).await);
+    assert_eq!(code.len(), 40);
+    assert!(!handoff_exists(test, &code).await);
+    append_code_secret(&mut code, &Secret::random());
+    assert_invalid_grant(za_exchange(app, &code).await);
+    assert!(grants_of(test, plain_id).await.is_empty());
+    assert_invalid_grant(za_exchange(app, &code[..40]).await);
+}
+
+async fn handoff_gone_after_redemption_and_expiry(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  handoff_gone_after_redemption_and_expiry");
+    let authorize = || za_authorize(app, OWNER, STRONG, None, Some(true), None);
+    let code = authorized_code(authorize().await);
+    assert!(handoff_exists(test, &code).await);
+    let tokens = granted(za_exchange(app, &code).await);
+    assert!(!handoff_exists(test, &code).await);
+    assert_eq!(
+        za_revoke_token(app, tokens.refresh_token.as_deref().unwrap()).await,
+        200
+    );
+
+    let _expiry = oauth_expiry(test, None, None, Some(2));
+    let code = authorized_code(authorize().await);
+    assert!(handoff_exists(test, &code).await);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!handoff_exists(test, &code).await);
+    assert_invalid_grant(za_exchange(app, &code).await);
+}
+
+async fn device_grant(client: &ZaOAuthClient) -> OAuthResponse {
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let codes: DeviceAuthResponse = http
+        .post(format!("{SERVER_URL}/auth/device"))
+        .form(&[
+            ("client_id", client.client_id.as_str()),
+            ("scope", ZA_SIGNIN_SCOPE),
+        ])
+        .send()
+        .await
+        .unwrap_or_else(|_| panic!("device authorization request failed"))
+        .json()
+        .await
+        .unwrap_or_else(|_| panic!("device authorization response is invalid"));
+    let approval: Value = http
+        .post(format!("{SERVER_URL}/api/auth"))
+        .json(&json!({
+            "type": "authDevice",
+            "accountName": OWNER,
+            "accountSecret": STRONG,
+            "code": codes.user_code,
+            "consent": true,
+        }))
+        .send()
+        .await
+        .unwrap_or_else(|_| panic!("device approval request failed"))
+        .json()
+        .await
+        .unwrap_or_else(|_| panic!("device approval response is invalid"));
+    assert!(approval == json!({ "type": "verified" }));
+    let response = http
+        .post(format!("{SERVER_URL}/auth/token"))
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", codes.device_code.as_str()),
+            ("client_id", client.client_id.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap_or_else(|_| panic!("device code exchange failed"))
+        .json()
+        .await
+        .unwrap_or_else(|_| panic!("device code exchange response is invalid"));
+    granted(response)
+}
+
+fn assert_keyless_pair(tokens: &OAuthResponse) {
+    assert!(!tokens.access_token.contains('~'));
+    assert!(!tokens.refresh_token.as_deref().unwrap().contains('~'));
+}
+
+async fn device_flow_stays_keyless(test: &TestServer, registered: &ZaOAuthClient) {
+    println!("  device_flow_stays_keyless");
+    let tokens = device_grant(registered).await;
+    assert_keyless_pair(&tokens);
+    let owner = test.account(OWNER);
+    assert!(
+        raw_token_record(test, owner.id().document_id())
+            .await
+            .is_none()
+    );
+    let (status, response) =
+        za_bearer_jmap(&tokens.access_token, CALENDAR_JMAP_USING, mail_get(owner)).await;
+    assert_eq!(status, 200);
+    assert!(response.is_error_at(0));
+    let error = &response.0["methodResponses"][0][1];
+    assert!(error["type"].as_str() == Some("forbidden"));
+    assert!(error["description"].as_str() == Some(ZA_MAIL_KEYLESS));
+    assert_eq!(
+        za_revoke_token(registered, tokens.refresh_token.as_deref().unwrap()).await,
+        200
+    );
+}
+
+async fn refresh_without_secret_of_keyed_grant_refused(
+    test: &TestServer,
+    app: &ZaOAuthClient,
+    registered: &ZaOAuthClient,
+) {
+    println!("  refresh_without_secret_of_keyed_grant_refused");
+    let id = test.account(OWNER).id().document_id();
+    let t0 = za_sign_in(test, app, OWNER, STRONG, None).await;
+    let before = test.server.oauth_grant(t0.grant_id).await.unwrap().unwrap();
+    let raw = raw_token_record(test, id)
+        .await
+        .expect("the keyed grant has a record");
+    let upstream = za_split_token(&t0.refresh).0;
+    let malformed = format!("{upstream}~short");
+    for refresh in [upstream, &malformed] {
+        assert_invalid_grant(za_refresh(app, refresh).await);
+        let after = test.server.oauth_grant(t0.grant_id).await.unwrap().unwrap();
+        assert_eq!(after.grant.generation, before.grant.generation);
+        assert_eq!(after.grant.pending, before.grant.pending);
+        assert!(raw_token_record(test, id).await.as_deref() == Some(raw.as_slice()));
+    }
+
+    // Task 18 replaces the interim refusal with the keyed refresh.
+    assert_invalid_grant(za_refresh(app, &t0.refresh).await);
+    let after = test.server.oauth_grant(t0.grant_id).await.unwrap().unwrap();
+    assert_eq!(after.grant.generation, before.grant.generation);
+    assert_eq!(after.grant.pending, before.grant.pending);
+    assert!(raw_token_record(test, id).await.as_deref() == Some(raw.as_slice()));
+    assert_eq!(za_revoke_token(app, &t0.refresh).await, 200);
+
+    let device = device_grant(registered).await;
+    let refreshed = granted(za_refresh(registered, device.refresh_token.as_deref().unwrap()).await);
+    assert_keyless_pair(&refreshed);
+    assert_eq!(
+        za_revoke_token(registered, refreshed.refresh_token.as_deref().unwrap()).await,
+        200
+    );
+}
+
+const SIGN_IN_VAULT_CHANGED: &str = "zero-access: vault changed during sign-in";
+
+async fn park_handoff(
+    test: &TestServer,
+    id: u32,
+    key_id: &'static str,
+) -> HookParked<trc::Result<Secret>> {
+    assert!(!handoff_exists(test, key_id).await);
+    let keys = za_unlock(test, id, STRONG).await;
+    let server = test.server.clone();
+    HookParked::start(id, test_hooks::set_token_handoff_write_pause, async move {
+        server
+            .za_handoff_put(key_id, id, &keys, server.core.oauth.oauth_expiry_auth_code)
+            .await
+    })
+    .await
+}
+
+async fn assert_handoff_refused(
+    test: &TestServer,
+    id: u32,
+    key_id: &str,
+    result: trc::Result<Secret>,
+) {
+    let Err(err) = result else {
+        panic!("the crossed hand-off returned a secret");
+    };
+    assert!(err.matches(AUTH_FAILED));
+    assert!(err.value_as_str(Key::Details) == Some(SIGN_IN_VAULT_CHANGED));
+    assert!(!handoff_exists(test, key_id).await);
+    assert!(grants_of(test, id).await.is_empty());
+    assert!(raw_token_record(test, id).await.is_none());
+}
+
+async fn handoff_crossed_by_password_change(test: &TestServer) {
+    println!("  handoff_crossed_by_password_change");
+    const KEY_ID: &str = concat!("handoffpassword", "0123456789012345678901234");
+    let id = test.account(RACE).id().document_id();
+    let parked = park_handoff(test, id, KEY_ID).await;
+    let reply = za_post(
+        "password",
+        &json!({ "username": RACE, "password": STRONG, "new_password": STRONG2 }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    let result = parked.finish().await;
+    let reply = za_post(
+        "password",
+        &json!({ "username": RACE, "password": STRONG2, "new_password": STRONG }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    assert_handoff_refused(test, id, KEY_ID, result).await;
+}
+
+async fn rotate_race_recovery_key(test: &mut TestServer) {
+    let reply = za_post(
+        "recovery-key",
+        &json!({ "username": RACE, "password": STRONG }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    test.accounts.get_mut(RACE).unwrap().recovery_key =
+        Some(reply.body["recovery_key"].as_str().unwrap().to_owned());
+}
+
+async fn handoff_crossed_by_other_vault_write(test: &mut TestServer) {
+    println!("  handoff_crossed_by_other_vault_write");
+    const KEY_ID: &str = concat!("handoffrecovery", "0123456789012345678901234");
+    let id = test.account(RACE).id().document_id();
+    let before = test.server.za_vault_record(id).await.unwrap().unwrap();
+    let parked = park_handoff(test, id, KEY_ID).await;
+    rotate_race_recovery_key(test).await;
+    let after = test.server.za_vault_record(id).await.unwrap().unwrap();
+    assert!(after.record.revision > before.record.revision);
+    assert_eq!(
+        za_session_binding(&after.record),
+        za_session_binding(&before.record)
+    );
+    assert_handoff_refused(test, id, KEY_ID, parked.finish().await).await;
+}
+
+async fn sign_in_crossed_by_vault_write_issues_no_code(
+    test: &mut TestServer,
+    app: &Arc<ZaOAuthClient>,
+) {
+    println!("  sign_in_crossed_by_vault_write_issues_no_code");
+    let id = test.account(RACE).id().document_id();
+    let traced = Traced::start(&[AUTH_FAILED]);
+    let parked = HookParked::start(id, test_hooks::set_token_handoff_write_pause, {
+        let app = app.clone();
+        async move {
+            let mut query = reqwest::Url::parse("https://example.org/").unwrap();
+            query.query_pairs_mut().extend_pairs([
+                ("response_type", "code"),
+                ("client_id", app.client_id.as_str()),
+                ("redirect_uri", app.redirect_uri.as_str()),
+                ("scope", ZA_SIGNIN_SCOPE),
+                (
+                    "code_challenge",
+                    "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                ),
+                ("code_challenge_method", "S256"),
+                ("state", "za-token-sign-in-race"),
+            ]);
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap()
+                .post(format!("{SERVER_URL}/api/auth"))
+                .header("X-Forwarded-For", "10.0.60.9")
+                .json(&json!({
+                    "type": "authCode",
+                    "accountName": RACE,
+                    "accountSecret": STRONG,
+                    "query": query.query().unwrap(),
+                    "consent": true,
+                }))
+                .send()
+                .await
+                .unwrap_or_else(|_| panic!("the parked authorization request failed"))
+        }
+    })
+    .await;
+    rotate_race_recovery_key(test).await;
+    let response = parked.finish().await;
+    assert_eq!(response.status().as_u16(), 401);
+    assert!(!response.headers().contains_key("location"));
+    let body: Value = response
+        .json()
+        .await
+        .unwrap_or_else(|_| panic!("authorization failure did not return a problem body"));
+    assert!(body.get("location").is_none());
+    assert!(body.get("token").is_none());
+    assert!(grants_of(test, id).await.is_empty());
+    assert!(raw_token_record(test, id).await.is_none());
+    assert!(traced.finish().await.iter().any(|event| {
+        event.typ == AUTH_FAILED
+            && event.account_id == Some(u64::from(id))
+            && event.details == SIGN_IN_VAULT_CHANGED
+    }));
+}
+
+async fn park_exchange(
+    test: &TestServer,
+    app: &Arc<ZaOAuthClient>,
+    password: &str,
+) -> (String, HookParked<TokenResponse>) {
+    let id = test.account(RACE).id().document_id();
+    let code = authorized_code(za_authorize(app, RACE, password, None, Some(true), None).await);
+    assert!(handoff_exists(test, &code).await);
+    let parked = HookParked::start(id, test_hooks::set_token_exchange_pause, {
+        let app = app.clone();
+        let code = code.clone();
+        async move { za_exchange(&app, &code).await }
+    })
+    .await;
+    assert!(raw_token_record(test, id).await.is_none());
+    assert_eq!(grants_of(test, id).await.len(), 1);
+    (code, parked)
+}
+
+async fn assert_crossed_exchange_refused(
+    test: &TestServer,
+    code: &str,
+    parked: HookParked<TokenResponse>,
+) {
+    assert_invalid_grant(parked.finish().await);
+    let id = test.account(RACE).id().document_id();
+    assert!(raw_token_record(test, id).await.is_none());
+    assert!(grants_of(test, id).await.is_empty());
+    assert!(!handoff_exists(test, code).await);
+}
+
+async fn exchange_crossed_by_password_change(test: &TestServer, app: &Arc<ZaOAuthClient>) {
+    println!("  exchange_crossed_by_password_change");
+    let (code, parked) = park_exchange(test, app, STRONG).await;
+    let reply = za_post(
+        "password",
+        &json!({
+            "username": RACE, "password": STRONG, "new_password": STRONG2,
+        }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    assert_crossed_exchange_refused(test, &code, parked).await;
+    let tokens = za_sign_in(test, app, RACE, STRONG2, None).await;
+    assert_sign_in_canaries(test.account(RACE), &tokens.access).await;
+    assert_eq!(za_revoke_token(app, &tokens.refresh).await, 200);
+}
+
+async fn exchange_crossed_by_recovery(test: &mut TestServer, app: &Arc<ZaOAuthClient>) {
+    println!("  exchange_crossed_by_recovery");
+    let (code, parked) = park_exchange(test, app, STRONG2).await;
+    let reply = za_post(
+        "recover",
+        &json!({
+            "username": RACE,
+            "recovery_key": test.account(RACE).recovery_key.as_deref().unwrap(),
+            "new_password": STRONG,
+        }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    test.accounts.get_mut(RACE).unwrap().recovery_key =
+        Some(reply.body["recovery_key"].as_str().unwrap().to_owned());
+    assert_crossed_exchange_refused(test, &code, parked).await;
+    let tokens = za_sign_in(test, app, RACE, STRONG, None).await;
+    assert_sign_in_canaries(test.account(RACE), &tokens.access).await;
+    assert_eq!(za_revoke_token(app, &tokens.refresh).await, 200);
+}
+
+async fn exchange_crossed_by_other_vault_write(test: &mut TestServer, app: &Arc<ZaOAuthClient>) {
+    println!("  exchange_crossed_by_other_vault_write");
+    let id = test.account(RACE).id().document_id();
+    let before = test.server.za_vault_record(id).await.unwrap().unwrap();
+    let binding = za_session_binding(&before.record);
+    let (code, parked) = park_exchange(test, app, STRONG).await;
+    rotate_race_recovery_key(test).await;
+    assert!(vault_revision(test, id).await > before.record.revision);
+    let tokens = granted(parked.finish().await);
+    assert!(!handoff_exists(test, &code).await);
+    let refresh = tokens.refresh_token.as_deref().unwrap();
+    assert_keyed_pair(&tokens.access_token, refresh);
+    let grant = test
+        .server
+        .decode_access_token(None, &tokens.access_token)
+        .unwrap_or_else(|_| panic!("could not decode the keyed access token"))
+        .grant
+        .unwrap();
+    let record = token_record(test, id).await.unwrap();
+    assert_eq!(record.binding, binding);
+    assert_first_entries(&record, grant.id);
+    assert_sign_in_canaries(test.account(RACE), &tokens.access_token).await;
+    assert_eq!(grants_of(test, id).await, vec![Id::new(grant.id)]);
+    assert_eq!(za_revoke_token(app, refresh).await, 200);
+}
+
+async fn thirty_third_sign_in_ends_the_oldest(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  thirty_third_sign_in_ends_the_oldest");
+    let id = test.account(CAP).id().document_id();
+    let mut tokens = Vec::with_capacity(32);
+    for _ in 0..32 {
+        tokens.push(za_sign_in(test, app, CAP, STRONG, None).await);
+    }
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let stored = test
+        .server
+        .oauth_grant(tokens[0].grant_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        test.server.rotate_oauth_grant(stored, 0).await.unwrap(),
+        GrantRotation::Issue { .. }
+    ));
+    let last = za_sign_in(test, app, CAP, STRONG, None).await;
+    let record = token_record(test, id).await.unwrap();
+    let evicted = tokens.remove(1);
+    assert_eq!(record.grants.len(), 32);
+    assert!(record.grant(evicted.grant_id).is_none());
+    assert!(record.grant(tokens[0].grant_id).is_some());
+    assert!(
+        test.server
+            .oauth_grant(evicted.grant_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(za_bearer_session(&evicted.access).await.0, 401);
+    assert_invalid_grant(za_refresh(app, &evicted.refresh).await);
+    assert_eq!(za_bearer_session(&last.access).await.0, 200);
+    assert_eq!(za_bearer_session(&tokens[0].access).await.0, 200);
+    for tokens in tokens.into_iter().chain([last]) {
+        assert_eq!(za_revoke_token(app, &tokens.refresh).await, 200);
+    }
+    assert!(grants_of(test, id).await.is_empty());
+    assert!(raw_token_record(test, id).await.is_none());
+}
+
+async fn granted_answer_is_untraced(app: &ZaOAuthClient, test: &TestServer) {
+    println!("  granted_answer_is_untraced");
+    let traced = Traced::start(EventType::variants());
+    let keyed = za_sign_in(test, app, OWNER, STRONG, None).await;
+    let plain = za_sign_in(test, app, PLAIN, STRONG, None).await;
+    assert!(za_split_token(&plain.access).1.is_none());
+    assert!(za_split_token(&plain.refresh).1.is_none());
+    assert_invalid_grant(za_exchange(app, &"x".repeat(40)).await);
+
+    let events = traced.finish().await;
+    for token in [&keyed.access, &keyed.refresh, &plain.access, &plain.refresh] {
+        let (upstream, secret) = za_split_token(token);
+        assert!(
+            events.iter().all(|event| {
+                !event.text.contains(upstream) && secret.is_none_or(|s| !event.text.contains(s))
+            }),
+            "the trace contains an OAuth token or a secret"
+        );
+    }
+    let has_body = |text| {
+        events.iter().any(|event| {
+            event.typ == EventType::Http(HttpEvent::ResponseBody) && event.text.contains(text)
+        })
+    };
+    assert!(has_body("[redacted]"));
+    assert!(has_body("invalid_grant"));
+    for tokens in [keyed, plain] {
+        assert_eq!(za_revoke_token(app, &tokens.refresh).await, 200);
+    }
 }

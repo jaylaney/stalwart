@@ -683,6 +683,10 @@ async fn oauth_sign_in_refuses_vault_app_password(test: &TestServer) {
         "authorization_pending"
     );
 
+    // Release 6 (spec 9.6): the exchange issues a keyed grant and token
+    // record. The app-password revoke at the end changes no credential
+    // binding (D19), so the record lasts until its grant or account goes.
+    // The emptiness check exempts field 153 while the account exists.
     let code_reply = api_auth(auth_code(STRONG)).await;
     assert_eq!(code_reply["type"], "authenticated");
     let redirect = reqwest::Url::parse(code_reply["location"].as_str().unwrap()).unwrap();

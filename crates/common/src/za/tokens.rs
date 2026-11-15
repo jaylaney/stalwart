@@ -5,7 +5,7 @@
  */
 
 use crate::{
-    Server,
+    KV_OAUTH, Server,
     auth::{
         oauth::{grant::GrantDeletion, token::TOKEN_HEADER},
         vault::{RawValue, vault_read_usable_store},
@@ -14,10 +14,12 @@ use crate::{
 };
 use std::{
     collections::{HashMap, hash_map::Entry},
+    fmt,
     sync::Arc,
 };
 use store::{
-    Deserialize, Serialize, Store, ValueKey,
+    Deserialize, Serialize, Store, Value, ValueKey,
+    dispatch::lookup::KeyValue,
     write::{
         Archive, ArchiveBytes, Archiver, BatchBuilder, Compression, ValueClass,
         assert::AssertValue, now,
@@ -29,7 +31,10 @@ use vault::{
     keys::Secret,
     record::za_session_binding,
     session::SessionKeys,
-    tokens::{TOKEN_RECORD_VERSION, ZaGrantState, ZaSuffix, ZaTokenRecord, split_secret},
+    tokens::{
+        TOKEN_RECORD_VERSION, ZaGrantState, ZaSuffix, ZaTokenRecord, open_handoff, seal_handoff,
+        split_secret,
+    },
 };
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -48,6 +53,54 @@ pub struct ZaIssued {
 pub enum ZaTokenIssue {
     Issued(ZaIssued),
     VaultChanged,
+}
+
+pub enum ZaRefreshPrecheck {
+    Keyless,
+    Keyed,
+    Refused,
+}
+
+pub struct ZaHandoff {
+    pub account_id: u32,
+    pub binding: u64,
+    pub mk: Secret,
+}
+
+// In-memory reads require Debug, but the hand-off holds a wrapped master key.
+struct HandoffValue(Vec<u8>);
+
+impl fmt::Debug for HandoffValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl Deserialize for HandoffValue {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
+        Ok(Self(bytes.to_vec()))
+    }
+}
+
+impl From<Value<'static>> for HandoffValue {
+    fn from(value: Value<'static>) -> Self {
+        match value {
+            Value::Blob(bytes) => Self(bytes.into_owned()),
+            _ => Self(Vec::new()),
+        }
+    }
+}
+
+fn handoff_key(key_id: &str) -> Vec<u8> {
+    KeyValue::<()>::build_key(KV_OAUTH, [b"~", key_id.as_bytes()].concat())
+}
+
+fn sign_in_vault_changed(account_id: u32) -> trc::Error {
+    trc::AuthEvent::Failed
+        .into_err()
+        .details("zero-access: vault changed during sign-in")
+        .account_id(account_id)
+        .caused_by(trc::location!())
 }
 
 pub struct ZaTokenRead {
@@ -158,6 +211,102 @@ fn retained_entries<T: PartialEq>(entries: &[T], previous: &[T]) -> bool {
 impl Server {
     pub async fn za_token_read(&self, account_id: u32) -> trc::Result<ZaTokenRead> {
         token_read_store(self.store(), account_id).await
+    }
+
+    pub async fn za_handoff_put(
+        &self,
+        key_id: &str,
+        account_id: u32,
+        keys: &SessionKeys,
+        expires: u64,
+    ) -> trc::Result<Secret> {
+        let Some(read) = self.za_vault_record(account_id).await?.filter(|read| {
+            keys.account_id == account_id && read.record.revision == keys.generation
+        }) else {
+            return Err(sign_in_vault_changed(account_id));
+        };
+        let (secret, value) = seal_handoff(
+            keys.mk(),
+            account_id,
+            za_session_binding(&read.record),
+            key_id,
+        );
+
+        #[cfg(feature = "test_mode")]
+        super::test_hooks::token_handoff_write_pause_point(account_id).await;
+        self.in_memory_store()
+            .key_set(KeyValue::new(handoff_key(key_id), value).expires(expires))
+            .await?;
+        // The entry is provisional until the vault snapshot is asserted
+        // after the in-memory write (D6). This batch mutates nothing.
+        let mut fence = BatchBuilder::new();
+        fence
+            .with_account_id(account_id)
+            .with_collection(Collection::Principal)
+            .with_document(0)
+            .assert_value(PrincipalField::ZeroAccessVault, AssertValue::Hash(read.cas));
+        if let Err(err) = self.store().write_batch(&mut fence).await {
+            let _ = self.za_handoff_delete(key_id).await;
+            return Err(if err.is_assertion_failure() {
+                sign_in_vault_changed(account_id)
+            } else {
+                err
+            });
+        }
+
+        Ok(secret)
+    }
+
+    pub async fn za_handoff_take(
+        &self,
+        key_id: &str,
+        secret: &Secret,
+    ) -> trc::Result<Option<ZaHandoff>> {
+        let store = self.in_memory_store();
+        let key = handoff_key(key_id);
+        let Some(value) = store.key_get::<HandoffValue>(key.as_slice()).await? else {
+            return Ok(None);
+        };
+        if !store.key_delete(key).await? {
+            return Ok(None);
+        }
+        Ok(
+            open_handoff(&value.0, secret, key_id).map(|(account_id, binding, mk)| ZaHandoff {
+                account_id,
+                binding,
+                mk,
+            }),
+        )
+    }
+
+    pub async fn za_handoff_delete(&self, key_id: &str) -> trc::Result<()> {
+        self.in_memory_store()
+            .key_delete(handoff_key(key_id))
+            .await
+            .map(|_| ())
+    }
+
+    /// D22: classify the presented suffix before upstream rotates the grant.
+    pub async fn za_token_refresh_precheck(
+        &self,
+        account_id: u32,
+        grant_id: u64,
+        suffix: &ZaSuffix,
+    ) -> trc::Result<ZaRefreshPrecheck> {
+        let read = token_read_store(self.store(), account_id).await?;
+        Ok(match suffix {
+            ZaSuffix::Secret(_) => ZaRefreshPrecheck::Keyed,
+            ZaSuffix::None
+                if read
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.grant(grant_id))
+                    .is_none() =>
+            {
+                ZaRefreshPrecheck::Keyless
+            }
+            ZaSuffix::None | ZaSuffix::Malformed => ZaRefreshPrecheck::Refused,
+        })
     }
 
     /// Spec 4.4: issue the first token entries under the binding of the MK.

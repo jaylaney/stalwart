@@ -46,6 +46,8 @@
 //!   (`Server::za_pin_state`) fails once with a store error, keyed by the
 //!   session's account (`common::auth::vault`; the drain's REFRESH answer,
 //!   iMIP spec 7's transient class, PR review ruling O-4).
+//! - `TOKEN_HANDOFF_WRITE_PAUSE`: in `za_handoff_put` after the revision
+//!   check and seal, immediately before storing the hand-off (release 6, D6).
 //! - `TOKEN_EXCHANGE_PAUSE`: in `za_token_issue` after the binding check
 //!   and before the batch, keyed by the account.
 //! - `TOKEN_FORGET_FAIL_ONCE`: at the head of `za_token_forget_grant`,
@@ -177,6 +179,7 @@ pub static PUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static UPDATE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static DELETE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static TOKEN_HANDOFF_WRITE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_EXCHANGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// Global: its `account_id` is ignored.
@@ -273,6 +276,10 @@ pub fn set_update_commit_pause(pause: Option<Arc<Pause>>) {
 }
 pub fn set_delete_commit_pause(pause: Option<Arc<Pause>>) {
     set_slot(&DELETE_COMMIT_PAUSE, pause);
+}
+
+pub fn set_token_handoff_write_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&TOKEN_HANDOFF_WRITE_PAUSE, pause);
 }
 
 pub fn set_token_exchange_pause(pause: Option<Arc<Pause>>) {
@@ -488,6 +495,10 @@ pub async fn update_commit_pause_point(account_id: u32) {
 }
 pub async fn delete_commit_pause_point(account_id: u32) {
     wait(take_for(&DELETE_COMMIT_PAUSE, account_id)).await;
+}
+
+pub async fn token_handoff_write_pause_point(account_id: u32) {
+    wait(take_for(&TOKEN_HANDOFF_WRITE_PAUSE, account_id)).await;
 }
 
 pub async fn token_exchange_pause_point(account_id: u32) {
