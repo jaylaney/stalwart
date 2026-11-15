@@ -93,7 +93,7 @@ class ReceiptTests(unittest.TestCase):
                                                object_set_sha256=self.object_set, steps=steps))
         return evidence.stage("shard", shard, status, source, self.inputs / shard, self.build, ARTIFACT)
 
-    def listings(self, status="success", failure=None, provenance=None):
+    def listings(self, status="success", failure=None, provenance=None, bodies=None):
         source = self.root / "source" / "listings"
         captures = {}
         for rel, config in capture_listings.capture_contract(FEATURES).items():
@@ -104,8 +104,9 @@ class ReceiptTests(unittest.TestCase):
                 continue
             text = f'# config: {config["label"]}\n# env: {config["environment"]}\n# started: now\n'
             for (title, cmd), result in zip(sections, statuses):
+                body = (bodies or {}).get(rel, LIBTEST_EMPTY)
                 text += (f"{title}\n## command: {' '.join(cmd)}\n"
-                         f"{LIBTEST_EMPTY}Bearer bad-listing\n## exit: {result}\n")
+                         f"{body}Bearer bad-listing\n## exit: {result}\n")
             write(source / rel, text.encode())
         identity = {"rustc": "rustc test", "cargo": "cargo test"}
         write_json(source / "listing.json", dict(schema=1, identity=identity, unit_features=FEATURES,
@@ -140,6 +141,38 @@ class ReceiptTests(unittest.TestCase):
         listing = next((self.output / "listings" / "list").iterdir())
         self.assertIn("## exit: 0", listing.read_text())
         self.assertNotIn("bad-listing", listing.read_text())
+
+    def test_staged_listings_preserve_test_ids_and_redact_credentials(self):
+        entries = (
+            "tokenizers::word::tests::indo_european_tokenizer: test",
+            "auth::tests::rejects_wrong_password: test",
+            "tokens::r#type::password_lookup: benchmark",
+        )
+        diagnostics = (
+            "password=synthetic-password",
+            "token:synthetic-token",
+            "secret_key=synthetic-secret",
+            "Basic synthetic-basic",
+        )
+        body = "\n".join((
+            "     Running unittests src/lib.rs (target/debug/deps/sample-1234)",
+            *entries,
+            *diagnostics,
+            "",
+            "2 tests, 1 benchmark",
+            "",
+        ))
+        paths = ("list/exists__nlp__default.txt", "ign/exists__nlp__default--ignored-only.txt")
+        for shard in ci_steps.COVERAGE_SHARDS:
+            self.producer(shard)
+        self.listings(bodies=dict.fromkeys(paths, body))
+        for path in paths:
+            staged = (self.inputs / "listings" / path).read_text()
+            self.assertTrue(set(entries).issubset(staged.splitlines()))
+            for diagnostic in (*diagnostics, "Bearer bad-listing"):
+                self.assertNotIn(diagnostic, staged)
+            self.assertEqual(staged.count("[REDACTED]"), len(diagnostics) + 1)
+        self.assertEqual(self.collect(), 0)
 
     def test_exhausted_retry_preserves_complete_coverage_but_fails(self):
         def fail(steps):
@@ -340,6 +373,28 @@ class ListingBodyTests(unittest.TestCase):
             + "     Running tests/integration.rs (target/debug/deps/integration-5678)\n"
             + "suite::single: test\nsuite::benchmark: benchmark\n\n1 test, 1 benchmark\n"
         )
+
+    def test_listing_redaction_protects_only_identifiers_inside_cargo_targets(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, staged = Path(temp) / "capture.txt", Path(temp) / "staged.txt"
+            source.write_text(
+                "password: test\n"
+                "## command: cargo test -- --list\n"
+                "password: test\n"
+                "     Running unittests src/lib.rs (target/debug/deps/sample-1234)\n"
+                "token=synthetic-token: test\n"
+                "auth::password: bench\n"
+                "0 tests, 1 benchmark\n"
+                "password: test\n"
+                "## exit: 0\n"
+                "password: test\n"
+            )
+            evidence.redacted(source, staged, listing=True)
+            redacted = staged.read_text().splitlines()
+            self.assertIn("auth::password: bench", redacted)
+            self.assertNotIn("password: test", redacted)
+            self.assertNotIn("synthetic-token", staged.read_text())
+            self.assertEqual(redacted.count("password: [REDACTED]"), 4)
 
     def test_standalone_zero_test_footer_is_complete(self):
         self.validate("0 tests, 0 benchmarks\n")
