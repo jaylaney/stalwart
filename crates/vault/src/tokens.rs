@@ -62,6 +62,17 @@ fn decode_secret(text: &str) -> Option<Secret> {
     if text.len() != SECRET_TEXT_LEN {
         return None;
     }
+    let (last, prefix) = text.as_bytes().split_last()?;
+    // A 32-byte secret leaves two unused bits in the final sextet. Check
+    // them and the alphabet before the decoder's error path can use scratch.
+    if !b"AEIMQUYcgkosw048".contains(last)
+        || !prefix
+            .iter()
+            .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+
     let mut bytes = Zeroizing::new([0; KEY_LEN]);
     match URL_SAFE_NO_PAD.decode_slice(text, bytes.as_mut()) {
         Ok(KEY_LEN) => Some(Secret::from_zeroizing(bytes)),
@@ -479,6 +490,8 @@ mod tests {
             format!("{token}A"),
             format!("{shortened}="),
             format!("{shortened}+"),
+            format!("{upstream}~+{}", &suffix[1..]),
+            format!("{upstream}~é{}", &suffix[2..]),
             format!("{upstream}~~{suffix}"),
             format!("{token}~{suffix}"),
             format!("{shortened}_"),
@@ -493,6 +506,23 @@ mod tests {
             assert!(matches!(
                 split_secret(&opaque, "sw1."),
                 (part, ZaSuffix::None) if part == opaque
+            ));
+        }
+    }
+
+    #[test]
+    fn split_secret_accepts_each_canonical_final_sextet() {
+        let upstream = "sw1.AAAA.BBBB";
+        let mut bytes = [0xFB; 32];
+        // The last four bits of a 32-byte value reach the final sextet.
+        for low_nibble in 0..16 {
+            bytes[31] = 0xF0 | low_nibble;
+            let secret = Secret::from_bytes(bytes);
+            let mut token = upstream.to_string();
+            append_secret(&mut token, &secret);
+            assert!(matches!(
+                split_secret(&token, "sw1."),
+                (part, ZaSuffix::Secret(opened)) if part == upstream && opened.as_bytes() == secret.as_bytes()
             ));
         }
     }
