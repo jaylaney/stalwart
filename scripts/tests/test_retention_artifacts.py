@@ -4,6 +4,7 @@
 
 """Offline tests of the retention build snapshot and dependency cache inputs."""
 
+import base64
 import io
 import json
 import os
@@ -256,6 +257,30 @@ class BuildSnapshotTests(unittest.TestCase):
         self.assertIn("build/fixture-111/output", result.stderr)
         self.assertNotIn("fixture_never_print_this", result.stdout + result.stderr)
         self.assertFalse(self.archive.exists())
+
+    def test_public_header_comments_do_not_match_basic_credentials(self):
+        header = self.make(
+            "debug/build/fixture-111/out/include/openssl/bio.h",
+            "// Basic I/O.\n// Check the X.509 basic constraints extension.\n",
+        )
+        packed = self.pack()
+        self.assertEqual(packed.returncode, 0, packed.stderr)
+        unpacked = self.unpack()
+        self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
+        self.assertEqual((self.consumer / header.relative_to(self.target)).read_bytes(),
+                         header.read_bytes())
+
+    def test_basic_user_password_credential_blocks_upload_without_leaking_value(self):
+        encoded = base64.b64encode(b"fixture-user:synthetic-password").decode()
+        self.assertTrue(encoded.endswith("="))
+        for token in (encoded, encoded.rstrip("=")):
+            with self.subTest(form="padded" if token.endswith("=") else "unpadded"):
+                self.output.write_text(f"cargo::warning=Authorization: Basic {token}\n")
+                result = self.pack()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("build/fixture-111/output", result.stderr)
+                self.assertNotIn(token, result.stdout + result.stderr)
+                self.assertFalse(self.archive.exists())
 
     def test_bare_explicit_credential_in_binary_blocks_upload_without_leaking_value(self):
         credential = "fixture_never_print_bare_value"
