@@ -58,9 +58,10 @@ SENSITIVE_IDENTIFIER = re.compile(
     rb"|(?:^|_)(?:password|secret|token)(?=[A-Z])"
 )
 SOURCE_TOKEN = re.compile(
-    rb'''(?P<string>r(?P<hash>#*)"[^\r\n]*?"(?P=hash)|"(?:\\.|[^"\\\r\n])*")'''
+    rb'(?P<raw>r(?P<hash>#*)")|(?P<string>")'
     rb"|(?P<char>'(?:\\.|[^'\\\r\n])')|(?P<line>//)|(?P<block>/\*)"
 )
+STRING_END = re.compile(rb'(?:\\.|[^"\\\r\n])*"')
 BLOCK_TOKEN = re.compile(rb"/\*|\*/")
 
 
@@ -171,13 +172,24 @@ def is_text_state(path):
 
 
 def source_code_lines(lines, nested_blocks):
-    """Yield code and string literals without scanning quotes in source comments."""
+    """Yield code and literal fragments while tracking comments and strings across lines."""
     depth = 0
+    string_end = None
     for line in lines:
         offset = 0
         code = []
         literals = []
         while offset < len(line):
+            if string_end is not None:
+                closing = string_end.match(line, offset)
+                end = closing.end() if closing else len(line)
+                fragment = line[offset:end]
+                code.append(fragment)
+                literals.append(fragment)
+                offset = end
+                if closing:
+                    string_end = None
+                continue
             if depth:
                 end = BLOCK_TOKEN.search(line, offset)
                 if end is None:
@@ -201,8 +213,10 @@ def source_code_lines(lines, nested_blocks):
                 code.append(b" ")
             else:
                 code.append(token[0])
-                if token["string"] is not None:
-                    literals.append(token[0])
+                if token["raw"] is not None:
+                    string_end = re.compile(rb'[^\r\n]*?"' + token["hash"])
+                elif token["string"] is not None:
+                    string_end = STRING_END
         yield line, b"".join(code), literals
 
 

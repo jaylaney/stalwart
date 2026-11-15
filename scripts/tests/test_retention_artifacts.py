@@ -284,7 +284,10 @@ class BuildSnapshotTests(unittest.TestCase):
             '// Example string: "Bearer sample_token"\n'
             '/* Sample value:\n'
             '  "password=example"\n'
-            '*/\n',
+            '*/\n'
+            'pub const HELP: &str = r##"\n'
+            'This contains a quote ".\n'
+            '"##; // "Bearer sample_token"\n',
         )
         packed = self.pack()
         self.assertEqual(packed.returncode, 0, packed.stderr)
@@ -306,6 +309,22 @@ class BuildSnapshotTests(unittest.TestCase):
         )
         for declaration in declarations:
             with self.subTest(assignment=declaration.split('"')[0]):
+                self.archive.unlink(missing_ok=True)
+                bindings = self.make("debug/build/fixture-111/out/bindgen.rs", declaration)
+                result = self.pack()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(bindings.name, result.stderr)
+                self.assertNotIn(credential, result.stdout + result.stderr)
+                self.assertFalse(self.archive.exists())
+
+    def test_generated_multiline_strings_with_credentials_block_upload(self):
+        credential = "fixture_never_print_multiline_source_value"
+        declarations = (
+            ("raw", f'let config = r###"\nAn interior quote "##.\npassword={credential}\n"###;'),
+            ("standard", f'let config = "An escaped quote \\".\nBearer {credential}\n";'),
+        )
+        for syntax, declaration in declarations:
+            with self.subTest(syntax=syntax):
                 self.archive.unlink(missing_ok=True)
                 bindings = self.make("debug/build/fixture-111/out/bindgen.rs", declaration)
                 result = self.pack()
