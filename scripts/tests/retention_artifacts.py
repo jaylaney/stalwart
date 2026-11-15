@@ -63,6 +63,10 @@ SOURCE_TOKEN = re.compile(
 )
 STRING_END = re.compile(rb'(?:\\.|[^"\\\r\n])*"')
 BLOCK_TOKEN = re.compile(rb"/\*|\*/")
+BUILD_SCRIPT_PRODUCT = re.compile(
+    r"build-script-[A-Za-z0-9_][A-Za-z0-9_-]*"
+    r"|build_script_[A-Za-z0-9_]+-[0-9a-f]{16}(?:\.d)?"
+)
 
 
 def git(repo, *args):
@@ -155,8 +159,8 @@ def allowed(parts):
             len(parts) <= 4
             or parts[4] == "out"
             or len(parts) == 5 and (
-                parts[4] in {"output", "root-output", "invoked.timestamp", "build-script-build"}
-                or parts[4].startswith("build_script_build-")
+                parts[4] in {"output", "root-output", "invoked.timestamp"}
+                or BUILD_SCRIPT_PRODUCT.fullmatch(parts[4]) is not None
             )
         )
     # Named Cargo bin outputs and their dep-info at the profile root, without subdirectories.

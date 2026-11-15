@@ -211,6 +211,27 @@ class BuildSnapshotTests(unittest.TestCase):
             self.consumer / "llvm-cov-target/debug/fixture",
         ))
 
+    def test_custom_build_script_executable_alias_and_dep_info_survive(self):
+        package = "debug/build/fixture-custom-0123456789abcdef"
+        executable = self.make(f"{package}/build_script_main-0123456789abcdef",
+                               "compiled custom build script\n", mode=0o755)
+        alias = executable.with_name("build-script-main")
+        os.link(executable, alias)
+        dep_info = self.make(f"{package}/build_script_main-0123456789abcdef.d", "native/main.rs\n")
+        unrelated = self.make(f"{package}/build_script_main-not-a-hash", "unrelated diagnostic\n")
+
+        packed = self.pack()
+        self.assertEqual(packed.returncode, 0, packed.stderr)
+        unpacked = self.unpack()
+        self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
+        copied = self.consumer / executable.relative_to(self.target)
+        self.assertEqual(copied.read_bytes(), executable.read_bytes())
+        self.assertEqual(stat.S_IMODE(copied.stat().st_mode), 0o755)
+        self.assertTrue(os.path.samefile(copied, self.consumer / alias.relative_to(self.target)))
+        self.assertEqual((self.consumer / dep_info.relative_to(self.target)).read_bytes(),
+                         dep_info.read_bytes())
+        self.assertFalse((self.consumer / unrelated.relative_to(self.target)).exists())
+
     def test_relative_symlink_in_cargo_target_survives_archive(self):
         relative_link = "llvm-cov-target/debug/examples/fixture"
         link = self.target / relative_link
