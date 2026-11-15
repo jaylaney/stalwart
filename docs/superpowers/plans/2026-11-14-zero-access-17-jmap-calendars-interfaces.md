@@ -554,6 +554,18 @@ Callers compute `send_itip` with `za_delete_send_itip`. Hooks:
 `za_delete_event` keeps passing the sealed content archive to
 `delete_za_at`.
 
+`za_destroy_event` builds one unsplit batch on each attempt. Its existing
+`remove_all_za_at` path, alarm clears and shared-container release enqueue
+without a commit point; the whole-event caller adds none after its logs.
+Finalization supplies one physical write, avoiding a terminal write that
+could fail after deletion. Existing CalDAV callers keep their boundaries.
+For each stored name whose parent exists in `resources`, derive its href
+from the attempt's matching asserted context's stored `Calendar.name`
+and the item name, canonicalizing both with `canonical_calcard_segment`
+and using `resources.format_item` for the base path (the Task 11 rule).
+A rename retry rebuilds that href; `za_delete_event` retains its supplied
+request href. No storage-helper API or body changes are needed here.
+
 ### 2.11 What stays in `dav`
 
 - Every upstream validation step of PUT, DELETE, COPY, MOVE, MKCOL and

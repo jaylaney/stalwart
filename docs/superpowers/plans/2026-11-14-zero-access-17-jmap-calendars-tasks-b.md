@@ -582,7 +582,7 @@ the fan-out), 9.2 (`jmap_calendar::pipeline`).
   (`za_destroy_event`; the shared commit's rebuild parameter);
   `crates/groupware/src/calendar/pipeline/schedule.rs`
   (`za_delete_send_itip`); `tests/src/za/jmap_calendar/pipeline.rs` (the
-  `destroy` helper, `invitation`, four cases).
+  `destroy` helper, `invitation`, five cases).
 - Test: `tests/src/za/jmap_calendar/pipeline.rs`.
 
 **Interfaces:**
@@ -630,11 +630,15 @@ With `Required` and a denied status the error is
    `AlarmTasks::None`, `send_itip`,
    `ContainerCleanup::empty(Collection::CalendarEvent)`,
    `Some(&contexts[0].domain)` and the cutoff.
-5. One `batch.log_calendar_vanished(parent_id, href)` per stored name,
-   with `href = resources.format_item(&format!("{}/{}", calendar.path(), name))`
-   for `resources.container_resource_path_by_id(parent_id)`; a name whose
-   calendar is not in `resources` logs nothing. Then
-   `batch.commit_point()`, as the one-name delete does after its log.
+5. One `batch.log_calendar_vanished(parent_id, href)` per stored name
+   whose parent is present in `resources`. Use that attempt's matching
+   context's stored `Calendar.name` and the stored item name, both through
+   `common::storage::dav::canonical_calcard_segment`, joined with `/`
+   and formatted by `resources.format_item`, as in Task 11. The supplied
+   snapshot supplies only the presence gate and base path. Do not add a
+   `commit_point()`: `remove_all_za_at`, alarm clears and metadata release
+   already enqueue without one, and finalization must supply the single
+   physical write. This applies to the first and rebuilt batches.
 6. The shared commit of Task 8, as an event delete: the fan-out of the
    returned message, `delete_commit_pause_point`,
    `take_delete_commit_fail`, the commit, the mail guard. Its retry
@@ -646,8 +650,11 @@ With `Required` and a denied status the error is
 **Constraints:**
 - A destroy of an event with one name stores and sends what a CalDAV
   `DELETE` of that name stores and sends.
-- A destroy is one commit: every name goes, one vanished href per name,
-  one change id.
+- A destroy is one physical commit: every name goes, one vanished href
+  per name, one change id. No terminal context-only chunk may report a
+  failure after the deletion has already been published. Existing
+  CalDAV delete paths retain their original commit points and saved
+  request hrefs; the new whole-event primitive changes neither.
 - With `Required` and a denied status nothing is resolved, delivered or
   deleted: the caller gets `SchedulingDenied` before it calls
   `za_destroy_event`.
@@ -678,13 +685,23 @@ const OUTSIDE: &str = "jmapcal-pipeline-att@remote.test";
 10's.
 
 `destroy_linked_event`:
-1. `create(.., &[a, b], event_ics("jmapcal-pipe-destroy", "linked, then gone"), On)`
-   is `Ok(written)`; `tip = written.change_id`.
-2. `destroy(.., written.document_id, On)` is `Ok(deleted)`.
+1. Create the event in `[a, b]`, UID `jmapcal-pipe-destroy`, with a future
+   `ACTION:EMAIL` alarm using the owner's address. Add a sealed dead
+   property through the owner's PROPPATCH of its name in `pipe-a`.
+   Assert that the shared container and queued alarm Task/Due rows exist;
+   capture their keys and the Calendar tip after all setup writes.
+2. Run `destroy(.., written.document_id, On)` under the existing
+   `ForceCommitSplit` and `set_second_chunk_fail_once` hooks, scoped only
+   to the destroy. Drop/reset both hooks before inspecting its result.
+   It is `Ok(deleted)`.
 3. `uid_copies` is 0: no name survived. `changes_after(owner, tip)` is
-   `[deleted.change_id]`: one commit. `vanished_at(owner, deleted.change_id)`
-   is `["{HOME}pipe-a/{uid}.ics", "{HOME}pipe-b/{uid}.ics"]`: one href
-   per name. The owner's GET of each href is 404. `za_uid_leases` is 0.
+   `[deleted.change_id]`. `vanished_at(owner, deleted.change_id)` is
+   `["{HOME}pipe-a/{uid}.ics", "{HOME}pipe-b/{uid}.ics"]`. The owner's
+   GET of each href is 404, and `za_uid_leases` is 0.
+4. The event archive, content, shared container and captured alarm
+   Task/Due rows are absent. The forced-boundary failure hook must not
+   turn this published deletion into an error; setup and cleanup run
+   with both hooks unset.
 
 `destroy_single_name_equals_dav_delete`, twins `jmapcal-pipe-twin-dav`
 and `jmapcal-pipe-twin-pipe`:
@@ -746,9 +763,26 @@ row shows the address is checked before the permission, as
 5. `destroy(.., id, ZaScheduling::On)` with the same token is `Ok`: the
    delete is saved unsent, as a CalDAV DELETE is. `uid_copies` is 0.
 
+`destroy_retry_after_source_rename` (`DELETE_COMMIT_PAUSE`):
+1. Create a temporary personal calendar `pipe-destroy-old` and an event
+   at `event%20name.ics`. Park `destroy(.., On)` with
+   `HookParked::start(owner, set_delete_commit_pause, ..)`.
+2. CalDAV MOVE the collection to `pipe%20destroy%20renamed` (201), then
+   initial-sync that renamed collection while the destroy remains
+   parked. Assert the current event href is present and retain its
+   token. Capture the post-rename Calendar tip.
+3. Arm `ForceCommitSplit` and `set_second_chunk_fail_once` only around
+   `parked.finish()`, then drop/reset them before result inspection. It
+   is `Ok(deleted)`: the first batch loses its original context assertion
+   and the rebuilt batch remains unsplit. The rename writer is unhooked.
+4. `changes_after(owner, tip)` is `[deleted.change_id]`, UID copies are
+   zero, and the vanished log at that id contains exactly the canonical
+   renamed event href. Incremental-sync from the token in step 2 returns
+   a 404 for that href. Delete the empty temporary calendar.
+
 Steps:
 
-- [ ] Write `destroy`, `invitation` and the four cases; call the cases
+- [ ] Write `destroy`, `invitation` and the five cases; call the cases
   from `test` after Task 11's, in the order above.
 - [ ] Run TM. Expected: `za_destroy_event` and `za_delete_send_itip` are
   not found.
