@@ -11,19 +11,41 @@ Task 1's rulings 7, 8, 25, 31 and 32 set their rules.
 - `coverage_net.py`: the baseline's 19-step `cargo llvm-cov --no-report` net, which writes the
   per-step exports and the merged export both gates read.
 - `capture_listings.py`: the libtest listing of every CI step, for the inventory gate.
-- `ci_steps.py`: the one table of the CI steps both of those read (each step's command,
-  environment, `if` and rerun as test.yml writes them), and `check_workflow`, which compares it
-  with `.github/workflows/test.yml`. A change to a gated step in test.yml needs the same change
-  in the table, or the self-tests fail (`python3 -I scripts/tests/ci_steps.py` runs the check
-  alone).
+- `ci_steps.py` holds the command, environment, condition and retry contract for each CI step
+  and the assignment of coverage configurations to shards. It checks `test.yml` and
+  `test-retention-shard.yml`.
+- `retention_artifacts.py` packages the instrumented build and stages and collects the evidence
+  used by the hosted jobs.
 
-The `gates` job of `.github/workflows/test.yml` runs the net, the captures and both gates,
-weekly and on manual dispatch. Locally, the same sequence is:
+## Hosted runs
+
+The **Test Retention Gates** check runs weekly and on manual dispatch of `test.yml`.
+`gates-build` runs the two instrumented setup builds and uploads the target. Three jobs use
+that exact build on separate runners. One runs the RocksDB zero-access configuration, one
+runs the filesystem-blob zero-access configuration, and one runs the other 17 configurations
+sequentially. `gates-listings` captures the ordinary listings in parallel. The instrumented
+and ordinary caches store dependency downloads under separate keys. A cache miss falls back
+to a locked fetch.
+
+The reporter binds coverage to the build artifact's object inventory, validates every selected
+receipt, and runs the inventory and coverage gates. An exhausted retry can still produce
+diagnostic reports from valid evidence. The check stays failed. Look at the producing job's
+sanitized diagnostics and the reporter's `collection.json` for missing or mismatched inputs.
+The build and evidence artifacts expire after one day. The sanitized diagnostic artifacts
+last seven days. **Re-run failed jobs** can reuse the successful jobs' artifacts while they
+are available. Use **Re-run all jobs** when the referenced artifacts have expired.
+
+## Serial reproduction
+
+Use `cargo-llvm-cov` 0.9.1 with the Rust toolchain's `llvm-tools-preview`. To compare hosted
+results, use the Rust pin from `test.yml`, an empty ordinary target for listing capture and
+the same `UNIT_TEST_FEATURES`. The serial sequence is:
 
 ```sh
 export STORE=RocksDb RUST_MIN_STACK=16777216 UNIT_TEST_FEATURES="<test.yml's list>"
 python3 -I scripts/tests/coverage_net.py --out /tmp/net
-python3 -I scripts/tests/capture_listings.py --out /tmp/listings
+CARGO_TARGET_DIR="$(mktemp -d)" \
+  python3 -I scripts/tests/capture_listings.py --out /tmp/listings
 mkdir -p /tmp/src-candidate && git archive HEAD tests crates | tar -x -C /tmp/src-candidate
 python3 -I tests/qualification/tools/strict_rule.py functions \
   --exports /tmp/net/steps --sources /tmp/src-candidate --out /tmp/functions-candidate.json
@@ -182,11 +204,14 @@ At 0.16.27, upstream's inline test modules sat in their own files; at 1.0 they l
 ## Self-tests
 
 ```sh
+python3 -I scripts/tests/ci_steps.py
 python3 -I scripts/tests/test_gates.py -v
+python3 -I scripts/tests/test_retention_artifacts.py -v
+python3 -I scripts/tests/test_retention_evidence.py -v
 ```
 
-The 40 offline tests take about 4 seconds; the run reports 42, the two `--real` tests below
-skipped. Their docstring lists the cases:
+The snapshot tests need Git and `zstd`. The two `--real` tests below skip by default.
+The offline tests cover:
 - the strict rule on synthetic exports, run through `strict_rule.py functions`;
 - listing faults against a candidate built from the committed baseline's own records;
 - coverage exports one line below each threshold, with a restored test file that would
@@ -194,7 +219,8 @@ skipped. Their docstring lists the cases:
 - the CI workflow against `ci_steps.STEPS`: the committed test.yml matches it, and edited copies
   with a narrowed filter, a dropped feature, a changed environment, a dropped, renamed or
   disabled step, a narrowed rerun, `continue-on-error`, an untracked `cargo test` step or a gates
-  job that runs fewer steps each fail; the net's steps are the baseline's names and commands.
+  job that runs fewer steps each fail. The tests also check the shard workflow contract and
+  reject stale, incomplete or mismatched artifacts before they reach reporting.
 
 ### The baseline as its own candidate
 

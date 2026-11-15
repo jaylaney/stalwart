@@ -708,17 +708,18 @@ class WorkflowTests(unittest.TestCase):
     def setUpClass(cls):
         with open(ci_steps.WORKFLOW, encoding="utf-8") as f:
             cls.text = f.read()
+        cls.shard = ci_steps.WORKFLOW.with_name("test-retention-shard.yml").read_text()
 
     def edited(self, old, new):
         self.assertEqual(self.text.count(old), 1, f"anchor not unique in test.yml: {old!r}")
-        return ci_steps.check_workflow(self.text.replace(old, new))
+        return ci_steps.check_workflow(self.text.replace(old, new), self.shard)
 
     def assertReports(self, problems, *parts):
         self.assertTrue(any(all(part in problem for part in parts) for problem in problems),
                         f"no problem names {parts}: {problems}")
 
     def test_the_committed_workflow_matches_the_table(self):
-        self.assertEqual(ci_steps.check_workflow(self.text), [])
+        self.assertEqual(ci_steps.check_workflow(self.text, self.shard), [])
 
     def test_a_narrowed_filter_fails(self):
         problems = self.edited(
@@ -772,7 +773,7 @@ class WorkflowTests(unittest.TestCase):
     def test_zero_access_backtraces_are_required_at_job_and_step_scope(self):
         # Removing the job setting must be rejected even when no step overrides it.
         without_backtrace = self.text.replace('      RUST_BACKTRACE: "1"\n', "")
-        problems = ci_steps.check_workflow(without_backtrace)
+        problems = ci_steps.check_workflow(without_backtrace, self.shard)
         self.assertReports(problems, "job zero-access", "RUST_BACKTRACE")
         self.assertReports(problems, "'Zero-access Tests'", "RUST_BACKTRACE")
         for value in ("0", "full"):
@@ -831,20 +832,164 @@ class WorkflowTests(unittest.TestCase):
             "      - name: CalDAV Tests (plain accounts)\n")
         self.assertReports(problems, "'Extra'", "not in ci_steps.STEPS")
 
-    def test_the_gates_job_runs_the_whole_net_and_every_capture(self):
-        problems = self.edited('coverage_net.py --out "$GATES/net"',
-                               'coverage_net.py --out "$GATES/net" za-tests')
-        self.assertReports(problems, "job gates", "Coverage net")
+    def edited_shard(self, old, new):
+        self.assertEqual(self.shard.count(old), 1, f"anchor not unique in shard workflow: {old!r}")
+        return ci_steps.check_workflow(self.text, self.shard.replace(old, new))
+
+    def test_a_missing_called_workflow_fails_the_api_and_runner_guard(self):
+        problems = ci_steps.check_workflow(self.text)
+        self.assertReports(problems, "test-retention-shard.yml", "missing")
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = Path(directory) / "test.yml"
+            workflow.write_text(self.text)
+            with contextlib.redirect_stderr(io.StringIO()) as report:
+                self.assertTrue(ci_steps.refuse_diverged_workflow(workflow))
+            self.assertIn("test-retention-shard.yml", report.getvalue())
+            code, output = run(str(ci_steps.REPO / "scripts/tests/ci_steps.py"),
+                               "--workflow", workflow)
+            self.assertEqual(code, 1)
+            self.assertIn("test-retention-shard.yml", output)
+
+    def test_a_wrong_shard_selection_or_snapshot_input_fails(self):
+        problems = self.edited("      shard-id: za-filesystem\n", "      shard-id: za-rocks\n")
+        self.assertReports(problems, "gates-za-filesystem", "with.shard-id")
+        problems = self.edited("      shard-id: za-filesystem\n"
+                               "      snapshot-artifact-id: ${{ needs.gates-build.outputs.snapshot-artifact-id }}\n",
+                               "      shard-id: za-filesystem\n"
+                               "      snapshot-artifact-id: 12\n")
+        self.assertReports(problems, "gates-za-filesystem", "with.snapshot-artifact-id")
+
+    def test_called_shard_env_timeout_and_output_must_match(self):
+        for field, original, changed in (
+            ("env.STORE", "      STORE: RocksDb\n", ""),
+            ("env.RUST_MIN_STACK", '      RUST_MIN_STACK: "16777216"\n', ""),
+            ("env.RUSTUP_TOOLCHAIN", '      RUSTUP_TOOLCHAIN: "${{ inputs.rust-toolchain }}"\n',
+             '      RUSTUP_TOOLCHAIN: "stable"\n'),
+            ("timeout-minutes", "    timeout-minutes: ${{ inputs.timeout-minutes }}\n",
+             "    timeout-minutes: 20\n"),
+            ("outputs.receipt-artifact-id.value",
+             "        value: ${{ jobs.shard.outputs.receipt-artifact-id }}\n",
+             "        value: ${{ jobs.shard.outputs.other }}\n"),
+        ):
+            with self.subTest(field=field):
+                self.assertReports(self.edited_shard(original, changed), "shard", field)
+
+    def test_retention_trigger_and_style_requirements_are_not_optional(self):
+        checks = (
+            ("      - style\n      - gates-build\n", "      - gates-build\n", "needs"),
+            (" && needs.style.result == 'success'", "", "if"),
+            (" && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')",
+             "", "if"),
+        )
+        for old, new, field in checks:
+            with self.subTest(field=field, old=old):
+                self.assertReports(self.edited(old, new), "job gates", field)
+        self.assertReports(self.edited('  schedule:\n    - cron: "0 7 * * 1"\n', ""),
+                           "test.yml", "on.schedule")
+
+    def test_all_listing_commands_are_required(self):
         problems = self.edited('capture_listings.py --out "$GATES/listings"',
                                'capture_listings.py --out "$GATES/listings" '
                                "test.yml__test__imap-tests")
-        self.assertReports(problems, "job gates", "Capture CI step listings")
+        self.assertReports(problems, "gates-listings", "step capture", "run")
+
+    def test_report_downloads_complete_by_exact_artifact_ids(self):
+        download = "          artifact-ids: ${{ needs.gates-za-filesystem.outputs.receipt-artifact-id }}\n"
+        for replacement in ("", "          name: retention-za-filesystem\n",
+                            "          artifact-ids: ${{ needs.gates-za-rocks.outputs.receipt-artifact-id }}\n"):
+            with self.subTest(replacement=replacement):
+                self.assertReports(self.edited(download, replacement), "job gates", "with.artifact-ids")
+        problems = self.edited('          check_id za-rocks "$ZA_ROCKS_ID"\n', "")
+        self.assertReports(problems, "artifact-ids", "run")
+
+    def test_collector_and_qualification_cannot_be_disabled_or_bypassed(self):
+        for old, new, step, field in (
+            ("          ${{ !cancelled() && steps.unpack.outcome == 'success' &&\n",
+             "          ${{ false && steps.unpack.outcome == 'success' &&\n",
+             "collect", "if"),
+            ("            --build-manifest \"$GATES/build.json\" --out \"$GATES/reports\" || status=$?\n",
+             "            --build-manifest \"$GATES/build.json\" --out \"$GATES/reports\" || true\n",
+             "collect", "run"),
+            ('            if [[ "${!key}" != success ]]; then\n',
+             '            if [[ "${!key}" != success && "${!key}" != skipped ]]; then\n',
+             "qualify", "run"),
+        ):
+            with self.subTest(step=step, field=field):
+                self.assertReports(self.edited(old, new), f"job gates, step {step}", field)
+
+    def test_reporter_requires_each_successful_transport(self):
+        old = "          steps.download-za-rocks.outcome == 'success' &&\n"
+        self.assertReports(self.edited(old, ""), "job gates, step collect", "if")
+
+    def test_native_download_limits_and_work_budget_checks_are_required(self):
+        old = ("      - name: Download short evidence\n"
+               "        id: download-short\n"
+               "        timeout-minutes: 5\n")
+        self.assertReports(self.edited(old, old.replace("        timeout-minutes: 5\n", "")),
+                           "job gates, step download-short", "timeout-minutes")
+        old = "          if (( remaining < 41 * 60 )); then\n"
+        self.assertReports(self.edited(old, "          if (( remaining < 1 )); then\n"),
+                           "job gates, step artifact-ids", "run")
+        old = "          if (( remaining < 21 * 60 )); then\n"
+        self.assertReports(self.edited_shard(old, "          if (( remaining < 1 )); then\n"),
+                           "job shard, step artifact-id", "run")
+
+    def test_reporter_does_not_remove_work_budget_from_gate_commands(self):
+        old = ("          bash scripts/tests/retention_ci_setup.sh within-budget \\\n"
+               "            python3 -I scripts/tests/check_coverage.py")
+        new = "          python3 -I scripts/tests/check_coverage.py"
+        self.assertReports(self.edited(old, new), "job gates, step coverage", "run")
+
+    def test_shard_artifact_is_uploaded_even_if_coverage_failed(self):
+        old = ("      - name: Upload coverage evidence\n"
+               "        id: receipt\n"
+               "        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}\n")
+        new = old.replace("!cancelled()", "success()")
+        self.assertReports(self.edited_shard(old, new), "job shard, step receipt", "if")
+        problems = self.edited_shard("          SHARD_OUTCOME: ${{ steps.coverage.outcome }}\n",
+                                     "          SHARD_OUTCOME: success\n")
+        self.assertReports(problems, "job shard, step stage", "env.SHARD_OUTCOME")
+
+    def test_seven_day_listing_diagnostics_allowlist_the_receipt(self):
+        original = "          path: ${{ env.GATES }}/evidence/receipt.json\n"
+        for replacement in ("", "          path: ${{ env.GATES }}/evidence/\n"):
+            with self.subTest(replacement=replacement):
+                self.assertReports(self.edited(original, replacement), "gates-listings",
+                                   "Retain sanitized listing receipt", "with.path")
+        days = original + "          if-no-files-found: ignore\n          retention-days: 7\n"
+        self.assertReports(self.edited(days, days.replace("retention-days: 7", "retention-days: 1")),
+                           "gates-listings", "Retain sanitized listing receipt", "retention-days")
+        old = ("      - name: Retain sanitized listing receipt\n"
+               "        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}\n")
+        self.assertReports(self.edited(old, old.replace("!cancelled()", "success()")),
+                           "gates-listings", "Retain sanitized listing receipt", "if")
+
+    def test_seven_day_shard_diagnostics_keep_receipt_and_sanitized_logs(self):
+        original = "            ${{ env.GATES }}/evidence/receipt.json\n"
+        for replacement in ("", "            ${{ env.GATES }}/evidence/profdata/\n"):
+            with self.subTest(replacement=replacement):
+                self.assertReports(self.edited_shard(original, replacement),
+                                   "Retain sanitized shard diagnostics", "with.path")
+        old = ("      - name: Retain sanitized shard diagnostics\n"
+               "        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}\n")
+        self.assertReports(self.edited_shard(old, old.replace("!cancelled()", "success()")),
+                           "Retain sanitized shard diagnostics", "if")
+
+    def test_gate_pipelines_keep_failure_status(self):
+        old = ("        if: ${{ !cancelled() && steps.functions.outcome == 'success' }}\n"
+               '        shell: bash\n')
+        self.assertReports(self.edited(old, old.replace("bash", "sh")),
+                           "job gates, step inventory", "shell")
+        old = '            --out "$GATES/reports/coverage.json" 2>&1 | tee "$GATES/reports/coverage.out"'
+        self.assertReports(self.edited(old, old + " || true"), "job gates, step coverage", "run")
 
     def test_the_style_job_runs_this_check(self):
         # Final review N14: the step that runs the check is itself checked.
         step = ("      - name: Check Gates\n        run: |\n"
                 "          python3 -I scripts/tests/ci_steps.py\n"
-                "          python3 -I scripts/tests/test_gates.py\n")
+                "          python3 -I scripts/tests/test_gates.py\n"
+                "          python3 -I scripts/tests/test_retention_artifacts.py\n"
+                "          python3 -I scripts/tests/test_retention_evidence.py\n")
         problems = self.edited(step, "")
         self.assertReports(problems, "job style", "'Check Gates'", "missing")
         problems = self.edited(step, step.replace("Check Gates", "Gates"))
