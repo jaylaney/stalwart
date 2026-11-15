@@ -9,8 +9,10 @@
 //! gate, the mail protocols' fixed client texts and trace details (mail
 //! spec 4, 8, 10), release 5's iMIP submission seam (iMIP spec 5.3: the
 //! submitter `services` registers and `za_imip_submit`) and, in test builds,
-//! the pause and failure hooks of spec 11.
+//! the pause and failure hooks of spec 11. Calendar methods have a fixed
+//! keyless refusal (release 6 spec 6.1).
 
+pub mod calendar;
 pub mod imip;
 pub mod lease;
 pub mod mail;
@@ -29,6 +31,10 @@ pub const ZA_MAIL_LOGIN_REFUSED: &str =
 /// holds no keys for the key account.
 pub const ZA_MAIL_KEYLESS: &str =
     "Mail in this account is encrypted at rest and is not available to this session.";
+/// Release 6 spec 6.1: the client text of a calendar method refused for a
+/// token that holds no keys for the key account.
+pub const ZA_CALENDAR_KEYLESS: &str =
+    "Calendars in this account are encrypted at rest and are not available to this session.";
 /// Mail spec 8: the client text of a content search refused on a key account.
 pub const ZA_MAIL_SEARCH_REFUSED: &str = "Mail in this account is encrypted at rest; the server cannot search message content. Search your local copy instead.";
 /// Search spec 7.4: the client text when keyed content search is unavailable.

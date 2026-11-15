@@ -9,7 +9,7 @@ use crate::{
     api::{
         auth::JmapAuthorization,
         metadata::{MetadataType, ObjectMetadata, za_metadata_refused},
-        request::za_assert_calendar_allowed,
+        za_calendar::{za_admit_calendar_method, za_calendar_method},
     },
     changes::{
         page::{
@@ -43,7 +43,10 @@ use jmap_proto::{
         JmapObject, NullObject, addressbook::AddressBookProperty, calendar::CalendarProperty,
         email::EmailProperty, file_node::FileNodeProperty, mailbox::MailboxProperty,
     },
-    request::{capability::CapabilityIds, method::MethodObject},
+    request::{
+        capability::CapabilityIds,
+        method::{MethodFunction, MethodObject},
+    },
     response::{ChangesResponseMethod, ResponseMethod},
     types::state::State,
 };
@@ -200,19 +203,37 @@ impl ChangesLookup for Server {
             }
             MethodObject::Calendar => {
                 access_token.assert_has_access(request.account_id, Collection::Calendar)?;
-                za_assert_calendar_allowed(self, request.account_id).await?;
+                za_admit_calendar_method(
+                    self,
+                    access_token,
+                    request.account_id,
+                    za_calendar_method(object, MethodFunction::Changes),
+                )
+                .await?;
 
                 (SyncCollection::Calendar, true)
             }
             MethodObject::CalendarEvent => {
                 access_token.assert_has_access(request.account_id, Collection::CalendarEvent)?;
-                za_assert_calendar_allowed(self, request.account_id).await?;
+                za_admit_calendar_method(
+                    self,
+                    access_token,
+                    request.account_id,
+                    za_calendar_method(object, MethodFunction::Changes),
+                )
+                .await?;
 
                 (SyncCollection::Calendar, false)
             }
             MethodObject::CalendarEventNotification => {
                 access_token.assert_has_access(request.account_id, Collection::CalendarEvent)?;
-                za_assert_calendar_allowed(self, request.account_id).await?;
+                za_admit_calendar_method(
+                    self,
+                    access_token,
+                    request.account_id,
+                    za_calendar_method(object, MethodFunction::Changes),
+                )
+                .await?;
 
                 (SyncCollection::CalendarEventNotification, false)
             }
@@ -223,9 +244,15 @@ impl ChangesLookup for Server {
             }
             MethodObject::ParticipantIdentity => {
                 access_token.assert_has_access(request.account_id, Collection::CalendarEvent)?;
-                // Spec 9: new at 1.0, a JMAP calendars method, refused for a
-                // key account as ParticipantIdentity/get and /set are.
-                za_assert_calendar_allowed(self, request.account_id).await?;
+                // Release 6 spec 6.2: the method's class determines whether
+                // /changes is served for a key account.
+                za_admit_calendar_method(
+                    self,
+                    access_token,
+                    request.account_id,
+                    za_calendar_method(object, MethodFunction::Changes),
+                )
+                .await?;
 
                 return self
                     .participant_identity_changes(request, access_token)

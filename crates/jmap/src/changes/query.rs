@@ -9,7 +9,11 @@ use super::{
     za::{ZaChangesSince, za_changes_page},
 };
 use crate::{
-    api::{auth::JmapAuthorization, request::resolve_account_id},
+    api::{
+        auth::JmapAuthorization,
+        request::resolve_account_id,
+        za_calendar::{za_admit_calendar_method, za_calendar_method},
+    },
     calendar_event::query::CalendarEventQuery,
     calendar_event_notification::query::CalendarEventNotificationQuery,
     contact::query::ContactCardQuery,
@@ -27,7 +31,11 @@ use jmap_proto::{
         query_changes::{AddedItem, QueryChangesRequest, QueryChangesResponse},
     },
     object::{JmapObject, NullObject},
-    request::{QueryChangesRequestMethod, capability::CapabilityIds, method::MethodObject},
+    request::{
+        QueryChangesRequestMethod,
+        capability::CapabilityIds,
+        method::{MethodFunction, MethodObject},
+    },
 };
 use std::future::Future;
 use store::{
@@ -311,6 +319,16 @@ impl QueryChanges for Server {
                     MethodObject::CalendarEvent,
                     access_token,
                 )?;
+                // Release 6 spec 6.1, 6.2: /queryChanges has its own row. The call to
+                // changes() below admits /changes. Repeat its access check so it answers first.
+                access_token.assert_has_access(request.account_id, Collection::CalendarEvent)?;
+                za_admit_calendar_method(
+                    self,
+                    access_token,
+                    request.account_id,
+                    za_calendar_method(MethodObject::CalendarEvent, MethodFunction::QueryChanges),
+                )
+                .await?;
                 changes = self
                     .changes(
                         build_changes_request(&request),
