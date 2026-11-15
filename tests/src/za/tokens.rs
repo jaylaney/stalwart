@@ -29,6 +29,7 @@ use crate::utils::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::{
+    KV_OAUTH,
     auth::{
         oauth::{grant::GrantRotation, scope::OAuthScopes},
         vault::{RawValue, ZaMark},
@@ -53,6 +54,7 @@ use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use store::{
     ValueKey,
+    dispatch::lookup::KeyValue,
     registry::{
         RegistryQuery,
         write::{RegistryWrite, RegistryWriteResult},
@@ -65,7 +67,7 @@ use vault::{
     keys::{Secret, derive_token_tag},
     record::za_session_binding,
     session::SessionKeys,
-    tokens::{TOKEN_RECORD_VERSION, ZaRefreshClass, append_code_secret, append_secret},
+    tokens::{CODE_LEN, TOKEN_RECORD_VERSION, ZaRefreshClass, append_code_secret, append_secret},
 };
 
 const OWNER: &str = "token-owner@example.com";
@@ -74,6 +76,7 @@ const CONSENT: &str = "token-consent@example.com";
 const RACE: &str = "token-race@example.com";
 const CAP: &str = "token-cap@example.com";
 const PLAIN: &str = "token-plain@example.com";
+const REMOVED: &str = "token-removed@example.com";
 const CAL: &str = "/dav/cal/token-owner%40example.com/";
 const AUTH_FAILED: EventType = EventType::Auth(AuthEvent::Failed);
 const STRONG2: &str = "another long passphrase with 2 numbers";
@@ -137,6 +140,8 @@ pub async fn test(test: &mut TestServer) {
     handoff_gone_after_redemption_and_expiry(test, &app).await;
     device_flow_stays_keyless(test, &registered).await;
     refresh_without_secret_of_keyed_grant_refused(test, &app, &registered).await;
+    malformed_code_lookups_miss_the_handoff(test, &app).await;
+    classification_failure_removes_the_handoff(test, &admin, &app).await;
 
     handoff_crossed_by_password_change(test).await;
     handoff_crossed_by_other_vault_write(test).await;
@@ -1361,6 +1366,204 @@ async fn refresh_without_secret_of_keyed_grant_refused(
         za_revoke_token(registered, refreshed.refresh_token.as_deref().unwrap()).await,
         200
     );
+}
+
+/// The public RFC 7636 example verifier of `za_authorize`'s challenge.
+const PKCE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+/// A synthetic code of the server's shape (40 alphanumeric characters) that
+/// the server never issued.
+const ALIAS_CODE: &str = "r17aliasSyntheticCode0000000000000000000";
+/// Inert bytes planted at `ALIAS_CODE`'s hand-off alias: no key, wrap,
+/// credential, token or code. Their last byte lacks the archive marker bit,
+/// so upstream's archive reader refuses them every time.
+const ALIAS_CANARY: &[u8] = b"za-r17-1 inert alias canary, holds nothing";
+const _: () = assert!(ALIAS_CANARY[ALIAS_CANARY.len() - 1] & 0x80 == 0);
+/// Raw token requests that may end in an authentication error.
+const RAW_TOKEN_IP: &str = "10.0.60.10";
+
+/// A raw token request through a five-second client: the status and the
+/// JSON body, or `Null` when the body is not JSON.
+async fn token_form(form: &[(&str, &str)]) -> (u16, Value) {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .post(format!("{SERVER_URL}/auth/token"))
+        .header("X-Forwarded-For", RAW_TOKEN_IP)
+        .form(form)
+        .send()
+        .await
+        .unwrap_or_else(|_| panic!("the raw token request failed"));
+    let status = response.status().as_u16();
+    let body = response
+        .bytes()
+        .await
+        .unwrap_or_else(|_| panic!("the raw token response was not read"));
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+/// Whether upstream's code entry of `code` (its first 40 characters) exists.
+async fn code_exists(test: &TestServer, code: &str) -> bool {
+    // `get` keeps a short code out of a slicing panic's message.
+    let code = code.get(..CODE_LEN).expect("OAuth code prefix");
+    test.server
+        .in_memory_store()
+        .key_exists(KeyValue::<()>::build_key(KV_OAUTH, code))
+        .await
+        .unwrap()
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Whether a traced value holds `needle`, through nested events and arrays,
+/// compared without formatting either.
+fn value_holds(value: &trc::Value, needle: &[u8]) -> bool {
+    match value {
+        trc::Value::Bytes(bytes) => contains_bytes(bytes, needle),
+        trc::Value::String(text) => contains_bytes(text.as_bytes(), needle),
+        trc::Value::Event(error) => error
+            .keys()
+            .iter()
+            .any(|(_, value)| value_holds(value, needle)),
+        trc::Value::Array(values) => values.iter().any(|value| value_holds(value, needle)),
+        _ => false,
+    }
+}
+
+fn holds_alias_canary(event: &TracedEvent) -> bool {
+    contains_bytes(event.text.as_bytes(), ALIAS_CANARY)
+        || event
+            .keys
+            .iter()
+            .any(|(_, value)| value_holds(value, ALIAS_CANARY))
+}
+
+/// R17-1: upstream's code and device-code lookups build their key from the
+/// caller's input, so `~` and a code would select that code's hand-off.
+/// Only the server's own code shape reaches a lookup.
+async fn malformed_code_lookups_miss_the_handoff(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  malformed_code_lookups_miss_the_handoff");
+    assert!(
+        ALIAS_CODE.len() == CODE_LEN && ALIAS_CODE.bytes().all(|ch| ch.is_ascii_alphanumeric())
+    );
+    let id = test.account(OWNER).id().document_id();
+    // Control: a real sign-in outstanding beside the planted entry.
+    let code = authorized_code(za_authorize(app, OWNER, STRONG, None, Some(true), None).await);
+    assert!(code_exists(test, &code).await);
+    assert!(handoff_exists(test, &code).await);
+
+    let store = test.server.in_memory_store();
+    let alias = format!("~{ALIAS_CODE}");
+    store
+        .key_set(KeyValue::with_prefix(KV_OAUTH, &alias, ALIAS_CANARY.to_vec()).expires(60))
+        .await
+        .unwrap();
+    assert!(handoff_exists(test, ALIAS_CODE).await);
+
+    let authorization_code = [
+        ("grant_type", "authorization_code"),
+        ("client_id", app.client_id.as_str()),
+        ("redirect_uri", app.redirect_uri.as_str()),
+        ("code", alias.as_str()),
+        ("code_verifier", PKCE_VERIFIER),
+    ];
+    let device_code = [
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ("client_id", app.client_id.as_str()),
+        ("device_code", alias.as_str()),
+    ];
+    for (form, expected) in [
+        (&authorization_code[..], "invalid_grant"),
+        (&device_code[..], "expired_token"),
+    ] {
+        let traced = Traced::start(EventType::variants());
+        let (status, body) = token_form(form).await;
+        let events = traced.finish().await;
+        assert!(
+            !events.iter().any(holds_alias_canary),
+            "a trace event holds the planted canary"
+        );
+        assert_eq!(status, 400);
+        assert!(
+            body["error"].as_str() == Some(expected),
+            "the malformed code lookup did not answer {expected}"
+        );
+        assert!(
+            handoff_exists(test, ALIAS_CODE).await,
+            "the planted entry is gone"
+        );
+        assert!(code_exists(test, &code).await);
+        assert!(handoff_exists(test, &code).await);
+    }
+
+    assert!(
+        store
+            .key_delete(KeyValue::<()>::build_key(KV_OAUTH, &alias))
+            .await
+            .unwrap()
+    );
+    assert!(!handoff_exists(test, ALIAS_CODE).await);
+
+    let tokens = granted(za_exchange(app, &code).await);
+    let refresh = tokens.refresh_token.as_deref().unwrap();
+    assert_keyed_pair(&tokens.access_token, refresh);
+    assert!(!code_exists(test, &code).await);
+    assert!(!handoff_exists(test, &code).await);
+    assert_eq!(za_revoke_token(app, refresh).await, 200);
+    assert!(grants_of(test, id).await.is_empty());
+    assert!(raw_token_record(test, id).await.is_none());
+}
+
+/// R17-2: upstream has consumed the code before the account is classified,
+/// so a classification failure must not leave the code's hand-off behind.
+/// The account's removal makes the classification fail while the in-memory
+/// store stays available.
+async fn classification_failure_removes_the_handoff(
+    test: &TestServer,
+    admin: &Account,
+    app: &ZaOAuthClient,
+) {
+    println!("  classification_failure_removes_the_handoff");
+    let account = admin
+        .create_key_user_account(REMOVED, STRONG, "Token Removed", &[], user_permissions())
+        .await;
+    let id = account.id().document_id();
+    let code = authorized_code(za_authorize(app, REMOVED, STRONG, None, Some(true), None).await);
+    // The case owns the account: it is never registered with the test server.
+    admin.destroy_account(account).await;
+    test.wait_for_tasks().await;
+    assert!(
+        test.server.account(id).await.is_err(),
+        "the removed account still classifies"
+    );
+    assert!(code_exists(test, &code).await);
+    assert!(handoff_exists(test, &code).await);
+
+    let (status, body) = token_form(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", app.client_id.as_str()),
+        ("redirect_uri", app.redirect_uri.as_str()),
+        ("code", code.as_str()),
+        ("code_verifier", PKCE_VERIFIER),
+    ])
+    .await;
+    assert_eq!(status, 401);
+    assert!(
+        body.get("access_token").is_none() && body.get("refresh_token").is_none(),
+        "the failed exchange returned a token"
+    );
+    assert!(!code_exists(test, &code).await, "the code was not consumed");
+    assert!(
+        !handoff_exists(test, &code).await,
+        "the hand-off outlived its code"
+    );
+    assert!(grants_of(test, id).await.is_empty());
+    assert!(raw_token_record(test, id).await.is_none());
 }
 
 const SIGN_IN_VAULT_CHANGED: &str = "zero-access: vault changed during sign-in";

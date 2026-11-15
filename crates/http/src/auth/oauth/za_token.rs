@@ -28,12 +28,16 @@ pub(crate) async fn za_code_handoff(
     code: &str,
     suffix: ZaSuffix,
 ) -> trc::Result<Result<Option<ZaGrantKeys>, ErrorType>> {
-    if !server
-        .account(account_id)
-        .await
-        .caused_by(trc::location!())?
-        .is_key_account()
-    {
+    let account = match server.account(account_id).await.caused_by(trc::location!()) {
+        Ok(account) => account,
+        Err(err) => {
+            // The code is spent, so its hand-off goes too. A failed cleanup
+            // never replaces the classification error.
+            let _ = server.za_handoff_delete(code).await;
+            return Err(err);
+        }
+    };
+    if !account.is_key_account() {
         return Ok(match suffix {
             ZaSuffix::None => Ok(None),
             _ => Err(ErrorType::InvalidGrant),

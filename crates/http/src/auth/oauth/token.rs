@@ -42,7 +42,7 @@ use store::{
     write::{Archive, ArchiveBytes, now},
 };
 use trc::AddContext;
-use vault::tokens::split_code;
+use vault::tokens::{CODE_LEN, split_code};
 
 pub trait TokenHandler: Sync + Send {
     fn handle_token_request(
@@ -290,6 +290,9 @@ impl TokenHandler for Server {
         };
 
         let (code, suffix) = split_code(code);
+        if !is_server_code(code) {
+            return Ok(TokenResponse::error(ErrorType::InvalidGrant));
+        }
         let Some(auth_code_) = self
             .in_memory_store()
             .key_get::<Archive<ArchiveBytes>>(KeyValue::<()>::build_key(KV_OAUTH, code.as_bytes()))
@@ -362,6 +365,9 @@ impl TokenHandler for Server {
             return Ok(TokenResponse::error(ErrorType::InvalidRequest));
         };
 
+        if !is_server_code(device_code) {
+            return Ok(TokenResponse::error(ErrorType::ExpiredToken));
+        }
         let Some(auth_code_) = self
             .in_memory_store()
             .key_get::<Archive<ArchiveBytes>>(KeyValue::<()>::build_key(
@@ -665,6 +671,14 @@ fn is_scope_subset(requested: &str, granted: &str) -> bool {
             granted_scopes.contains(scope)
         }
     })
+}
+
+/// The server issues codes and device codes as 40 ASCII alphanumeric
+/// characters. A lookup key built from other input could select another entry
+/// under the OAuth prefix, such as a zero-access hand-off (`~` and a code),
+/// whose bytes the archive reader would attach to its error.
+fn is_server_code(code: &str) -> bool {
+    code.len() == CODE_LEN && code.bytes().all(|ch| ch.is_ascii_alphanumeric())
 }
 
 pub struct NewGrantRequest<'x> {
