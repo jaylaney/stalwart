@@ -1,0 +1,276 @@
+name: Retention transport probe
+
+# Disposable. Copy into .github/workflows only on the branch below.
+'on':
+  push:
+    branches: [codex/retention-transport-probe]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTUP_TOOLCHAIN: '1.99.1'
+  RETENTION_TARGET: x86_64-unknown-linux-gnu
+  STORE: RocksDb
+  RUST_MIN_STACK: '16777216'
+  CARGO_TARGET_DIR: /mnt/target
+  CARGO_HOME: /mnt/retention-probe/cargo
+  CARGO_TERM_COLOR: never
+  GIT_OPTIONAL_LOCKS: '0'
+  GATES: /mnt/retention-probe
+  TMPDIR: /mnt/retention-probe/tmp
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      snapshot-id: ${{ steps.snapshot.outputs.artifact-id }}
+    steps:
+      - &disk
+        name: Prepare identical absolute paths
+        run: |
+          sudo mkdir -p "$CARGO_TARGET_DIR" "$GATES" "$CARGO_HOME" "$TMPDIR"
+          sudo chown "$(id -u):$(id -g)" "$CARGO_TARGET_DIR" "$GATES" "$CARGO_HOME" "$TMPDIR"
+          printf 'Workspace: %s\nCargo home: %s\nTarget: %s\n' \
+            "$GITHUB_WORKSPACE" "$CARGO_HOME" "$CARGO_TARGET_DIR" >> "$GITHUB_STEP_SUMMARY"
+          df -h "$CARGO_TARGET_DIR"
+          mkdir -p "$GATES/bin"
+          cat > "$GATES/bin/measure-snapshot" <<'BASH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          phase="$1"
+          shift
+          sample="$GATES/$phase.space"
+          available() { df -B1 --output=avail "$CARGO_TARGET_DIR" | tail -n1; }
+          available > "$sample"
+          (
+            while sleep 2; do
+              available >> "$sample"
+            done
+          ) &
+          sampler=$!
+          trap 'kill "$sampler" 2>/dev/null || true' EXIT
+          status=0
+          time "$@" || status=$?
+          kill "$sampler" 2>/dev/null || true
+          wait "$sampler" 2>/dev/null || true
+          available >> "$sample"
+          printf '%s: minimum sampled free bytes %s\n' "$phase" \
+            "$(awk 'NR == 1 || $1 < min { min = $1 } END { print min }' "$sample")" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+          BASH
+          chmod 0755 "$GATES/bin/measure-snapshot"
+      - &checkout
+        name: Check out the probe commit
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - &tools
+        name: Install pinned Rust and cargo-llvm-cov
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal \
+            --component llvm-tools-preview
+          install -d "$GATES/bin"
+          asset=cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz
+          curl --fail --silent --show-error --location \
+            "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/$asset" \
+            --output "$GATES/$asset"
+          printf '%s  %s\n' \
+            b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a \
+            "$GATES/$asset" | sha256sum --check --strict
+          tar -xzf "$GATES/$asset" -C "$GATES/bin" cargo-llvm-cov
+          printf '%s\n' "$GATES/bin" >> "$GITHUB_PATH"
+          {
+            printf 'Runner image: %s %s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            rustc -vV
+            cargo -V
+            PATH="$GATES/bin:$PATH" cargo llvm-cov --version
+            "$(rustc --print target-libdir)/../bin/llvm-cov" --version
+            "$(rustc --print target-libdir)/../bin/llvm-profdata" --version
+            cc --version
+            ld --version
+            ldd --version
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$RETENTION_TARGET"
+          command -v zstd
+      - &normalize
+        name: Normalize tracked and watched Git paths
+        run: python3 -I scripts/tests/retention_artifacts.py normalize-checkout
+      - &fetch
+        name: Fetch locked dependencies
+        run: |
+          time cargo fetch --locked --target "$RETENTION_TARGET"
+          du -sb "$CARGO_HOME"
+          df -h "$CARGO_HOME"
+      - &materialize
+        name: Materialize dependency sources without compiling
+        run: |
+          time cargo metadata --offline --locked --format-version 1 \
+            --filter-platform "$RETENTION_TARGET" >/dev/null
+      - name: Build the instrumented workspace and integration targets
+        run: |
+          time python3 -I scripts/tests/coverage_net.py --out "$GATES/build" --build-only
+          du -sb "$CARGO_TARGET_DIR"
+          df -h "$CARGO_TARGET_DIR"
+      - name: Pack the build snapshot
+        run: |
+          "$GATES/bin/measure-snapshot" pack python3 -I scripts/tests/retention_artifacts.py pack-build \
+            --manifest "$GATES/build/build.json" --target "$CARGO_TARGET_DIR" \
+            --out "$GATES/snapshot.tar.zst"
+          archive_bytes=$(stat -c '%s' "$GATES/snapshot.tar.zst")
+          target_bytes=$(du -sb "$CARGO_TARGET_DIR" | cut -f1)
+          printf 'Build snapshot: %s compressed bytes, %s Cargo target bytes\n' \
+            "$archive_bytes" "$target_bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          df -h "$CARGO_TARGET_DIR"
+      - name: Upload the snapshot
+        id: snapshot
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: retention-probe-target-${{ github.run_attempt }}
+          path: ${{ env.GATES }}/snapshot.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: build
+    outputs:
+      evidence-id: ${{ steps.leak.outputs.artifact-id }}
+    steps:
+      - *disk
+      - *checkout
+      - *tools
+      - *normalize
+      - *fetch
+      - *materialize
+      - &check_snapshot_id
+        name: Require the selected build artifact ID
+        env:
+          SNAPSHOT_ID: ${{ needs.build.outputs.snapshot-id }}
+        run: |
+          [[ "$SNAPSHOT_ID" =~ ^[0-9]+$ ]]
+      - &download
+        name: Download the selected snapshot
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.snapshot-id }}
+          path: ${{ env.GATES }}/download
+          digest-mismatch: error
+      - &unpack
+        name: Restore the target and validate the object set
+        run: |
+          "$GATES/bin/measure-snapshot" unpack python3 -I scripts/tests/retention_artifacts.py unpack-build \
+            --archive "$GATES/download/snapshot.tar.zst" --target "$CARGO_TARGET_DIR" \
+            --manifest-out "$GATES/build.json"
+          stat -c '%s bytes downloaded' "$GATES/download/snapshot.tar.zst"
+          du -sb "$CARGO_TARGET_DIR"
+          df -h "$CARGO_TARGET_DIR"
+          test -z "$(find "$CARGO_TARGET_DIR" -type f \
+            \( -name '*.profraw' -o -name '*.profdata' \) -print -quit)"
+          time python3 -I scripts/tests/coverage_net.py --check-build \
+            --build-manifest "$GATES/build.json"
+      - name: Prove both Cargo build shapes are fresh
+        run: |
+          check_fresh() {
+            local label="$1"
+            shift
+            local log="$GATES/$label.log"
+            time env CARGO_LOG=cargo::core::compiler::fingerprint=info \
+              cargo llvm-cov --no-report test -vv "$@" -- --list 2>&1 | tee "$log"
+            if grep -E '^[[:space:]]*(Compiling|Dirty|Running .*build-script)' "$log"; then
+              printf 'Restored Cargo target was dirty for %s\n' "$label" >&2
+              return 1
+            fi
+            grep -Eq '^[[:space:]]*Fresh[[:space:]]+' "$log"
+          }
+          check_fresh build-A --workspace --exclude-from-test scim --exclude-from-test scim-proto \
+            --lib --bins --tests --no-fail-fast
+          check_fresh build-B -p tests
+          # Listing the tests can flush counters even though no test body ran.
+          find "$CARGO_TARGET_DIR/llvm-cov-target" -maxdepth 1 -type f \
+            -name '*.profraw' -delete
+          time python3 -I scripts/tests/coverage_net.py --check-build \
+            --build-manifest "$GATES/build.json"
+      - name: Run and export the existing leak unit test
+        run: |
+          time python3 -I scripts/tests/coverage_net.py --out "$GATES/leak" leak-unit-test
+          time python3 -I scripts/tests/coverage_net.py --check-build \
+            --build-manifest "$GATES/build.json"
+          test -s "$GATES/leak/profdata/leak-unit-test.profdata"
+          test -s "$GATES/leak/steps/leak-unit-test.json"
+          df -h "$CARGO_TARGET_DIR"
+      - name: Upload the step profile and export
+        id: leak
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: retention-probe-leak-${{ github.run_attempt }}
+          path: |
+            ${{ env.GATES }}/leak/profdata/leak-unit-test.profdata
+            ${{ env.GATES }}/leak/steps/leak-unit-test.json
+          if-no-files-found: error
+          retention-days: 1
+
+  reporter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: [build, coverage]
+    steps:
+      - *disk
+      - *checkout
+      - *tools
+      - *normalize
+      - *fetch
+      - *materialize
+      - *check_snapshot_id
+      - *download
+      - *unpack
+      - name: Require the selected leak artifact ID
+        env:
+          EVIDENCE_ID: ${{ needs.coverage.outputs.evidence-id }}
+        run: |
+          [[ "$EVIDENCE_ID" =~ ^[0-9]+$ ]]
+      - name: Download the leak step evidence
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.coverage.outputs.evidence-id }}
+          path: ${{ env.GATES }}/leak-evidence
+          digest-mismatch: error
+      - name: Re-export the leak profile on the reporting runner
+        run: |
+          mkdir -p "$GATES/report/profdata"
+          cp "$GATES/leak-evidence/profdata/leak-unit-test.profdata" "$GATES/report/profdata/"
+          status=0
+          time python3 -I scripts/tests/coverage_net.py --out "$GATES/report" \
+            --merge-only --build-manifest "$GATES/build.json" || status=$?
+          test "$status" -eq 1
+          python3 -I - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          root = Path(os.environ["GATES"])
+          manifest = json.loads((root / "report" / "merge.json").read_text())
+          assert manifest["complete"] is False, "a one-step export cannot qualify the gate"
+          listing = subprocess.check_output(
+              [sys.executable, "-I", "scripts/tests/coverage_net.py", "--list"], text=True
+          )
+          step_names = {row.split(maxsplit=1)[0] for row in listing.splitlines()}
+          expected_missing = step_names - {"build-A", "build-B", "leak-unit-test"}
+          assert len(expected_missing) == 18
+          assert sorted(manifest["missing_steps"]) == sorted(expected_missing)
+          reporter = json.loads((root / "report" / "merged.json").read_text())
+          producer = json.loads((root / "leak-evidence" / "steps" / "leak-unit-test.json").read_text())
+          assert reporter["data"], "the reporter wrote no coverage"
+          assert reporter == producer, "exports differ for the same profile and object set"
+          PY
+          df -h "$CARGO_TARGET_DIR"
