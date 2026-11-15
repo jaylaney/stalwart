@@ -52,7 +52,7 @@ jobs:
       shell: bash
       run: |
         test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-        git diff --exit-code HEAD --
+        git -c diff.autoRefreshIndex=false diff --exit-code HEAD --
     - name: Install pinned coverage tools
       id: tools
       shell: bash
@@ -144,7 +144,7 @@ jobs:
       shell: bash
       run: |
         date --utc --iso-8601=seconds
-        git diff --exit-code HEAD --
+        git -c diff.autoRefreshIndex=false diff --exit-code HEAD --
         status=0
         for phase in COVERAGE_NET LISTINGS FUNCTIONS INVENTORY COVERAGE_GATE; do
           declare -n outcome="$phase"_OUTCOME
