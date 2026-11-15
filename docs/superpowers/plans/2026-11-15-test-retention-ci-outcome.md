@@ -85,8 +85,39 @@ test `dav_proto::requests::tests::parse_requests` rewrote tracked JSON fixtures 
 next WebDAV command rebuilt coverage objects. The test now writes to a private
 temporary directory and still exercises parsing, serialization and file writes.
 [Short-shard result](https://github.com/jaylaney/stalwart/actions/runs/43752266663/job/132933900954)
+Replaying that snapshot on another hosted runner found 47 fixture timestamp changes and
+26 content changes. Cargo named `crates/dav-proto/resources/requests/acl-001.json` as the
+build input that made `common` dirty. [Fingerprint replay](https://github.com/jaylaney/stalwart/actions/runs/43757223934/job/132943843746)
+The isolated locked unit test confirmed all 94 tracked request fixtures retained their
+contents and timestamps. The first comparison was stopped after its diagnostics were saved.
 
 The first [production dispatch](https://github.com/jaylaney/stalwart/actions/runs/43754819285)
 and [intentional-failure trial](https://github.com/jaylaney/stalwart/actions/runs/43754934544)
 used the earlier unit test. Both were cancelled before the retention report so that
 validation can run with the corrected fixture writer.
+
+The replacement [production dispatch](https://github.com/jaylaney/stalwart/actions/runs/43757776610)
+uses `3291c73264e1372e255e01cb9cf55bcabb98ef8c`. The corrected
+[comparison](https://github.com/jaylaney/stalwart/actions/runs/43757810802) and
+[intentional-failure trial](https://github.com/jaylaney/stalwart/actions/runs/43757835753)
+use that source with disposable harness files. The comparison runs the warm lane when
+both cold producers save their scoped downloads, and checks key invalidation separately.
+
+The corrected short shard passed all 17 configurations and validated the original object
+hashes in both runs. The measured driver step took 18m 8s in production and 21m 45s in
+the comparison. [Production short shard](https://github.com/jaylaney/stalwart/actions/runs/43757776610/job/132950855150) ·
+[Comparison short shard](https://github.com/jaylaney/stalwart/actions/runs/43757810802/job/132950870859)
+
+Both cold producers missed their scoped keys and measured 9,941,331,255 bytes of live
+usage. The roughly 59 MB of headroom could not cover both downloads, about 383 MB each
+before compression, so both saves and the warm lane were skipped. The disposable
+lockfile change generated new keys that missed in both lanes. The original keys were
+also cold. [Cache outcomes](https://github.com/jaylaney/stalwart/actions/runs/43757810802/job/132956473426) ·
+[Key invalidation check](https://github.com/jaylaney/stalwart/actions/runs/43757810802/job/132956473002)
+
+All three comparison coverage producers passed. The reporter rejected the ordinary
+listing at collection because the credential sanitizer had changed valid Rust test IDs
+such as `tokenizers::…: test`. The corrected sanitizer preserves structured libtest rows
+within Cargo's listing output and continues to redact credentials in diagnostic text.
+The selected and ignored listing fixtures cover both behaviors.
+[Reporter rejection](https://github.com/jaylaney/stalwart/actions/runs/43757810802/job/132962819014)
