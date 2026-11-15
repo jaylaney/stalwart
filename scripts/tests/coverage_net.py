@@ -125,12 +125,7 @@ def run(cmd, *, env=None, timeout=None, deadline=None, output=None, check=False)
                 stdout, stderr = child.communicate(timeout=remaining if budget_limited else timeout)
                 status = child.returncode
             except subprocess.TimeoutExpired:
-                terminate(child, signal.SIGTERM)
-                try:
-                    stdout, stderr = child.communicate(timeout=60)
-                except subprocess.TimeoutExpired:
-                    terminate(child, signal.SIGKILL)
-                    stdout, stderr = child.communicate()
+                stdout, stderr = stop_after_timeout(child)
                 status = "deadline" if budget_limited else "timeout"
     if check and status != 0:
         raise RuntimeError(f"{' '.join(cmd[:3])} failed ({status})")
@@ -142,6 +137,24 @@ def terminate(child, sig):
         os.killpg(child.pid, sig)
     except ProcessLookupError:
         pass
+
+
+def stop_after_timeout(child):
+    terminate(child, signal.SIGTERM)
+    try:
+        return child.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        # With output redirected to a file, communicate can return when the leader exits
+        # even though other processes in its group can still write profiles or hold ports.
+        terminate(child, signal.SIGKILL)
+    try:
+        return child.communicate(timeout=5)
+    except subprocess.TimeoutExpired as error:
+        # Processes outside the group can keep inherited pipes open after group cleanup.
+        return ((error.stdout or b"").decode(errors="replace"),
+                (error.stderr or b"").decode(errors="replace"))
 
 
 def canonical_json(value):
