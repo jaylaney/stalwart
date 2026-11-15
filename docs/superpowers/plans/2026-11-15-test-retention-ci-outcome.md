@@ -13,7 +13,8 @@ same inputs as on the serial workflow. [Issue #86](https://github.com/jaylaney/s
 | [Historical serial run](https://github.com/jaylaney/stalwart/actions/runs/43509717996/job/132176748499) | Included in 2h 39m coverage phase | — | Overall 3h 17m. Inventory failed on that historical head. |
 | [Transport trial 1](https://github.com/jaylaney/stalwart/actions/runs/43744029033) | 20m 42s | 19,280,751,439 | Packaging stopped on a public AWS-LC header comment that matched the Basic credential pattern. |
 | [Transport trial 2](https://github.com/jaylaney/stalwart/actions/runs/43746550649) | 17m 21s | 19,281,070,126 | Packaging stopped on type declarations in SQLite's generated bindings. |
-| [Transport trial 3](https://github.com/jaylaney/stalwart/actions/runs/43748806097) | Pending | — | Tests the corrected credential checks and target-local restore. |
+| [Transport trial 3](https://github.com/jaylaney/stalwart/actions/runs/43748806097) | 14m 40s | 19,281,070,127 | Restored all expected coverage objects. Cargo rebuilt after finding three missing custom build-script executables. |
+| [Transport trial 4](https://github.com/jaylaney/stalwart/actions/runs/43751500051) | Pending | — | Checks the corrected file list and fresh coverage on separate runners. |
 
 The first two transport trials compiled both build configurations. Their times describe build-only
 work and provide no comparison with the serial gate's total. The local instrumented
@@ -21,6 +22,18 @@ fixture restored a small Cargo target into a fresh checkout at the same absolute
 passed Cargo's freshness check and produced a fresh coverage export. The hosted probe
 uses verbose instrumented test listings to check freshness. It clears listing counters
 before collecting coverage because cargo-llvm-cov 0.9.1 rejects `--no-run` in this mode.
+
+Trial 3 packed 4,512,244,449 bytes in 47 seconds. Upload took approximately 38 seconds.
+The coverage runner downloaded the artifact in 46 seconds, unpacked it and checked the
+object set in 57 seconds, and verified toolchain and object identity after dependency
+fetch in 18 seconds. The producer had at least 65,699,819,520 free bytes during packing,
+sampled every two seconds.
+
+The Cargo freshness check identified missing `build_script_main-*` executables in two
+AWS-LC versions and OpenSSL. All other dirty units depended on those crates. The corrected
+file list preserves each executable, its dep-info, and its `build-script-main` hardlink.
+A local Cargo fixture with a custom build script restored all three byte for byte and
+reported the build fresh. [Trial 3 freshness log](https://github.com/jaylaney/stalwart/actions/runs/43748806097/job/132922845186)
 
 A [hosted artifact fixture](https://github.com/jaylaney/stalwart/actions/runs/43746694042)
 validated evidence from a failed reusable shard and kept its first report red. On
