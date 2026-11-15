@@ -57,22 +57,25 @@ download_paths_bytes() {
 }
 
 cache_budget() {
-    local used limit bytes
+    # The verified fork quota and GitHub's default are both 10 GB.
+    local limit=10000000000 used bytes
     # Reserve headroom for both scheduled lanes because they can save concurrently.
     # Size the reservation from uncompressed inputs and leave room for archive overhead.
     bytes=$(download_paths_bytes)
     if ! used=$(gh api "repos/$GITHUB_REPOSITORY/actions/cache/usage" \
-        --jq '.active_caches_size_in_bytes') ||
-       ! limit=$(gh api "repos/$GITHUB_REPOSITORY/actions/cache/storage-limit" \
-        --jq '.max_cache_size_gb') ||
-       [[ ! "$used" =~ ^[0-9]+$ || ! "$limit" =~ ^[1-9][0-9]*$ ]]; then
-        printf '%s\n' 'Cache usage or limit unavailable. Skip this optional save.'
+        --jq '.active_caches_size_in_bytes'); then
+        printf '%s\n' 'Cache usage request failed. Skip this optional save.'
         return
     fi
-    limit=$((limit * 1000 * 1000 * 1000))
+    if [[ ! "$used" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        printf '%s\n' 'Cache usage response is invalid. Skip this optional save.'
+        return
+    fi
     printf 'Cache bytes: %s used of %s, %s for this lane before compression\n' \
         "$used" "$limit" "$bytes" | tee -a "$GITHUB_STEP_SUMMARY"
-    if (( bytes > 0 && used + 2 * (bytes + 32 * 1024 * 1024) <= limit )); then
+    # Values longer than the budget are already too large and could overflow Bash arithmetic.
+    if (( ${#used} <= ${#limit} && ${#bytes} <= ${#limit} &&
+          bytes > 0 && used + 2 * (bytes + 32 * 1024 * 1024) <= limit )); then
         printf '%s\n' 'room=true' >> "$GITHUB_OUTPUT"
     else
         printf '%s\n' 'Insufficient cache room for both download scopes. Skip this optional save.'
