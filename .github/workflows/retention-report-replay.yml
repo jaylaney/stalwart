@@ -1,4 +1,4 @@
-# Temporary qualification replay of the pinned attempt's immutable producer artifacts.
+# Temporary reporter-only replay of immutable producer artifacts and sealed listings.
 name: Retention Report Replay
 'on':
   push:
@@ -11,124 +11,10 @@ env:
   SOURCE_SHA: 9b966c97ff291fbc45aa1eeca888a6d2f6186e03
   SOURCE_RUN_ID: '43757810802'
   SOURCE_RUN_ATTEMPT: '1'
+  SOURCE_REF: refs/heads/codex/retention-qualification
+  LISTINGS_RUN_ID: '43764661867'
+  LISTINGS_ID: '14182508601'
 jobs:
-  replay-listings:
-    name: Replay · Capture Retention Test Listings
-    runs-on: ubuntu-24.04
-    timeout-minutes: 100
-    permissions:
-      actions: read
-      contents: read
-    outputs:
-      receipt-artifact-id: "${{ steps.receipt.outputs.artifact-id }}"
-    env:
-      STORE: RocksDb
-      RUST_MIN_STACK: '16777216'
-      RUSTUP_TOOLCHAIN: 1.99.1
-      RETENTION_TIMEOUT_MINUTES: '100'
-      RETENTION_TARGET: x86_64-unknown-linux-gnu
-      CARGO_TARGET_DIR: "/mnt/listing-target"
-      CARGO_HOME: "/mnt/retention-ci/.cargo"
-      CARGO_TERM_COLOR: never
-      GIT_OPTIONAL_LOCKS: '0'
-      GATES: "/mnt/gates"
-      TMPDIR: "/mnt/gates/tmp"
-    steps:
-    - name: Set the work deadline and prepare retention directories
-      id: prepare
-      shell: bash
-      run: |
-        # Leave the final 12 minutes for settlement, diagnostics and bounded uploads.
-        printf 'RETENTION_DEADLINE_EPOCH=%s\n' \
-          "$(( $(date +%s) + (RETENTION_TIMEOUT_MINUTES - 12) * 60 ))" >> "$GITHUB_ENV"
-        sudo mkdir -p "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
-        sudo chown "$(id -u):$(id -g)" "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
-        df -h "$GATES"
-    - name: Checkout the replay definition
-      uses: actions/checkout@v7
-      with:
-        persist-credentials: false
-    - name: Stage corrected evidence module outside the pinned tree
-      shell: bash
-      run: cp scripts/tests/retention_evidence.py "$RUNNER_TEMP/retention_evidence.py"
-    - name: Checkout exact source revision
-      uses: actions/checkout@v7
-      with:
-        ref: "${{ env.SOURCE_SHA }}"
-        persist-credentials: false
-    - name: Verify the pinned source tree
-      shell: bash
-      run: |
-        test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-        git diff --exit-code HEAD --
-    - name: Install pinned tools
-      id: tools
-      shell: bash
-      run: bash scripts/tests/retention_ci_setup.sh install-tools ordinary
-    - name: Normalize checkout mtimes
-      id: normalize
-      shell: bash
-      run: python3 -I scripts/tests/retention_artifacts.py normalize-checkout
-    - name: Fetch and materialize dependencies
-      id: fetch
-      shell: bash
-      run: bash scripts/tests/retention_ci_setup.sh fetch
-    - name: Capture all CI step listings
-      id: capture
-      shell: bash
-      run: |
-        time env GITHUB_SHA="$SOURCE_SHA" GITHUB_RUN_ID="$SOURCE_RUN_ID" \
-          GITHUB_RUN_ATTEMPT="$SOURCE_RUN_ATTEMPT" \
-          python3 -I scripts/tests/capture_listings.py --out "$GATES/listings" \
-          --deadline-epoch "$RETENTION_DEADLINE_EPOCH"
-    - name: Stage listing evidence
-      id: stage
-      if: "${{ !cancelled() }}"
-      timeout-minutes: 2
-      shell: bash
-      env:
-        CAPTURE_OUTCOME: "${{ steps.capture.outcome }}"
-      run: |
-        git diff --exit-code HEAD --
-        env GITHUB_SHA="$SOURCE_SHA" GITHUB_RUN_ID="$SOURCE_RUN_ID" \
-          GITHUB_RUN_ATTEMPT="$SOURCE_RUN_ATTEMPT" \
-          python3 -I -B - "$RUNNER_TEMP/retention_evidence.py" \
-            scripts/tests/retention_artifacts.py stage --kind listings \
-            --producer listings --status "$CAPTURE_OUTCOME" \
-            --source "$GATES/listings" --out "$GATES/evidence" <<'PY'
-        import importlib.util
-        from pathlib import Path
-        import runpy
-        import sys
-
-        module_path, command, *args = sys.argv[1:]
-        sys.path.insert(0, str(Path(command).resolve().parent))
-        spec = importlib.util.spec_from_file_location("retention_evidence", module_path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-        sys.argv = [command, *args]
-        runpy.run_path(command, run_name="__main__")
-        PY
-    - name: Upload listing evidence
-      id: receipt
-      if: "${{ !cancelled() && steps.stage.outcome == 'success' }}"
-      timeout-minutes: 4
-      uses: actions/upload-artifact@v7.0.1
-      with:
-        name: retention-replay-listings-${{ github.run_attempt }}
-        path: "${{ env.GATES }}/evidence/"
-        if-no-files-found: error
-        retention-days: 1
-    - name: Retain sanitized listing receipt
-      if: "${{ !cancelled() && steps.stage.outcome == 'success' }}"
-      timeout-minutes: 2
-      uses: actions/upload-artifact@v7.0.1
-      with:
-        name: retention-replay-listings-diagnostics-${{ github.run_attempt }}
-        path: "${{ env.GATES }}/evidence/receipt.json"
-        if-no-files-found: ignore
-        retention-days: 7
   replay-gates:
     name: Replay · Test Retention Gates
     runs-on: ubuntu-24.04
@@ -159,11 +45,12 @@ jobs:
     - name: Checkout exact source revision
       uses: actions/checkout@v7
       with:
-        ref: "${{ env.SOURCE_SHA }}"
+        ref: "${{ env.SOURCE_REF }}"
         persist-credentials: false
     - name: Verify the pinned source tree
       shell: bash
       run: |
+        test "$(git symbolic-ref HEAD)" = "$SOURCE_REF"
         test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
         git diff --exit-code HEAD --
     - name: Install pinned coverage tools
@@ -183,7 +70,6 @@ jobs:
         SHORT_ID: '14180033696'
         ZA_ROCKS_ID: '14181162028'
         ZA_FILESYSTEM_ID: '14180804426'
-        LISTINGS_ID: "${{ needs.replay-listings.outputs.receipt-artifact-id }}"
       run: |
         remaining=$((RETENTION_DEADLINE_EPOCH - $(date +%s)))
         if (( remaining < 41 * 60 )); then
@@ -247,9 +133,12 @@ jobs:
       if: "${{ !cancelled() && steps.artifact-ids.outputs.listings == 'true' }}"
       uses: actions/download-artifact@v8
       with:
-        artifact-ids: "${{ needs.replay-listings.outputs.receipt-artifact-id }}"
+        artifact-ids: "${{ env.LISTINGS_ID }}"
         path: "/mnt/gates/inputs/listings"
         digest-mismatch: error
+        github-token: "${{ github.token }}"
+        repository: "${{ github.repository }}"
+        run-id: "${{ env.LISTINGS_RUN_ID }}"
     - name: Download the selected build snapshot
       if: "${{ !cancelled() && steps.artifact-ids.outputs.snapshot == 'true' }}"
       uses: actions/download-artifact@v8
@@ -377,7 +266,7 @@ jobs:
       if: "${{ !cancelled() }}"
       shell: bash
       env:
-        LISTINGS_OUTCOME: "${{ needs.replay-listings.result }}"
+        LISTINGS_OUTCOME: "${{ steps.download-listings.outcome }}"
         COLLECT_OUTCOME: "${{ steps.collect.outcome }}"
         MERGE_OUTCOME: "${{ steps.merge.outcome }}"
         FUNCTIONS_OUTCOME: "${{ steps.functions.outcome }}"
@@ -397,13 +286,69 @@ jobs:
         exit "$status"
     - name: Record replay comparison evidence
       id: comparison
-      if: "${{ !cancelled() && steps.functions.outcome == 'success' && steps.coverage.outcome != 'skipped' }}"
+      if: "${{ !cancelled() && steps.qualify.outcome == 'success' }}"
       shell: bash
       run: |
         env GITHUB_SHA="$SOURCE_SHA" GITHUB_RUN_ID="$SOURCE_RUN_ID" \
           GITHUB_RUN_ATTEMPT="$SOURCE_RUN_ATTEMPT" \
-          python3 -I scripts/tests/retention_qualification.py capture --reports "$GATES/reports" \
-            --out "$GATES/comparison" --attempt-dir "$GATES/inputs"
+          python3 -I -B - capture --reports "$GATES/reports" --out "$GATES/comparison" \
+            --attempt-dir "$GATES/inputs" <<'PY'
+        from collections import deque
+        import os
+        from pathlib import Path
+        import re
+        import sys
+        import time
+
+        sys.path.insert(0, str(Path("scripts/tests").resolve()))
+        import retention_qualification as qualification
+
+        original_run = qualification.coverage_net.Net.run
+        diagnostics = Path(os.environ["RUNNER_TEMP"]) / "selector-cargo.log"
+
+        def run(self, command, **kwargs):
+            if "--list" not in command:
+                return original_run(self, command, **kwargs)
+            kwargs["env"] = {**kwargs["env"], "CARGO_LOG": "cargo::core::compiler::fingerprint=info"}
+            started = time.monotonic()
+            result = original_run(self, command, **kwargs)
+            output = kwargs.get("output")
+            fingerprints, terminal = deque(maxlen=24), deque(maxlen=20)
+
+            def inspect(lines):
+                dirty = False
+                for line in lines:
+                    snippet = line.rstrip()[:500]
+                    if "cargo::core::compiler::fingerprint" in snippet:
+                        fingerprints.append(snippet)
+                    terminal.append(snippet)
+                    if re.match(r"^\s*(Compiling|Dirty)\s", snippet):
+                        dirty = True
+                return dirty
+
+            if output is None:
+                dirty = inspect((result.stdout + result.stderr).splitlines())
+            else:
+                output.flush()
+                with open(output.name, encoding="utf-8", errors="replace") as source:
+                    dirty = inspect(source)
+            if result.returncode != 0 or dirty:
+                elapsed = time.monotonic() - started
+                with diagnostics.open("a", encoding="utf-8") as log:
+                    print(f"exit={result.returncode} timeout={kwargs.get('timeout')} "
+                          f"elapsed={elapsed:.1f}s dirty={dirty} command={command[:12]}", file=log)
+                    print("Recent Cargo fingerprint messages:", *fingerprints, sep="\n", file=log)
+                    print("Recent terminal lines:", *terminal, sep="\n", file=log)
+            return result
+
+        qualification.coverage_net.Net.run = run
+        sys.exit(qualification.main())
+        PY
+        env GITHUB_SHA="$SOURCE_SHA" GITHUB_RUN_ID="$SOURCE_RUN_ID" \
+          GITHUB_RUN_ATTEMPT="$SOURCE_RUN_ATTEMPT" \
+          python3 -I scripts/tests/coverage_net.py --check-build \
+            --build-manifest "$GATES/build.json" --deadline-epoch "$RETENTION_DEADLINE_EPOCH"
+      timeout-minutes: 30
     - name: Retain replay comparison evidence
       if: "${{ !cancelled() && steps.comparison.outcome == 'success' }}"
       uses: actions/upload-artifact@v7.0.1
@@ -412,26 +357,26 @@ jobs:
         path: "${{ env.GATES }}/comparison/"
         if-no-files-found: error
         retention-days: 7
-    - name: Verify incompatible evidence and deadline diagnostics
-      id: negative
-      if: "${{ !cancelled() && github.run_attempt == 1 && (steps.collect.outputs.code == '0' || steps.collect.outputs.code == '1') }}"
-      timeout-minutes: 10
+    - name: Sanitize selector Cargo diagnostics
+      id: selector-diagnostics
+      if: "${{ !cancelled() && steps.comparison.outcome == 'failure' }}"
+      timeout-minutes: 2
       shell: bash
-      env:
-        SNAPSHOT_ID: '14179413511'
       run: |
-        env GITHUB_SHA="$SOURCE_SHA" GITHUB_RUN_ID="$SOURCE_RUN_ID" \
-          GITHUB_RUN_ATTEMPT="$SOURCE_RUN_ATTEMPT" \
-          python3 -I scripts/tests/retention_qualification.py negative \
-            --inputs "$GATES/inputs" --build-manifest "$GATES/build.json" \
-            --snapshot-artifact-id "$SNAPSHOT_ID" | tee -a "$GITHUB_STEP_SUMMARY"
-        python3 -I scripts/tests/test_gates.py -v \
-          CoverageNetTests.test_shard_settles_earlier_steps_after_work_cutoff \
-          CoverageNetTests.test_raw_profile_is_merged_during_diagnostics_reserve \
-          WorkflowTests.test_shard_artifact_is_uploaded_even_if_coverage_failed \
-          WorkflowTests.test_seven_day_shard_diagnostics_keep_receipt_and_sanitized_logs
-    needs:
-    - replay-listings
+        bash scripts/tests/retention_ci_setup.sh stage-logs \
+          "$RUNNER_TEMP/selector-diagnostics" "$RUNNER_TEMP/selector-cargo.log"
+        if [[ -f "$RUNNER_TEMP/selector-diagnostics/selector-cargo.log" ]]; then
+          cat "$RUNNER_TEMP/selector-diagnostics/selector-cargo.log"
+        fi
+    - name: Retain sanitized selector Cargo diagnostics
+      if: "${{ !cancelled() && steps.selector-diagnostics.outcome == 'success' }}"
+      timeout-minutes: 3
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: retention-replay-selector-diagnostics-${{ github.run_attempt }}
+        path: "${{ runner.temp }}/selector-diagnostics/"
+        if-no-files-found: ignore
+        retention-days: 7
     if: "${{ !cancelled() }}"
     permissions:
       actions: read
