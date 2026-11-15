@@ -64,21 +64,40 @@ def file_digest(path):
     return digest.hexdigest()
 
 
-def redacted(path, destination):
+def redacted(path, destination, *, listing=False):
     destination.parent.mkdir(parents=True, exist_ok=True)
+    in_section = in_target = False
     with path.open("rb") as source, destination.open("wb") as output:
         for line in source:
+            if listing:
+                if line.startswith(b"## command:"):
+                    in_section, in_target = True, False
+                elif line.startswith(b"## exit:"):
+                    in_section = in_target = False
+                elif in_section:
+                    text = line.rstrip(b"\r\n").decode("utf-8")
+                    if RUNNING.fullmatch(text):
+                        in_target = True
+                    elif LISTING_FOOTER.fullmatch(text):
+                        in_target = False
+                    elif in_target and (entry := ENTRY.fullmatch(text)):
+                        # Assignment redaction can mistake a Rust module separator or
+                        # the test-kind suffix for a credential delimiter.
+                        if all(segment.removeprefix("r#").isidentifier()
+                               for segment in entry.group(1).split("::")):
+                            output.write(line)
+                            continue
             output.write(ASSIGNMENT.sub(rb"\1[REDACTED]", AUTH.sub(rb"\1[REDACTED]", line)))
 
 
-def transfer(source, out, names, *, redact=False):
+def transfer(source, out, names, *, redact=False, listing=False):
     files = {}
     for name in names:
         path, destination = source / name, out / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         require(path.is_file() and not path.is_symlink(), f"missing regular file: {name}")
-        if redact:
-            redacted(path, destination)
+        if redact or listing:
+            redacted(path, destination, listing=listing)
         else:
             shutil.copyfile(path, destination)
         files[name] = file_digest(destination)
@@ -387,7 +406,7 @@ def stage(kind, producer, status, source, out, manifest=None, snapshot=None):
             require(source_files(source, ("steps", "profdata")) - separate_attempts == names,
                     "coverage files disagree with step outcomes")
             validate_coverage(source, names)
-        files = transfer(source, out, names, redact=(kind == "listings"))
+        files = transfer(source, out, names, listing=(kind == "listings"))
         receipt = dict(candidate, files={**receipt["files"], **files})
     except (OSError, ValueError):
         for kind_dir in ("steps", "profdata", "list", "ign"):
