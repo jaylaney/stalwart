@@ -688,7 +688,9 @@ jobs:
     needs:
     - style
     - cold-gates-build
-    if: github.event_name == 'push'
+    - cold-gates-listings
+    if: github.event_name == 'push' && needs.cold-gates-build.outputs.qualification-save
+      == 'success' && needs.cold-gates-listings.outputs.qualification-save == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -840,8 +842,10 @@ jobs:
     name: Warm · Capture Retention Test Listings
     needs:
     - style
+    - cold-gates-build
     - cold-gates-listings
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && needs.cold-gates-build.outputs.qualification-save
+      == 'success' && needs.cold-gates-listings.outputs.qualification-save == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     permissions:
@@ -1026,8 +1030,9 @@ jobs:
     - warm-gates-za-rocks
     - warm-gates-za-filesystem
     - warm-gates-listings
-    if: "${{ !cancelled() && needs.style.result == 'success' && (github.event_name
-      == 'push') }}"
+    if: "${{ !cancelled() && needs.warm-gates-build.result != 'skipped' && needs.warm-gates-listings.result
+      != 'skipped' && needs.style.result == 'success' && (github.event_name == 'push')
+      }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     env:
@@ -1520,7 +1525,9 @@ jobs:
     - cold-gates-listings
     - warm-gates-build
     - warm-gates-listings
-    if: "${{ !cancelled() && needs.cold-gates-build.result != 'skipped' }}"
+    if: "${{ !cancelled() && (needs.cold-gates-build.result == 'success' || needs.cold-gates-build.result
+      == 'failure') && (needs.cold-gates-listings.result == 'success' || needs.cold-gates-listings.result
+      == 'failure') }}"
     runs-on: ubuntu-24.04
     permissions: {}
     steps:
@@ -1531,18 +1538,39 @@ jobs:
           }}"
         SAVE_BUILD: "${{ needs.cold-gates-build.outputs.qualification-save }}"
         SAVE_LISTINGS: "${{ needs.cold-gates-listings.outputs.qualification-save }}"
+        COLD_BUILD_RESULT: "${{ needs.cold-gates-build.result }}"
+        COLD_LISTINGS_RESULT: "${{ needs.cold-gates-listings.result }}"
+        WARM_BUILD_RESULT: "${{ needs.warm-gates-build.result }}"
+        WARM_LISTINGS_RESULT: "${{ needs.warm-gates-listings.result }}"
         WARM_BUILD: "${{ needs.warm-gates-build.outputs.qualification-cache-hit }}"
         WARM_LISTINGS: "${{ needs.warm-gates-listings.outputs.qualification-cache-hit
           }}"
       run: |
-        printf 'Exact hits: cold build=%s, cold listings=%s, warm build=%s, warm listings=%s\n' \
-          "$COLD_BUILD" "$COLD_LISTINGS" "$WARM_BUILD" "$WARM_LISTINGS" | tee -a "$GITHUB_STEP_SUMMARY"
+        {
+          printf 'Cold producers build=%s listings=%s\n' "$COLD_BUILD_RESULT" "$COLD_LISTINGS_RESULT"
+          printf 'Cold exact hits build=%s listings=%s\n' "${COLD_BUILD:-false}" "${COLD_LISTINGS:-false}"
+          printf 'Cold saves build=%s listings=%s\n' "${SAVE_BUILD:-unavailable}" "${SAVE_LISTINGS:-unavailable}"
+          printf 'Warm producers build=%s listings=%s\n' "$WARM_BUILD_RESULT" "$WARM_LISTINGS_RESULT"
+        } | tee -a "$GITHUB_STEP_SUMMARY"
         [[ "$COLD_BUILD" != true && "$COLD_LISTINGS" != true ]]
-        [[ "$SAVE_BUILD" == success && "$SAVE_LISTINGS" == success ]]
-        [[ "$WARM_BUILD" == true && "$WARM_LISTINGS" == true ]]
+        if [[ "$COLD_BUILD_RESULT" == success && "$COLD_LISTINGS_RESULT" == success &&
+              "$SAVE_BUILD" == success && "$SAVE_LISTINGS" == success ]]; then
+          printf 'Warm exact hits build=%s listings=%s\n' "${WARM_BUILD:-false}" "${WARM_LISTINGS:-false}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ "$WARM_BUILD" == true && "$WARM_LISTINGS" == true ]]
+        else
+          printf '%s\n' 'Warm lane unavailable because a cold producer or cache save did not succeed.' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ "$WARM_BUILD_RESULT" == skipped && "$WARM_LISTINGS_RESULT" == skipped ]]
+        fi
   cache-invalidation:
-    name: Verify lockfile changes miss both populated download scopes
-    needs: cache-expectations
+    name: Verify lockfile changes miss both download scopes
+    needs:
+    - cold-gates-build
+    - cold-gates-listings
+    if: "${{ !cancelled() && (needs.cold-gates-build.result == 'success' || needs.cold-gates-build.result
+      == 'failure') && (needs.cold-gates-listings.result == 'success' || needs.cold-gates-listings.result
+      == 'failure') }}"
     runs-on: ubuntu-24.04
     env:
       CARGO_HOME: "/mnt/retention-ci/.cargo"
