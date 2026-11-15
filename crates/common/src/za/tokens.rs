@@ -7,7 +7,7 @@
 use crate::{
     Server,
     auth::{
-        oauth::grant::GrantDeletion,
+        oauth::{grant::GrantDeletion, token::TOKEN_HEADER},
         vault::{RawValue, vault_read_usable_store},
     },
     cache::invalidate::CacheInvalidationBuilder,
@@ -29,11 +29,16 @@ use vault::{
     keys::Secret,
     record::za_session_binding,
     session::SessionKeys,
-    tokens::{TOKEN_RECORD_VERSION, ZaGrantState, ZaTokenRecord},
+    tokens::{TOKEN_RECORD_VERSION, ZaGrantState, ZaSuffix, ZaTokenRecord, split_secret},
 };
 use xxhash_rust::xxh3::xxh3_64;
 
 const TOKEN_WRITE_ATTEMPTS: usize = 3;
+
+/// Split only tokens that carry the server's header (spec 4.2, D26).
+pub fn za_split_bearer(token: &str) -> (&str, ZaSuffix) {
+    split_secret(token, TOKEN_HEADER)
+}
 
 pub struct ZaIssued {
     pub access: Secret,
@@ -358,12 +363,28 @@ mod tests {
     use vault::{
         keys::Secret,
         record::{VAULT_RECORD_VERSION, VaultRecord},
-        tokens::{TOKEN_RECORD_VERSION, ZaTokenRecord},
+        tokens::{TOKEN_RECORD_VERSION, ZaSuffix, ZaTokenRecord, append_secret},
     };
 
     use xxhash_rust::xxh3::xxh3_64;
 
     const ACCOUNT: u32 = 5;
+
+    #[test]
+    fn a_value_without_the_token_header_is_not_split() {
+        let (opaque, suffix) = super::za_split_bearer("opaque~value");
+        assert!(opaque == "opaque~value");
+        assert!(matches!(suffix, ZaSuffix::None));
+
+        let secret = Secret::random();
+        let mut keyed = "sw1.AAAA.BBBB".to_owned();
+        append_secret(&mut keyed, &secret);
+        let (upstream, suffix) = super::za_split_bearer(&keyed);
+        assert!(upstream == "sw1.AAAA.BBBB");
+        assert!(
+            matches!(suffix, ZaSuffix::Secret(opened) if opened.as_bytes() == secret.as_bytes())
+        );
+    }
 
     async fn pending_vault(store: &Store) -> VaultRead {
         let record = VaultRecord::pending(vec![1; 32], 100);

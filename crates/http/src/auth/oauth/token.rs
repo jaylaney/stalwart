@@ -660,7 +660,10 @@ pub(crate) fn token_response(response: TokenResponse, used_basic: bool) -> HttpR
     let response = JsonResponse::with_status(status, response)
         .no_cache()
         .into_http_response();
-    if status == StatusCode::UNAUTHORIZED && used_basic {
+    if status == StatusCode::OK {
+        // D24: successful answers carry credentials for every account.
+        response.with_untraced_body()
+    } else if status == StatusCode::UNAUTHORIZED && used_basic {
         response.with_header(WWW_AUTHENTICATE, BASIC_CHALLENGE)
     } else {
         response
@@ -768,3 +771,28 @@ fn verify_pkce(
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/http/src/auth/oauth/token/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod za_tests {
+    use super::*;
+
+    #[test]
+    fn granted_token_answer_is_untraced() {
+        let granted = TokenResponse::Granted(OAuthResponse {
+            access_token: "sample-access".to_owned(),
+            token_type: "bearer".to_owned(),
+            expires_in: 60,
+            refresh_token: Some("sample-refresh".to_owned()),
+            scope: String::new(),
+            username: "sample@example.org".to_owned(),
+            id_token: None,
+        });
+        assert!(token_response(granted, false).is_untraced());
+        assert!(
+            !token_response(TokenResponse::error(ErrorType::InvalidGrant), false).is_untraced()
+        );
+        assert!(
+            !token_response(TokenResponse::error(ErrorType::InvalidClient), true).is_untraced()
+        );
+    }
+}

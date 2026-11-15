@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::za_bearer::{TOKEN_KEYS_UNAVAILABLE, za_bearer_keys, za_bearer_refusal};
 use common::{
     HttpAuthCache, Server,
     auth::{
@@ -152,7 +153,8 @@ fn za_is_impersonation(token: &str) -> bool {
 
 /// Full verification of an Authorization header, caching the result under
 /// the header's own token, given here so that no caller can cache under
-/// another key. The only place session keys are attached (spec 5).
+/// another key. Session keys are attached here on a cache miss, from Basic
+/// verification or an opened Bearer token (spec 4.6, release 1 invariant 5).
 async fn authenticate_uncached(
     server: &Server,
     mechanism: &str,
@@ -206,6 +208,12 @@ async fn authenticate_uncached(
         ))
         .await?;
 
+    let (session_keys, keys_from_bearer) = if mechanism.eq_ignore_ascii_case("bearer") {
+        (za_bearer_keys(server, token, &access_token).await?, true)
+    } else {
+        (session_keys, false)
+    };
+
     #[cfg(feature = "test_mode")]
     za_test::pause_point(access_token.account_id()).await;
 
@@ -225,7 +233,7 @@ async fn authenticate_uncached(
     };
     match session_keys {
         None => {
-            // A keyless result for a key account (Bearer/OAuth, an
+            // A keyless result for a key account (a token without a secret, an
             // impersonation, or a password verified against the pre-setup
             // hash while setup committed) is never cached: the hit rule would
             // refuse it anyway. Only ordinary accounts are cached here, as
@@ -260,18 +268,25 @@ async fn authenticate_uncached(
             );
         }
         Some(keys) => {
-            // Generation fence (spec 5). Race defended: this login read the
-            // vault record at revision r and spent its time in Argon2 while
-            // a password change committed r+1 and called `remove_account`.
-            // Caching now would resurrect the superseded verification, so
-            // both inserts happen only if the verified generation still
-            // equals the one rebuilt from the store; otherwise the request
-            // succeeds uncached. Generation 0 is never cached. The entry
-            // also passes upstream's revocation epoch.
-            let account = server.account(account_id).await?;
+            // Generation fence (spec 4.6): a vault write can invalidate the
+            // opened keys before cache publication. Both inserts require the
+            // current generation. Basic still serves a crossed request
+            // uncached, while D23 requires Bearer to refuse it.
+            let account = server.account(account_id).await.map_err(|err| {
+                if keys_from_bearer {
+                    za_bearer_refusal(&access_token, TOKEN_KEYS_UNAVAILABLE)
+                } else {
+                    err
+                }
+            })?;
             if keys.generation != 0 && keys.generation == account.za_generation() {
                 revocations.insert(&cache.http_auth, token, entry, epoch);
                 cache.za_insert_keys(cache.za_fingerprint(token), keys.clone(), Instant::now());
+            } else if keys_from_bearer {
+                return Err(za_bearer_refusal(
+                    &access_token,
+                    "zero-access: token keys of a superseded generation",
+                ));
             }
             access_token = access_token.with_session_keys(keys);
         }

@@ -7,24 +7,32 @@
 use super::{
     STRONG,
     drain::DrainOn,
+    mail::{self, Traced, TracedEvent, live_keys},
     pinning::{forget, lookup, pin},
+    uid_lease::put,
     user_permissions,
 };
 use crate::utils::{
+    account::Account,
+    pop3::{Pop3Connection, ResponseType as Pop3Reply},
     server::TestServer,
+    webdav::DummyWebDavClient,
     za::{
-        Parked, VaultReply, code, raw_token_record, set_raw_token_record, substitute_public_key,
-        token_record, totp_url, trigger_drain, vault_revision, wait_for_index_queue, wrap_mark,
-        writer_key, za_grant_token, za_post, za_revoke_grant, za_unlock,
+        CALENDAR_JMAP_USING, Conn, Parked, VaultReply, assert_nothing_cached, code, park_login,
+        raw_token_record, set_raw_token_record, substitute_public_key, token_record, totp_url,
+        trigger_drain, vault_revision, wait_for_index_queue, wrap_mark, writer_key, za_bearer_dav,
+        za_bearer_jmap, za_bearer_session, za_grant_token, za_post, za_revoke_grant,
+        za_split_token, za_tamper_secret, za_unlock,
     },
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use common::{
     auth::{
         oauth::{grant::GrantRotation, scope::OAuthScopes},
         vault::{RawValue, ZaMark},
     },
     za::{
-        test_hooks,
+        ZA_MAIL_KEYLESS, ZA_MAIL_LOGIN_REFUSED, test_hooks,
         tokens::{ZaIssued, ZaTokenIssue},
     },
 };
@@ -36,25 +44,28 @@ use registry::{
     },
     types::id::ObjectId,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use store::{
     ValueKey,
     registry::write::{RegistryWrite, RegistryWriteResult},
     write::{BatchBuilder, now},
 };
+use trc::{AuthEvent, EventType, Key};
 use types::{collection::Collection, field::PrincipalField};
 use vault::{
     keys::{Secret, derive_token_tag},
     record::za_session_binding,
     session::SessionKeys,
-    tokens::{TOKEN_RECORD_VERSION, ZaRefreshClass},
+    tokens::{TOKEN_RECORD_VERSION, ZaRefreshClass, append_secret},
 };
 
 const OWNER: &str = "token-owner@example.com";
 const MFA: &str = "token-mfa@example.com";
 const CAP: &str = "token-cap@example.com";
 const PLAIN: &str = "token-plain@example.com";
+const CAL: &str = "/dav/cal/token-owner%40example.com/";
+const AUTH_FAILED: EventType = EventType::Auth(AuthEvent::Failed);
 const STRONG2: &str = "another long passphrase with 2 numbers";
 const PLANTED: &[u8] = &[1, 0xde, 0xad];
 const HOUR: u64 = 3_600;
@@ -93,6 +104,15 @@ pub async fn test(test: &mut TestServer) {
     forget_failure_does_not_fail_deletion(test, owner).await;
     ordinary_grant_deletion_reads_no_record(test, plain_id).await;
 
+    let owner_account = test.account(OWNER).clone();
+    keyed_bearer_reads_sealed_data(test, &owner_account).await;
+    tampered_or_foreign_secret_is_401(test, &owner_account).await;
+    suffix_on_ordinary_token_is_401(test, plain_id).await;
+    keyed_token_without_secret_is_keyless(test, &owner_account).await;
+    bearer_crossed_by_vault_write_is_refused(test, owner).await;
+    mail_bearer_login_stays_refused(test, owner).await;
+    revocation_and_introspection_accept_the_suffix(test, owner).await;
+
     wait_for_index_queue(test, plain_id, Duration::from_secs(30)).await;
     admin.destroy_account(plain).await;
     test.wait_for_tasks().await;
@@ -127,6 +147,308 @@ async fn issue(test: &TestServer, id: u32, grant: u64, mk: &Secret, binding: u64
         .za_token_issue(id, grant, mk, binding, now() + HOUR, now() + MONTH)
         .await
         .unwrap()
+}
+
+async fn keyed_grant(test: &TestServer, id: u32) -> (u64, String, ZaIssued) {
+    let (grant, mut token, keys, binding) = minted(test, OWNER, id, STRONG).await;
+    let ZaTokenIssue::Issued(issued) = issue(test, id, grant, keys.mk(), binding).await else {
+        panic!("the grant was not issued");
+    };
+    append_secret(&mut token, &issued.access);
+    (grant, token, issued)
+}
+
+async fn keyed_bearer_reads_sealed_data(test: &TestServer, owner: &Account) {
+    println!("  keyed_bearer_reads_sealed_data");
+    let id = owner.id().document_id();
+    let event_path = format!("{CAL}default/token-canary.ics");
+    let event = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//ZA//EN\r\n\
+                 BEGIN:VEVENT\r\nUID:token-canary\r\nDTSTAMP:20261020T100000Z\r\n\
+                 DTSTART:20261020T100000Z\r\nDTEND:20261020T110000Z\r\n\
+                 SUMMARY:token canary event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    assert_eq!(
+        put(OWNER, STRONG, event_path.clone(), event.to_owned()).await,
+        201
+    );
+    mail::deliver(
+        test,
+        "sender@example.org",
+        OWNER,
+        &mail::message_with("token canary subject", "body"),
+    )
+    .await;
+
+    let (grant, keyed, _) = keyed_grant(test, id).await;
+    let response = za_bearer_dav(owner, &keyed)
+        .request("GET", &event_path, "")
+        .await;
+    assert_eq!(response.status.as_u16(), 200, "keyed CalDAV GET");
+    assert!(
+        response
+            .body
+            .is_ok_and(|body| body.contains("SUMMARY:token canary event")),
+        "the keyed CalDAV GET opens the event summary"
+    );
+
+    let (status, response) = za_bearer_jmap(
+        &keyed,
+        CALENDAR_JMAP_USING,
+        json!([
+            ["Email/query", { "accountId": owner.id_string() }, "q"],
+            ["Email/get", {
+                "accountId": owner.id_string(),
+                "#ids": { "resultOf": "q", "name": "Email/query", "path": "/ids" },
+                "properties": ["subject"],
+            }, "g"],
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(response.0["methodResponses"][0][0].as_str() == Some("Email/query"));
+    assert!(response.0["methodResponses"][1][0].as_str() == Some("Email/get"));
+    assert!(
+        response.0["methodResponses"][1][1]["list"][0]["subject"].as_str()
+            == Some("token canary subject"),
+        "the keyed Email/get opens the message subject"
+    );
+    assert_eq!(za_bearer_session(&keyed).await.0, 200);
+    let cache = &test.server.inner.cache;
+    assert!(cache.za_keys.contains_account(id));
+    assert!(cache.http_auth.get(&keyed).is_some());
+
+    let basic = DummyWebDavClient::new(id, OWNER, STRONG, OWNER);
+    assert_eq!(
+        basic
+            .request("DELETE", &event_path, "")
+            .await
+            .status
+            .as_u16(),
+        204
+    );
+    test.destroy_all_mailboxes(owner).await;
+    za_revoke_grant(&test.server, grant).await;
+}
+
+async fn tampered_or_foreign_secret_is_401(test: &TestServer, owner: &Account) {
+    println!("  tampered_or_foreign_secret_is_401");
+    let id = owner.id().document_id();
+    let (grant, keyed, issued) = keyed_grant(test, id).await;
+    assert_eq!(za_bearer_session(&keyed).await.0, 200);
+    assert!(test.server.inner.cache.http_auth.get(&keyed).is_some());
+
+    let upstream = za_split_token(&keyed).0;
+    let (other_grant, other_issued, _, _) = issued_for(test, OWNER, id).await;
+    let mut refresh = upstream.to_owned();
+    append_secret(&mut refresh, &issued.refresh);
+    let mut foreign = upstream.to_owned();
+    append_secret(&mut foreign, &other_issued.access);
+    let cases = [
+        za_tamper_secret(&keyed),
+        refresh,
+        foreign,
+        format!("{upstream}~short"),
+        format!("{keyed}~"),
+    ];
+
+    let traced = Traced::start(&[AUTH_FAILED]);
+    for (case, token) in cases.iter().enumerate() {
+        assert_eq!(za_bearer_session(token).await.0, 401, "session case {case}");
+        let response = za_bearer_dav(owner, token)
+            .request("PROPFIND", CAL, "")
+            .await;
+        assert_eq!(response.status.as_u16(), 401, "CalDAV case {case}");
+        assert_eq!(
+            za_bearer_jmap(token, CALENDAR_JMAP_USING, mail_get(owner))
+                .await
+                .0,
+            401,
+            "JMAP case {case}"
+        );
+    }
+    let events = traced.finish().await;
+    for (reason, count) in [
+        ("zero-access: token keys unavailable", 9),
+        ("zero-access: malformed token secret", 6),
+    ] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| bearer_failure(event, id, grant, reason))
+                .count(),
+            count,
+            "{reason}"
+        );
+    }
+    for event in &events {
+        assert!(
+            !event.text.contains(upstream),
+            "the token appeared in a trace"
+        );
+        for token in [&keyed, &cases[0], &cases[1], &cases[2]] {
+            let secret = za_split_token(token).1.expect("expected a token secret");
+            assert!(!event.text.contains(secret), "a secret appeared in a trace");
+        }
+    }
+
+    // Spec 4.6 (D27): these fifteen fork refusals use one address without
+    // X-Forwarded-For. The control checks continued service below the ban threshold.
+    assert_eq!(za_bearer_session(&keyed).await.0, 200);
+    za_revoke_grant(&test.server, grant).await;
+    za_revoke_grant(&test.server, other_grant).await;
+}
+
+fn bearer_failure(event: &TracedEvent, id: u32, grant: u64, reason: &str) -> bool {
+    event.account_id == Some(u64::from(id))
+        && event.details == reason
+        && event.keys.iter().any(|(key, value)| {
+            *key == Key::Id && matches!(value, trc::Value::UInt(value) if *value == grant)
+        })
+}
+
+fn mail_get(owner: &Account) -> Value {
+    json!([["Email/get", { "accountId": owner.id_string(), "ids": [] }, "g"]])
+}
+
+async fn suffix_on_ordinary_token_is_401(test: &TestServer, id: u32) {
+    println!("  suffix_on_ordinary_token_is_401");
+    let (grant, token) = za_grant_token(&test.server, PLAIN, OAuthScopes::ALL).await;
+    assert_eq!(za_bearer_session(&token).await.0, 200);
+    let mut suffixed = token.clone();
+    append_secret(&mut suffixed, &Secret::random());
+    let traced = Traced::start(&[AUTH_FAILED]);
+    assert_eq!(za_bearer_session(&suffixed).await.0, 401);
+    assert!(traced.finish().await.iter().any(|event| bearer_failure(
+        event,
+        id,
+        grant,
+        "zero-access: token secret on an ordinary account's token"
+    )));
+    assert_eq!(za_bearer_session(&token).await.0, 200);
+    za_revoke_grant(&test.server, grant).await;
+}
+
+async fn keyed_token_without_secret_is_keyless(test: &TestServer, owner: &Account) {
+    println!("  keyed_token_without_secret_is_keyless");
+    let (grant, keyed, _) = keyed_grant(test, owner.id().document_id()).await;
+    let upstream = za_split_token(&keyed).0;
+    assert_eq!(za_bearer_session(upstream).await.0, 200);
+    let (status, response) = za_bearer_jmap(upstream, CALENDAR_JMAP_USING, mail_get(owner)).await;
+    assert_eq!(status, 200);
+    assert!(response.is_error_at(0));
+    let error = &response.0["methodResponses"][0][1];
+    assert!(error["type"].as_str() == Some("forbidden"));
+    assert!(error["description"].as_str() == Some(ZA_MAIL_KEYLESS));
+    let response = za_bearer_dav(owner, upstream)
+        .request("PROPFIND", CAL, "")
+        .await;
+    assert_eq!(response.status.as_u16(), 403);
+    za_revoke_grant(&test.server, grant).await;
+}
+
+async fn bearer_crossed_by_vault_write_is_refused(test: &mut TestServer, id: u32) {
+    println!("  bearer_crossed_by_vault_write_is_refused");
+    let superseded = "zero-access: token keys of a superseded generation";
+    let (grant, keyed, _) = keyed_grant(test, id).await;
+    let traced = Traced::start(&[AUTH_FAILED]);
+    let parked = Parked::start(
+        id,
+        za_test::set,
+        async move { za_bearer_session(&keyed).await },
+    )
+    .await;
+    change_password(STRONG, STRONG2).await;
+    assert_eq!(parked.finish().await.0, 401);
+    assert_nothing_cached(test, id);
+    assert!(
+        traced
+            .finish()
+            .await
+            .iter()
+            .any(|event| bearer_failure(event, id, grant, superseded))
+    );
+    za_revoke_grant(&test.server, grant).await;
+
+    let parked = park_login(id, OWNER, STRONG2).await;
+    change_password(STRONG2, STRONG).await;
+    assert_eq!(parked.finish().await, 207);
+
+    let (grant, keyed, _) = keyed_grant(test, id).await;
+    let token = keyed.clone();
+    let traced = Traced::start(&[AUTH_FAILED]);
+    let parked = Parked::start(
+        id,
+        za_test::set,
+        async move { za_bearer_session(&token).await },
+    )
+    .await;
+    new_recovery_key(test).await;
+    assert_eq!(parked.finish().await.0, 401);
+    assert_nothing_cached(test, id);
+    assert!(
+        traced
+            .finish()
+            .await
+            .iter()
+            .any(|event| bearer_failure(event, id, grant, superseded))
+    );
+    assert_eq!(za_bearer_session(&keyed).await.0, 200);
+    za_revoke_grant(&test.server, grant).await;
+}
+
+async fn mail_bearer_login_stays_refused(test: &TestServer, id: u32) {
+    println!("  mail_bearer_login_stays_refused");
+    let (grant, keyed, _) = keyed_grant(test, id).await;
+    let base = live_keys(id);
+    let oauthbearer = STANDARD.encode(format!("n,a={OWNER},\u{1}auth=Bearer {keyed}\u{1}\u{1}"));
+    let xoauth2 = STANDARD.encode(format!("user={OWNER}\u{1}auth=Bearer {keyed}\u{1}\u{1}"));
+    let mut imap = Conn::open(9992).await;
+    imap.until(&["* OK"]).await;
+    for (mechanism, response) in [("OAUTHBEARER", &oauthbearer), ("XOAUTH2", &xoauth2)] {
+        imap.send(&format!("k1 AUTHENTICATE {mechanism} {response}\r\n"))
+            .await;
+        let line = imap.until(&["k1 "]).await;
+        assert!(
+            line.trim_end() == format!("k1 NO [NOPERM] {ZA_MAIL_LOGIN_REFUSED}"),
+            "{mechanism}"
+        );
+        assert_eq!(live_keys(id), base, "{mechanism}: no keys after refusal");
+        imap.exchange("k2 NOOP\r\n", "k2 OK").await;
+    }
+    imap.exchange("k3 LOGOUT\r\n", "k3 OK").await;
+
+    let mut pop3 = Pop3Connection::connect().await;
+    pop3.send(&format!("AUTH XOAUTH2 {xoauth2}")).await;
+    let reply = pop3.read(false).await;
+    assert!(
+        reply
+            .last()
+            .is_some_and(|line| *line == format!("-ERR {ZA_MAIL_LOGIN_REFUSED}"))
+    );
+    assert_eq!(live_keys(id), base, "POP3: no keys after refusal");
+    pop3.send("QUIT").await;
+    pop3.assert_read(Pop3Reply::Ok).await;
+    za_revoke_grant(&test.server, grant).await;
+}
+
+async fn revocation_and_introspection_accept_the_suffix(test: &TestServer, id: u32) {
+    println!("  revocation_and_introspection_accept_the_suffix");
+    let (grant, keyed, _) = keyed_grant(test, id).await;
+    let decoded = test
+        .server
+        .decode_access_token(None, &keyed)
+        .unwrap_or_else(|_| panic!("decode the keyed token for revocation"));
+    assert_eq!(decoded.account_id, id);
+    assert_eq!(decoded.grant.map(|token_grant| token_grant.id), Some(grant));
+    for token in [&keyed, &za_tamper_secret(&keyed)] {
+        assert!(
+            test.server
+                .introspect_access_token(token)
+                .await
+                .is_ok_and(|response| response.active),
+            "introspection reports the upstream grant's state"
+        );
+    }
+    za_revoke_grant(&test.server, grant).await;
 }
 
 async fn issue_writes_first_entries(test: &TestServer, id: u32) {
