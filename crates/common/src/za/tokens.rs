@@ -12,6 +12,7 @@ use crate::{
     },
     cache::invalidate::CacheInvalidationBuilder,
 };
+use registry::schema::prelude::ObjectType;
 use std::{
     collections::{HashMap, hash_map::Entry},
     fmt,
@@ -20,6 +21,8 @@ use std::{
 use store::{
     Deserialize, Serialize, Store, Value, ValueKey,
     dispatch::lookup::KeyValue,
+    registry::RegistryQuery,
+    roaring::RoaringBitmap,
     write::{
         Archive, ArchiveBytes, Archiver, BatchBuilder, Compression, ValueClass,
         assert::AssertValue, now,
@@ -407,8 +410,8 @@ impl Server {
             }
 
             let grants = self.token_grant_states(account_id, &record, None).await?;
-            // Upstream accepted this request with the grant's stored
-            // generation at `presented`, and its own rotation leaves it there.
+            // This request's rotation left the grant's stored generation at
+            // `presented`, and the generation never falls.
             // A higher one is a later rotation: this refresh is superseded,
             // however old this attempt's record read is (spec 4.5 step 2).
             if grants
@@ -513,6 +516,52 @@ impl Server {
             }
         }
         unreachable!("the last write attempt returns");
+    }
+
+    /// Spec 4.7 (D8, D21): reconcile each account's token record without
+    /// opening wraps or reading the vault. Count only committed changes.
+    pub async fn za_token_sweep(&self) -> trc::Result<usize> {
+        let accounts = self
+            .registry()
+            .query::<RoaringBitmap>(RegistryQuery::new(ObjectType::Account))
+            .await
+            .caused_by(trc::location!())?;
+        let store = self.store();
+        let mut changed = 0;
+        for account_id in accounts {
+            let result = async {
+                let read = token_read_store(store, account_id).await?;
+                let Some(mut record) = read.record.clone() else {
+                    // This also leaves records in an unknown format alone.
+                    return Ok(false);
+                };
+                let grants = self.token_grant_states(account_id, &record, None).await?;
+                if !record.reconcile(account_id, now(), &grants) {
+                    return Ok(false);
+                }
+                match token_write_store(store, account_id, None, &read, Some(&record)).await {
+                    Ok(()) => Ok(true),
+                    // Another writer won the assertion. Do not retry.
+                    Err(err) if err.is_assertion_failure() => Ok(false),
+                    Err(err) => Err(err),
+                }
+            }
+            .await;
+            match result {
+                Ok(true) => changed += 1,
+                Ok(false) => (),
+                Err(err) => {
+                    // Backend error context can contain stored bytes.
+                    trc::error!(
+                        trc::Error::new(err.event_type())
+                            .account_id(account_id)
+                            .details("zero-access: token sweep failed for an account")
+                            .caused_by(trc::location!())
+                    );
+                }
+            }
+        }
+        Ok(changed)
     }
 
     /// Grant deletion classifies the account before touching the token record.

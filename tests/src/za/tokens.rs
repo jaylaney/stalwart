@@ -20,12 +20,12 @@ use crate::utils::{
     za::{
         CALENDAR_JMAP_USING, Conn, HookParked, Parked, SERVER_URL, VaultReply, ZA_SIGNIN_SCOPE,
         ZaClientKind, ZaOAuthClient, ZaTokens, assert_nothing_cached, code, handoff_exists,
-        oauth_expiry, park_login, raw_token_record, set_raw_token_record, substitute_public_key,
-        token_record, totp_url, trigger_drain, vault_revision, wait_for_index_queue, wrap_mark,
-        writer_key, za_authorize, za_bearer_dav, za_bearer_jmap, za_bearer_session,
-        za_confirm_consent, za_drop_oauth_client, za_exchange, za_grant_token, za_oauth_client,
-        za_post, za_refresh, za_revoke_grant, za_revoke_token, za_sign_in, za_split_token,
-        za_tamper_secret, za_unlock,
+        oauth_expiry, park_login, raw_token_record, run_purge_maintenance, set_raw_token_record,
+        substitute_public_key, token_record, totp_url, trigger_drain, vault_revision,
+        wait_for_index_queue, wrap_mark, writer_key, za_authorize, za_bearer_dav, za_bearer_jmap,
+        za_bearer_session, za_confirm_consent, za_drop_oauth_client, za_exchange, za_grant_token,
+        za_oauth_client, za_post, za_refresh, za_revoke_grant, za_revoke_token, za_sign_in,
+        za_split_token, za_tamper_secret, za_unlock,
     },
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -80,6 +80,7 @@ const RACE: &str = "token-race@example.com";
 const CAP: &str = "token-cap@example.com";
 const PLAIN: &str = "token-plain@example.com";
 const REMOVED: &str = "token-removed@example.com";
+const GONE: &str = "token-gone@example.com";
 const CAL: &str = "/dav/cal/token-owner%40example.com/";
 const AUTH_FAILED: EventType = EventType::Auth(AuthEvent::Failed);
 const STRONG2: &str = "another long passphrase with 2 numbers";
@@ -91,8 +92,8 @@ pub async fn test(test: &mut TestServer) {
     println!("Running zero-access token tests...");
     let admin = test.account("admin@example.com").clone();
     for (name, description) in [
-        (OWNER, "Token Owner"),
         (MFA, "Token MFA"),
+        (OWNER, "Token Owner"),
         (CAP, "Token Cap"),
         (CONSENT, "Token Consent"),
         (RACE, "Token Race"),
@@ -171,6 +172,24 @@ pub async fn test(test: &mut TestServer) {
 
     thirty_third_sign_in_ends_the_oldest(test, &app).await;
     granted_answer_is_untraced(&app, test).await;
+    sweep_removes_expired_entries(test, &admin, &app, owner).await;
+    registry_destroyed_grant(test, &admin, &owner_account, &app).await;
+    interrupted_refresh_cleared_by_sweep(test, &admin, &app, owner).await;
+    sweep_passes_a_broken_record(test, &admin, &app, owner, mfa, race.id().document_id()).await;
+    account_destruction_removes_the_record(test, &admin, &app).await;
+
+    for id in [
+        owner,
+        mfa,
+        cap,
+        test.account(CONSENT).id().document_id(),
+        race.id().document_id(),
+        plain_id,
+    ] {
+        for grant in grants_of(test, id).await {
+            za_revoke_grant(&test.server, grant.id()).await;
+        }
+    }
     for client in [app, registered] {
         za_drop_oauth_client(
             test,
@@ -2328,4 +2347,138 @@ async fn interrupted_refresh_cleared_by_another_grants_write(
     );
     assert_eq!(za_revoke_token(app, &g1).await, 200);
     assert_eq!(za_revoke_token(app, &b.refresh).await, 200);
+}
+
+async fn sign_in_with_short_expiry(test: &TestServer, app: &ZaOAuthClient) -> ZaTokens {
+    let _expiry = oauth_expiry(test, Some(3), Some(3), None);
+    za_sign_in(test, app, OWNER, STRONG, None).await
+}
+
+async fn sweep_removes_expired_entries(
+    test: &TestServer,
+    admin: &Account,
+    app: &ZaOAuthClient,
+    id: u32,
+) {
+    println!("  sweep_removes_expired_entries");
+    let tokens = sign_in_with_short_expiry(test, app).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let record = token_record(test, id).await.expect("expiry is not a write");
+    assert!(record.grant(tokens.grant_id).is_some());
+    assert!(
+        record
+            .open_access(id, tokens.grant_id, &token_secret(&tokens.access), now())
+            .is_none()
+    );
+    assert_eq!(za_bearer_session(&tokens.access).await.0, 401);
+
+    run_purge_maintenance(test, admin).await;
+    assert!(
+        raw_token_record(test, id).await.is_none(),
+        "D8: expired entries survived the sweep"
+    );
+    za_revoke_grant(&test.server, tokens.grant_id).await;
+}
+
+async fn registry_destroyed_grant(
+    test: &TestServer,
+    admin: &Account,
+    owner: &Account,
+    app: &ZaOAuthClient,
+) {
+    println!("  registry_destroyed_grant");
+    let id = owner.id().document_id();
+    let tokens = za_sign_in(test, app, OWNER, STRONG, None).await;
+    let grant = Id::new(tokens.grant_id);
+    assert_eq!(za_bearer_session(&tokens.access).await.0, 200);
+    owner
+        .registry_destroy(ObjectType::OAuthGrant, [grant])
+        .await
+        .assert_destroyed(&[grant]);
+    assert_eq!(za_bearer_session(&tokens.access).await.0, 401);
+    assert!(
+        token_record(test, id)
+            .await
+            .unwrap()
+            .grant(tokens.grant_id)
+            .is_some()
+    );
+
+    run_purge_maintenance(test, admin).await;
+    assert!(
+        raw_token_record(test, id).await.is_none(),
+        "D8: a deleted grant survived the sweep"
+    );
+}
+
+async fn interrupted_refresh_cleared_by_sweep(
+    test: &TestServer,
+    admin: &Account,
+    app: &ZaOAuthClient,
+    id: u32,
+) {
+    println!("  interrupted_refresh_cleared_by_sweep");
+    let tokens = za_sign_in(test, app, OWNER, STRONG, None).await;
+    let g1 = refresh_of(za_refresh(app, &tokens.refresh).await);
+    refresh_write_fails(app, id, &g1).await;
+    let grant = tokens.grant_id;
+    let stored = test.server.oauth_grant(grant).await.unwrap().unwrap();
+    assert_eq!(stored.grant.generation, 1);
+    assert_eq!(generations(test, id, grant).await, [0, 1]);
+
+    run_purge_maintenance(test, admin).await;
+    assert_eq!(
+        generations(test, id, grant).await,
+        [1],
+        "D8: only the stored generation survives"
+    );
+    assert!(test.server.oauth_grant(grant).await.unwrap().is_some());
+    za_revoke_grant(&test.server, grant).await;
+}
+
+async fn sweep_passes_a_broken_record(
+    test: &TestServer,
+    admin: &Account,
+    app: &ZaOAuthClient,
+    owner: u32,
+    mfa: u32,
+    race: u32,
+) {
+    println!("  sweep_passes_a_broken_record");
+    assert!(
+        mfa < owner && owner < race,
+        "broken records must surround the expired record"
+    );
+    let tokens = sign_in_with_short_expiry(test, app).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(raw_token_record(test, owner).await.is_some());
+    for id in [mfa, race] {
+        set_raw_token_record(test, id, Some(PLANTED)).await;
+    }
+
+    run_purge_maintenance(test, admin).await;
+    assert!(raw_token_record(test, owner).await.is_none());
+    for id in [mfa, race] {
+        assert!(raw_token_record(test, id).await.as_deref() == Some(PLANTED));
+        set_raw_token_record(test, id, None).await;
+    }
+    za_revoke_grant(&test.server, tokens.grant_id).await;
+}
+
+async fn account_destruction_removes_the_record(
+    test: &TestServer,
+    admin: &Account,
+    app: &ZaOAuthClient,
+) {
+    println!("  account_destruction_removes_the_record");
+    let gone = admin
+        .create_key_user_account(GONE, STRONG, "Token Gone", &[], user_permissions())
+        .await;
+    let id = gone.id().document_id();
+    za_sign_in(test, app, GONE, STRONG, None).await;
+    assert!(raw_token_record(test, id).await.is_some());
+
+    admin.destroy_account(gone).await;
+    test.wait_for_tasks().await;
+    assert!(raw_token_record(test, id).await.is_none());
 }
