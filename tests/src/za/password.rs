@@ -156,8 +156,8 @@ pub async fn test(test: &mut TestServer) {
     caldav(name, STRONG, StatusCode::MULTI_STATUS).await;
     assert!(test.server.inner.cache.za_keys.contains_account(id));
     // Ruling 135 (M14, mutation a001): a key account's OAuth access token is
-    // bound to the vault record's revision (its registry secret is the
-    // constant marker), so a password change revokes it.
+    // bound to the vault's credential binding (release 6 spec D19), so a
+    // password change revokes it.
     let (grant_id, bearer) = za_grant_token(&test.server, name, OAuthScopes::ALL).await;
     assert_eq!(
         session_status(&bearer).await,

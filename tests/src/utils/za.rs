@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+pub use crate::utils::oauth::*;
+
 use crate::{
     utils::{
         account::Account,

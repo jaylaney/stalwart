@@ -27,7 +27,7 @@ use registry::{
 use serde_json::json;
 use store::{registry::write::RegistryWrite, write::now};
 use types::id::Id;
-use vault::record::{VaultRecord, VaultState};
+use vault::record::{VaultRecord, VaultState, za_session_binding};
 
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access setup tests...");
@@ -785,7 +785,7 @@ pub async fn test_grants_die_with_the_marker(test: &mut TestServer) {
     // version 0, as one minted in the window between the marker write's
     // revocation query and its invalidation would carry. Its access and
     // refresh tokens are refused, while the same grant's tokens at the
-    // account's own version (the vault revision) work: the control.
+    // vault's credential binding (release 6 spec D19) work: the control.
     let (grant_id, current) =
         crate::utils::za::za_grant_token(&test.server, NAME, OAuthScopes::ALL).await;
     let version = test
@@ -794,9 +794,11 @@ pub async fn test_grants_die_with_the_marker(test: &mut TestServer) {
         .await
         .unwrap()
         .credential_version();
-    assert!(
-        version >= 1,
-        "a key account's version is its vault revision"
+    let vault = test.server.za_vault_record(id).await.unwrap().unwrap();
+    assert_eq!(
+        version,
+        za_session_binding(&vault.record),
+        "a key account's credential version follows the vault credential binding (spec D19)"
     );
     let unversioned = test
         .server

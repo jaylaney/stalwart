@@ -48,6 +48,7 @@ pub mod sharing_races;
 pub mod sharing_review;
 pub mod sharing_tombstones;
 pub mod sweep;
+pub mod tokens;
 pub mod totp;
 pub mod tracing;
 pub mod uid_lease;
@@ -189,6 +190,7 @@ pub async fn za_tests() {
     sharing::revoke_cleanup_does_not_rewrite_sealed_event(&mut test).await;
     sharing::conversion_carries_dead_property_containers(&mut test).await;
     sharing_races::test(&mut test).await;
+    tokens::test(&mut test).await;
     jmap_calendar::pipeline::test(&mut test).await;
     sweep::test(&mut test).await;
     tracing::test(&mut test).await;
