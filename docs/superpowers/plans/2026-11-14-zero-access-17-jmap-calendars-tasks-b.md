@@ -558,8 +558,10 @@ Steps:
   `za_commit_update` is the CalDAV PUT's commit too.
 - [ ] Kill-check the container reseal. Fault: in `pipeline/update.rs`,
   the call of `za_reseal_event_container` is removed. Run ZA. Expected:
-  a panic in `placement_reseals_event_container`, at the first
-  `assert_dead_round_trip` after the move.
+  a panic in `placement_reseals_event_container`, at the grantee's
+  `assert_dead_round_trip` after the move. The owner's retained personal
+  key can still open the original container, so its preceding read
+  may succeed.
 - [ ] The closing checks.
 - [ ] Commit: `Release 6: placement and content in one pipeline update`.
 
