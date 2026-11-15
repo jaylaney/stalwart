@@ -666,6 +666,23 @@ jobs:
         path: "${{ env.GATES }}/comparison/"
         if-no-files-found: error
         retention-days: 7
+    - name: Verify incompatible evidence and deadline diagnostics
+      id: negative
+      if: "${{ !cancelled() && github.run_attempt == 1 && (steps.collect.outputs.code
+        == '0' || steps.collect.outputs.code == '1') }}"
+      timeout-minutes: 10
+      shell: bash
+      env:
+        SNAPSHOT_ID: "${{ needs.cold-gates-build.outputs.snapshot-artifact-id }}"
+      run: |
+        python3 -I scripts/tests/retention_qualification.py negative \
+          --inputs "$GATES/inputs" --build-manifest "$GATES/build.json" \
+          --snapshot-artifact-id "$SNAPSHOT_ID" | tee -a "$GITHUB_STEP_SUMMARY"
+        python3 -I scripts/tests/test_gates.py -v \
+          CoverageNetTests.test_shard_settles_earlier_steps_after_work_cutoff \
+          CoverageNetTests.test_raw_profile_is_merged_during_diagnostics_reserve \
+          WorkflowTests.test_shard_artifact_is_uploaded_even_if_coverage_failed \
+          WorkflowTests.test_seven_day_shard_diagnostics_keep_receipt_and_sanitized_logs
   warm-gates-build:
     name: Warm · Build Retention Coverage Target
     needs:
@@ -1426,6 +1443,76 @@ jobs:
         path: "${{ env.GATES }}/comparison/"
         if-no-files-found: error
         retention-days: 7
+  ordinary-cache-probe:
+    name: Probe existing ordinary compilation cache
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions: {}
+    env:
+      ORDINARY_CACHE_PATHS: |
+        /home/runner/.cargo/bin
+        /home/runner/.cargo/.crates.toml
+        /home/runner/.cargo/.crates2.json
+        /home/runner/.cargo/registry
+        /home/runner/.cargo/git
+        /home/runner/work/stalwart/stalwart/target
+    steps:
+    - name: Record the source toolchain and host before restore
+      id: before
+      shell: bash
+      run: |
+        rustup toolchain install 1.99.1 --profile minimal --no-self-update
+        rustup run 1.99.1 rustc -Vv
+        uname -srmo
+        printf 'Runner image %s %s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+        cat /etc/os-release
+        cc --version
+        c++ --version
+        ld --version
+        ldd --version
+        total=0
+        while IFS= read -r path; do
+          [[ -n "$path" && -e "$path" ]] || continue
+          size=$(/usr/bin/du -sb -- "$path" | /usr/bin/cut -f1)
+          printf '%s bytes %s\n' "$size" "$path"
+          total=$((total + size))
+        done <<< "$ORDINARY_CACHE_PATHS"
+        /usr/bin/df -h /home/runner
+        printf 'bytes=%s\n' "$total" >> "$GITHUB_OUTPUT"
+    - name: Restore the exact main Unit Tests cache
+      id: restore
+      uses: actions/cache/restore@v6.1.0
+      continue-on-error: true
+      with:
+        key: v0-rust-unit-tests-Linux-x64-a005ad7d-e24b726b
+        path: |
+          /home/runner/.cargo/bin
+          /home/runner/.cargo/.crates.toml
+          /home/runner/.cargo/.crates2.json
+          /home/runner/.cargo/registry
+          /home/runner/.cargo/git
+          /home/runner/work/stalwart/stalwart/target
+    - name: Record exact hit and restored footprint
+      if: "${{ !cancelled() && steps.before.outcome == 'success' }}"
+      shell: "/usr/bin/bash --noprofile --norc -eo pipefail {0}"
+      env:
+        CACHE_HIT: "${{ steps.restore.outputs.cache-hit }}"
+        RESTORE_OUTCOME: "${{ steps.restore.outcome }}"
+        BEFORE_BYTES: "${{ steps.before.outputs.bytes }}"
+      run: |
+        total=0
+        while IFS= read -r path; do
+          [[ -n "$path" && -e "$path" ]] || continue
+          size=$(/usr/bin/du -sb -- "$path" | /usr/bin/cut -f1)
+          printf '%s bytes %s\n' "$size" "$path"
+          total=$((total + size))
+        done <<< "$ORDINARY_CACHE_PATHS"
+        /usr/bin/df -h /home/runner
+        {
+          printf 'Restore outcome %s, exact hit %s\n' "$RESTORE_OUTCOME" "${CACHE_HIT:-false}"
+          printf 'Cache path bytes after restore %s, before restore %s, difference %s\n' \
+            "$total" "$BEFORE_BYTES" "$((total - BEFORE_BYTES))"
+        } | /usr/bin/tee -a "$GITHUB_STEP_SUMMARY"
   cache-expectations:
     name: Record measured producer cache behavior
     needs:

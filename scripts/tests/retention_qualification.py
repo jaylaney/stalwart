@@ -2,9 +2,11 @@
 """Disposable post-gate comparison evidence for issue #86."""
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -162,6 +164,61 @@ def compare(left, right):
     return differences
 
 
+def negative_cases(inputs, manifest, snapshot_id):
+    """Apply only on an already validated producer set, outside measured work."""
+    collector = Path(__file__).with_name("retention_artifacts.py")
+    snapshot_errors = [f"{name}: selected build snapshot differs"
+                       for name in coverage_net.ci_steps.COVERAGE_SHARDS]
+
+    with tempfile.TemporaryDirectory(prefix="retention-negative-", dir=inputs.parent) as temp:
+        scratch = Path(temp)
+        omitted = inputs / "listings"
+
+        def omit_receipt(directory, names):
+            if Path(directory) == omitted and "receipt.json" in names:
+                return {"receipt.json"}
+            return set()
+
+        if not (omitted / "receipt.json").is_file():
+            raise ValueError("negative trial requires the validated listing receipt")
+        missing = scratch / "missing"
+        shutil.copytree(inputs, missing, copy_function=os.link, ignore=omit_receipt,
+                        symlinks=True)
+
+        incompatible = load(manifest)
+        first = incompatible["objects"][0]
+        first["sha256"] = "f" * 64 if first["sha256"] == "0" * 64 else "0" * 64
+        incompatible["object_set_sha256"] = hashlib.sha256(
+            coverage_net.canonical_json(incompatible["objects"])
+        ).hexdigest()
+        wrong_manifest = scratch / "wrong-build.json"
+        wrong_manifest.write_text(json.dumps(incompatible), encoding="utf-8")
+
+        wrong_id = str(int(snapshot_id) + 1)
+        cases = (
+            ("missing-receipt", missing, manifest, snapshot_id,
+             ["missing regular file: receipt.json"]),
+            ("incompatible-object-set", inputs, wrong_manifest, snapshot_id, snapshot_errors),
+            ("mismatched-artifact-id", inputs, manifest, wrong_id, snapshot_errors),
+        )
+        for name, supplied, build, artifact, expected_errors in cases:
+            report = scratch / name
+            outcome = subprocess.run(
+                [sys.executable, "-I", str(collector), "collect",
+                 "--inputs", str(supplied), "--build-manifest", str(build),
+                 "--snapshot-artifact-id", artifact, "--out", str(report)],
+                capture_output=True, text=True, check=False,
+            )
+            if outcome.returncode != 2:
+                raise ValueError(f"{name}: expected collector exit 2, got {outcome.returncode}")
+            summary = load(report / "collection.json")
+            if (summary.get("status") != "integrity-error"
+                    or sorted(summary.get("errors", [])) != sorted(expected_errors)
+                    or {entry.name for entry in report.iterdir()} != {"collection.json"}):
+                raise ValueError(f"{name}: wrong integrity diagnosis or unexpected gate inputs")
+            print(f"{name}: rejected with exit 2 and no gate inputs", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -171,12 +228,19 @@ def main():
     kind = capture.add_mutually_exclusive_group(required=True)
     kind.add_argument("--serial", action="store_true")
     kind.add_argument("--attempt-dir", type=Path)
+    negative = commands.add_parser("negative")
+    negative.add_argument("--inputs", type=Path, required=True)
+    negative.add_argument("--build-manifest", type=Path, required=True)
+    negative.add_argument("--snapshot-artifact-id", required=True)
     diff = commands.add_parser("compare")
     diff.add_argument("left", type=Path)
     diff.add_argument("right", type=Path)
     args = parser.parse_args()
     if args.command == "capture":
         save_comparison(args)
+        return 0
+    if args.command == "negative":
+        negative_cases(args.inputs.resolve(), args.build_manifest, args.snapshot_artifact_id)
         return 0
     left, right = load(args.left), load(args.right)
     if left["commit"] != right["commit"]:
