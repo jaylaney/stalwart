@@ -35,7 +35,7 @@ Every shell command that uses cargo starts with `export PATH="/opt/homebrew/opt/
 | IP, IK | the same for `imap::imap_tests`; IK adds `ZA_KEY_ACCOUNTS=1` | `test result: ok. 1 passed` |
 | SYS | `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests system_tests -- --nocapture` | the same |
 | PRODUCT | `CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release -p stalwart --no-default-features --features rocks`. A local test binary; never the `enterprise` feature. Task 44 builds with the full profile and `--locked`. | exit 0, no warning in a fork file |
-| FRESH | `python3 -B tests/product/fresh_store.py --binary target/release/stalwart` | exit 0 after nine readback checks |
+| FRESH | `python3 -B tests/product/fresh_store.py --binary target/release/stalwart --log-dir "$(mktemp -d)/fresh-store-logs"` | exit 0 after nine readback checks |
 | CALDAV | the second block below, with `--mode key` or `--mode plain`, on the binary PRODUCT built. The client is fetched at its pinned commit into a new, empty directory outside the repository. | the harness's unit suite passes; the runner exits 0 with the mode's recorded entries and nothing else (key mode: 1 skipped, 2 xfailed; plain mode: its five records, `docs/zero-access/client-caldav.md`) |
 
 ```bash
@@ -57,6 +57,10 @@ python3.12 -m venv "$work/venv"
 "$work/venv/bin/python" -m unittest discover -s tests/caldav_client -p test_runner.py -v
 "$work/venv/bin/python" tests/caldav_client/runner.py --binary target/release/stalwart --caldav-source "$work/python-caldav" --mode key
 ```
+
+FRESH requires a log directory that does not yet exist. The command above creates a private
+temporary parent and lets the harness create its child. A task may instead pass a new path in
+its per-run diagnostics directory; record that path with the result.
 
 SHIP, TM and FMT run at the end of every task that changes a file. A task does not repeat them as steps; its last step before the commit is "the closing checks".
 
