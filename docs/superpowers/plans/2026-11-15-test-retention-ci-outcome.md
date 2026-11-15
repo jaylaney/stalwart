@@ -14,7 +14,7 @@ same inputs as on the serial workflow. [Issue #86](https://github.com/jaylaney/s
 | [Transport trial 1](https://github.com/jaylaney/stalwart/actions/runs/43744029033) | 20m 42s | 19,280,751,439 | Packaging stopped on a public AWS-LC header comment that matched the Basic credential pattern. |
 | [Transport trial 2](https://github.com/jaylaney/stalwart/actions/runs/43746550649) | 17m 21s | 19,281,070,126 | Packaging stopped on type declarations in SQLite's generated bindings. |
 | [Transport trial 3](https://github.com/jaylaney/stalwart/actions/runs/43748806097) | 14m 40s | 19,281,070,127 | Restored all expected coverage objects. Cargo rebuilt after finding three missing custom build-script executables. |
-| [Transport trial 4](https://github.com/jaylaney/stalwart/actions/runs/43751500051) | Pending | — | Checks the corrected file list and fresh coverage on separate runners. |
+| [Transport trial 4](https://github.com/jaylaney/stalwart/actions/runs/43751500051) | 15m 58s | 19,281,070,346 | Both restored Cargo build shapes were fresh. The coverage runner ran and exported the leak test. Reporter check pending. |
 
 The first two transport trials compiled both build configurations. Their times describe build-only
 work and provide no comparison with the serial gate's total. The local instrumented
@@ -35,6 +35,12 @@ file list preserves each executable, its dep-info, and its `build-script-main` h
 A local Cargo fixture with a custom build script restored all three byte for byte and
 reported the build fresh. [Trial 3 freshness log](https://github.com/jaylaney/stalwart/actions/runs/43748806097/job/132922845186)
 
+Trial 4 packed 4,517,130,237 bytes in 41 seconds and uploaded them in 23 seconds. The
+coverage runner downloaded the archive in 6m 7s, unpacked it in 76 seconds, and checked
+both build shapes in under two seconds with zero compilation. The existing leak test
+and export took seven seconds. Minimum free space during the two-second sampling was
+69,132,685,312 bytes while packing and 70,227,390,464 bytes while unpacking.
+
 A [hosted artifact fixture](https://github.com/jaylaney/stalwart/actions/runs/43746694042)
 validated evidence from a failed reusable shard and kept its first report red. On
 **Re-run failed jobs**, the second report validated fresh shard evidence with the original
@@ -45,8 +51,19 @@ with a small fixture.
 
 The Actions API returned a 10 GB storage limit and 10,725,606,288 bytes in 12 entries when
 the work began. The new production keys cover dependency downloads and are scoped by lane.
-The scheduled producers check available room before a save. Qualification of warm restores
-depends on observing both scoped writes and corresponding hits.
+The cold comparison skipped saves when the workflow token received HTTP 403 from the
+cache storage-limit endpoint. A separate hosted check identified the endpoint and read
+12,433,401,138 bytes from the usage endpoint with the same workflow permissions. The
+scheduled producers use live usage and the verified 10 GB budget before a save.
+Qualification of warm restores depends on observing both scoped writes and corresponding
+hits. [Workflow token check](https://github.com/jaylaney/stalwart/actions/runs/43754170815)
+
+The existing ordinary unit-test cache restored an exact key in 41 seconds in its original
+Ubuntu 26.04 layout. Its 1,994,370,095-byte archive added 7,771,141,421 apparent bytes after
+extraction. Both hosts used Rust 1.99.1. The Ubuntu 26.04 restore runner reported GCC 15.2,
+binutils 2.46 and glibc 2.43. The retention runner reported GCC 13.3, binutils 2.42 and
+glibc 2.39. Ordinary listing jobs use the dependency downloads and compile on Ubuntu 24.04.
+[Ordinary cache probe](https://github.com/jaylaney/stalwart/actions/runs/43752266663/job/132928606509)
 
 ## Pending hosted qualification
 
@@ -55,3 +72,7 @@ including selected tests, executed-function evidence and merged coverage. Record
 warm cache results, invalidation, wall time, summed runner time, transfer and disk use, and
 the results of negative paths. The retention jobs are gated to the weekly schedule and
 manual dispatch.
+
+The [same-commit comparison](https://github.com/jaylaney/stalwart/actions/runs/43752266663)
+uses `4d5fee1930338b494b0c148aa0252bcf4ab36eb1` on the disposable branch. It contains the
+production candidate `3fb4c0384` plus the two harness workflows and the comparison script.
