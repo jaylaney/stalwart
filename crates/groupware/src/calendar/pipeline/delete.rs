@@ -4,7 +4,12 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{ZaDeleted, admission::ZaRoles, context::za_mutation_context, error::ZaPipelineError};
+use super::{
+    ZaDeleted,
+    admission::ZaRoles,
+    context::{za_mutation_context, za_write_contexts},
+    error::{ZaPipelineError, ZaRefusal},
+};
 use crate::{
     DestroyArchive,
     calendar::{
@@ -13,13 +18,19 @@ use crate::{
             ZaSelfOperation, za_combine_delegated, za_resolve_delegation, za_self_cancel,
         },
         fanout::{ZaDeleteMessage, ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaSource},
+        schedule::AlarmTasks,
         sharing::resolve::{ZaCalendarContext, ZaCalendarError, calendars_changed},
     },
 };
 use common::{
-    GroupwareResources, Server, auth::AccessToken, cache::invalidate::CacheInvalidationBuilder,
-    ipc::CacheInvalidation, storage::metadata::ContainerCleanup, za::imip::ZaImipPending,
+    GroupwareResources, Server,
+    auth::AccessToken,
+    cache::invalidate::CacheInvalidationBuilder,
+    ipc::CacheInvalidation,
+    storage::{dav::canonical_calcard_segment, metadata::ContainerCleanup},
+    za::imip::ZaImipPending,
 };
+use std::future::{Future, Ready};
 use store::write::{Archive, ArchiveBytes, BatchBuilder, now};
 use trc::AddContext;
 use types::{
@@ -85,15 +96,6 @@ pub async fn za_calendar_delete_target(
     })
 }
 
-struct DeleteEventRetry {
-    event: Archive<ArchiveBytes>,
-    document_id: u32,
-    calendar_id: u32,
-    context: ZaCalendarContext,
-    href: Option<String>,
-    cutoff: i64,
-}
-
 /// Delete one name of a key account's event. The content input is the stored archive.
 #[allow(clippy::too_many_arguments)]
 pub async fn za_delete_event(
@@ -126,14 +128,8 @@ pub async fn za_delete_event(
     let mut batch = BatchBuilder::new();
     context.assert_in(&mut batch);
     let cutoff = now() as i64;
-    let retry = DeleteEventRetry {
-        event: event.clone(),
-        document_id,
-        calendar_id,
-        context,
-        href: href.clone(),
-        cutoff,
-    };
+    let retry_event = event.clone();
+    let retry_href = href.clone();
     let message = DestroyArchive(
         event
             .to_unarchived::<CalendarEvent>()
@@ -148,25 +144,210 @@ pub async fn za_delete_event(
         content,
         href,
         send_itip,
-        Some(&retry.context.domain),
+        Some(&context.domain),
         cutoff,
         &mut batch,
     )
     .await
     .caused_by(trc::location!())?;
 
+    let rebuild = |error: trc::Error| async move {
+        let fresh = za_mutation_context(
+            server,
+            token,
+            owner_id,
+            calendar_id,
+            Bitmap::new().with_item(Acl::RemoveItems),
+        )
+        .await
+        .map_err(|error| ZaPipelineError::from_calendar(error, owner_id, calendar_id))?;
+        if !calendars_changed(std::slice::from_ref(&context), fresh.as_slice()) {
+            return Err(error.caused_by(trc::location!()).into());
+        }
+        let mut batch = BatchBuilder::new();
+        if let Some(context) = &fresh {
+            context.assert_in(&mut batch);
+        }
+        DestroyArchive(
+            retry_event
+                .to_unarchived::<CalendarEvent>()
+                .caused_by(trc::location!())?,
+        )
+        .delete_za_at(
+            server,
+            &roles.sender,
+            owner_id,
+            document_id,
+            calendar_id,
+            None,
+            retry_href,
+            false,
+            fresh.as_ref().map(|context| &context.domain),
+            cutoff,
+            &mut batch,
+        )
+        .await
+        .caused_by(trc::location!())?;
+        Ok(batch)
+    };
+
     za_commit_delete(
         server,
-        token,
         keys,
         roles,
         owner_id,
         batch,
         message,
-        Some(retry),
+        Some(rebuild),
         Vec::new(),
     )
     .await
+}
+
+/// Destroy a key account's event and every one of its names in one batch.
+#[allow(clippy::too_many_arguments)]
+pub async fn za_destroy_event(
+    server: &Server,
+    token: &AccessToken,
+    resources: &GroupwareResources,
+    keys: &SessionKeys,
+    roles: &ZaRoles,
+    owner_id: u32,
+    document_id: u32,
+    event: Archive<ArchiveBytes>,
+    send_itip: bool,
+) -> Result<ZaDeleted, ZaPipelineError> {
+    let row = event
+        .deserialize::<CalendarEvent>()
+        .caused_by(trc::location!())?;
+    let addressed = row
+        .names
+        .first()
+        .ok_or(ZaPipelineError::Forbidden(ZaRefusal::Context))?
+        .parent_id;
+    let contexts =
+        za_write_contexts(server, token, owner_id, &row, addressed, Acl::RemoveItems).await?;
+    if contexts.is_empty() {
+        return Err(ZaPipelineError::Forbidden(ZaRefusal::Context));
+    }
+    let mut batch = BatchBuilder::new();
+    for context in &contexts {
+        context.assert_in(&mut batch);
+    }
+    let cutoff = now() as i64;
+    let retry_event = event.clone();
+    let message = enqueue_destroy_event(
+        server,
+        resources,
+        roles,
+        owner_id,
+        document_id,
+        &event,
+        &contexts,
+        send_itip,
+        cutoff,
+        &mut batch,
+    )
+    .await?;
+
+    let rebuild = |error: trc::Error| async move {
+        let fresh =
+            za_write_contexts(server, token, owner_id, &row, addressed, Acl::RemoveItems).await?;
+        if !calendars_changed(&contexts, &fresh) {
+            return Err(error.caused_by(trc::location!()).into());
+        }
+        if fresh.is_empty() {
+            return Err(ZaPipelineError::Forbidden(ZaRefusal::Context));
+        }
+        let mut batch = BatchBuilder::new();
+        for context in &fresh {
+            context.assert_in(&mut batch);
+        }
+        enqueue_destroy_event(
+            server,
+            resources,
+            roles,
+            owner_id,
+            document_id,
+            &retry_event,
+            &fresh,
+            false,
+            cutoff,
+            &mut batch,
+        )
+        .await?;
+        Ok(batch)
+    };
+
+    za_commit_delete(
+        server,
+        keys,
+        roles,
+        owner_id,
+        batch,
+        message,
+        Some(rebuild),
+        Vec::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_destroy_event(
+    server: &Server,
+    resources: &GroupwareResources,
+    roles: &ZaRoles,
+    owner_id: u32,
+    document_id: u32,
+    event: &Archive<ArchiveBytes>,
+    contexts: &[ZaCalendarContext],
+    send_itip: bool,
+    cutoff: i64,
+    batch: &mut BatchBuilder,
+) -> Result<Option<ZaDeleteMessage>, ZaPipelineError> {
+    let event = event
+        .to_unarchived::<CalendarEvent>()
+        .caused_by(trc::location!())?;
+    let names = &event.inner.names;
+    let message = DestroyArchive(event)
+        .remove_all_za_at(
+            server,
+            &roles.sender,
+            owner_id,
+            document_id,
+            None,
+            &mut AlarmTasks::None,
+            send_itip,
+            &ContainerCleanup::empty(Collection::CalendarEvent),
+            Some(&contexts[0].domain),
+            cutoff,
+            batch,
+        )
+        .await
+        .caused_by(trc::location!())?;
+    for name in names.iter() {
+        let parent_id = name.parent_id.to_native();
+        if resources.container_resource_path_by_id(parent_id).is_none() {
+            continue;
+        }
+        // Use this attempt's asserted calendar name, including after a rename.
+        let parent = contexts
+            .iter()
+            .find(|context| context.calendar_id == parent_id)
+            .expect("destroy must resolve every stored parent");
+        let calendar = parent
+            .stored
+            .unarchive::<Calendar>()
+            .caused_by(trc::location!())?;
+        let calendar = canonical_calcard_segment(calendar.name.as_str());
+        let name = canonical_calcard_segment(name.name.as_str());
+        batch.log_calendar_vanished(
+            parent_id,
+            resources.format_item(&format!("{calendar}/{name}")),
+        );
+    }
+    // Finalization writes the whole batch once, including alarm and container cleanup.
+    Ok(message)
 }
 
 /// Delete a key account's calendar and its events, including scheduling when enabled.
@@ -218,30 +399,31 @@ pub async fn za_delete_calendar(
 
     za_commit_delete(
         server,
-        token,
         keys,
         roles,
         owner_id,
         batch,
         messages,
-        None,
+        None::<fn(trc::Error) -> Ready<_>>,
         target.deleted_grantees,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn za_commit_delete(
+async fn za_commit_delete<F>(
     server: &Server,
-    token: &AccessToken,
     keys: &SessionKeys,
     roles: &ZaRoles,
     owner_id: u32,
     batch: BatchBuilder,
     messages: impl IntoIterator<Item = ZaDeleteMessage>,
-    retry: Option<DeleteEventRetry>,
+    rebuild: Option<impl FnOnce(trc::Error) -> F>,
     deleted_grantees: Vec<u32>,
-) -> Result<ZaDeleted, ZaPipelineError> {
+) -> Result<ZaDeleted, ZaPipelineError>
+where
+    F: Future<Output = Result<BatchBuilder, ZaPipelineError>>,
+{
     // iMIP spec 5.4, decision 9: each fan-out's mail attempts wait for
     // the deletion's one commit.
     let mut za_mail = ZaImipPending::default();
@@ -300,7 +482,7 @@ async fn za_commit_delete(
     }
 
     #[cfg(feature = "test_mode")]
-    if retry.is_some() {
+    if rebuild.is_some() {
         common::za::test_hooks::delete_commit_pause_point(owner_id).await;
     }
     #[cfg(feature = "test_mode")]
@@ -318,49 +500,13 @@ async fn za_commit_delete(
             Ok(ids) => return Ok(ids),
             Err(error) => error,
         };
-        let Some(retry) = retry.filter(|_| error.is_assertion_failure()) else {
+        let Some(rebuild) = rebuild.filter(|_| error.is_assertion_failure()) else {
             return Err(error.caused_by(trc::location!()).into());
         };
         // A calendar change (a grant, a rotation or a conversion) lost
         // the assertion: one bounded retry in the fresh domain, with
         // scheduling off (its items already went out).
-        let fresh = za_mutation_context(
-            server,
-            token,
-            owner_id,
-            retry.calendar_id,
-            Bitmap::new().with_item(Acl::RemoveItems),
-        )
-        .await
-        .map_err(|error| ZaPipelineError::from_calendar(error, owner_id, retry.calendar_id))?;
-        if !calendars_changed(std::slice::from_ref(&retry.context), fresh.as_slice()) {
-            return Err(error.caused_by(trc::location!()).into());
-        }
-        let mut batch = BatchBuilder::new();
-        if let Some(context) = &fresh {
-            context.assert_in(&mut batch);
-        }
-        DestroyArchive(
-            retry
-                .event
-                .to_unarchived::<CalendarEvent>()
-                .caused_by(trc::location!())?,
-        )
-        .delete_za_at(
-            server,
-            &roles.sender,
-            owner_id,
-            retry.document_id,
-            retry.calendar_id,
-            None,
-            retry.href,
-            false,
-            fresh.as_ref().map(|context| &context.domain),
-            retry.cutoff,
-            &mut batch,
-        )
-        .await
-        .caused_by(trc::location!())?;
+        let batch = rebuild(error).await?;
         Ok(server
             .commit_batch(batch)
             .await

@@ -25,13 +25,38 @@ use crate::{
     },
 };
 use calcard::icalendar::ICalendar;
-use common::{Server, auth::AccessToken};
+use common::{
+    Server,
+    auth::{AccessToken, AccountInfo},
+};
 use compact_str::ToCompactString;
 use trc::AddContext;
 
 pub struct ZaScheduled {
     pub messages: Option<Vec<ZaFanOutMessage>>,
     pub resolution: Option<ZaDelegationResolution>,
+}
+
+/// Resolves CalDAV's delete scheduling condition with the calendar owner's addresses.
+pub fn za_delete_send_itip(
+    server: &Server,
+    token: &AccessToken,
+    owner: &AccountInfo,
+    schedule: ZaScheduling,
+) -> Result<bool, ZaPipelineError> {
+    if schedule == ZaScheduling::Off {
+        return Ok(false);
+    }
+    let status = ItipSendStatus::resolve(server, token, owner, i64::MAX, true);
+    let denied = status.is_denied();
+    if denied && schedule == ZaScheduling::Required {
+        return Err(ZaPipelineError::SchedulingDenied(
+            status
+                .reason()
+                .expect("a denied scheduling status has a reason"),
+        ));
+    }
+    Ok(!denied)
 }
 
 /// Invitations spec 5.1 (release 2) and delegated scheduling (release 4): a

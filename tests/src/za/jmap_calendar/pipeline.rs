@@ -7,11 +7,15 @@
 use super::{Pair, event_ics, finish, make_calendar, pair, put_event, session_token, share};
 use crate::{
     utils::{
+        http::HttpRequest,
         server::TestServer,
+        smtp_sink::sink,
         webdav::DummyWebDavClient,
         za::{
-            HookParked, assert_no_event_preferences, delete_inbox_item, inbox_ids,
-            plant_sealed_event, shared_container, stored_event, za_post, za_uid_leases, za_unlock,
+            HookParked, assert_no_event_preferences, delete_inbox_item, inbox_ids, item_attendees,
+            item_method, item_sequence, itip_tasks_for, new_inbox_items, open_pending_item_as,
+            plant_sealed_event, shared_container, stored_event, wait_for_queue, za_post,
+            za_uid_leases, za_unlock,
         },
     },
     za::{
@@ -22,16 +26,20 @@ use crate::{
         },
         fanout::{CONTENT_TYPE, NO_REPLY, uid_copies},
         mail::Traced,
+        uid_lease::put,
     },
 };
-use calcard::{common::timezone::Tz, icalendar::ICalendar};
+use calcard::{
+    common::timezone::Tz,
+    icalendar::{ICalendar, ICalendarMethod},
+};
 use common::{
     DavName, Server,
-    auth::AccessToken,
+    auth::{AccessToken, vault::RawValue},
     za::{
         lease::ZaUidLease,
         test_hooks::{
-            ForceCommitSplit, set_commit_pause, set_lease_secs_override,
+            ForceCommitSplit, set_commit_pause, set_delete_commit_pause, set_lease_secs_override,
             set_second_chunk_fail_once, set_update_commit_pause,
         },
     },
@@ -44,13 +52,14 @@ use groupware::{
         alarm::AlarmTarget,
         alerts::{DefaultAlerts, DefaultAlertsResolver},
         pipeline::{
-            ZaScheduling, ZaWritten,
+            ZaDeleted, ZaScheduling, ZaWritten,
             admission::{za_roles, za_writer_keys},
             context::{ZaReadMemo, za_read_event_view, za_write_contexts},
             create::{ZaEventCreate, za_create_event},
+            delete::za_destroy_event,
             error::{ZaBusy, ZaPipelineError, ZaRefusal},
             placement::{ZaPlacementContexts, ZaPlacementPlan, za_placement_contexts},
-            schedule::{ZaScheduled, za_schedule_create},
+            schedule::{ZaScheduled, za_delete_send_itip, za_schedule_create},
             uid::za_take_uid_lease,
             update::{ZaEventUpdate, za_commit_update},
         },
@@ -60,14 +69,20 @@ use groupware::{
         sharing::resolve::za_owned_calendar_context,
     },
 };
-use hyper::StatusCode;
-use registry::schema::structs::{Task, TaskStatus};
+use hyper::{Method, StatusCode};
+use registry::schema::{
+    enums::{Permission, TaskType},
+    structs::{Task, TaskStatus},
+};
 use serde_json::json;
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 use store::{
     ValueKey,
     query::log::Query,
-    write::{Archive, ArchiveBytes, TaskQueueClass, ValueClass, now},
+    write::{Archive, ArchiveBytes, TaskId, TaskQueueClass, ValueClass, now},
 };
 use trc::{AddContext, EventType, SecurityEvent};
 use types::{
@@ -77,6 +92,7 @@ use types::{
 };
 
 const HOME: &str = "/dav/cal/jmapcal-pipeline%40example.com/";
+const OUTSIDE: &str = "jmapcal-pipeline-att@remote.test";
 
 /// The module's pair and the ids of `pipe-a`, `pipe-b` and `pipe-s`.
 struct Fx {
@@ -372,6 +388,57 @@ async fn update(
     .await
 }
 
+/// The stages a key account's destroy runs, in process.
+async fn destroy(
+    server: &Server,
+    token: &AccessToken,
+    owner: u32,
+    document_id: u32,
+    schedule: ZaScheduling,
+) -> Result<ZaDeleted, ZaPipelineError> {
+    let resources = server
+        .fetch_groupware_resources(token.account_id(), owner, SyncCollection::Calendar)
+        .await?;
+    let event: Archive<ArchiveBytes> = server
+        .store()
+        .get_value(ValueKey::archive(
+            owner,
+            Collection::CalendarEvent,
+            document_id,
+        ))
+        .await?
+        .ok_or(ZaPipelineError::NotFound)?;
+    let keys = za_writer_keys(server, token, owner)
+        .await?
+        .expect("pipeline fixture is a key account");
+    let roles = za_roles(server, token, owner).await?;
+    let send_itip = za_delete_send_itip(server, token, &roles.owner, schedule)?;
+    za_destroy_event(
+        server,
+        token,
+        &resources,
+        &keys,
+        &roles,
+        owner,
+        document_id,
+        event,
+        send_itip,
+    )
+    .await
+}
+
+/// An event organized by the pipeline owner with each attendee initially needing action.
+fn invitation(uid: &str, summary: &str, attendees: &[&str]) -> String {
+    let mut properties = String::from("ORGANIZER:mailto:jmapcal-pipeline@example.com\r\n");
+    for attendee in attendees {
+        properties.push_str(&format!(
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{attendee}\r\n"
+        ));
+    }
+    properties.push_str("END:VEVENT\r\n");
+    event_ics(uid, summary).replace("END:VEVENT\r\n", &properties)
+}
+
 async fn domains(test: &TestServer, fx: &Fx) -> (ZaKeyDomain, ZaKeyDomain) {
     let keys = za_unlock(test, fx.pair.key_id, STRONG).await;
     let personal = za_owned_calendar_context(&test.server, &keys, fx.a)
@@ -445,6 +512,11 @@ pub async fn test(test: &mut TestServer) {
     placement_with_content_change_commits_once(test, &fx).await;
     placement_retry_after_grant_change(test, &fx).await;
     placement_retry_after_source_rename(test, &fx).await;
+    destroy_linked_event(test, &fx).await;
+    destroy_single_name_equals_dav_delete(test, &fx).await;
+    delete_send_itip_matches_dav(test, &fx).await;
+    destroy_required_denied(test, &fx).await;
+    destroy_retry_after_source_rename(test, &fx).await;
     fx.cleanup(test).await;
     finish(test, "pipeline").await;
 }
@@ -1410,6 +1482,384 @@ async fn placement_retry_after_source_rename(test: &TestServer, fx: &Fx) {
         .request_with_headers("DELETE", &format!("{HOME}pipe-b/{name}"), [NO_REPLY], "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+    client
+        .request("DELETE", &renamed_calendar, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+}
+
+async fn destroy_linked_event(test: &TestServer, fx: &Fx) {
+    let owner = fx.pair.key_id;
+    let client = &fx.pair.dav;
+    let uid = "jmapcal-pipe-destroy";
+    let value = "jmapcal-pipe-destroy-property";
+    let ics = event_ics(uid, "destroy in both calendars").replace(
+        "END:VEVENT\r\n",
+        &format!(
+            concat!(
+                "BEGIN:VALARM\r\nACTION:EMAIL\r\nTRIGGER:-PT10M\r\n",
+                "ATTENDEE:mailto:{}\r\nSUMMARY:destroy alarm\r\n",
+                "DESCRIPTION:destroy alarm\r\nEND:VALARM\r\nEND:VEVENT\r\n",
+            ),
+            fx.pair.key.name(),
+        ),
+    );
+    let token = session_token(test, owner).await;
+    let written = create(
+        &test.server,
+        &token,
+        owner,
+        &[fx.a, fx.b],
+        &ics,
+        ZaScheduling::On,
+    )
+    .await
+    .expect("destroy_linked_event: create an event with two names and an email alarm");
+    let id = written.document_id;
+    let hrefs = [
+        format!("{HOME}pipe-a/{uid}.ics"),
+        format!("{HOME}pipe-b/{uid}.ics"),
+    ];
+    client
+        .request("PROPPATCH", &hrefs[0], dead_proppatch(value))
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert_dead_round_trip(client, &hrefs[0], value).await;
+    let canaries: Vec<_> = DEAD_CANARIES.iter().copied().chain([value]).collect();
+    assert_dead_container_sealed(test, owner, id, &canaries).await;
+
+    let store = test.server.store();
+    let alarm_id = TaskId::Assigned(AlarmTarget::Owner.task_id().resolve(owner, id));
+    let task_key = ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: alarm_id }));
+    let Some(Task::CalendarAlarmEmail(alarm)) =
+        store.get_value::<Task>(task_key.clone()).await.unwrap()
+    else {
+        panic!("destroy_linked_event: missing email alarm");
+    };
+    assert_eq!(alarm.account_id.document_id(), owner);
+    assert_eq!(alarm.document_id.document_id(), id);
+    let TaskStatus::Pending(status) = alarm.status else {
+        panic!("destroy_linked_event: alarm is not pending");
+    };
+    // 2099-03-01T09:50:00Z, ten minutes before the event.
+    assert_eq!(status.due.timestamp(), 4_076_041_800);
+    let due_key = ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Due {
+        id: alarm_id,
+        typ: TaskType::CalendarAlarmEmail,
+        due: status.due.timestamp() as u64,
+    }));
+    assert!(
+        store
+            .get_value::<RawValue>(due_key.clone())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let tip = store
+        .get_last_change_id(owner, SyncCollection::Calendar.into())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let result = {
+        let _split = ForceCommitSplit::new(owner);
+        set_second_chunk_fail_once(Some(owner));
+        let result = destroy(&test.server, &token, owner, id, ZaScheduling::On).await;
+        set_second_chunk_fail_once(None);
+        result
+    };
+    let deleted = result.expect("destroy_linked_event: all names commit together");
+
+    assert_eq!(uid_copies(test, owner, uid).await, 0);
+    assert_eq!(changes_after(test, owner, tip).await, [deleted.change_id]);
+    assert_eq!(vanished_at(test, owner, deleted.change_id).await, hrefs);
+    for href in hrefs {
+        client
+            .request("GET", &href, "")
+            .await
+            .with_status(StatusCode::NOT_FOUND);
+    }
+    assert_eq!(za_uid_leases(test).await, 0);
+    for (label, key) in [
+        (
+            "event archive",
+            ValueKey::archive(owner, Collection::CalendarEvent, id),
+        ),
+        (
+            "event content",
+            ValueKey::property(
+                owner,
+                Collection::CalendarEvent,
+                id,
+                CalendarEventField::Content,
+            ),
+        ),
+        ("alarm Task", task_key),
+        ("alarm Due", due_key),
+    ] {
+        assert!(
+            store.get_value::<RawValue>(key).await.unwrap().is_none(),
+            "{label} survived destroy"
+        );
+    }
+    assert!(
+        shared_container(test, owner, Collection::CalendarEvent, id)
+            .await
+            .is_none()
+    );
+}
+
+async fn destroy_single_name_equals_dav_delete(test: &TestServer, fx: &Fx) {
+    const DAV_UID: &str = "jmapcal-pipe-twin-dav";
+    const PIPE_UID: &str = "jmapcal-pipe-twin-pipe";
+
+    let owner = fx.pair.key_id;
+    let address = fx.pair.key.name();
+    let grantee = fx.pair.key2_id;
+    let attendees = [fx.pair.key2.name(), OUTSIDE];
+    let dav_href = format!("{HOME}pipe-a/{DAV_UID}.ics");
+    let pipe_href = format!("{HOME}pipe-a/{PIPE_UID}.ics");
+    for (uid, href) in [(DAV_UID, &dav_href), (PIPE_UID, &pipe_href)] {
+        assert_eq!(
+            put(
+                address,
+                STRONG,
+                href.clone(),
+                invitation(uid, "cancelled twice", &attendees)
+            )
+            .await,
+            StatusCode::CREATED.as_u16(),
+            "{uid}",
+        );
+    }
+    wait_for_queue(test).await;
+    let before = inbox_ids(test, grantee).await;
+    sink().clear();
+
+    let response = HttpRequest::with_credentials(8899, address, STRONG)
+        .send_full(Method::DELETE, &dav_href, None, None)
+        .await;
+    assert_eq!(response.status, StatusCode::NO_CONTENT);
+    let id = resource_id(test, owner, &format!("pipe-a/{PIPE_UID}.ics")).await;
+    let token = session_token(test, owner).await;
+    let deleted = destroy(&test.server, &token, owner, id, ZaScheduling::On)
+        .await
+        .expect("destroy_single_name_equals_dav_delete: destroy the pipeline twin");
+    wait_for_queue(test).await;
+
+    assert_eq!(uid_copies(test, owner, DAV_UID).await, 0);
+    assert_eq!(uid_copies(test, owner, PIPE_UID).await, 0);
+    assert_eq!(
+        vanished_at(test, owner, deleted.change_id).await,
+        [pipe_href]
+    );
+    let items = new_inbox_items(test, grantee, &before).await;
+    assert_eq!(
+        items.len(),
+        2,
+        "destroy_single_name_equals_dav_delete: grantee's new inbox items"
+    );
+    let mut by_uid = BTreeMap::new();
+    for (id, _) in &items {
+        let (ical, _) = open_pending_item_as(test, grantee, STRONG, *id).await;
+        let uid = ical.uids().next().expect("cancellation UID").to_string();
+        let fields = (
+            item_method(&ical),
+            item_sequence(&ical),
+            item_attendees(&ical),
+        );
+        assert!(
+            by_uid.insert(uid, fields).is_none(),
+            "duplicate cancellation"
+        );
+    }
+    let dav = by_uid.get(DAV_UID).expect("CalDAV twin's cancellation");
+    let pipeline = by_uid.get(PIPE_UID).expect("pipeline twin's cancellation");
+    assert_eq!(dav.0, Some(ICalendarMethod::Cancel));
+    assert_eq!(dav, pipeline);
+
+    let mail = sink().take_to(OUTSIDE);
+    assert_eq!(mail.len(), 2, "outside attendee's cancellation mail");
+    let [dav_method, pipe_method] = [DAV_UID, PIPE_UID].map(|uid| {
+        let uid_line = format!("UID:{uid}");
+        let mut matches = mail.iter().filter(|message| {
+            message
+                .calendar_part()
+                .is_some_and(|part| part.lines().any(|line| line == uid_line))
+        });
+        let method = matches
+            .next()
+            .unwrap_or_else(|| panic!("{uid}: missing cancellation mail"))
+            .calendar_method()
+            .expect("calendar MIME method");
+        assert!(
+            matches.next().is_none(),
+            "{uid}: duplicate cancellation mail"
+        );
+        method
+    });
+    assert_eq!(dav_method, pipe_method);
+    assert!(dav_method.eq_ignore_ascii_case("CANCEL"));
+    assert_eq!(itip_tasks_for(test, owner).await, 0);
+
+    for (id, _) in items {
+        delete_inbox_item(test, &fx.pair.dav2, grantee, id).await;
+    }
+    sink().clear();
+}
+
+async fn delete_send_itip_matches_dav(test: &TestServer, fx: &Fx) {
+    const NO_ADDRESS: &str =
+        "This account has no calendar address to send scheduling messages from.";
+    const NO_PERMISSION: &str = "This account is not allowed to send calendar scheduling messages.";
+
+    let server = &test.server;
+    let owner = fx.pair.key_id;
+    let allowed = AccessToken::from_permissions(owner, [Permission::CalendarSchedulingSend]);
+    let denied = AccessToken::from_permissions(owner, []);
+    let stored = server.account_info(owner).await.unwrap();
+    let mut no_address = stored.clone();
+    no_address.addresses.clear();
+
+    assert!(server.core.groupware.itip_enabled);
+    for (token, info, sends, refusal) in [
+        (&allowed, &stored, true, None),
+        (&allowed, &no_address, false, Some(NO_ADDRESS)),
+        (&denied, &stored, false, Some(NO_PERMISSION)),
+        (&denied, &no_address, false, Some(NO_ADDRESS)),
+    ] {
+        let handler = server.core.groupware.itip_enabled
+            && !info.addresses().is_empty()
+            && token.has_permission(Permission::CalendarSchedulingSend);
+        assert_eq!(handler, sends);
+        assert!(!za_delete_send_itip(server, token, info, ZaScheduling::Off).unwrap());
+        assert_eq!(
+            za_delete_send_itip(server, token, info, ZaScheduling::On).unwrap(),
+            handler
+        );
+        match (
+            za_delete_send_itip(server, token, info, ZaScheduling::Required),
+            refusal,
+        ) {
+            (Ok(true), None) => (),
+            (Err(ZaPipelineError::SchedulingDenied(actual)), Some(expected)) => {
+                assert_eq!(actual, expected);
+            }
+            (actual, expected) => {
+                panic!("Required scheduling returned {actual:?}, expected refusal {expected:?}")
+            }
+        }
+    }
+}
+
+async fn destroy_required_denied(test: &TestServer, fx: &Fx) {
+    let owner = fx.pair.key_id;
+    let uid = "jmapcal-pipe-denied";
+    let client = &fx.pair.dav;
+    let id = put_event(test, &fx.pair.key, client, "pipe-a", uid, "stays").await;
+    let version = stored_event(test, owner, id).await.version;
+    let token = AccessToken::from_permissions(owner, [])
+        .with_session_keys(za_unlock(test, owner, STRONG).await);
+    match destroy(&test.server, &token, owner, id, ZaScheduling::Required).await {
+        Err(ZaPipelineError::SchedulingDenied(reason)) => {
+            assert_eq!(
+                reason,
+                "This account is not allowed to send calendar scheduling messages."
+            );
+        }
+        Err(err) => panic!("destroy_required_denied: unexpected refusal {err:?}"),
+        Ok(_) => panic!("destroy_required_denied: destroyed an event despite denied scheduling"),
+    }
+    assert_eq!(uid_copies(test, owner, uid).await, 1);
+    assert_eq!(stored_event(test, owner, id).await.version, version);
+    client
+        .request("GET", &format!("{HOME}pipe-a/{uid}.ics"), "")
+        .await
+        .with_status(StatusCode::OK);
+
+    destroy(&test.server, &token, owner, id, ZaScheduling::On)
+        .await
+        .expect("destroy_required_denied: On saves despite denied scheduling");
+    assert_eq!(uid_copies(test, owner, uid).await, 0);
+}
+
+async fn destroy_retry_after_source_rename(test: &TestServer, fx: &Fx) {
+    let owner = fx.pair.key_id;
+    let client = &fx.pair.dav;
+    let uid = "jmapcal-pipe-destroy-rename";
+    let name = "event%20name.ics";
+    let old_calendar = format!("{HOME}pipe-destroy-old/");
+    let renamed_calendar = format!("{HOME}pipe%20destroy%20renamed/");
+    let renamed_event = format!("{renamed_calendar}{name}");
+    make_calendar(test, &fx.pair.key, client, "pipe-destroy-old").await;
+    client
+        .request_with_headers(
+            "PUT",
+            &format!("{old_calendar}{name}"),
+            [CONTENT_TYPE],
+            event_ics(uid, "destroy after the source calendar is renamed"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let id = resource_id(test, owner, &format!("pipe-destroy-old/{name}")).await;
+    let token = session_token(test, owner).await;
+    let server = test.server.clone();
+    let parked = HookParked::start(owner, set_delete_commit_pause, async move {
+        destroy(&server, &token, owner, id, ZaScheduling::On).await
+    })
+    .await;
+
+    client
+        .request_with_headers(
+            "MOVE",
+            &old_calendar,
+            [("destination", renamed_calendar.as_str())],
+            "",
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let initial = client
+        .sync_collection(&renamed_calendar, "", Depth::Infinity, None, ["D:getetag"])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert!(initial.hrefs().contains(&renamed_event.as_str()));
+    let sync_token = initial.sync_token().to_string();
+    let tip = test
+        .server
+        .store()
+        .get_last_change_id(owner, SyncCollection::Calendar.into())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let result = {
+        let _split = ForceCommitSplit::new(owner);
+        set_second_chunk_fail_once(Some(owner));
+        let result = parked.finish().await;
+        set_second_chunk_fail_once(None);
+        result
+    };
+    let deleted = result.expect("destroy_retry_after_source_rename: retry with the renamed source");
+
+    assert_eq!(changes_after(test, owner, tip).await, [deleted.change_id]);
+    assert_eq!(uid_copies(test, owner, uid).await, 0);
+    assert_eq!(
+        vanished_at(test, owner, deleted.change_id).await,
+        [renamed_event.clone()]
+    );
+    client
+        .sync_collection(
+            &renamed_calendar,
+            &sync_token,
+            Depth::Infinity,
+            None,
+            ["D:getetag"],
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .into_propfind_response(None)
+        .properties(&renamed_event)
+        .with_status(StatusCode::NOT_FOUND);
     client
         .request("DELETE", &renamed_calendar, "")
         .await
