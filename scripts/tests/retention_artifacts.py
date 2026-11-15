@@ -5,6 +5,8 @@
 """Package and restore the retention workflow's pre-test Cargo target."""
 
 import argparse
+import base64
+import binascii
 from decimal import Decimal
 import hashlib
 import json
@@ -35,8 +37,9 @@ SOURCE_ENV = re.compile(
     r"|REGISTRY_(?:INDEX|DEFAULT)|NET_GIT_FETCH_WITH_CLI)"
 )
 
+BASIC_TOKEN = re.compile(rb"\bBasic[ \t]+([A-Za-z0-9._~+/=-]+)", re.IGNORECASE)
 CREDENTIAL_SHAPE = re.compile(
-    rb"(?:Basic|Bearer) [A-Za-z0-9._~+/=-]+"
+    rb"Bearer [A-Za-z0-9._~+/=-]+"
     rb"|(?:password|secret|token)[A-Za-z_]*[\"']?[=:] *[\"']?[^\"' ,}\s]+",
     re.IGNORECASE,
 )
@@ -146,10 +149,26 @@ def is_text_state(path):
     }
 
 
+def has_credential_shape(line):
+    if CREDENTIAL_SHAPE.search(line):
+        return True
+    for candidate in BASIC_TOKEN.finditer(line):
+        token = candidate[1]
+        unpadded = token.rstrip(b"=")
+        try:
+            user_password = base64.b64decode(unpadded + b"=" * (-len(unpadded) % 4), validate=True)
+        except binascii.Error:
+            continue
+        canonical = base64.b64encode(user_password)
+        if b":" in user_password and token in (canonical, canonical.rstrip(b"=")):
+            return True
+    return False
+
+
 def check_credentials(path, name, credential_values):
     if is_text_state(path):
         with path.open("rb") as source:
-            if any(CREDENTIAL_SHAPE.search(line) for line in source):
+            if any(has_credential_shape(line) for line in source):
                 raise ValueError(f"credential pattern in {name}")
     if credential_values:
         overlap = max(map(len, credential_values)) - 1
@@ -397,7 +416,13 @@ def register_snapshot_commands(commands):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    register_snapshot_commands(parser.add_subparsers(required=True))
+    commands = parser.add_subparsers(required=True)
+    register_snapshot_commands(commands)
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from retention_evidence import register_evidence_commands
+
+    register_evidence_commands(commands)
     args = parser.parse_args(argv)
     try:
         return args.handler(args) or 0

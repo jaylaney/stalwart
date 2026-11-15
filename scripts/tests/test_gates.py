@@ -906,6 +906,7 @@ class CoverageNetTests(unittest.TestCase):
             (self.net.out / name).mkdir(parents=True)
         self.net.failed = []
         self.net.deadline = None
+        self.net.work_deadline = None
         self.net.run_identity = lambda: {
             "commit": "a" * 40, "run_id": "12", "producer_attempt": 3,
         }
@@ -1020,12 +1021,15 @@ class CoverageNetTests(unittest.TestCase):
         output = "\n".join(f"{name}: test" for name in reversed(names + names[:1]))
         listing = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
         outcome = self.attempt(1, 0, "collected")
+        self.net.deadline = time.monotonic() + 600
+        self.net.work_deadline = self.net.deadline - 300
         with mock.patch.object(coverage_net, "run", return_value=listing) as cargo, \
              mock.patch.object(self.net, "attempt", return_value=outcome) as run_attempt, \
              mock.patch.object(self.net, "export", side_effect=self.export), \
              contextlib.redirect_stdout(io.StringIO()):
             self.net.step("unit-tests")
         self.assertEqual(cargo.call_args.args[0][-5:], ["test", "-p", "tests", "--", "--list"])
+        self.assertEqual(cargo.call_args.kwargs["deadline"], self.net.work_deadline)
         self.assertEqual(run_attempt.call_args.args[2][-180:],
                          [arg for name in names for arg in ("--skip", name)])
 
@@ -1082,6 +1086,69 @@ class CoverageNetTests(unittest.TestCase):
                                str(marker)])
         self.assertEqual(result.returncode, "deadline")
         self.assertFalse(marker.exists())
+
+    def test_shard_settles_earlier_steps_after_work_cutoff(self):
+        self.net.deadline = time.monotonic() + 600
+        self.net.work_deadline = self.net.deadline - 300
+        manifest = {"build_attempt": 2, "object_set_sha256": "f" * 64}
+        ran = []
+
+        def finish_first_step(step):
+            ran.append(step)
+            self.net.work_deadline = time.monotonic() - 1
+            return dict(status="success", attempts=[{"status": 0}], profile=True, export="success")
+
+        with mock.patch.object(self.net, "verify_build") as verify, \
+             mock.patch.object(self.net, "step", side_effect=finish_first_step), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.net.shard("short", manifest)
+        self.assertEqual(ran, ["leak-unit-test"])
+        self.assertEqual(verify.call_count, 2)
+        summary = json.loads((self.net.out / "shard.json").read_text())
+        self.assertTrue(summary["compatible"])
+        self.assertEqual(summary["steps"]["leak-unit-test"]["status"], "success")
+        self.assertEqual(summary["steps"]["unit-tests"]["status"], "not-run")
+        self.assertTrue(self.net.failed)
+
+    def test_raw_profile_is_merged_during_diagnostics_reserve(self):
+        self.net.deadline = time.monotonic() + 600
+        self.net.work_deadline = time.monotonic() - 1
+        self.net.profdata_tool = "llvm-profdata"
+        raw = self.net.target / "profile.profraw"
+
+        def run_phase(cmd, *, deadline, **_):
+            if cmd[0] == "cargo":
+                self.assertEqual(deadline, self.net.work_deadline)
+                raw.write_text("raw profile flushed by terminated cargo process")
+                return subprocess.CompletedProcess(cmd, "deadline", "", "")
+            self.assertEqual(deadline, self.net.deadline)
+            self.assertEqual(Path(cmd[cmd.index("-f") + 1]).read_text(), f"{raw}\n")
+            Path(cmd[cmd.index("-o") + 1]).write_text("indexed profile")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(coverage_net, "run", side_effect=run_phase):
+            attempt = self.net.attempt("za-tests", 1, ["cargo", "test"], {}, 180 * 60)
+        self.assertEqual(attempt["status"], "deadline")
+        self.assertEqual(attempt["profile_status"], "collected")
+        self.assertEqual(attempt["profile"].read_text(), "indexed profile")
+        self.assertFalse(raw.exists())
+
+    def test_hard_deadline_keeps_unmerged_raw_local(self):
+        self.net.deadline = time.monotonic() - 1
+        self.net.work_deadline = self.net.deadline - 300
+        self.net.profdata_tool = "llvm-profdata"
+        raw = self.net.target / "profile.profraw"
+        raw.write_text("unmerged raw profile")
+
+        attempt = self.net.attempt("za-tests", 1, ["cargo", "test"], {}, 180 * 60)
+        self.net.clear_profiles()
+
+        self.assertEqual(attempt["profile_status"], "merge-error")
+        self.assertFalse(raw.exists())
+        preserved = list(self.net.target.rglob("*.profraw"))
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0].read_text(), "unmerged raw profile")
+        self.assertFalse(list(self.net.out.rglob("*.profraw")))
 
     def test_partial_merge_publishes_diagnostic_with_missing_steps(self):
         path = self.net.out / "profdata" / "za-tests.profdata"

@@ -25,6 +25,8 @@ Build mode writes build.json for the prepared report objects. Shard mode records
 settled steps in shard.json and verifies that the report objects still match the build.
 Merge mode verifies the same objects and consumes the collected step profiles in
 DIR/profdata. An incomplete merge returns failure and names missing steps in merge.json.
+With --deadline-epoch, --diagnostics-reserve-seconds stops test work early enough to
+settle available profiles and verify the final report objects before the deadline.
 
 Step names and commands are the baseline's (`helpers.steps` in
 `tests/qualification/baseline-0.16.27.json`; the upgrade outcome note's part 7d1). Each step
@@ -153,10 +155,12 @@ def write_json(path, value):
 
 
 class Net:
-    def __init__(self, out, deadline_epoch=None):
+    def __init__(self, out, deadline_epoch=None, diagnostics_reserve_seconds=0):
         self.out = out
         self.deadline = (None if deadline_epoch is None else
                          time.monotonic() + (deadline_epoch - time.time()))
+        self.work_deadline = (None if self.deadline is None else
+                              self.deadline - diagnostics_reserve_seconds)
         for sub in ("steps", "logs", "profdata"):
             (out / sub).mkdir(parents=True, exist_ok=True)
         meta = json.loads(self.run(["cargo", "metadata", "--no-deps", "--format-version", "1"],
@@ -171,8 +175,8 @@ class Net:
             raise RuntimeError("LLVM tools not found: rustup component add llvm-tools-preview")
         self.failed = []
 
-    def run(self, cmd, **kwargs):
-        return run(cmd, deadline=self.deadline, **kwargs)
+    def run(self, cmd, *, work=False, **kwargs):
+        return run(cmd, deadline=self.work_deadline if work else self.deadline, **kwargs)
 
     def env(self, extra):
         env = dict(os.environ)
@@ -314,7 +318,7 @@ class Net:
 
     def tests_crate_skips(self):
         """`--skip` arguments for every test of the tests crate, from its instrumented listing."""
-        result = self.run(LLVM_TEST + ["-p", "tests", "--", "--list"], env=self.env({}))
+        result = self.run(LLVM_TEST + ["-p", "tests", "--", "--list"], env=self.env({}), work=True)
         (self.out / "logs" / "unit-tests.listing.log").write_text(result.stdout + result.stderr)
         names = sorted(set(re.findall(r"^(\S+): test$", result.stdout, re.M)))
         if result.returncode != 0 or len(names) < 90:
@@ -326,7 +330,8 @@ class Net:
         log = self.out / "logs" / f"{step}.attempt{attempt}.log"
         start, began = now(), time.monotonic()
         with open(log, "wb") as output:
-            status = self.run(cmd, env=self.env(extra), timeout=timeout, output=output).returncode
+            status = self.run(cmd, env=self.env(extra), timeout=timeout, output=output,
+                              work=True).returncode
         passed, failed, ignored, names, notes = parse_log(log)
         shown = " ".join(cmd)
         if len(shown) > 600:
@@ -338,6 +343,7 @@ class Net:
                   " | ".join(notes + [f"wall={int(time.monotonic() - began)}s"])])
         raws = self.profraws()
         profile = None
+        unmerged = None
         profile_status = "no-data" if keep else "discarded"
         if keep and raws:
             profile = self.out / "profdata" / f"{step}.attempt{attempt}.profdata"
@@ -355,8 +361,15 @@ class Net:
                 profile.unlink(missing_ok=True)
                 profile = None
                 profile_status = "merge-error"
-        for path in raws:
-            os.remove(path)
+                if merged.returncode == "deadline":
+                    # Keep timed-out raw data outside the report search and receipt trees.
+                    unmerged = self.target / "_unmerged_profiles" / f"{step}.attempt{attempt}"
+                    unmerged.mkdir(parents=True, exist_ok=True)
+        for raw in map(Path, raws):
+            if unmerged is None:
+                raw.unlink()
+            else:
+                raw.replace(unmerged / raw.name)
         return dict(attempt=attempt, status=status, names=names, profile=profile,
                     profile_status=profile_status)
 
@@ -458,8 +471,9 @@ class Net:
         receipt = self.out / "shard.json"
         write_json(receipt, summary)
         for step in steps:
-            if self.deadline is not None and time.monotonic() >= self.deadline:
-                raise RuntimeError(f"deadline before {step}")
+            if self.work_deadline is not None and time.monotonic() >= self.work_deadline:
+                self.failed.append(f"work cutoff before {step}")
+                break
             records[step] = self.step(step)
             write_json(receipt, summary)
         self.verify_build(manifest)
@@ -484,7 +498,7 @@ class Net:
 
 def parse_log(path):
     """Passed, failed and ignored totals, the failing tests' names and up to six panics."""
-    text = open(path, errors="replace").read()
+    text = Path(path).read_text(errors="replace")
     passed = failed = ignored = 0
     for m in re.finditer(r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; "
                          r"(\d+) ignored", text, re.M):
@@ -511,7 +525,7 @@ def execute(args, out):
                for path in out.glob("*")):
             raise ValueError(f"fresh output directory required: {out}")
     manifest = json.loads(args.build_manifest.read_text()) if args.build_manifest else None
-    net = Net(out, args.deadline_epoch)
+    net = Net(out, args.deadline_epoch, args.diagnostics_reserve_seconds)
     if args.shard:
         net.shard(args.shard, manifest)
     elif args.check_build or args.merge_only:
@@ -544,7 +558,9 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--build-manifest", type=Path)
-    parser.add_argument("--deadline-epoch", type=int, help="Unix deadline for starting and running work")
+    parser.add_argument("--deadline-epoch", type=int, help="Unix deadline for completing work")
+    parser.add_argument("--diagnostics-reserve-seconds", type=int, default=0,
+                        help="time before the deadline reserved for profile settlement and checks")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--list", action="store_true", help="print the steps and exit")
     modes.add_argument("--build-only", action="store_true")
@@ -553,6 +569,9 @@ def main():
     modes.add_argument("--merge-only", action="store_true")
     parser.add_argument("steps", nargs="*", help="steps to run (default: all, then the merge)")
     args = parser.parse_args()
+    if args.diagnostics_reserve_seconds < 0 or (
+            args.diagnostics_reserve_seconds and args.deadline_epoch is None):
+        parser.error("a diagnostics reserve must be nonnegative and requires --deadline-epoch")
     needs_manifest = args.shard is not None or args.check_build or args.merge_only
     if needs_manifest != (args.build_manifest is not None):
         parser.error("--build-manifest is only allowed and required for shard, check and merge modes")
