@@ -46,6 +46,10 @@
 //!   (`Server::za_pin_state`) fails once with a store error, keyed by the
 //!   session's account (`common::auth::vault`; the drain's REFRESH answer,
 //!   iMIP spec 7's transient class, PR review ruling O-4).
+//! - `TOKEN_EXCHANGE_PAUSE`: in `za_token_issue` after the binding check
+//!   and before the batch, keyed by the account.
+//! - `TOKEN_FORGET_FAIL_ONCE`: at the head of `za_token_forget_grant`,
+//!   returns a store error before any read, keyed by the account.
 //! - `TASK_CONSUMER_PAUSE`: the task manager's consumer loop takes no task
 //!   while it is held; global (`services::task_manager::manager`).
 //! - The lease-duration override: stands in for `ZA_UID_LEASE_SECS`, which
@@ -173,6 +177,7 @@ pub static PUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static UPDATE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static DELETE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static TOKEN_EXCHANGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// Global: its `account_id` is ignored.
 pub static TASK_CONSUMER_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -191,6 +196,9 @@ pub static IMIP_SUBMIT_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 
 /// The account whose next pin-state read fails.
 pub static PIN_READ_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// The account whose next token-record removal fails before reading the record.
+pub static TOKEN_FORGET_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 
 pub static DRAIN_LOOKUP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
@@ -267,6 +275,10 @@ pub fn set_delete_commit_pause(pause: Option<Arc<Pause>>) {
     set_slot(&DELETE_COMMIT_PAUSE, pause);
 }
 
+pub fn set_token_exchange_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&TOKEN_EXCHANGE_PAUSE, pause);
+}
+
 pub fn set_task_consumer_pause(pause: Option<Arc<Pause>>) {
     set_slot(&TASK_CONSUMER_PAUSE, pause);
 }
@@ -295,6 +307,12 @@ pub fn set_imip_submit_fail_once(account_id: Option<u32>) {
 
 pub fn set_pin_read_fail_once(account_id: Option<u32>) {
     *PIN_READ_FAIL_ONCE.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_token_forget_fail_once(account_id: Option<u32>) {
+    *TOKEN_FORGET_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
 }
 
 pub fn set_lease_secs_override(secs: Option<u64>) {
@@ -472,6 +490,10 @@ pub async fn delete_commit_pause_point(account_id: u32) {
     wait(take_for(&DELETE_COMMIT_PAUSE, account_id)).await;
 }
 
+pub async fn token_exchange_pause_point(account_id: u32) {
+    wait(take_for(&TOKEN_EXCHANGE_PAUSE, account_id)).await;
+}
+
 pub async fn task_consumer_pause_point() {
     let pause = TASK_CONSUMER_PAUSE
         .lock()
@@ -555,6 +577,11 @@ pub fn take_imip_submit_fail(account_id: u32) -> bool {
 /// Whether the account's pin-state read must fail now; clears the flag.
 pub fn take_pin_read_fail(account_id: u32) -> bool {
     take_flag(&PIN_READ_FAIL_ONCE, account_id)
+}
+
+/// Whether the next token-record removal for this account must fail.
+pub fn take_token_forget_fail(account_id: u32) -> bool {
+    take_flag(&TOKEN_FORGET_FAIL_ONCE, account_id)
 }
 
 /// Whether the account's next private-key unwrap must fail; clears the flag.

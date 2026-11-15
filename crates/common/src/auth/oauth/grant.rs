@@ -387,9 +387,13 @@ impl Server {
                         account_id,
                         grant_id: stored.id,
                     });
+                    self.za_forget_deleted_grant(account_id, stored.id).await;
                     return Ok(true);
                 }
-                Ok(RegistryWriteResult::NotFound { .. }) => return Ok(false),
+                Ok(RegistryWriteResult::NotFound { .. }) => {
+                    self.za_forget_deleted_grant(account_id, stored.id).await;
+                    return Ok(false);
+                }
                 Ok(failure) => {
                     return Err(trc::AuthEvent::Error
                         .into_err()

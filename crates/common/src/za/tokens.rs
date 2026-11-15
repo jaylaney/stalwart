@@ -4,17 +4,46 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{Server, auth::vault::RawValue};
+use crate::{
+    Server,
+    auth::{
+        oauth::grant::GrantDeletion,
+        vault::{RawValue, vault_read_usable_store},
+    },
+    cache::invalidate::CacheInvalidationBuilder,
+};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
 use store::{
     Deserialize, Serialize, Store, ValueKey,
     write::{
-        Archive, ArchiveBytes, Archiver, BatchBuilder, Compression, ValueClass, assert::AssertValue,
+        Archive, ArchiveBytes, Archiver, BatchBuilder, Compression, ValueClass,
+        assert::AssertValue, now,
     },
 };
 use trc::AddContext;
 use types::{collection::Collection, field::PrincipalField};
-use vault::tokens::{TOKEN_RECORD_VERSION, ZaTokenRecord};
+use vault::{
+    keys::Secret,
+    record::za_session_binding,
+    session::SessionKeys,
+    tokens::{TOKEN_RECORD_VERSION, ZaGrantState, ZaTokenRecord},
+};
 use xxhash_rust::xxh3::xxh3_64;
+
+const TOKEN_WRITE_ATTEMPTS: usize = 3;
+
+pub struct ZaIssued {
+    pub access: Secret,
+    pub refresh: Secret,
+}
+
+pub enum ZaTokenIssue {
+    Issued(ZaIssued),
+    VaultChanged,
+}
 
 pub struct ZaTokenRead {
     pub raw: Option<Vec<u8>>,
@@ -61,7 +90,6 @@ pub(crate) async fn token_read_store(store: &Store, account_id: u32) -> trc::Res
 
 /// A write with wraps asserts both records. A removal alone needs only the
 /// token assertion and may retain existing entries under the same binding.
-#[allow(dead_code)] // Task 15 supplies the first production caller.
 pub(crate) async fn token_write_store(
     store: &Store,
     account_id: u32,
@@ -125,6 +153,195 @@ fn retained_entries<T: PartialEq>(entries: &[T], previous: &[T]) -> bool {
 impl Server {
     pub async fn za_token_read(&self, account_id: u32) -> trc::Result<ZaTokenRead> {
         token_read_store(self.store(), account_id).await
+    }
+
+    /// Spec 4.4: issue the first token entries under the binding of the MK.
+    pub async fn za_token_issue(
+        &self,
+        account_id: u32,
+        grant_id: u64,
+        mk: &Secret,
+        binding: u64,
+        access_expires: u64,
+        refresh_expires: u64,
+    ) -> trc::Result<ZaTokenIssue> {
+        let store = self.store();
+        for remaining in (0..TOKEN_WRITE_ATTEMPTS).rev() {
+            let Some(vault) = vault_read_usable_store(store, account_id).await? else {
+                return Ok(ZaTokenIssue::VaultChanged);
+            };
+            if za_session_binding(&vault.record) != binding {
+                return Ok(ZaTokenIssue::VaultChanged);
+            }
+
+            let read = token_read_store(store, account_id).await?;
+            let mut record = read
+                .record
+                .as_ref()
+                .filter(|record| record.binding == binding)
+                .cloned()
+                .unwrap_or_else(|| ZaTokenRecord::new(binding));
+            let grants = self
+                .token_grant_states(account_id, &record, Some(grant_id))
+                .await?;
+            record.reconcile(account_id, now(), &grants);
+            let evicted = record.eviction(grant_id, &grants);
+            if let Some(evicted) = evicted {
+                record.remove_grant(evicted);
+            }
+
+            let refresh = Secret::random();
+            record.put_refresh(account_id, grant_id, mk, None, 0, &refresh, refresh_expires);
+            let access = record.put_access(account_id, grant_id, mk, access_expires);
+
+            #[cfg(feature = "test_mode")]
+            super::test_hooks::token_exchange_pause_point(account_id).await;
+            match token_write_store(store, account_id, Some(vault.cas), &read, Some(&record)).await
+            {
+                Err(err) if remaining > 0 && err.is_assertion_failure() => continue,
+                result => result?,
+            }
+
+            if let Some(evicted) = evicted {
+                self.za_delete_evicted_grant(account_id, evicted).await;
+            }
+            return Ok(ZaTokenIssue::Issued(ZaIssued { access, refresh }));
+        }
+        unreachable!("the last write attempt returns");
+    }
+
+    /// Spec 4.6: attach the vault revision of this read to the opened MK.
+    pub async fn za_token_open_access(
+        &self,
+        account_id: u32,
+        grant_id: u64,
+        secret: &Secret,
+    ) -> trc::Result<Option<Arc<SessionKeys>>> {
+        let store = self.store();
+        let Some(record) = token_read_store(store, account_id).await?.record else {
+            return Ok(None);
+        };
+        let Some(mk) = record.open_access(account_id, grant_id, secret, now()) else {
+            return Ok(None);
+        };
+        let Some(vault) = vault_read_usable_store(store, account_id).await? else {
+            return Ok(None);
+        };
+        if record.binding != za_session_binding(&vault.record) {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(SessionKeys::new(
+            account_id,
+            vault.record.revision,
+            mk,
+        ))))
+    }
+
+    /// Spec 4.7: remove a grant's entries with only the token assertion.
+    pub async fn za_token_forget_grant(&self, account_id: u32, grant_id: u64) -> trc::Result<()> {
+        #[cfg(feature = "test_mode")]
+        if super::test_hooks::take_token_forget_fail(account_id) {
+            return Err(trc::StoreEvent::UnexpectedError.into_err());
+        }
+
+        let store = self.store();
+        for remaining in (0..TOKEN_WRITE_ATTEMPTS).rev() {
+            let read = token_read_store(store, account_id).await?;
+            let Some(mut record) = read.record.clone() else {
+                return Ok(());
+            };
+            if !record.remove_grant(grant_id) {
+                return Ok(());
+            }
+            let grants = self.token_grant_states(account_id, &record, None).await?;
+            record.reconcile(account_id, now(), &grants);
+            match token_write_store(store, account_id, None, &read, Some(&record)).await {
+                Err(err) if remaining > 0 && err.is_assertion_failure() => continue,
+                result => return result,
+            }
+        }
+        unreachable!("the last write attempt returns");
+    }
+
+    /// Grant deletion classifies the account before touching the token record.
+    pub(crate) async fn za_forget_deleted_grant(&self, account_id: u32, grant_id: u64) {
+        let result = match self.za_is_key_account(account_id).await {
+            Ok(true) => self.za_token_forget_grant(account_id, grant_id).await,
+            Ok(false) => return,
+            Err(err) => Err(err),
+        };
+        if result.is_err() {
+            trc::error!(
+                trc::StoreEvent::UnexpectedError
+                    .into_err()
+                    .account_id(account_id)
+                    .id(grant_id)
+                    .details("zero-access: token entries not removed with their grant")
+            );
+        }
+    }
+
+    async fn token_grant_states(
+        &self,
+        account_id: u32,
+        record: &ZaTokenRecord,
+        required_grant: Option<u64>,
+    ) -> trc::Result<HashMap<u64, Option<ZaGrantState>>> {
+        let mut states =
+            HashMap::with_capacity(record.grants.len() + usize::from(required_grant.is_some()));
+        for grant_id in required_grant
+            .into_iter()
+            .chain(record.grants.iter().map(|grant| grant.grant_id))
+        {
+            let Entry::Vacant(entry) = states.entry(grant_id) else {
+                continue;
+            };
+            let state = self
+                .oauth_grant(grant_id)
+                .await?
+                .map(|stored| ZaGrantState {
+                    account_id: stored.account_id(),
+                    generation: stored.grant.generation,
+                    last_used_at: stored.grant.last_used_at.timestamp(),
+                });
+            if required_grant == Some(grant_id)
+                && !state
+                    .as_ref()
+                    .is_some_and(|state| state.account_id == account_id)
+            {
+                return Err(trc::StoreEvent::UnexpectedError
+                    .into_err()
+                    .account_id(account_id)
+                    .id(grant_id)
+                    .details("zero-access: OAuth grant not found"));
+            }
+            entry.insert(state);
+        }
+        Ok(states)
+    }
+
+    async fn za_delete_evicted_grant(&self, account_id: u32, grant_id: u64) {
+        let result = async {
+            if let Some(stored) = self.oauth_grant(grant_id).await?
+                && stored.account_id() == account_id
+            {
+                let mut invalidator = CacheInvalidationBuilder::default();
+                self.delete_oauth_grant(stored, GrantDeletion::Unconditional, &mut invalidator)
+                    .await?;
+                self.invalidate_caches(invalidator).await?;
+            }
+            Ok::<(), trc::Error>(())
+        }
+        .await;
+        if result.is_err() {
+            trc::error!(
+                trc::StoreEvent::UnexpectedError
+                    .into_err()
+                    .account_id(account_id)
+                    .id(grant_id)
+                    .details("zero-access: evicted grant not deleted")
+            );
+        }
     }
 }
 
