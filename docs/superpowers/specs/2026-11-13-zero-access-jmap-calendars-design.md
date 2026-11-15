@@ -590,6 +590,15 @@ The fork follows that state machine without changing it:
    presented generation against the grant's refresh entries. The grant's
    rotation and the record's write are separate operations, so the
    record can have moved on since upstream accepted this request.
+   In every attempt, after reading a usable record and its named grants
+   from the registry, but before reconciling or classifying that record,
+   a stored generation of the presenting grant above the presented
+   generation answers `Superseded`: `invalid_grant`, no entry written
+   and no grant deleted. This request's rotation left the stored
+   generation at the presented generation, and it never falls; a higher
+   value therefore belongs to a later rotation, even when this attempt
+   read an older record snapshot. A record that does not name the grant
+   still answers `Lost`. Otherwise reconcile and classify as follows.
    - **Its entry is there and opens** with the presented secret. The
      fork has MK and goes on.
    - **Its entry is gone and the record holds a higher generation of the

@@ -775,8 +775,8 @@ Catchers for Task 42: "the hand-off is not deleted on redemption" is `handoff_go
 - [ ] **Step 4: implement `za_token_refresh`.** Under `test_mode` it starts with `token_refresh_read_pause_point(account_id)`. Each of at most three attempts runs these steps in order.
   1. Read the vault record (`vault_read_usable_store`). None: `VaultChanged`. Its binding differs from the first attempt's: `VaultChanged`.
   2. Read field 153. No usable record: `Lost`. `record.binding` differs from the vault record's binding: `VaultChanged`.
-  3. Read `oauth_grant` for every grant the record names; `reconcile(account_id, now(), &grants)`.
-  4. `classify_refresh(account_id, grant_id, presented, secret, now())`. `Superseded` and `Lost` are returned as they are; nothing is written.
+  3. Read `oauth_grant` for every grant the record names. Before reconciling or classifying, if the presenting grant's stored generation is above `presented`, return `Superseded` without writing or deleting anything. This request's rotation left its stored generation at `presented`, and it never falls; the record snapshot may predate a later rotation. A record that does not name the grant still answers `Lost`.
+  4. `reconcile(account_id, now(), &grants)`, then `classify_refresh(account_id, grant_id, presented, secret, now())`. `Superseded` and `Lost` are returned as they are; nothing is written.
   5. With `Opened { mk, next: sealed }`: the next secret is `sealed` when it is `Some`, else `Secret::random()`. `put_refresh(account_id, grant_id, &mk, Some((presented, secret)), next, &next_secret, refresh_expires)`, then `put_access(account_id, grant_id, &mk, access_expires)`.
   6. Under `test_mode`: `token_refresh_write_pause_point(account_id)`; then, when `take_token_refresh_write_fail(account_id)`, return a `StoreEvent::UnexpectedError` with the hook's details of I §9.
   7. `token_write_store(store, account_id, Some(vault.cas), &read, Some(&record))`. Success returns `Issued` with the access secret and the next secret. An assertion failure starts the next attempt; after the third it is returned. Any other error is returned.
@@ -800,7 +800,13 @@ Catchers for Task 42: "the hand-off is not deleted on redemption" is `handoff_go
 
 - [ ] **Step 9: commit.** `Release 6: refresh of keyed grants`
 
-Catchers for Task 42: "a superseded refresh generation deletes the grant" is `retry_of_g_while_g1_completes`, run 1; "a lost record race puts back a pruned entry" is its run 2; "a token-record write omits the vault assertion", in the refresh, is `refresh_crossed_by_credential_change`, run 2.
+Task 18 fix-round acceptance: `retry_reading_a_stale_record_keeps_the_grant`
+plants an older stored record after the grant advances and verifies that
+the superseded retry leaves the grant and newer token usable. This is a
+stored-snapshot regression, not a two-request race; its recorded RED/GREEN
+evidence is in the execution ledger.
+
+Catchers for Task 42: "a superseded refresh generation deletes the grant" is `retry_of_g_while_g1_completes`, run 1; "a lost record race puts back a pruned entry" is its run 2. Removing the pre-reconcile superseded-generation check is caught by `retry_reading_a_stale_record_keeps_the_grant`. `refresh_crossed_by_credential_change`, run 2, does not independently catch an omitted vault assertion: the credential write also clears field 153, so the record assertion alone rejects the write. J9's separately named unit/exchange catchers remain its acceptance evidence.
 
 ---
 
