@@ -43,6 +43,19 @@ CREDENTIAL_SHAPE = re.compile(
     rb"|(?:password|secret|token)[A-Za-z_]*[\"']?[=:] *[\"']?[^\"' ,}\s]+",
     re.IGNORECASE,
 )
+SOURCE_SUFFIXES = {".rs", ".h", ".c", ".cc", ".cpp", ".hpp"}
+SOURCE_BEARER = re.compile(
+    rb"\bauthorization[ \t\"']*[:=][ \t\"']*Bearer[ \t]+[A-Za-z0-9._~+/=-]+",
+    re.IGNORECASE,
+)
+QUOTED_ASSIGNMENT = re.compile(
+    rb"\b([A-Za-z_][A-Za-z0-9_]*)[\"']?[ \t]*"
+    rb"(?:=|:(?:[^\r\n\";={}]{0,160}=)?)[ \t]*(?:[bcr]{1,2}#*)?[\"'][^\r\n\"']"
+)
+SENSITIVE_IDENTIFIER = re.compile(
+    rb"(?i:(?:^|_)(?:password|secret|token)(?:$|_))"
+    rb"|(?<=[a-z0-9])(?:Password|Secret|Token)(?=$|[A-Z_])"
+)
 
 
 def git(repo, *args):
@@ -144,13 +157,23 @@ def allowed(parts):
 
 
 def is_text_state(path):
-    return path.name in {"output", "root-output"} or path.suffix in {
-        ".json", ".toml", ".rs", ".d", ".txt", ".h", ".c", ".cc", ".cpp", ".hpp", ".cmake",
-    }
+    return (
+        path.name in {"output", "root-output"}
+        or path.suffix in SOURCE_SUFFIXES
+        or path.suffix in {".json", ".toml", ".d", ".txt", ".cmake"}
+    )
 
 
-def has_credential_shape(line):
-    if CREDENTIAL_SHAPE.search(line):
+def has_credential_shape(line, source_code=False):
+    if source_code:
+        # Generated source commonly contains token type declarations and integer
+        # constants. Look for sensitive names assigned nonempty string literals.
+        if SOURCE_BEARER.search(line) or any(
+            SENSITIVE_IDENTIFIER.search(assignment[1])
+            for assignment in QUOTED_ASSIGNMENT.finditer(line)
+        ):
+            return True
+    elif CREDENTIAL_SHAPE.search(line):
         return True
     for candidate in BASIC_TOKEN.finditer(line):
         token = candidate[1]
@@ -165,11 +188,12 @@ def has_credential_shape(line):
     return False
 
 
-def check_credentials(path, name, credential_values):
+def credential_match(path, credential_values):
     if is_text_state(path):
         with path.open("rb") as source:
-            if any(has_credential_shape(line) for line in source):
-                raise ValueError(f"credential pattern in {name}")
+            source_code = path.suffix in SOURCE_SUFFIXES
+            if any(has_credential_shape(line, source_code) for line in source):
+                return "credential pattern"
     if credential_values:
         overlap = max(map(len, credential_values)) - 1
         with path.open("rb") as source:
@@ -177,8 +201,29 @@ def check_credentials(path, name, credential_values):
             for chunk in iter(lambda: source.read(COPY_SIZE), b""):
                 data = tail + chunk
                 if any(value in data for value in credential_values):
-                    raise ValueError(f"literal credential in {name}")
+                    return "literal credential"
                 tail = data[-overlap:] if overlap else b""
+    return None
+
+
+def check_snapshot_credentials(files, credential_values):
+    limit = 20
+    count = 0
+    findings = []
+    for path, name in files:
+        match = credential_match(path, credential_values)
+        if match is None:
+            continue
+        count += 1
+        if len(findings) < limit:
+            label = os.fsencode(name)
+            for value in credential_values:
+                label = label.replace(value, b"[redacted]")
+            findings.append(f"{match} in {os.fsdecode(label)}")
+    if count > limit:
+        findings.append(f"{count - limit} additional flagged files omitted")
+    if findings:
+        raise ValueError("\n".join(findings))
 
 
 def check_cargo_state(tree):
@@ -228,17 +273,25 @@ def link_destination(member, entry):
     return relative_path(posixpath.normpath(str(entry.parent / target)))
 
 
-def add_target(archive, target, path, credentials):
+def build_members(target, path):
     relative = relative_path(path.relative_to(target).as_posix())
     if not allowed(relative.parts):
         return
-    info = archive.gettarinfo(str(path), relative.as_posix())
-    if info is None or not (info.isfile() or info.isdir() or info.issym() or info.islnk()):
-        raise ValueError(f"unsupported build artifact at {relative}")
-    if info.isdir() and len(relative.parts) == 3 and relative.parts[2] not in {
+    mode = path.lstat().st_mode
+    if stat.S_ISDIR(mode) and len(relative.parts) == 3 and relative.parts[2] not in {
         ".fingerprint", "build", "deps", "examples",
     }:
         return
+    yield path, relative, stat.S_ISREG(mode)
+    if stat.S_ISDIR(mode):
+        for child in sorted(path.iterdir()):
+            yield from build_members(target, child)
+
+
+def add_target(archive, path, relative):
+    info = archive.gettarinfo(str(path), relative.as_posix())
+    if info is None or not (info.isfile() or info.isdir() or info.issym() or info.islnk()):
+        raise ValueError(f"unsupported build artifact at {relative}")
     if info.issym() or info.islnk():
         dest = link_destination(info, relative)
         if not allowed(dest.parts):
@@ -248,14 +301,10 @@ def add_target(archive, target, path, credentials):
     info.uname = info.gname = ""
     info.mode &= 0o777
     if info.isfile():
-        check_credentials(path, relative, credentials)
         with path.open("rb") as source:
             archive.addfile(info, source)
     else:
         archive.addfile(info)
-    if info.isdir():
-        for child in sorted(path.iterdir()):
-            add_target(archive, target, child, credentials)
 
 
 def inspect_manifest(manifest):
@@ -275,10 +324,13 @@ def require_external_output(path, target, label):
 def pack_build(manifest, target, destination, credentials):
     require_external_output(destination, target, "snapshot archive")
     inspect_manifest(manifest)
-    check_credentials(manifest, BUILD_MANIFEST, credentials)
     check_cargo_state(target)
     if destination.exists() or destination.is_symlink():
         raise ValueError("snapshot archive already exists")
+    members = list(build_members(target, target / COV_TARGET))
+    files = [(manifest, BUILD_MANIFEST)]
+    files.extend((path, relative.as_posix()) for path, relative, regular in members if regular)
+    check_snapshot_credentials(files, credentials)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=destination.parent) as scratch:
         pending = Path(scratch) / "snapshot.tar.zst"
@@ -292,7 +344,8 @@ def pack_build(manifest, target, destination, credentials):
                         bufsize=COPY_SIZE, copybufsize=COPY_SIZE,
                     ) as archive:
                         archive.add(str(manifest), arcname=BUILD_MANIFEST, recursive=False)
-                        add_target(archive, target, target / COV_TARGET, credentials)
+                        for path, relative, _regular in members:
+                            add_target(archive, path, relative)
                 except BaseException:
                     encoder.kill()
                     raise
