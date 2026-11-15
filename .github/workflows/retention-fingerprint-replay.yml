@@ -1,0 +1,119 @@
+name: Diagnose restored Cargo fingerprint
+
+on:
+  push:
+    branches: [codex/retention-transport-replay]
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  ORIGINAL_SHA: 4d5fee1930338b494b0c148aa0252bcf4ab36eb1
+  ORIGINAL_RUN_ID: '43752266663'
+  ORIGINAL_RUN_ATTEMPT: '1'
+  ORIGINAL_ARTIFACT_ID: '14177965348'
+  RUSTUP_TOOLCHAIN: '1.99.1'
+  RETENTION_TARGET: x86_64-unknown-linux-gnu
+  STORE: RocksDb
+  RUST_MIN_STACK: '16777216'
+  CARGO_TARGET_DIR: /mnt/target
+  CARGO_HOME: /mnt/retention-ci/.cargo
+  CARGO_TERM_COLOR: never
+  GIT_OPTIONAL_LOCKS: '0'
+  GATES: /mnt/gates
+  TMPDIR: /mnt/gates/tmp
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/heads/codex/retention-qualification
+          persist-credentials: false
+      - name: Prepare the original checkout and paths
+        run: |
+          test "$(git rev-parse HEAD)" = "$ORIGINAL_SHA"
+          sudo mkdir -p "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+          sudo chown "$(id -u):$(id -g)" "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+          printf 'RETENTION_DEADLINE_EPOCH=%s\n' \
+            "$(( $(date +%s) + 38 * 60 ))" >> "$GITHUB_ENV"
+          python3 -I scripts/tests/retention_artifacts.py normalize-checkout
+          bash scripts/tests/retention_ci_setup.sh install-tools instrumented
+      - name: Read the original cold build
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ env.ORIGINAL_ARTIFACT_ID }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.ORIGINAL_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: ${{ env.GATES }}/download
+          digest-mismatch: error
+      - name: Restore and materialize the original dependencies
+        run: |
+          python3 -I scripts/tests/retention_artifacts.py unpack-build \
+            --archive "$GATES/download/snapshot.tar.zst" --target "$CARGO_TARGET_DIR" \
+            --manifest-out "$GATES/build.json"
+          bash scripts/tests/retention_ci_setup.sh fetch
+      - name: Reproduce the short shard prefix with watched-path and Cargo diagnostics
+        run: |
+          replay() {
+            env GITHUB_SHA="$ORIGINAL_SHA" GITHUB_RUN_ID="$ORIGINAL_RUN_ID" \
+              GITHUB_RUN_ATTEMPT="$ORIGINAL_RUN_ATTEMPT" python3 -I scripts/tests/coverage_net.py "$@"
+          }
+          watch() {
+            python3 -I - > "$1" <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import subprocess
+
+          def git(*args):
+              return subprocess.check_output(["git", *args])
+
+          root = Path.cwd()
+          paths = {root / os.fsdecode(path) for path in git("ls-files", "-z").split(b"\0") if path}
+          for name in ("HEAD", "index", "packed-refs", "refs"):
+              watcher = Path(os.fsdecode(git("rev-parse", "--path-format=absolute",
+                                             "--git-path", name).rstrip(b"\n")))
+              if watcher.exists():
+                  paths.add(watcher)
+                  if name == "refs":
+                      paths.update(watcher.rglob("*"))
+          for path in sorted(paths):
+              try:
+                  st = path.lstat()
+              except FileNotFoundError:
+                  print(path.relative_to(root), "missing")
+                  continue
+              digest = "-"
+              if path.is_file() and not path.is_symlink():
+                  with path.open("rb") as source:
+                      digest = hashlib.file_digest(source, "sha256").hexdigest()
+              print(path.relative_to(root), st.st_size, st.st_mtime_ns, digest)
+          PY
+          }
+          replay --check-build --out "$GATES/check-before" --build-manifest "$GATES/build.json"
+          watch "$GATES/files-before.txt"
+          CARGO_LOG=cargo::core::compiler::fingerprint=info \
+            replay --out "$GATES/leak" leak-unit-test
+          watch "$GATES/files-after-leak.txt"
+          CARGO_LOG=cargo::core::compiler::fingerprint=info replay --out "$GATES/unit" unit-tests
+          watch "$GATES/files-after-unit.txt"
+          diff -u "$GATES/files-before.txt" "$GATES/files-after-leak.txt" > "$GATES/leak.diff" || true
+          diff -u "$GATES/files-after-leak.txt" "$GATES/files-after-unit.txt" > "$GATES/unit.diff" || true
+          head -160 "$GATES/leak.diff" "$GATES/unit.diff"
+          git status --short --untracked-files=no
+          env CARGO_LOG=cargo::core::compiler::fingerprint=info \
+            cargo llvm-cov --no-report test -vv -p tests -- --list > "$GATES/after-cargo.log" 2>&1
+          grep -E 'Dirty |Compiling |fingerprint error|stale:' "$GATES/after-cargo.log" \
+            | cut -c1-500 | head -100 || true
+          for log in "$GATES"/unit/logs/unit-tests{.listing,.attempt1}.log; do
+            grep -E 'Dirty |Compiling |fingerprint error|stale:' "$log" | cut -c1-500 | head -30 || true
+          done
+          replay --check-build --out "$GATES/check-after" --build-manifest "$GATES/build.json"
