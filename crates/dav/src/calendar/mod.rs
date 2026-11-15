@@ -557,29 +557,6 @@ pub(crate) async fn za_write_contexts(
     Ok(context::za_write_contexts(server, token, owner_id, event, calendar_id, required).await?)
 }
 
-/// Called once after an ambiguous assertion loss. Keep the original event
-/// assertion and already-sealed payload; only its key envelope can change.
-pub(crate) async fn za_refresh_event(
-    server: &Server,
-    token: &common::auth::AccessToken,
-    owner_id: u32,
-    calendar_id: u32,
-    required: types::acl::Acl,
-    before: &[groupware::calendar::sharing::resolve::ZaCalendarContext],
-    sealed: &mut groupware::calendar::seal::ZaEvent,
-) -> crate::Result<Option<Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>>> {
-    Ok(context::za_refresh_event(
-        server,
-        token,
-        owner_id,
-        calendar_id,
-        required,
-        before,
-        sealed,
-    )
-    .await?)
-}
-
 /// Event writers keep the authenticated writer's keys. The fresh calendar
 /// resolver below decides whether those keys authorize this owner's calendar.
 pub(crate) async fn za_writer_keys(

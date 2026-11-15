@@ -11,6 +11,7 @@ pub mod error;
 pub mod placement;
 pub mod schedule;
 pub mod uid;
+pub mod update;
 
 use calcard::icalendar::ICalendar;
 
