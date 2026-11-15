@@ -18,7 +18,7 @@ env:
   STORE: RocksDb
   RUST_MIN_STACK: '16777216'
   CARGO_TARGET_DIR: /mnt/target
-  CARGO_HOME: /mnt/retention-probe/cargo
+  CARGO_HOME: /mnt/retention-probe/.cargo
   CARGO_TERM_COLOR: never
   GIT_OPTIONAL_LOCKS: '0'
   GATES: /mnt/retention-probe
@@ -137,6 +137,25 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
+      - name: Stage sanitized build failure diagnostics
+        if: ${{ failure() }}
+        run: |
+          mkdir -p "$GATES/diagnostics"
+          for file in "$GATES"/build/logs/*.log; do
+            [[ -f "$file" ]] || continue
+            sed -E \
+              -e 's~(Basic|Bearer) [A-Za-z0-9._+/=-]+~\1 [REDACTED]~g' \
+              -e 's/((password|secret|token)[A-Za-z_]*["]?[=:] *["]?)[^" ,}]+/\1[REDACTED]/Ig' \
+              "$file" > "$GATES/diagnostics/$(basename "$file")"
+          done
+      - name: Upload sanitized build failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: retention-probe-build-failure-${{ github.run_attempt }}
+          path: ${{ env.GATES }}/diagnostics/
+          if-no-files-found: ignore
+          retention-days: 3
 
   coverage:
     runs-on: ubuntu-24.04
@@ -149,8 +168,6 @@ jobs:
       - *checkout
       - *tools
       - *normalize
-      - *fetch
-      - *materialize
       - &check_snapshot_id
         name: Require the selected build artifact ID
         env:
@@ -175,6 +192,11 @@ jobs:
           df -h "$CARGO_TARGET_DIR"
           test -z "$(find "$CARGO_TARGET_DIR" -type f \
             \( -name '*.profraw' -o -name '*.profdata' \) -print -quit)"
+      - *fetch
+      - *materialize
+      - &verify_target
+        name: Verify restored coverage objects and toolchain
+        run: |
           time python3 -I scripts/tests/coverage_net.py --check-build \
             --build-manifest "$GATES/build.json"
       - name: Prove both Cargo build shapes are fresh
@@ -227,11 +249,12 @@ jobs:
       - *checkout
       - *tools
       - *normalize
-      - *fetch
-      - *materialize
       - *check_snapshot_id
       - *download
       - *unpack
+      - *fetch
+      - *materialize
+      - *verify_target
       - name: Require the selected leak artifact ID
         env:
           EVIDENCE_ID: ${{ needs.coverage.outputs.evidence-id }}
