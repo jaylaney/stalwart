@@ -6,8 +6,10 @@
 
 use super::{ErrorType, OAuthResponse};
 use common::{
-    Server, auth::oauth::grant::GrantDeletion, cache::invalidate::CacheInvalidationBuilder,
-    za::tokens::ZaTokenIssue,
+    Server,
+    auth::oauth::{grant::GrantDeletion, token::TokenGrant},
+    cache::invalidate::CacheInvalidationBuilder,
+    za::tokens::{ZaTokenIssue, ZaTokenRefresh},
 };
 use store::write::now;
 use trc::AddContext;
@@ -90,6 +92,59 @@ pub(crate) async fn za_issue_keyed(
         Ok(ZaTokenIssue::VaultChanged) => Ok(Err(ErrorType::InvalidGrant)),
         Err(err) => Err(err),
     };
+    delete_keyed_grant(server, account_id, grant_id).await;
+    failure
+}
+
+/// Spec 4.5: the refresh after upstream's rotation issued `next`. A keyed
+/// grant never becomes a keyless one: when its keys are lost it is deleted.
+pub(crate) async fn za_refresh_keyed(
+    server: &Server,
+    account_id: u32,
+    presented: TokenGrant,
+    next: TokenGrant,
+    secret: &Secret,
+    response: &mut OAuthResponse,
+) -> trc::Result<Result<(), ErrorType>> {
+    let now = now();
+    match server
+        .za_token_refresh(
+            account_id,
+            presented.id,
+            presented.generation,
+            secret,
+            next.generation,
+            now + server.core.oauth.oauth_expiry_token,
+            now + server.core.oauth.oauth_expiry_refresh_token,
+        )
+        .await?
+    {
+        ZaTokenRefresh::Issued(issued) => {
+            append_secret(&mut response.access_token, &issued.access);
+            if let Some(refresh) = &mut response.refresh_token {
+                append_secret(refresh, &issued.refresh);
+            }
+            Ok(Ok(()))
+        }
+        ZaTokenRefresh::Lost => {
+            trc::event!(
+                Auth(trc::AuthEvent::Failed),
+                AccountId = account_id,
+                Id = presented.id,
+                Reason = "zero-access: token keys lost, OAuth grant deleted",
+            );
+            delete_keyed_grant(server, account_id, presented.id).await;
+            Ok(Err(ErrorType::InvalidGrant))
+        }
+        // A newer refresh superseded this one, or a credential changed.
+        ZaTokenRefresh::Superseded | ZaTokenRefresh::VaultChanged => {
+            Ok(Err(ErrorType::InvalidGrant))
+        }
+    }
+}
+
+/// Deletes a keyed grant that holds no usable entry; a failure is traced.
+async fn delete_keyed_grant(server: &Server, account_id: u32, grant_id: u64) {
     if delete_unissued_grant(server, account_id, grant_id)
         .await
         .is_err()
@@ -102,7 +157,6 @@ pub(crate) async fn za_issue_keyed(
                 .details("zero-access: unissued OAuth grant not deleted")
         );
     }
-    failure
 }
 
 async fn delete_unissued_grant(server: &Server, account_id: u32, grant_id: u64) -> trc::Result<()> {

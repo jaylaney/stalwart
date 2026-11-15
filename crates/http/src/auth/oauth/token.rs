@@ -10,7 +10,7 @@ use super::{
     authorize::issuer,
     registration::ClientRegistrationHandler,
     request_origin,
-    za_token::{ZaGrantKeys, za_code_handoff, za_issue_keyed},
+    za_token::{ZaGrantKeys, za_code_handoff, za_issue_keyed, za_refresh_keyed},
 };
 use crate::{api::BASIC_CHALLENGE, auth::authenticate::HttpHeaders};
 use common::{
@@ -42,7 +42,7 @@ use store::{
     write::{Archive, ArchiveBytes, now},
 };
 use trc::AddContext;
-use vault::tokens::{CODE_LEN, split_code};
+use vault::tokens::{CODE_LEN, ZaSuffix, split_code};
 
 pub trait TokenHandler: Sync + Send {
     fn handle_token_request(
@@ -501,27 +501,29 @@ impl TokenHandler for Server {
             return Ok(TokenResponse::error(ErrorType::InvalidGrant));
         }
 
+        let mut za_secret = None;
         if self
             .account(token_info.account_id)
             .await
             .caused_by(trc::location!())?
             .is_key_account()
         {
+            let suffix = za_split_bearer(refresh_token).1;
             match self
-                .za_token_refresh_precheck(
-                    token_info.account_id,
-                    presented.id,
-                    &za_split_bearer(refresh_token).1,
-                )
+                .za_token_refresh_precheck(token_info.account_id, presented.id, &suffix)
                 .await?
             {
                 ZaRefreshPrecheck::Keyless => {}
                 ZaRefreshPrecheck::Refused => {
                     return Ok(TokenResponse::error(ErrorType::InvalidGrant));
                 }
-                // Task 18 replaces this arm with the keyed refresh.
+                // Spec 4.5: the secret opens the presented entry after the
+                // rotation. Without one the grant must not rotate keyless.
                 ZaRefreshPrecheck::Keyed => {
-                    return Ok(TokenResponse::error(ErrorType::InvalidGrant));
+                    let ZaSuffix::Secret(secret) = suffix else {
+                        return Ok(TokenResponse::error(ErrorType::InvalidGrant));
+                    };
+                    za_secret = Some(secret);
                 }
             }
         }
@@ -535,7 +537,7 @@ impl TokenHandler for Server {
                     .account(token_info.account_id)
                     .await
                     .caused_by(trc::location!())?;
-                self.grant_response(GrantResponse {
+                let mut response = self.grant_response(GrantResponse {
                     account_id: token_info.account_id,
                     account_name: account.name(),
                     credential_version: token_info.credential_version,
@@ -543,8 +545,21 @@ impl TokenHandler for Server {
                     rotated_at,
                     scope: granted_scope,
                     id_token: None,
-                })
-                .map(TokenResponse::Granted)
+                })?;
+                if let Some(secret) = &za_secret
+                    && let Err(error) = za_refresh_keyed(
+                        self,
+                        token_info.account_id,
+                        presented,
+                        next,
+                        secret,
+                        &mut response,
+                    )
+                    .await?
+                {
+                    return Ok(TokenResponse::error(error));
+                }
+                Ok(TokenResponse::Granted(response))
             }
             GrantRotation::Revoked | GrantRotation::Rejected => {
                 Ok(TokenResponse::error(ErrorType::InvalidGrant))

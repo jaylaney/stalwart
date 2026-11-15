@@ -19,12 +19,13 @@ use crate::utils::{
     webdav::DummyWebDavClient,
     za::{
         CALENDAR_JMAP_USING, Conn, HookParked, Parked, SERVER_URL, VaultReply, ZA_SIGNIN_SCOPE,
-        ZaClientKind, ZaOAuthClient, assert_nothing_cached, code, handoff_exists, oauth_expiry,
-        park_login, raw_token_record, set_raw_token_record, substitute_public_key, token_record,
-        totp_url, trigger_drain, vault_revision, wait_for_index_queue, wrap_mark, writer_key,
-        za_authorize, za_bearer_dav, za_bearer_jmap, za_bearer_session, za_confirm_consent,
-        za_drop_oauth_client, za_exchange, za_grant_token, za_oauth_client, za_post, za_refresh,
-        za_revoke_grant, za_revoke_token, za_sign_in, za_split_token, za_tamper_secret, za_unlock,
+        ZaClientKind, ZaOAuthClient, ZaTokens, assert_nothing_cached, code, handoff_exists,
+        oauth_expiry, park_login, raw_token_record, set_raw_token_record, substitute_public_key,
+        token_record, totp_url, trigger_drain, vault_revision, wait_for_index_queue, wrap_mark,
+        writer_key, za_authorize, za_bearer_dav, za_bearer_jmap, za_bearer_session,
+        za_confirm_consent, za_drop_oauth_client, za_exchange, za_grant_token, za_oauth_client,
+        za_post, za_refresh, za_revoke_grant, za_revoke_token, za_sign_in, za_split_token,
+        za_tamper_secret, za_unlock,
     },
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -36,7 +37,7 @@ use common::{
     },
     za::{
         ZA_MAIL_KEYLESS, ZA_MAIL_LOGIN_REFUSED, test_hooks,
-        tokens::{ZaIssued, ZaTokenIssue},
+        tokens::{ZaIssued, ZaTokenIssue, za_split_bearer},
     },
 };
 use http::auth::{
@@ -64,10 +65,12 @@ use store::{
 use trc::{AuthEvent, EventType, HttpEvent, Key};
 use types::{collection::Collection, field::PrincipalField, id::Id};
 use vault::{
-    keys::{Secret, derive_token_tag},
+    keys::{Secret, derive_token_next_key, derive_token_tag, token_next_aad, unwrap_key},
     record::za_session_binding,
     session::SessionKeys,
-    tokens::{CODE_LEN, TOKEN_RECORD_VERSION, ZaRefreshClass, append_code_secret, append_secret},
+    tokens::{
+        CODE_LEN, TOKEN_RECORD_VERSION, ZaRefreshClass, ZaSuffix, append_code_secret, append_secret,
+    },
 };
 
 const OWNER: &str = "token-owner@example.com";
@@ -140,6 +143,11 @@ pub async fn test(test: &mut TestServer) {
     handoff_gone_after_redemption_and_expiry(test, &app).await;
     device_flow_stays_keyless(test, &registered).await;
     refresh_without_secret_of_keyed_grant_refused(test, &app, &registered).await;
+    refresh_rotates_and_reads(test, &app).await;
+    retried_refresh_returns_the_same_token(test, &app).await;
+    replayed_refresh_revokes(test, &app).await;
+    superseded_token_opens_nothing(test, &app).await;
+    refresh_with_missing_entry_deletes_grant(test, &app).await;
     malformed_code_lookups_miss_the_handoff(test, &app).await;
     classification_failure_removes_the_handoff(test, &admin, &app).await;
 
@@ -153,6 +161,12 @@ pub async fn test(test: &mut TestServer) {
     exchange_crossed_by_recovery(test, &app).await;
     exchange_crossed_by_other_vault_write(test, &app).await;
     remove_sign_in_canaries(test, &race).await;
+
+    refresh_crossed_by_credential_change(test, &app).await;
+    refresh_crossed_by_other_vault_write(test, &app).await;
+    retry_of_g_while_g1_completes(test, &app).await;
+    failed_write_then_client_retry(test, &app).await;
+    interrupted_refresh_cleared_by_another_grants_write(test, &app).await;
 
     thirty_third_sign_in_ends_the_oldest(test, &app).await;
     granted_answer_is_untraced(&app, test).await;
@@ -1351,12 +1365,8 @@ async fn refresh_without_secret_of_keyed_grant_refused(
         assert!(raw_token_record(test, id).await.as_deref() == Some(raw.as_slice()));
     }
 
-    // Task 18 replaces the interim refusal with the keyed refresh.
-    assert_invalid_grant(za_refresh(app, &t0.refresh).await);
-    let after = test.server.oauth_grant(t0.grant_id).await.unwrap().unwrap();
-    assert_eq!(after.grant.generation, before.grant.generation);
-    assert_eq!(after.grant.pending, before.grant.pending);
-    assert!(raw_token_record(test, id).await.as_deref() == Some(raw.as_slice()));
+    // Spec 4.5: with its secret, the keyed grant's refresh token refreshes.
+    granted(za_refresh(app, &t0.refresh).await);
     assert_eq!(za_revoke_token(app, &t0.refresh).await, 200);
 
     let device = device_grant(registered).await;
@@ -1876,4 +1886,399 @@ async fn granted_answer_is_untraced(app: &ZaOAuthClient, test: &TestServer) {
     for tokens in [keyed, plain] {
         assert_eq!(za_revoke_token(app, &tokens.refresh).await, 200);
     }
+}
+
+/// The refresh generations the token record holds for `grant`, in order.
+async fn generations(test: &TestServer, id: u32, grant: u64) -> Vec<u64> {
+    token_record(test, id)
+        .await
+        .and_then(|record| {
+            record
+                .grant(grant)
+                .map(|grant| grant.refresh.iter().map(|entry| entry.generation).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// The secret a keyed token string carries.
+fn token_secret(token: &str) -> Secret {
+    let (_, ZaSuffix::Secret(secret)) = za_split_bearer(token) else {
+        panic!("expected a token secret");
+    };
+    secret
+}
+
+fn refresh_of(response: TokenResponse) -> String {
+    granted(response)
+        .refresh_token
+        .expect("the refresh issued a refresh token")
+}
+
+/// A sign-in of `OWNER` and two refreshes: `g(0)`, `g(1)` and `g(2)`, with
+/// the grant's stored generation at 1.
+async fn refreshed_twice(test: &TestServer, app: &ZaOAuthClient) -> (u64, [String; 3]) {
+    let t0 = za_sign_in(test, app, OWNER, STRONG, None).await;
+    let g1 = refresh_of(za_refresh(app, &t0.refresh).await);
+    let g2 = refresh_of(za_refresh(app, &g1).await);
+    let stored = test.server.oauth_grant(t0.grant_id).await.unwrap().unwrap();
+    assert_eq!(stored.grant.generation, 1);
+    (t0.grant_id, [t0.refresh, g1, g2])
+}
+
+async fn refresh_rotates_and_reads(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  refresh_rotates_and_reads");
+    let id = test.account(OWNER).id().document_id();
+    let t0 = za_sign_in(test, app, OWNER, STRONG, None).await;
+    let t1 = granted(za_refresh(app, &t0.refresh).await);
+    let g1 = t1.refresh_token.as_deref().unwrap();
+    assert!(g1 != t0.refresh, "the refresh token did not rotate");
+    assert_keyed_pair(&t1.access_token, g1);
+    assert_eq!(za_bearer_session(&t1.access_token).await.0, 200);
+    // The sign-in's access token lives until it expires.
+    assert_eq!(za_bearer_session(&t0.access).await.0, 200);
+    assert_eq!(generations(test, id, t0.grant_id).await, [0, 1]);
+    let t2 = granted(za_refresh(app, g1).await);
+    assert_eq!(generations(test, id, t0.grant_id).await, [1, 2]);
+    assert_eq!(
+        za_revoke_token(app, t2.refresh_token.as_deref().unwrap()).await,
+        200
+    );
+}
+
+async fn retried_refresh_returns_the_same_token(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  retried_refresh_returns_the_same_token");
+    let id = test.account(OWNER).id().document_id();
+    let t0 = za_sign_in(test, app, OWNER, STRONG, None).await;
+    let first = granted(za_refresh(app, &t0.refresh).await);
+    let retry = granted(za_refresh(app, &t0.refresh).await);
+    let refresh = first.refresh_token.as_deref().unwrap();
+    assert!(za_split_token(refresh).1.is_some());
+    assert!(
+        retry.refresh_token.as_deref() == Some(refresh),
+        "a retry returns the same refresh token, secret included"
+    );
+    assert!(
+        first.access_token != retry.access_token,
+        "a retry returns a new access token"
+    );
+    for access in [&first.access_token, &retry.access_token] {
+        assert_eq!(za_bearer_session(access).await.0, 200);
+    }
+    let record = token_record(test, id).await.unwrap();
+    assert_eq!(record.grant(t0.grant_id).unwrap().access.len(), 3);
+    assert_eq!(za_revoke_token(app, refresh).await, 200);
+}
+
+async fn replayed_refresh_revokes(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  replayed_refresh_revokes");
+    let id = test.account(OWNER).id().document_id();
+    let (grant, [g0, _, g2]) = refreshed_twice(test, app).await;
+    // Upstream revokes the grant on a replay; its entries leave with it.
+    assert_invalid_grant(za_refresh(app, &g0).await);
+    assert!(test.server.oauth_grant(grant).await.unwrap().is_none());
+    assert!(raw_token_record(test, id).await.is_none());
+    assert_invalid_grant(za_refresh(app, &g2).await);
+}
+
+/// `g(0)` is never presented here: presenting it would revoke the grant.
+async fn superseded_token_opens_nothing(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  superseded_token_opens_nothing");
+    let id = test.account(OWNER).id().document_id();
+    let (grant, [g0, _, g2]) = refreshed_twice(test, app).await;
+    let secret0 = token_secret(&g0);
+    let record = token_record(test, id).await.unwrap();
+    let entries = &record.grant(grant).unwrap().refresh;
+    assert!(entries.iter().all(|entry| entry.generation != 0));
+    assert!(!matches!(
+        record.classify_refresh(id, grant, 0, &secret0, now()),
+        ZaRefreshClass::Opened { .. }
+    ));
+    let next = entries
+        .iter()
+        .find(|entry| entry.generation == 1)
+        .and_then(|entry| entry.next.as_deref())
+        .expect("generation 1 holds its sealed next secret");
+    assert!(
+        unwrap_key(
+            next,
+            &derive_token_next_key(&secret0),
+            &token_next_aad(id, grant, 1)
+        )
+        .is_err()
+    );
+    assert_eq!(za_revoke_token(app, &g2).await, 200);
+}
+
+async fn refresh_with_missing_entry_deletes_grant(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  refresh_with_missing_entry_deletes_grant");
+    let id = test.account(OWNER).id().document_id();
+    let t0 = za_sign_in(test, app, OWNER, STRONG, None).await;
+    test.server
+        .za_token_forget_grant(id, t0.grant_id)
+        .await
+        .unwrap();
+    assert!(
+        token_record(test, id)
+            .await
+            .is_none_or(|record| record.grant(t0.grant_id).is_none())
+    );
+    assert!(
+        test.server
+            .oauth_grant(t0.grant_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // Spec 4.5 step 2: the keys are lost, so the grant ends.
+    assert_invalid_grant(za_refresh(app, &t0.refresh).await);
+    assert!(
+        test.server
+            .oauth_grant(t0.grant_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A sign-in of `RACE` with `password`, then its refresh, parked at the
+/// pause `set` installs.
+async fn park_refresh(
+    test: &TestServer,
+    app: &Arc<ZaOAuthClient>,
+    password: &str,
+    set: fn(Option<Arc<test_hooks::Pause>>),
+) -> (ZaTokens, HookParked<TokenResponse>) {
+    let id = test.account(RACE).id().document_id();
+    let tokens = za_sign_in(test, app, RACE, password, None).await;
+    let parked = HookParked::start(id, set, {
+        let app = app.clone();
+        let refresh = tokens.refresh.clone();
+        async move { za_refresh(&app, &refresh).await }
+    })
+    .await;
+    (tokens, parked)
+}
+
+async fn assert_crossed_refresh_refused(
+    test: &TestServer,
+    app: &ZaOAuthClient,
+    tokens: ZaTokens,
+    parked: HookParked<TokenResponse>,
+) {
+    let id = test.account(RACE).id().document_id();
+    assert_invalid_grant(parked.finish().await);
+    assert!(raw_token_record(test, id).await.is_none());
+    assert_eq!(za_bearer_session(&tokens.access).await.0, 401);
+    assert_invalid_grant(za_refresh(app, &tokens.refresh).await);
+    // Spec 9.2: the grant object may remain, as any grant of the account
+    // does after a credential change. The case removes what it created.
+    if test
+        .server
+        .oauth_grant(tokens.grant_id)
+        .await
+        .unwrap()
+        .is_some()
+    {
+        za_revoke_grant(&test.server, tokens.grant_id).await;
+    }
+}
+
+async fn change_race_password(old: &str, new: &str) {
+    let reply = za_post(
+        "password",
+        &json!({ "username": RACE, "password": old, "new_password": new }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+}
+
+async fn refresh_crossed_by_credential_change(test: &mut TestServer, app: &Arc<ZaOAuthClient>) {
+    println!("  refresh_crossed_by_credential_change");
+    // Run 1: the grant has rotated; the refresh waits before its first
+    // record read.
+    let (tokens, parked) =
+        park_refresh(test, app, STRONG, test_hooks::set_token_refresh_read_pause).await;
+    change_race_password(STRONG, STRONG2).await;
+    assert_crossed_refresh_refused(test, app, tokens, parked).await;
+
+    // Run 1b: the same pause, crossed by a recovery.
+    let (tokens, parked) =
+        park_refresh(test, app, STRONG2, test_hooks::set_token_refresh_read_pause).await;
+    let reply = za_post(
+        "recover",
+        &json!({
+            "username": RACE,
+            "recovery_key": test.account(RACE).recovery_key.as_deref().unwrap(),
+            "new_password": STRONG,
+        }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    test.accounts.get_mut(RACE).unwrap().recovery_key =
+        Some(reply.body["recovery_key"].as_str().unwrap().to_owned());
+    assert_crossed_refresh_refused(test, app, tokens, parked).await;
+
+    // Run 2: MK opened and the entries built; the batch then loses its
+    // vault assertion.
+    let (tokens, parked) =
+        park_refresh(test, app, STRONG, test_hooks::set_token_refresh_write_pause).await;
+    change_race_password(STRONG, STRONG2).await;
+    assert_crossed_refresh_refused(test, app, tokens, parked).await;
+
+    change_race_password(STRONG2, STRONG).await;
+}
+
+async fn refresh_crossed_by_other_vault_write(test: &mut TestServer, app: &Arc<ZaOAuthClient>) {
+    println!("  refresh_crossed_by_other_vault_write");
+    let id = test.account(RACE).id().document_id();
+    let pauses: [fn(Option<Arc<test_hooks::Pause>>); 2] = [
+        test_hooks::set_token_refresh_read_pause,
+        test_hooks::set_token_refresh_write_pause,
+    ];
+    for set in pauses {
+        let before = test.server.za_vault_record(id).await.unwrap().unwrap();
+        let (tokens, parked) = park_refresh(test, app, STRONG, set).await;
+        rotate_race_recovery_key(test).await;
+        let after = test.server.za_vault_record(id).await.unwrap().unwrap();
+        assert!(after.record.revision > before.record.revision);
+        assert_eq!(
+            za_session_binding(&after.record),
+            za_session_binding(&before.record)
+        );
+        // With the write pause the batch asserted the vault bytes of the
+        // revision before, so it lost that assertion once and the refresh
+        // wrote on a later attempt under the unchanged binding.
+        let refreshed = granted(parked.finish().await);
+        assert_eq!(generations(test, id, tokens.grant_id).await, [0, 1]);
+        assert_eq!(za_bearer_session(&refreshed.access_token).await.0, 200);
+        let next = granted(za_refresh(app, refreshed.refresh_token.as_deref().unwrap()).await);
+        // Its keys open again at the new revision.
+        assert_eq!(za_bearer_session(&tokens.access).await.0, 200);
+        assert_eq!(
+            za_revoke_token(app, next.refresh_token.as_deref().unwrap()).await,
+            200
+        );
+    }
+}
+
+async fn retry_of_g_while_g1_completes(test: &TestServer, app: &Arc<ZaOAuthClient>) {
+    println!("  retry_of_g_while_g1_completes");
+    let id = test.account(OWNER).id().document_id();
+    let pauses: [fn(Option<Arc<test_hooks::Pause>>); 2] = [
+        test_hooks::set_token_refresh_read_pause,
+        test_hooks::set_token_refresh_write_pause,
+    ];
+    for set in pauses {
+        let t0 = za_sign_in(test, app, OWNER, STRONG, None).await;
+        let grant = t0.grant_id;
+        let g1 = refresh_of(za_refresh(app, &t0.refresh).await);
+        let stored = test.server.oauth_grant(grant).await.unwrap().unwrap();
+        assert_eq!(stored.grant.generation, 0);
+        assert!(stored.grant.pending);
+        assert_eq!(generations(test, id, grant).await, [0, 1]);
+
+        // Upstream accepts the retry of g(0); it waits while g(1) completes.
+        let parked = HookParked::start(id, set, {
+            let app = app.clone();
+            let g0 = t0.refresh.clone();
+            async move { za_refresh(&app, &g0).await }
+        })
+        .await;
+        let t2 = granted(za_refresh(app, &g1).await);
+        let stored = test.server.oauth_grant(grant).await.unwrap().unwrap();
+        assert_eq!(stored.grant.generation, 1);
+        assert_eq!(generations(test, id, grant).await, [1, 2]);
+
+        assert_invalid_grant(parked.finish().await);
+        let stored = test
+            .server
+            .oauth_grant(grant)
+            .await
+            .unwrap()
+            .expect("the superseded retry deleted the grant");
+        assert_eq!(stored.grant.generation, 1);
+        assert_eq!(generations(test, id, grant).await, [1, 2]);
+        assert_eq!(za_bearer_session(&t2.access_token).await.0, 200);
+        let t3 = granted(za_refresh(app, t2.refresh_token.as_deref().unwrap()).await);
+        assert_eq!(
+            za_revoke_token(app, t3.refresh_token.as_deref().unwrap()).await,
+            200
+        );
+    }
+}
+
+/// The refresh form through a raw client, whose answer is a server error
+/// under `TOKEN_REFRESH_WRITE_FAIL_ONCE`, not a token response.
+async fn refresh_write_fails(app: &ZaOAuthClient, id: u32, refresh: &str) {
+    test_hooks::set_token_refresh_write_fail_once(Some(id));
+    let (status, _) = token_form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", app.client_id.as_str()),
+        ("refresh_token", refresh),
+    ])
+    .await;
+    assert!(
+        !test_hooks::take_token_refresh_write_fail(id),
+        "the refresh did not reach its record write"
+    );
+    assert!((500..600).contains(&status), "expected a server error");
+}
+
+async fn failed_write_then_client_retry(test: &TestServer, app: &ZaOAuthClient) {
+    println!("  failed_write_then_client_retry");
+    let id = test.account(OWNER).id().document_id();
+    let t0 = za_sign_in(test, app, OWNER, STRONG, None).await;
+    refresh_write_fails(app, id, &t0.refresh).await;
+    // The grant rotated; the record did not follow.
+    let stored = test.server.oauth_grant(t0.grant_id).await.unwrap().unwrap();
+    assert_eq!(stored.grant.generation, 0);
+    assert!(stored.grant.pending);
+    let record = token_record(test, id).await.unwrap();
+    let entries = &record.grant(t0.grant_id).unwrap().refresh;
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.generation)
+            .collect::<Vec<_>>(),
+        [0]
+    );
+    assert!(entries[0].next.is_none());
+
+    // The client's retry is upstream's retry case.
+    let t1 = granted(za_refresh(app, &t0.refresh).await);
+    assert_eq!(za_bearer_session(&t1.access_token).await.0, 200);
+    assert_eq!(generations(test, id, t0.grant_id).await, [0, 1]);
+    let t2 = granted(za_refresh(app, t1.refresh_token.as_deref().unwrap()).await);
+    assert_eq!(
+        za_revoke_token(app, t2.refresh_token.as_deref().unwrap()).await,
+        200
+    );
+}
+
+async fn interrupted_refresh_cleared_by_another_grants_write(
+    test: &TestServer,
+    app: &ZaOAuthClient,
+) {
+    println!("  interrupted_refresh_cleared_by_another_grants_write");
+    let id = test.account(OWNER).id().document_id();
+    let a = za_sign_in(test, app, OWNER, STRONG, None).await;
+    let g1 = refresh_of(za_refresh(app, &a.refresh).await);
+    refresh_write_fails(app, id, &g1).await;
+    // Entry 0 is below the stored generation and nobody retries.
+    assert_eq!(generations(test, id, a.grant_id).await, [0, 1]);
+    let stored = test.server.oauth_grant(a.grant_id).await.unwrap().unwrap();
+    assert_eq!(stored.grant.generation, 1);
+
+    // Spec 4.5: any later write of the record drops it.
+    let b = za_sign_in(test, app, OWNER, STRONG, None).await;
+    assert_eq!(generations(test, id, a.grant_id).await, [1]);
+    assert!(
+        token_record(test, id)
+            .await
+            .unwrap()
+            .grant(b.grant_id)
+            .is_some()
+    );
+    assert_eq!(za_revoke_token(app, &g1).await, 200);
+    assert_eq!(za_revoke_token(app, &b.refresh).await, 200);
 }

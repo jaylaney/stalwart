@@ -32,8 +32,8 @@ use vault::{
     record::za_session_binding,
     session::SessionKeys,
     tokens::{
-        TOKEN_RECORD_VERSION, ZaGrantState, ZaSuffix, ZaTokenRecord, open_handoff, seal_handoff,
-        split_secret,
+        TOKEN_RECORD_VERSION, ZaGrantState, ZaRefreshClass, ZaSuffix, ZaTokenRecord, open_handoff,
+        seal_handoff, split_secret,
     },
 };
 use xxhash_rust::xxh3::xxh3_64;
@@ -52,6 +52,13 @@ pub struct ZaIssued {
 
 pub enum ZaTokenIssue {
     Issued(ZaIssued),
+    VaultChanged,
+}
+
+pub enum ZaTokenRefresh {
+    Issued(ZaIssued),
+    Superseded,
+    Lost,
     VaultChanged,
 }
 
@@ -360,6 +367,86 @@ impl Server {
                 self.za_delete_evicted_grant(account_id, evicted).await;
             }
             return Ok(ZaTokenIssue::Issued(ZaIssued { access, refresh }));
+        }
+        unreachable!("the last write attempt returns");
+    }
+
+    /// Spec 4.5 steps 2 to 5, after `rotate_oauth_grant` issued `next`.
+    /// Every attempt decides from its own reads: MK comes only from the
+    /// presented entry of the record that attempt read.
+    pub async fn za_token_refresh(
+        &self,
+        account_id: u32,
+        grant_id: u64,
+        presented: u64,
+        secret: &Secret,
+        next: u64,
+        access_expires: u64,
+        refresh_expires: u64,
+    ) -> trc::Result<ZaTokenRefresh> {
+        #[cfg(feature = "test_mode")]
+        super::test_hooks::token_refresh_read_pause_point(account_id).await;
+
+        let store = self.store();
+        let mut first_binding = None;
+        for remaining in (0..TOKEN_WRITE_ATTEMPTS).rev() {
+            let Some(vault) = vault_read_usable_store(store, account_id).await? else {
+                return Ok(ZaTokenRefresh::VaultChanged);
+            };
+            let binding = za_session_binding(&vault.record);
+            if *first_binding.get_or_insert(binding) != binding {
+                return Ok(ZaTokenRefresh::VaultChanged);
+            }
+
+            let read = token_read_store(store, account_id).await?;
+            let Some(mut record) = read.record.clone() else {
+                return Ok(ZaTokenRefresh::Lost);
+            };
+            if record.binding != binding {
+                return Ok(ZaTokenRefresh::VaultChanged);
+            }
+
+            let grants = self.token_grant_states(account_id, &record, None).await?;
+            let now = now();
+            record.reconcile(account_id, now, &grants);
+            let (mk, sealed) =
+                match record.classify_refresh(account_id, grant_id, presented, secret, now) {
+                    ZaRefreshClass::Opened { mk, next } => (mk, next),
+                    ZaRefreshClass::Superseded => return Ok(ZaTokenRefresh::Superseded),
+                    ZaRefreshClass::Lost => return Ok(ZaTokenRefresh::Lost),
+                };
+
+            // A retry finds the next secret sealed in the presented entry.
+            let next_secret = sealed.unwrap_or_else(Secret::random);
+            record.put_refresh(
+                account_id,
+                grant_id,
+                &mk,
+                Some((presented, secret)),
+                next,
+                &next_secret,
+                refresh_expires,
+            );
+            let access = record.put_access(account_id, grant_id, &mk, access_expires);
+
+            #[cfg(feature = "test_mode")]
+            {
+                super::test_hooks::token_refresh_write_pause_point(account_id).await;
+                if super::test_hooks::take_token_refresh_write_fail(account_id) {
+                    return Err(trc::StoreEvent::UnexpectedError
+                        .into_err()
+                        .details("zero-access test hook: token refresh write failure"));
+                }
+            }
+            match token_write_store(store, account_id, Some(vault.cas), &read, Some(&record)).await
+            {
+                Err(err) if remaining > 0 && err.is_assertion_failure() => continue,
+                result => result?,
+            }
+            return Ok(ZaTokenRefresh::Issued(ZaIssued {
+                access,
+                refresh: next_secret,
+            }));
         }
         unreachable!("the last write attempt returns");
     }
