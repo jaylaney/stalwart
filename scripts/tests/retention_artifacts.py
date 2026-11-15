@@ -397,7 +397,13 @@ def register_snapshot_commands(commands):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    register_snapshot_commands(parser.add_subparsers(required=True))
+    commands = parser.add_subparsers(required=True)
+    register_snapshot_commands(commands)
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from retention_evidence import register_evidence_commands
+
+    register_evidence_commands(commands)
     args = parser.parse_args(argv)
     try:
         return args.handler(args) or 0

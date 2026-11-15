@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Stalwart contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Offline tests for issue #86 producer and collection receipts."""
+import contextlib
+import hashlib
+import io
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import capture_listings
+import ci_steps
+import retention_evidence as evidence
+
+COMMIT = "1" * 40
+RUN = dict(commit=COMMIT, run_id="21", producer_attempt=1)
+FEATURES = "test/feature test/other"
+ARTIFACT = "40"
+OBJECTS = [{"path": "debug/deps/example", "sha256": "b" * 64}]
+PROFILE = b"\xfflprofi\x81" + (14).to_bytes(8, "little") + b"\x00" * 16 + (64).to_bytes(8, "little") + b"\x00" * 88
+EXPORT = {"type": "llvm.coverage.json.export", "version": "2.0.1",
+          "data": [{"files": [], "functions": [], "totals": {}}]}
+
+
+def write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(value)
+
+
+def write_json(path, value):
+    write(path, json.dumps(value).encode())
+
+
+def read_json(path):
+    return json.loads(path.read_bytes())
+
+
+def attempt(status=0, number=1, names=None, profile="collected"):
+    return dict(attempt=number, status=status, names=names or [], profile=profile)
+
+
+class ReceiptTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.inputs = self.root / "inputs"
+        self.output = self.root / "gate"
+        self.build = self.root / "build.json"
+        self.object_set = hashlib.sha256(
+            json.dumps(OBJECTS, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        write_json(self.build, dict(schema=1, commit=COMMIT, run_id=RUN["run_id"], build_attempt=1,
+                                    identity={"rustc": "rustc test", "cargo": "cargo test"}, objects=OBJECTS,
+                                    object_set_sha256=self.object_set))
+        self.run = dict(RUN)
+        runner = patch.object(evidence, "run_identity", side_effect=lambda: dict(self.run))
+        features = patch.object(evidence, "unit_features", return_value=FEATURES)
+        for patcher in (runner, features):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def producer(self, shard, status="success", change=None):
+        source = self.root / "source" / shard
+        steps = dict()
+        for name in ci_steps.COVERAGE_SHARDS[shard]:
+            steps[name] = dict(status="success", attempts=[attempt()], profile=True, export="success")
+        if change:
+            change(steps)
+        for name, step in steps.items():
+            if step["profile"]:
+                write(source / "profdata" / f"{name}.profdata", PROFILE)
+            if step["export"] == "success":
+                write_json(source / "steps" / f"{name}.json", EXPORT)
+            if step["attempts"]:
+                write(source / "logs" / f"{name}.attempt1.log", b"Bearer bad-bearer\npassword=bad-secret\n")
+        write_json(source / "shard.json", dict(schema=1, shard=shard, compatible=True,
+                                               **self.run, build_attempt=1,
+                                               object_set_sha256=self.object_set, steps=steps))
+        return evidence.stage("shard", shard, status, source, self.inputs / shard, self.build, ARTIFACT)
+
+    def listings(self, status="success", failure=None, provenance=None):
+        source = self.root / "source" / "listings"
+        captures = {}
+        for rel, config in capture_listings.capture_contract(FEATURES).items():
+            sections = config["sections"]
+            statuses = [0] * len(sections) if rel != failure else ["not-run"] * len(sections)
+            captures[rel] = statuses
+            if rel == failure:
+                continue
+            text = f'# config: {config["label"]}\n# env: {config["environment"]}\n# started: now\n'
+            for (title, cmd), result in zip(sections, statuses):
+                text += f"{title}\n## command: {' '.join(cmd)}\nBearer bad-listing\n## exit: {result}\n"
+            write(source / rel, text.encode())
+        identity = {"rustc": "rustc test", "cargo": "cargo test"}
+        write_json(source / "listing.json", dict(schema=1, identity=identity, unit_features=FEATURES,
+                                                  captures=captures, **(provenance or self.run)))
+        return evidence.stage("listings", "listings", status, source, self.inputs / "listings")
+
+    def all(self, replace=None):
+        replace = replace or {}
+        for shard in ci_steps.COVERAGE_SHARDS:
+            self.producer(shard, *replace.get(shard, ()))
+        self.listings(*replace.get("listings", ()))
+
+    def collect(self, artifact=ARTIFACT):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return evidence.collect(self.inputs, self.output, self.build, artifact)
+
+    def assertIntegrityError(self, artifact=ARTIFACT):
+        self.assertEqual(self.collect(artifact), 2)
+        self.assertFalse((self.output / "net").exists())
+        self.assertFalse((self.output / "listings").exists())
+
+    def test_complete_matrix_and_older_producer_attempt(self):
+        self.all()
+        self.run["producer_attempt"] = 2
+        self.assertEqual(self.collect(), 0)
+        self.assertEqual(len(list((self.output / "net" / "profdata").iterdir())), 19)
+        self.assertEqual(len(list((self.output / "listings" / "ign").iterdir())),
+                         len(capture_listings.configurations(FEATURES)))
+        log = self.inputs / "za-rocks" / "logs" / "za-tests.attempt1.log"
+        self.assertNotIn(b"bad-bearer", log.read_bytes())
+        self.assertNotIn(b"bad-secret", log.read_bytes())
+        listing = next((self.output / "listings" / "list").iterdir())
+        self.assertIn("## exit: 0", listing.read_text())
+        self.assertNotIn("bad-listing", listing.read_text())
+
+    def test_exhausted_retry_preserves_complete_coverage_but_fails(self):
+        def fail(steps):
+            steps["za-tests"].update(status="failure", attempts=[attempt(101), attempt(101, 2)])
+        self.all({"za-rocks": ("failure", fail)})
+        self.assertEqual(self.collect(), 1)
+        self.assertEqual(read_json(self.output / "collection.json")["missing_steps"], [])
+        self.assertTrue((self.output / "net" / "steps" / "za-tests.json").is_file())
+
+    def test_incomplete_outcome_and_listing_are_explicit_for_diagnostics(self):
+        def fail(steps):
+            steps["za-tests"].update(status="failure", attempts=[attempt("deadline", profile="no-data")],
+                                     export="not-attempted", profile=False)
+        capture = "ign/exists__nlp__default--ignored-only.txt"
+        self.all({"za-rocks": ("failure", fail), "listings": ("failure", capture)})
+        self.assertEqual(self.collect(), 1)
+        result = read_json(self.output / "collection.json")
+        self.assertEqual(result["missing_steps"], ["za-tests"])
+        self.assertEqual(result["missing_captures"], [capture])
+        self.assertFalse((self.output / "net" / "profdata" / "za-tests.profdata").exists())
+
+    def test_smtp_failing_names_retry_passes_with_combined_evidence(self):
+        def retry(steps):
+            steps["smtp"]["attempts"] = [attempt(101, names=["smtp::flaky"]), attempt(0, 2)]
+        self.all({"short": ("success", retry)})
+        self.assertEqual(self.collect(), 0)
+        short = read_json(self.inputs / "short" / "receipt.json")
+        self.assertEqual(len(short["ledger"]["steps"]["smtp"]["attempts"]), 2)
+        self.assertTrue((self.output / "net" / "profdata" / "smtp.profdata").is_file())
+
+    def test_missing_latest_upload_does_not_fall_back_to_previous_receipt(self):
+        self.all()
+        (self.inputs / "za-rocks").rename(self.inputs / "old-za-rocks")
+        self.assertIntegrityError()
+
+    def test_duplicate_receipt_is_refused(self):
+        self.all()
+        shutil.copytree(self.inputs / "short", self.inputs / "unexpected-producer")
+        self.assertIntegrityError()
+
+    def test_wrong_snapshot_id_is_refused(self):
+        self.all()
+        self.assertIntegrityError("99")
+
+    def test_wrong_commit_run_objects_or_attempt_are_refused(self):
+        self.all()
+        path = self.inputs / "za-rocks" / "receipt.json"
+        original = path.read_bytes()
+        for key, val in (("commit", "0" * 40), ("run_id", "99"), ("object_set_sha256", "a" * 64),
+                         ("producer_attempt", 2), ("build_attempt", 2)):
+            with self.subTest(field=key):
+                receipt = json.loads(original)
+                receipt[key] = val
+                write_json(path, receipt)
+                self.assertIntegrityError()
+                shutil.rmtree(self.output)
+
+    def test_skipped_producer_is_an_integrity_failure(self):
+        self.all({"za-rocks": ("skipped",)})
+        self.assertIntegrityError()
+
+    def test_damaged_payload_fails_even_with_a_matching_digest(self):
+        self.all()
+        path = self.inputs / "za-rocks" / "profdata" / "za-tests.profdata"
+        write(path, b"no profile")
+        receipt_path = self.inputs / "za-rocks" / "receipt.json"
+        receipt = read_json(receipt_path)
+        receipt["files"]["profdata/za-tests.profdata"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        write_json(receipt_path, receipt)
+        self.assertIntegrityError()
+
+    def test_unexpected_or_unexplained_missing_file_is_refused(self):
+        self.all()
+        path = self.inputs / "listings" / "ign" / "exists__nlp__default--ignored-only.txt"
+        original = path.read_bytes()
+        path.unlink()
+        self.assertIntegrityError()
+        shutil.rmtree(self.output)
+        write(path, original)
+        write(self.inputs / "short" / "steps" / "unassigned.json", b"{}")
+        self.assertIntegrityError()
+
+    def test_successful_producer_cannot_hide_retries_or_coverage_gaps(self):
+        def omit_retry(steps):
+            steps["za-tests"].update(status="failure", attempts=[attempt(101)])
+        self.all({"za-rocks": ("success", omit_retry)})
+        self.assertIntegrityError()
+
+    def test_invalid_ledger_is_never_published_with_safe_diagnostics(self):
+        marker = "unexpected-metadata-that-must-not-be-published"
+
+        def invalidate(steps):
+            steps["za-tests"].update(status="invalid", unexpected=marker)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.producer("za-rocks", status="failure", change=invalidate)
+        directory = self.inputs / "za-rocks"
+        receipt = read_json(directory / "receipt.json")
+        self.assertTrue(receipt["integrity_error"])
+        self.assertNotIn("ledger", receipt)
+        self.assertNotIn(marker, stderr.getvalue())
+        self.assertNotIn(marker, (directory / "receipt.json").read_text())
+        diagnostic = (directory / "logs" / "za-tests.attempt1.log").read_text()
+        self.assertIn("Bearer [REDACTED]", diagnostic)
+        self.assertNotIn("bad-bearer", diagnostic)
+        self.assertFalse((directory / "profdata").exists())
+
+    def test_stage_refuses_to_relabel_stale_listing_capture(self):
+        for key, value in (("commit", "7" * 40), ("run_id", "20"), ("producer_attempt", 1)):
+            with self.subTest(field=key):
+                self.run["producer_attempt"] = 2
+                self.listings(provenance=dict(self.run, **{key: value}))
+                directory = self.inputs / "listings"
+                receipt = read_json(directory / "receipt.json")
+                shutil.rmtree(directory)
+                self.assertIs(receipt.get("integrity_error"), True)
+                self.assertEqual(receipt["files"], {})
+
+    def test_collector_requires_listing_ledger_to_match_its_receipt(self):
+        self.all()
+        self.run["producer_attempt"] = 2
+        path = self.inputs / "listings" / "receipt.json"
+        receipt = read_json(path)
+        receipt["producer_attempt"] = 2
+        write_json(path, receipt)
+        self.assertIntegrityError()
+        self.assertIn("ledger differs in producer_attempt",
+                      read_json(self.output / "collection.json")["errors"][0])
+
+    def test_listing_commands_and_features_are_checked_after_transfer(self):
+        self.all()
+        relative = "list/test.yml__test__smtp-tests.txt"
+        path = self.inputs / "listings" / relative
+        path.write_text(path.read_text().replace(" --nocapture --list", " --nocapture --ignored --list"))
+        receipt_path = self.inputs / "listings" / "receipt.json"
+        receipt = read_json(receipt_path)
+        receipt["files"][relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        write_json(receipt_path, receipt)
+        self.assertIntegrityError()
+        summary = read_json(self.output / "collection.json")
+        self.assertIn("contradicts its capture contract", summary["errors"][0])
+
+    def test_stale_output_is_rejected_without_overwriting(self):
+        self.all()
+        stale = self.output / "unrelated"
+        write(stale, b"old")
+        self.assertIntegrityError()
+        self.assertEqual(stale.read_bytes(), b"old")
+
+
+class ListingDeadlineTests(unittest.TestCase):
+    def test_expired_budget_does_not_spawn_a_child(self):
+        with patch.object(capture_listings.subprocess, "Popen") as child:
+            status, text = capture_listings.run(["cargo", "test"], {}, time.monotonic() - 1)
+        self.assertEqual(status, "not-run")
+        self.assertFalse(text)
+        child.assert_not_called()
+
+    def test_deadline_stops_starting_more_configurations_and_checkpoints_missing_sections(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(capture_listings.ci_steps, "refuse_diverged_workflow", return_value=False), \
+                patch.dict("os.environ", {"UNIT_TEST_FEATURES": FEATURES, "GITHUB_SHA": COMMIT,
+                                          "GITHUB_RUN_ID": "21", "GITHUB_RUN_ATTEMPT": "1"}), \
+                patch.object(capture_listings.subprocess, "run", return_value=subprocess.CompletedProcess(
+                    ["git", "rev-parse", "HEAD"], 0, stdout=COMMIT + "\n")), \
+                patch.object(capture_listings, "build_identity", return_value={"rustc": "rustc test", "cargo": "cargo test"}), \
+                patch.object(capture_listings, "run", return_value=("deadline", "interrupted")) as run:
+            root = Path(temp)
+            self.assertEqual(capture_listings.main(["--out", temp, "--deadline-epoch", str(int(time.time()) + 60)]), 1)
+            ledger = read_json(root / "listing.json")
+            self.assertEqual({key: ledger.get(key) for key in RUN}, RUN)
+            counts = ledger["captures"]
+            self.assertEqual(sum("deadline" in values for values in counts.values()), 1)
+            self.assertTrue(all("not-run" in values for values in list(counts.values())[1:]))
+            self.assertEqual(run.call_count, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
