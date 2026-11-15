@@ -17,16 +17,16 @@
 //! - `PUT_PAUSE`: in the CalDAV PUT handler right after the resource
 //!   snapshot (`fetch_dav_resources`), keyed by the account
 //!   (`dav::calendar::update`).
-//! - `COMMIT_PAUSE`: in the CalDAV PUT handler immediately before the key
-//!   account's leased create commits (`za_commit_create`), after the fan-out
-//!   and the seal.
+//! - `COMMIT_PAUSE`: immediately before a key account's leased create
+//!   commits, after the fan-out and the seal
+//!   (`groupware::calendar::pipeline::uid::za_commit_create`).
 //! - `UPDATE_COMMIT_PAUSE`: immediately before an event PUT update commit,
 //!   after fan-out and sealing, keyed by the event owner.
 //! - `DELETE_COMMIT_PAUSE`: immediately before an event DELETE commit,
 //!   after fan-out, keyed by the event owner.
 //! - `COMMIT_FAIL_ONCE`: the commit of a key account's PUT create fails once
 //!   with an internal error after its fan-out, keyed by the account
-//!   (`dav::calendar::za_commit_create`).
+//!   (`groupware::calendar::pipeline::uid::za_commit_create`).
 //! - `UPDATE_COMMIT_FAIL_ONCE`: the first commit of a key account's PUT
 //!   update fails once with an internal error after its fan-out, in place of
 //!   `commit_batch`'s result, keyed by the event owner

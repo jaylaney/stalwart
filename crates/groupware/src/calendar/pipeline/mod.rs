@@ -7,6 +7,7 @@
 pub mod admission;
 pub mod context;
 pub mod error;
+pub mod uid;
 
 use calcard::icalendar::ICalendar;
 

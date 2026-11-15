@@ -7,8 +7,7 @@
 use super::{
     CalendarComponentSupport, CalendarEventView, ZaRoles, assert_event_privacy_access,
     assert_event_privacy_allowed, assert_is_unique_uid, serves_ical, user_data_error,
-    za_commit_create, za_lost_create_fence, za_refresh_event, za_roles, za_take_uid_lease,
-    za_write_contexts,
+    za_refresh_event, za_roles, za_write_contexts,
 };
 use crate::{
     DavError, DavErrorCondition, DavMethod,
@@ -49,6 +48,7 @@ use groupware::{
         identity::ParticipantIdentityAddresses,
         itip::ItipSendStatus,
         notification::{NotificationAudience, may_have_viewers},
+        pipeline::uid::{za_commit_create, za_lost_create_fence, za_take_uid_lease},
         privacy::EventViewer,
         rights::{EventAcl, EventChanges},
         schedule::{AlarmTasks, EventAlarmScheduler, EventAlarmUsers},
@@ -915,7 +915,7 @@ impl CalendarUpdateRequestHandler for Server {
                         &resources,
                         access_token,
                         account_id,
-                        parent.document_id(),
+                        &[parent.document_id()],
                         uid,
                     )
                     .await?,
@@ -1446,16 +1446,17 @@ async fn za_create_event(
             Ok(fan_out) => fan_out,
             Err(err) if err.is_assertion_failure() => {
                 let (lease, uid) = lease.take().expect("a lost fence needs a lease");
-                return za_lost_create_fence(
+                let Err(error) = za_lost_create_fence(
                     server,
                     resources,
                     access_token,
                     lease,
                     account_id,
-                    calendar_id,
+                    &[calendar_id],
                     &uid,
                 )
                 .await;
+                return Err(error.into());
             }
             Err(err) => {
                 if let Some((lease, _)) = lease.take() {
@@ -1560,24 +1561,26 @@ async fn za_create_event(
                             batch,
                             lease_guard,
                             account_id,
-                            calendar_id,
+                            &[calendar_id],
                             &uid,
                         )
-                        .await,
+                        .await
+                        .map_err(DavError::from),
                     )?;
                 } else {
                     let (lease, uid) = lease.take().unwrap();
                     za_mail.dropped();
-                    return za_lost_create_fence(
+                    let Err(error) = za_lost_create_fence(
                         server,
                         resources,
                         access_token,
                         lease,
                         account_id,
-                        calendar_id,
+                        &[calendar_id],
                         &uid,
                     )
                     .await;
+                    return Err(error.into());
                 }
             }
             Err(error) => {
