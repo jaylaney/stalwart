@@ -47,32 +47,47 @@ within_budget() {
 }
 
 download_paths_bytes() {
-    local path sum=0
+    local path bytes sum=0
     for path in "$CARGO_HOME/registry/cache" "$CARGO_HOME/registry/index" "$CARGO_HOME/git/db"; do
         if [[ -d "$path" ]]; then
-            sum=$((sum + $(du -sb "$path" | cut -f1)))
+            if ! bytes=$(du -sb "$path" | cut -s -f1); then
+                printf 'Could not measure dependency download path %s\n' "$path" >&2
+                return 1
+            fi
+            # Bound each of the three counts before adding them in Bash.
+            if [[ ! "$bytes" =~ ^(0|[1-9][0-9]{0,17})$ ]]; then
+                printf 'Invalid byte count for dependency download path %s\n' "$path" >&2
+                return 1
+            fi
+            sum=$((sum + bytes))
         fi
     done
     printf '%s\n' "$sum"
 }
 
 cache_budget() {
-    local used limit bytes
+    # The verified fork quota and GitHub's default are both 10 GB.
+    local limit=10000000000 used bytes
     # Reserve headroom for both scheduled lanes because they can save concurrently.
     # Size the reservation from uncompressed inputs and leave room for archive overhead.
-    bytes=$(download_paths_bytes)
-    if ! used=$(gh api "repos/$GITHUB_REPOSITORY/actions/cache/usage" \
-        --jq '.active_caches_size_in_bytes') ||
-       ! limit=$(gh api "repos/$GITHUB_REPOSITORY/actions/cache/storage-limit" \
-        --jq '.max_cache_size_gb') ||
-       [[ ! "$used" =~ ^[0-9]+$ || ! "$limit" =~ ^[1-9][0-9]*$ ]]; then
-        printf '%s\n' 'Cache usage or limit unavailable. Skip this optional save.'
+    if ! bytes=$(download_paths_bytes); then
+        printf '%s\n' 'Cache download size measurement failed. Skip this optional save.'
         return
     fi
-    limit=$((limit * 1000 * 1000 * 1000))
+    if ! used=$(gh api "repos/$GITHUB_REPOSITORY/actions/cache/usage" \
+        --jq '.active_caches_size_in_bytes'); then
+        printf '%s\n' 'Cache usage request failed. Skip this optional save.'
+        return
+    fi
+    if [[ ! "$used" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        printf '%s\n' 'Cache usage response is invalid. Skip this optional save.'
+        return
+    fi
     printf 'Cache bytes: %s used of %s, %s for this lane before compression\n' \
         "$used" "$limit" "$bytes" | tee -a "$GITHUB_STEP_SUMMARY"
-    if (( bytes > 0 && used + 2 * (bytes + 32 * 1024 * 1024) <= limit )); then
+    # Values longer than the budget are already too large and could overflow Bash arithmetic.
+    if (( ${#used} <= ${#limit} && ${#bytes} <= ${#limit} &&
+          bytes > 0 && used + 2 * (bytes + 32 * 1024 * 1024) <= limit )); then
         printf '%s\n' 'room=true' >> "$GITHUB_OUTPUT"
     else
         printf '%s\n' 'Insufficient cache room for both download scopes. Skip this optional save.'
@@ -108,8 +123,11 @@ case "$1" in
         time within_budget cargo fetch --locked --target "$RETENTION_TARGET"
         time within_budget cargo metadata --offline --locked --format-version 1 \
             --filter-platform "$RETENTION_TARGET" > /dev/null
-        printf 'Dependency download paths: %s bytes\n' "$(download_paths_bytes)" \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+        if bytes=$(download_paths_bytes); then
+            printf 'Dependency download paths: %s bytes\n' "$bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+        else
+            printf '%s\n' 'Dependency download path sizes are unavailable.' | tee -a "$GITHUB_STEP_SUMMARY"
+        fi
         df -h "$GATES"
         ;;
     cache-budget)

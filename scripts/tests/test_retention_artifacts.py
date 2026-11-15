@@ -15,11 +15,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().with_name("retention_artifacts.py")
+SETUP = SCRIPT.with_name("retention_ci_setup.sh")
 MTIME = 1_790_000_000_123_456_789
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(SCRIPT.parent))
@@ -36,6 +38,81 @@ def run_tool(*args, env=None):
 
 
 class DependencyCacheTests(unittest.TestCase):
+    def test_live_usage_is_required_and_reserves_budget_for_both_lanes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / "bin"
+            commands.mkdir()
+            (commands / "gh").write_text(
+                '#!/bin/sh\n'
+                'test "$*" = "api repos/fixture/example/actions/cache/usage --jq .active_caches_size_in_bytes" || exit 99\n'
+                'printf "%s\\n" "$FIXTURE_CACHE_USAGE"\n'
+                'exit "$FIXTURE_USAGE_STATUS"\n'
+            )
+            (commands / "du").write_text(
+                '#!/bin/sh\n'
+                'printf "%s\\t%s\\n" "$FIXTURE_DU_BYTES" "$2"\n'
+                'exit "$FIXTURE_DU_STATUS"\n'
+            )
+            (commands / "timeout").write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
+            (commands / "cargo").write_text('#!/bin/sh\nexit 0\n')
+            for command in commands.iterdir():
+                command.chmod(0o755)
+            cargo_home = root / "cargo"
+            (cargo_home / "registry/cache").mkdir(parents=True)
+            output = root / "outputs"
+            summary = root / "summary"
+
+            def run_setup(operation, usage="9500000000", status=0, size="100000000", du_status=0):
+                output.write_text("")
+                return subprocess.run(
+                    ["bash", str(SETUP), operation],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "PATH": f"{commands}{os.pathsep}{os.environ['PATH']}",
+                        "GITHUB_REPOSITORY": "fixture/example",
+                        "GITHUB_OUTPUT": str(output),
+                        "GITHUB_STEP_SUMMARY": str(summary),
+                        "CARGO_HOME": str(cargo_home),
+                        "GATES": str(root),
+                        "RETENTION_DEADLINE_EPOCH": str(int(time.time()) + 60),
+                        "RETENTION_TARGET": "x86_64-unknown-linux-gnu",
+                        "FIXTURE_CACHE_USAGE": usage,
+                        "FIXTURE_USAGE_STATUS": str(status),
+                        "FIXTURE_DU_BYTES": size,
+                        "FIXTURE_DU_STATUS": str(du_status),
+                    },
+                )
+
+            cases = (
+                ("query failed", "", 1, "Cache usage request failed", False),
+                ("empty", "", 0, "Cache usage response is invalid", False),
+                ("malformed", "null", 0, "Cache usage response is invalid", False),
+                ("under budget", "9500000000", 0, "9500000000 used of 10000000000", True),
+                ("room for one lane", "9800000000", 0, "Insufficient cache room", False),
+                ("reported usage", "12433401138", 0, "Insufficient cache room", False),
+                ("oversized usage", "18446744073709551616", 0, "Insufficient cache room", False),
+            )
+            for label, usage, status, log, can_save in cases:
+                with self.subTest(label=label):
+                    result = run_setup("cache-budget", usage, status)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(log, result.stdout)
+                    self.assertEqual(output.read_text(), "room=true\n" if can_save else "")
+
+            for size, du_status in (("100000000", 1), ("bad-size", 0)):
+                with self.subTest(size=size, du_status=du_status):
+                    result = run_setup("cache-budget", size=size, du_status=du_status)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("Cache download size measurement failed", result.stdout)
+                    self.assertEqual(output.read_text(), "")
+
+            result = run_setup("fetch", du_status=1)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Dependency download path sizes are unavailable.", result.stdout)
+
     def test_cache_keys_cover_sources_and_platform_independently_of_build_flags(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
