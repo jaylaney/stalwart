@@ -1240,7 +1240,14 @@ The shared commit:
 8. The mail's `submit`, whether or not the invalidation failed.
 9. The invalidation's error, if any; else `ZaDeleted { change_id }` from
    the last successful commit's
-   `last_change_id(owner, SyncCollection::Calendar)`.
+   `change_id(owner, SyncCollection::Calendar).unwrap_or_default()`.
+   A concurrent unlink can remove the addressed parent after DAV takes
+   its resource snapshot but before it reads the event archive. If the
+   event still has another name, `delete_from_calendar_za` adds no write
+   or Calendar log entry; the assertion-only commit has no assigned
+   change id. Preserve the existing 204 with a zero receipt in that
+   case, instead of `last_change_id`'s debug assertion. Real mutations
+   return their assigned change id; do not fetch a later account tip.
 
 The invalidation builder contains only `AccessToken` entries. At the
 plan's base, `invalidate_caches` can return an error only while expanding

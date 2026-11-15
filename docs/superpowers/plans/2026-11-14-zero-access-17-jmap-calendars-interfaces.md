@@ -71,6 +71,8 @@ pub struct ZaWritten {
 }
 
 pub struct ZaDeleted {
+    /// The assigned Calendar change id, or 0 for an assertion-only CalDAV no-op
+    /// when a concurrent unlink already removed the addressed parent.
     pub change_id: u64,
 }
 ```
