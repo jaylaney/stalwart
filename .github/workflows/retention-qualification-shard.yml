@@ -1,0 +1,178 @@
+---
+name: Retention Coverage Shard
+'on':
+  workflow_call:
+    inputs:
+      shard-id:
+        required: true
+        type: string
+      snapshot-artifact-id:
+        required: true
+        type: string
+      rust-toolchain:
+        required: true
+        type: string
+      timeout-minutes:
+        required: true
+        type: number
+      qualification-lane:
+        type: string
+        required: true
+    outputs:
+      receipt-artifact-id:
+        value: "${{ jobs.shard.outputs.receipt-artifact-id }}"
+permissions:
+  contents: read
+jobs:
+  shard:
+    name: Run coverage shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: "${{ inputs.timeout-minutes }}"
+    outputs:
+      receipt-artifact-id: "${{ steps.receipt.outputs.artifact-id }}"
+    env:
+      STORE: RocksDb
+      RUST_MIN_STACK: '16777216'
+      RUSTUP_TOOLCHAIN: "${{ inputs.rust-toolchain }}"
+      RETENTION_TIMEOUT_MINUTES: "${{ inputs.timeout-minutes }}"
+      RETENTION_TARGET: x86_64-unknown-linux-gnu
+      CARGO_TARGET_DIR: "/mnt/target"
+      CARGO_HOME: "/mnt/retention-ci/.cargo"
+      CARGO_TERM_COLOR: never
+      GIT_OPTIONAL_LOCKS: '0'
+      GATES: "/mnt/gates"
+      TMPDIR: "/mnt/gates/tmp"
+    steps:
+    - name: Set the work deadline and prepare retention directories
+      id: prepare
+      shell: bash
+      run: |
+        # Leave the final 12 minutes for settlement, diagnostics and bounded uploads.
+        printf 'RETENTION_DEADLINE_EPOCH=%s\n' \
+          "$(( $(date +%s) + (RETENTION_TIMEOUT_MINUTES - 12) * 60 ))" >> "$GITHUB_ENV"
+        sudo mkdir -p "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+        sudo chown "$(id -u):$(id -g)" "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+        df -h "$GATES"
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - name: Install pinned coverage tools
+      id: tools
+      shell: bash
+      run: bash scripts/tests/retention_ci_setup.sh install-tools instrumented
+    - name: Normalize checkout mtimes
+      id: normalize
+      shell: bash
+      run: python3 -I scripts/tests/retention_artifacts.py normalize-checkout
+    - name: Require a selected build snapshot ID
+      id: artifact-id
+      shell: bash
+      env:
+        SNAPSHOT_ID: "${{ inputs.snapshot-artifact-id }}"
+      run: |
+        remaining=$((RETENTION_DEADLINE_EPOCH - $(date +%s)))
+        if (( remaining < 21 * 60 )); then
+          printf '%s\n' 'Insufficient work time for the build snapshot download' >&2
+          exit 1
+        fi
+        [[ "$SNAPSHOT_ID" =~ ^[1-9][0-9]*$ ]]
+    - name: Download the selected build snapshot
+      timeout-minutes: 20
+      uses: actions/download-artifact@v8
+      with:
+        artifact-ids: "${{ inputs.snapshot-artifact-id }}"
+        path: "/mnt/gates/snapshot"
+        digest-mismatch: error
+    - name: Restore the instrumented build
+      id: unpack
+      shell: bash
+      run: |
+        time bash scripts/tests/retention_ci_setup.sh within-budget \
+          python3 -I scripts/tests/retention_artifacts.py unpack-build \
+          --archive "$GATES/snapshot/snapshot.tar.zst" --target "$CARGO_TARGET_DIR" \
+          --manifest-out "$GATES/build.json"
+        printf 'Expanded build bytes: %s\n' "$(du -sb "$CARGO_TARGET_DIR" | cut -f1)" \
+          | tee -a "$GITHUB_STEP_SUMMARY"
+        df -h "$GATES"
+    - name: Compute instrumented dependency download key
+      id: cache-key
+      continue-on-error: true
+      shell: bash
+      run: |
+        key=$(python3 -I scripts/tests/retention_artifacts.py cache-key --lane instrumented \
+          --target-triple "$RETENTION_TARGET")
+        test -n "$key"
+        printf 'key=%s\n' "qualification-$GITHUB_RUN_ID-$key" >> "$GITHUB_OUTPUT"
+    - name: Restore instrumented dependency downloads
+      id: cache-restore
+      if: "${{ steps.cache-key.outcome == 'success' && steps.cache-key.outputs.key
+        != '' }}"
+      continue-on-error: true
+      timeout-minutes: 5
+      uses: actions/cache/restore@v6.1.0
+      with:
+        path: |
+          /mnt/retention-ci/.cargo/registry/cache
+          /mnt/retention-ci/.cargo/registry/index
+          /mnt/retention-ci/.cargo/git/db
+        key: "${{ steps.cache-key.outputs.key }}"
+    - name: Fetch and materialize dependencies
+      id: fetch
+      shell: bash
+      env:
+        CACHE_HIT: "${{ steps.cache-restore.outputs.cache-hit }}"
+        CACHE_RESULT: "${{ steps.cache-restore.outcome }}"
+      run: |
+        printf 'Dependency cache %s (exact hit: %s)\n' \
+          "${CACHE_RESULT:-skipped}" "${CACHE_HIT:-false}" | tee -a "$GITHUB_STEP_SUMMARY"
+        bash scripts/tests/retention_ci_setup.sh fetch
+    - name: Run coverage shard
+      id: coverage
+      shell: bash
+      env:
+        SHARD_ID: "${{ inputs.shard-id }}"
+      run: |
+        time python3 -I scripts/tests/coverage_net.py --shard "$SHARD_ID" \
+          --out "$GATES/net" --build-manifest "$GATES/build.json" \
+          --deadline-epoch "$RETENTION_DEADLINE_EPOCH" --diagnostics-reserve-seconds 300
+    - name: Stage validated coverage evidence
+      id: stage
+      if: "${{ !cancelled() }}"
+      timeout-minutes: 3
+      shell: bash
+      env:
+        SHARD_ID: "${{ inputs.shard-id }}"
+        SNAPSHOT_ID: "${{ inputs.snapshot-artifact-id }}"
+        SHARD_OUTCOME: "${{ steps.coverage.outcome }}"
+      run: |
+        python3 -I scripts/tests/retention_artifacts.py stage --kind shard \
+          --producer "$SHARD_ID" --status "$SHARD_OUTCOME" \
+          --source "$GATES/net" --out "$GATES/evidence" \
+          --build-manifest "$GATES/build.json" --snapshot-artifact-id "$SNAPSHOT_ID"
+        printf 'Staged shard bytes: %s\n' "$(du -sb "$GATES/evidence" | cut -f1)" \
+          | tee -a "$GITHUB_STEP_SUMMARY"
+    - name: Upload coverage evidence
+      id: receipt
+      if: "${{ !cancelled() && steps.stage.outcome == 'success' }}"
+      timeout-minutes: 5
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: qualification-${{ inputs.qualification-lane }}-retention-${{ inputs.shard-id
+          }}-${{ github.run_attempt }}
+        path: "${{ env.GATES }}/evidence/"
+        if-no-files-found: error
+        retention-days: 1
+    - name: Retain sanitized shard diagnostics
+      if: "${{ !cancelled() && steps.stage.outcome == 'success' }}"
+      timeout-minutes: 2
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: qualification-${{ inputs.qualification-lane }}-retention-${{ inputs.shard-id
+          }}-diagnostics-${{ github.run_attempt }}
+        path: |
+          ${{ env.GATES }}/evidence/receipt.json
+          ${{ env.GATES }}/evidence/logs/
+          ${{ env.GATES }}/evidence/steps.tsv
+        if-no-files-found: ignore
+        retention-days: 7
