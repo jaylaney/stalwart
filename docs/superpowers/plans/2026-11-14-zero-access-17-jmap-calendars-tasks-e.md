@@ -521,9 +521,9 @@ The ledger gets one line per row: its id, killed or survived, the first failure.
 | Where the code lives, after the release 7 bullet (`:107-129`) | A release 6 bullet naming the spec, the plan's files and the outcome note, and every file of the header's "File structure" with its one-line role. |
 | Invariants, `:137` | `SessionKeys` are attached by the HTTP layer for one request, from Basic or from a token with a secret; a token without a secret is keyless. |
 | Invariants, after the release 7 bullet (`:144-178`) | One bullet, "JMAP calendars and browser sign-in (release 6 spec section 10, 57-76)", restating each invariant in a clause with its number, then the amendments of section 10. |
-| Invariant 9 exceptions (`:179-197`) | Two more. `decode_access_token` strips a `~` suffix from every token that begins with the server's token header before it opens it (spec 4.2, D26). A successful answer of the token endpoint is untraced for every account (D24). With them, the three costs section 10 names for ordinary accounts. |
+| Invariant 9 exceptions (`:179-197`) | Two more. `decode_access_token` strips a `~` suffix from every token that begins with the server's token header before it opens it (spec 4.2, D26). A successful answer of the token endpoint is untraced for every account (D24). With them, the three ordinary-account I/O costs and D29 codec/context costs in section 10; D29 adds no global lookup or extra ordinary-account store I/O. |
 | Where release 2 lives, `:286` | The drain is also called from `handle_jmap_request`, for a request whose token holds its own account's keys and that holds a calendar method. |
-| Merge hotspots, after the release 7 paragraphs (`:304-411`) | A paragraph "Release 6 added merge hotspots" with every insertion of spec 11's first list, and one "Release 6 silent dependencies" with every item of its second list. Among them, or added to them: the key writer of `CalendarEvent/set` repeats the head and the update grouping of upstream's handler; `za_calendar_set` repeats the head of `calendar/set.rs`; `za_itip_fails_write` names every `ItipError` variant; the split of a token relies on `TOKEN_HEADER`; D15's paged form relies on the fields of an intermediate state (Task 22); the recipient rule of `za_apply_default_alerts_by_value` repeats `alerts.rs:472-489`; the query branch relies on no key account's event carrying `EVENT_HIDE_ATTENDEES`; the place of each use of `za_session_binding` (the header's table). |
+| Merge hotspots, after the release 7 paragraphs (`:304-411`) | A paragraph "Release 6 added merge hotspots" with every insertion of spec 11's first list, and one "Release 6 silent dependencies" with every item of its second list. Among them, or added to them: the key writer of `CalendarEvent/set` repeats the head and the update grouping of upstream's handler; `za_calendar_set` repeats the head of `calendar/set.rs`; `za_itip_fails_write` names every `ItipError` variant; the split of a token relies on `TOKEN_HEADER`; D29 relies on the versioned origin codec, method/expected-state context checks, unchanged origin across range/count changes, the legacy owner chain, and queryChanges forwarding (Task 22; spec 11); the recipient rule of `za_apply_default_alerts_by_value` repeats `alerts.rs:472-489`; the query branch relies on no key account's event carrying `EVENT_HIDE_ATTENDEES`; the place of each use of `za_session_binding` (the header's table). |
 | The za suite paragraph, `:419` | The modules `tokens` and `jmap_calendar::{pipeline, events, calendars, query, scheduling, sharing, refusals, oracle}` after `sharing_races::test`; `leak::test_jmap_calendars` after `leak::test_imip`; the fixture rule of the header's suite rules, and the `token-*` and `jmapcal-*` allocations, by module, as the tasks made them. |
 | Release 4 calendar sharing, `:426-434` | A grantee reads and writes a shared key calendar through JMAP under the rules CalDAV applies; `shareWith` stays refused; a shared calendar's colour is in each principal's sealed bundle, and a new grantee's entry starts as a copy of the owner's (D14). |
 
@@ -544,7 +544,7 @@ In the form of `client-caldav.md`. Sections:
 - **What this is**: the manual gate of spec 9.8 for the reference client, Bulwark Webmail 1.21.2, static edition. It qualifies the server; the release ships, hosts and configures no client.
 - **Setup**: serving the static edition from a local server; the OAuth client and Application registration it needs and the server's CORS setting, as steps on a local machine; the accounts: a key account without a second factor, one with, a second key account as grantee and invitee, an outside address at a local SMTP sink.
 - **Recording**: the date, the client's version, the server's commit, and one result per row.
-- **Checks**: every row of spec section 7's table, in its order, each with the action and the expected result. The row "after the first invitation to a key account" expects the browser to stay signed in (D19).
+- **Checks**: every row of spec section 7's table, in its order, each with the action and the expected result. The row "after the first invitation to a key account" expects the browser to stay signed in (D19). Add D29 qualification: the unmodified client echoes opaque `z` continuation strings across multiple pages, an initial sync continues across a sharing-boundary change, and an invalidated incremental sync restarts after `cannotCalculateChanges`. Automated handler/codec tests do not establish this client result.
 - **Assumptions to confirm on a running instance**: the five facts of spec 1.3, each with how to observe it.
 
 - [ ] **Step 4: The smaller files**
@@ -569,13 +569,13 @@ In the form of `client-caldav.md`. Sections:
 - **Accepted residuals**:
   - spec 3.3 in substance, and 3.4's four limitations, of which only the round trip has a test;
   - 4.5's interrupted refresh; D22's residual; D7 at a cache hit; section 2's at-rest and client statements;
-  - the three costs on ordinary accounts (spec section 10);
+  - the three ordinary-account I/O costs, D29 codec/context costs and the legacy grantee restart (spec sections 6.8 and 10);
   - a retried refresh's next entry can outlive its token by the retry's delay (4.3);
   - a grantee's JMAP update stamps `updated`, so most JMAP moves ask `ModifyItems` as well (5.2);
   - coverage that stays partial: the refresh steps of 4.5 have a unit test for the classification only and run otherwise in the za suite; the pass-through of a foreign Bearer value has a unit test only.
 - **Deferred findings**, by task.
 - **Merge hotspots**: spec 11 and Step 1's additions.
-- **Open questions for the project owner**: decision 4; whatever is still open of D15 on a paged sync, the memory of an unranged text query and the `/set` answer after D11; and whatever execution found.
+- **Decisions and remaining qualification**: D19 and the explicit-origin D29 amendment are approved. Record Task 22 collision/legacy/context evidence, Task 26 queryChanges evidence and the separate reference-client result; do not reopen origin inference or treat source review as runtime proof. List any new unresolved findings, the memory of an unranged text query and the `/set` answer after D11 with their observed status.
 
 - [ ] **Step 6: Commit**: `Plan 17 outcome note, the reference client's checklist, CLAUDE.md and the release 6 documentation`
 
@@ -633,18 +633,19 @@ The outcome note's "Where things stand" gets one line per row: command, result, 
 
 One fresh, independent Astra reviewer (`gpt-6-astra`, `xhigh`), with a clean context and this brief:
 
-- **Read**: the spec, revision 6; the plan's header, the interface sheet and the six task files; `AGENTS.md` and `CLAUDE.md`; and `git diff <base>..<head>`, with both refs pinned and the base the branch's merge base with `origin/main`. The controller supplies the accepted contract and a validation-only extract of Step 1's commands, results and tested head. The initial brief includes no implementer report, prior finding list, task-review conclusions or outcome-note rulings.
+- **Read**: the spec, revision 7 (including approved D29); the plan's header, the interface sheet and the six task files; `AGENTS.md` and `CLAUDE.md`; and `git diff <base>..<head>`, with both refs pinned and the base the branch's merge base with `origin/main`. The controller supplies the accepted contract and a validation-only extract of Step 1's commands, results and tested head. The initial brief includes no implementer report, prior finding list, task-review conclusions or outcome-note rulings.
 - **Run nothing.** The matrix of Step 1 ran on this head; its results are in the validation extract.
 - **Look for**:
   1. a place where JMAP and CalDAV differ for a key account in anything spec 3.2 does not list as an input, and a JMAP write that stores plaintext CalDAV would have sealed (3.6);
   2. each invariant 57 to 76 against the code that carries it (74 to 76 are revision 5's: D26, D28 and D29), with an input that would break it;
   3. the refresh steps of 4.5 against `rotate_oauth_grant`, and every write of the token record against the two assertions of 4.3 and D21;
   4. each function moved in group A against the lines it replaced, and every hook, trace string and unsettled mail guard that had to move unchanged;
-  5. every fork insertion in an upstream file: more than one call or one short branch, a copied upstream check, and a path an ordinary account now takes differently beyond what section 10 records: the strip of a `~` suffix from a token that begins with the server's token header, the untraced successful answer of the token endpoint, and the three costs it names;
+  5. every fork insertion in an upstream file: more than one call or one short branch, a copied upstream check, and a path an ordinary account now takes differently beyond what section 10 records: the strip of a `~` suffix from a token that begins with the server's token header, the untraced successful answer of the token endpoint, the three ordinary-account I/O costs, and D29's documented codec/context work and narrow state-consumer insertions;
   6. a `/set` call for a key account in which a store error fails the method, changes an earlier object's answer or lets a later object run (5.3, D3);
   7. a trace, log or error that can carry a token, a secret, a code, a tag, event content or an address;
   8. a test that would pass on wrong behaviour, an assertion changed without its spec section, a retained test function that no longer runs in its step;
-  9. a use of the session rule that does not go through `za_session_binding`.
+  9. a use of the session rule that does not go through `za_session_binding`;
+  10. D29: an origin lost across a continuation or queryChanges, a boundary check against a range ID instead of the original exact state, a legacy owner chain silently upgraded, an out-of-scope state accepted, or a precondition converted into an unconditional write. Preserve upstream log validity and authorization checks and ordinary state bytes.
 - **Report every finding**, each with its file and line, what happens, the input or interleaving that shows it, a confidence (high, medium or low) and a severity (critical, important or minor). Do not filter, merge or rank findings away, and do not fix anything.
 - **Accepted contract**: spec 3.3 and 3.4 record accepted limits. Inherited upstream behaviour is reported as such, in one line. Report findings independently; the controller compares them with prior rulings and residuals during Step 4.
 

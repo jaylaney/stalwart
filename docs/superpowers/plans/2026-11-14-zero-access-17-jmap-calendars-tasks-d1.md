@@ -192,115 +192,171 @@ The rule of `ZaEventReader::view`. A memoised view of `document_id` is returned 
 
 ---
 
-### Task 22: `/changes` and the sync boundary
+### Task 22: `/changes`, explicit sync origin and the sharing boundary
 
-**Spec:** 6.8, D15, D29; 6.2 (two rows); invariant 76.
+**Spec:** revision 7, 6.8, D15/D29; 6.2 (two rows); 9.1/9.2; invariant 76.
+Jay approved the explicit-origin amendment, recorded 2026-11-15. The
+former first-retained-log inference is superseded, not a remaining design
+question. Sol implements at `high`; independent Astra review is `xhigh`.
 
 **Files:**
 - Create: `crates/jmap/src/changes/za_calendar.rs`; `tests/src/za/jmap_calendar/sharing.rs`.
-- Modify:
-  - `crates/jmap/src/changes/mod.rs:7-11` (`pub mod za_calendar;`).
-  - `crates/jmap/src/changes/get.rs:245-254`: one arm in the fork's `match object` block, which runs after admission and before the log is read.
-  - `crates/jmap/src/api/za_calendar.rs` (two rows).
-  - `tests/src/za/jmap_calendar/events.rs` (one case); `tests/src/za/jmap_calendar/mod.rs` (`pub mod sharing;`); `tests/src/za/mod.rs` (the call `jmap_calendar::sharing::test`, after `jmap_calendar::calendars::test`; Tasks 26 and 31 put `query` and `scheduling` between them).
-  - `tests/src/za/gating.rs` (two rows).
+- Modify: `crates/jmap-proto/src/types/{state,state_restored_tests}.rs`;
+  `crates/jmap-proto/src/request/{parser,parser_restored_tests}.rs`;
+  `crates/jmap/src/changes/{mod,get,query,za}.rs`;
+  `crates/jmap/src/participant_identity/changes.rs`;
+  `crates/jmap/src/api/za_calendar.rs` (two served rows).
+- Tests: `tests/src/za/jmap_calendar/{events,mod}.rs`, `tests/src/za/{mod,gating}.rs`,
+  `tests/src/jmap/za_variants.rs`. Keep every retained test function in place.
+- Read without changing the algorithm: `crates/jmap/src/changes/{page,state}.rs`,
+  `crates/store/src/query/log.rs`, `crates/common/src/storage/transaction.rs`,
+  and the protocol `method/{changes,query_changes,set,import,copy}.rs`.
 
 **Interfaces:**
-- Consumes: `za_foreign_calendar_contexts` (I §2.4); `ZaSyncBoundary::refuses`, `ZaCalendarContext.boundary` (I §2.4). Tests: `pair`, `key_account`, `make_calendar`, `share`, `put_event`, `finish`, `mark_boundary_pending`, `owner_boundary` (I §10).
-- Produces: `za_calendar_sync_boundary` (I §7.2), and the private `since_change_id` that Step 1 decides.
+- Consumes: `za_foreign_calendar_contexts`, `ZaSyncBoundary::refuses`,
+  `ZaCalendarContext.boundary` (I §2.4); admission (I §6); `pair`,
+  `key_account`, `make_calendar`, `share`, `put_event`, `finish`,
+  `mark_boundary_pending`, `owner_boundary` (I §10).
+- Produces: `ZaCalendarOrigin`, `State::ZaCalendarIntermediate`,
+  `za_calendar_sync_boundary`, `za_calendar_sync_origin`,
+  `za_calendar_reattach_origin`, and the fallible `ZaChangesSince::new`
+  (I §7.2). I §7.6 fixes the codec, legacy handling and context errors.
 
-**The rule (spec 6.8, D15 and D29).** The predicate is applied to the state the sync started from, with the same comparison on every page. A page of a sync that started from an initial state is never refused. The owner is never checked.
+**State consumer and context inventory.** Recheck these symbols at the
+current head before editing. Record any newly found consumer in the task
+report and apply the same contract; do not silently accept `z` elsewhere.
 
-**What the code holds.**
-- An intermediate state is `JMAPIntermediateState { from_id, to_id, items_sent }` (`crates/jmap-proto/src/types/state.rs:19-23`). `LogBounds::new_state` builds it (`crates/jmap/src/changes/page.rs:278-279`) from the first and last change id of the range the first page read (`:204-228`).
-- It does not record whether the sync began at `Initial` or at `Exact(s)`.
-- An initial sync reads the log from its first record (`Query::All`, `crates/jmap/src/changes/get.rs:324-333`), so its `from_id` is the first retained change id of the log. An exact start gives the first change after `s`.
-- A boundary's change ids are taken from the calendar log: `crates/groupware/src/calendar/sharing/boundary.rs:158-170` and `sharing/mutations.rs:176-183,443-447`.
+| Site | Required handling |
+|---|---|
+| `types/state.rs`: `State`, `parse`, `Display`, `get_change_id` | Add the transient origin/range variant and version-1 `z` codec. `get_change_id` returns its range end. Expand the buffer for all fields (42 bytes suffice on 64-bit: two one-byte fields and four ten-byte LEB128 values). Keep old format bytes and parsing behavior unchanged. |
+| `types/state.rs`: `Deserialize for State` and `ExpectedState` | Normal slots parse valid `z`; malformed `z` is invalid. `ExpectedState` maps valid or malformed `z` to the same invalid sentinel used for an invalid string, preserving the eventual `stateMismatch` path. Never treat it as absent. |
+| `request/parser.rs`: `DeserializeSeed for MethodArguments` | After decoding arguments, permit `z` only in `Calendar/changes`, `CalendarEvent/changes` and `CalendarEvent/queryChanges` normal state slots. Other known methods with those slots give `invalidArguments`. Use the already-known method name; no account lookup or permission check. Preserve unknown-method and invalid-argument ordering. |
+| `changes/get.rs`: calendar arm, state match, response construction | After existing calendar admission/access checks, get the original origin from the boundary helper. Process the new variant's range with the existing intermediate arm. Reattach origin to each intermediate result after `LogBounds::new_state`; echo the original `old_state`. Audit early returns. Reject out-of-scope `z` before it could reach another object's reader. |
+| `changes/query.rs`: keyed Email fast path and calendar path; `build_changes_request`, `build_query_changes_response` | Propagate the mail constructor's new error with `?`. Keep the calendar request/response state clones intact; there is no origin recomputation. Task 26 exercises the public calendar path after admission opens it. |
+| `changes/za.rs`: `ZaChangesSince::new` | Add an explicit `InvalidArguments` arm for `z` and return `trc::Result<Self>`; update both callers. Never interpret calendar range fields as a mail snapshot continuation. |
+| `participant_identity/changes.rs`: state match | `z` is `invalidArguments`, including direct in-process calls. Retain the legacy `r` refusal and existing account/access order. Task 23 must preserve this arm. |
+| `changes/page.rs`: `LogBounds::new_state`; `changes/state.rs`: `max_state` | Inspect all wildcard and state matches. Keep their algorithms unchanged; origin wrapping belongs to the calendar adapter. A new exact response stays exact, and a legacy owner's chain stays legacy. |
+| Protocol `method/{changes,query_changes,set,import,copy}.rs` and server precondition checks | Inventory `sinceState`/`sinceQueryState` and all `ExpectedState` slots (`ifInState`, `ifFromInState`, `destroyFromIfInState`). No precondition is converted into an unconditional write. Exercise each slot and the normal authorization precedence. |
 
-**The candidate for a later page.** The sync started from an initial state exactly when `from_id` is the first retained change id of the calendar log; then the page is served. Otherwise the start is some `s < from_id`, and the page is checked as `refuses(from_id - 1)`. It costs one log read per later page, and only for a grantee's sync of a key account.
-
-`za_calendar_sync_boundary`, in this order:
-
-1. `State::Initial`: `Ok`.
-2. `access_token.account_id() == account_id`: `Ok`. This is CalDAV's own test for "not a sharer's calendars" (`crates/dav/src/common/propfind/get.rs:84-89`).
-3. `!server.za_is_key_account(account_id).await?`: `Ok`.
-4. The id to check: `Exact(id)` is `id`. `Intermediate` follows Step 1's decision; under the candidate it reads the log's first retained change id, returns `Ok` when `from_id` equals it, and otherwise checks `from_id - 1`.
-5. The calendars are `document_ids(true)` of `fetch_groupware_resources(access_token.account_id(), account_id, SyncCollection::Calendar)`, passed to `za_foreign_calendar_contexts(.., None)`. `Err(ZaPipelineError::Store(error))` is `Err(error)`; any other `Err` is `Err(trc::JmapEvent::CannotCalculateChanges.into_err())`.
-6. If any context has `boundary.is_some_and(|b| b.refuses(id))`: `Err(trc::JmapEvent::CannotCalculateChanges.into_err())`, with no details.
+**Boundary and continuation rule:** follow I §§7.2/7.6. Classify the
+calendar account even for an owner/Initial request to choose the format;
+reuse admission's cached classification where available. Ordinary `z`
+is `invalidArguments`; ordinary existing states are unchanged. A key
+owner's legacy `r` returns no origin and stays `r`. A key grantee's legacy
+`r` is `cannotCalculateChanges`. Every other key-calendar start has an
+explicit origin: owner and Initial origin skip the sharing-boundary
+check; an exact-origin grantee checks the original ID with the shared
+predicate on every page. No first-retained lookup or `from_id - 1` guess.
 
 **Constraints:**
-- The change log is keyless and is served as upstream serves it, with upstream's filtering for a grantee. Do not touch the log reader or another object's arm.
-- One predicate decides both protocols: call `ZaSyncBoundary::refuses` and write no comparison of a boundary's change ids in `jmap`.
-- For an ordinary account the arm costs at most one cached classification read, and none when the caller is the owner or the state is initial.
-- `/queryChanges` inherits the check through `self.changes(..)` (`crates/jmap/src/changes/query.rs:314-322`); add nothing there.
-- The insertion in `changes/get.rs` is one arm with one call.
+- The new state is transient protocol data, never an rkyv/stored-layout change.
+- Only the calendar adapter emits `z`; no secret, account permission or
+  client change is encoded by its origin. All authorization still runs.
+- Upstream's log reader, retention, filtering, folding, pagination and
+  validity checks are unchanged. Initial-origin exemption concerns the
+  sharing boundary, not an exemption from unrelated log errors.
+- No global account lookup. No additional ordinary-account store I/O
+  beyond the calendar classification; the extra token fields and codec
+  checks are the format cost. There is no inference read on later pages.
+- Do not call or extend `za_log_first_retained` for this task.
+- Test setup may create/trim its isolated account's log through existing
+  storage APIs. No production hook or alternate pagination algorithm.
 
-- [ ] **Step 1: confirm the reading, before any test.** Read the four places under "What the code holds" and decide how a later page tells the two starts apart. Check these and write each answer in the task report:
-  - that `from_id` of an initial sync is the log's first retained change id, also when the log's head was trimmed (an empty record marks truncation, `crates/store/src/query/log.rs:160-168`);
-  - how a later page reads the first retained change id with one read;
-  - that a boundary above `s` is at or above `from_id`, because a boundary's ids are ids of the calendar log;
-  - what an exact start below the first retained record gives: the same `from_id` as an initial sync. Say whether upstream refuses that start itself.
+- [ ] **Step 1: write the codec and consumer unit tests.** In
+  `state_restored_tests.rs`, use the prefix `za_calendar_state_`:
+  `round_trips` covers Initial/Exact origins and maximal field sizes;
+  `rejects_malformed` covers unknown versions/tags, missing/trailing
+  fields, zero exact ID/count, LEB128 overflow and overflowing range end;
+  `legacy_fixtures` pins existing `n`/`s`/`r` bytes and zero-exact behavior;
+  `expected_state_mismatch` covers every precondition slot and its invalid
+  sentinel. In `parser_restored_tests.rs`, `za_calendar_state_contexts`
+  covers every existing Changes/QueryChanges method family: only the
+  three named calendar slots accept `z` at the parser, and other known
+  families return `invalidArguments`; existing invalid/missing account
+  and unknown-method precedence is preserved. No parser account read.
+- [ ] **Step 2: run U-ws `za_calendar_state_`.** Expected RED: missing
+  origin type/variant or assertions against the absent codec/context
+  handling. Record the actual failure; zero matching tests is not a RED.
+- [ ] **Step 3: implement the codec and its consumer adaptations.** Follow
+  the inventory and I §7.6; keep the new variant unserved until the
+  calendar adapter is implemented. Run U-ws `za_calendar_state_` and the
+  existing `test_state_id`/`test_state_zero_change_id_is_initial`. Expected
+  GREEN. The current code must compile with every enum match covered.
+- [ ] **Step 4: write `sync_boundary_origins` in `changes/za_calendar.rs`.**
+  Exercise pure extraction and reattachment, not guessed log starts:
+  Initial -> Initial; Exact(41) -> Exact(41); `z` keeps its original
+  origin when its range changes from 42..50 to 45..60; legacy `r` has no
+  origin. Reattachment wraps only an Intermediate result with Some
+  origin; exact results and None-origin legacy chains are unchanged.
+- [ ] **Step 5: run U-ws `sync_boundary_origins`.** Expected RED for the
+  missing helpers; then implement the pure helpers and rerun to GREEN.
+- [ ] **Step 6: write the actual-handler cases.**
 
-  If the code does not let the two starts be told apart, stop and report to the controller. Do not choose a side.
-- [ ] **Step 2: write the failing unit test**, `jmap`, in `changes/za_calendar.rs`: `sync_boundary_since_ids`. Under the candidate, `since_change_id(since: &State, first_retained: Option<u64>) -> Option<u64>` returns the id to check, or `None` for a state that is never checked. If Step 1 decided another form, the rows follow it.
+  `events::changes_as_upstream`: over CalDAV, PUT `a` and `b`, change
+  `a`, then delete `b`; collect actual exact states between writes.
+  `CalendarEvent/changes` reports the expected created/updated/destroyed
+  IDs. `Calendar/changes` reports a newly created calendar. Initial sync
+  is served. These remain real HTTP JMAP requests through the harness.
 
-  | `since` | First retained | Result |
-  |---|---|---|
-  | `Initial` | any | `None` |
-  | `Exact(41)` | any | `Some(41)` |
-  | `Intermediate { from_id: 42, to_id: 50, items_sent: 3 }` | `Some(42)` | `None`: the sync started from an initial state |
-  | the same | `Some(7)` | `Some(41)` |
-  | the same | `None` | `Some(41)` |
-  | `Intermediate { from_id: 1, to_id: 9, items_sent: 1 }` | `Some(1)` | `None` |
-- [ ] **Step 3: run it.** U-ws `sync_boundary_since_ids`. Expected: fails to compile, `file not found for module za_calendar`.
-- [ ] **Step 4: write the failing za cases.**
+  `sharing.rs` banner: `Running zero-access JMAP calendar sharing tests...`.
+  Setup: `pair(test, "sharing")` (owner and never-granted `key2`),
+  `key_account(test, "sharing-reader", user_permissions())` (grantee),
+  shared calendar `jmapcal-shared`, two events and a `view` grant. Remove
+  `key_account`'s dead-code allowance at its first use (I §10.1). Cases
+  restore a completed boundary, the two setup events and the view grant
+  for Task 36. Delete temporary accounts/items, then `finish` at module end.
 
-  `events::changes_as_upstream`, called from `events::test`. Over CalDAV: PUT `a` and `b`; change `a`'s SUMMARY; DELETE `b`. A state is read from `CalendarEvent/get`'s `state` before the first step (`s0`) and after each (`s1`, `s2`, `s3`).
-  - `CalendarEvent/changes` since `s0`, after the two PUTs: `created` is `{a, b}`, `updated` and `destroyed` are empty, `newState` is `s1`;
-  - since `s1`, after the change: `updated` is `[a]`, the other two empty;
-  - since `s2`, after the delete: `destroyed` is `[b]`;
-  - `Calendar/changes` since the calendar state read before a `make_calendar`: `created` is the new calendar's id;
-  - `CalendarEvent/changes` since `"n"` has no method error.
+  | Case | Required assertions |
+  |---|---|
+  | `sync_boundary_matches_caldav` | Both calendar Changes methods and CalDAV agree: pending refuses exact states; completed boundary `b` refuses exact IDs at/below `b`; valid later exact IDs pass. Key owner is exempt. Initial paging passes while pending and completed; every intermediate response is `z` with Initial origin. Start an exact page after `b`, then make the boundary pending: its next page refuses while the initial-origin page continues. |
+  | `paged_sync_retention_collision` | Reproduce the amendment's actual CalendarEvent log history using real IDs `b < m < f < g < c`, an empty retention marker at `m`, and records at `f`,`g`. Assert the stored marker and successful first pages from Initial and Exact(m), both `maxChanges: 1`, with equal range/count but distinct `z` origins. Complete a rename to boundary `c`; Initial continuation is served, Exact(m) is `cannotCalculateChanges`. Do not substitute a helper-only test. |
+  | `paged_sync_origin_survives_range_changes` | At least three pages preserve the exact same origin. Exercise insert/delete folding that moves the returned range's first ID and trimming between requests. The origin remains unchanged when upstream permits continuation; trimming that invalidates the underlying range retains upstream's refusal. Include paging for both calendar object types with suitable visible fixtures. |
+  | `paged_sync_legacy_and_ordinary` | Key grantee legacy `r` requires Initial restart. A key owner's valid legacy chain emits only `r` until completion; its next new paged sync emits `z`. Ordinary initial/exact/legacy paging and bytes are unchanged; ordinary calendar `z` is `invalidArguments`. |
+  | `calendar_state_slot_errors` | With otherwise authorized requests, feed both `z` origins to non-calendar state slots (including keyed Email queryChanges and ParticipantIdentity), and to ordinary calendar state slots: `invalidArguments`. Exercise the precondition matrix below. Retain unauthorized/keyless controls with their established admission errors. Task 37 adds the key-calendar writer slots after those methods are served. |
 
-  `sharing.rs`. Banner: `Running zero-access JMAP calendar sharing tests...`. Set-up: `pair(test, "sharing")` (the owner, and `key2`, which is never granted) and `key_account(test, "sharing-reader", user_permissions())`, the grantee. This is the first call of `key_account`: remove its `#[allow(dead_code)]` in `jmap_calendar/mod.rs` (I §10.1). `make_calendar(.., "jmapcal-shared")`, two events with `put_event`, `share(.., "view")` to the grantee. End: the events and the calendar deleted, `finish(test, "sharing")`. Task 36 adds cases.
+  Precondition matrix: valid and malformed `z` in `ifInState` of an
+  already-served `/set`, Email/import and ordinary CalendarEvent/copy
+  gives `stateMismatch` before that operation writes. On ordinary
+  CalendarEvent/copy between distinct authorized accounts, `ifFromInState`
+  gives `stateMismatch` before copying. `destroyFromIfInState` is checked
+  by the generated follow-up `/set`, after a successful copy: assert that
+  follow-up's `stateMismatch`, source retained and destination copy still
+  present, matching the existing invalid-string control. Do not demand
+  rollback of the earlier successful copy or add precondition semantics
+  to methods that do not support that slot. Clean up both fixture accounts.
 
-  `sharing::sync_boundary_matches_caldav`. Three helpers of the case:
-  - `dav(id)`: the grantee's REPORT `sync-collection` on `/dav/cal/jmapcal-sharing%40example.com/jmapcal-shared/` with the token `urn:stalwart:davsync:{id:x}`. Refused means status 403 and a body that holds "valid-sync-token" (`tests/src/za/sharing_tombstones.rs:31-53`).
-  - `jmap(method, since)`: the grantee's `method` with the owner's account id and that `sinceState`. Refused means the method error `cannotCalculateChanges`.
-  - `exact(id)`: `State::new_exact(id).to_string()`.
+- [ ] **Step 7: move the two `/changes` gating rows** in `gating.rs` and
+  `za_variants::calendars` to their served blocks, per the header. Keep
+  the function names and closing store-emptiness checks.
+- [ ] **Step 8: run ZA.** Expected RED at the first newly served calendar
+  changes call (`accountNotSupportedByMethod`) or the precise unmet D29
+  assertion. Record the actual first failure.
+- [ ] **Step 9: implement the calendar adapter.** Add the module and the
+  boundary helper, range arm and response reattachment from I §7.2.
+  Existing `old_state` echoes the request. Cover every path that returns
+  an intermediate response; do not modify `LogBounds::new_state` or the
+  log reader to infer an origin. Flip `(Calendar, Changes)` and
+  `(CalendarEvent, Changes)` in both admission and `calendar_method_classes`.
+- [ ] **Step 10: run U-ws `sync_boundary_origins`, then `calendar_method_classes`,
+  then ZA.** Expected GREEN, including all five sharing cases and
+  `events::changes_as_upstream`. Public `CalendarEvent/queryChanges`
+  remains refused until Task 26; its origin-preservation tests are there.
+- [ ] **Step 11: run JP, then JK.** Expected GREEN. Both modes matter
+  because the new state variant and request parser are shared.
+- [ ] **Step 12: the closing checks.** SHIP, TM and FMT include `jmap-proto`.
+- [ ] **Step 13: commit.** `Release 6: preserve calendar sync origin across pages`
 
-  The assertions, in order:
-  1. `mark_boundary_pending`. For `id` in `1` and `u64::MAX - 1`: `dav(id)`, `jmap("CalendarEvent/changes", exact(id))` and `jmap("Calendar/changes", exact(id))` are all refused. A pending boundary refuses every incremental state on both protocols.
-  2. (a) Still pending: the grantee's `CalendarEvent/changes` from `"n"` with `maxChanges: 1`. The first answer has no error, `hasMoreChanges: true` and a `newState` that begins with `r`. Each next request sends the last `newState`. Every page has no error, until `hasMoreChanges` is false.
-  3. The owner's `Calendar/get` with `ids: null`. Then `owner_boundary(..).pending` is false. `b` is its `rename_change_id`: the later of grant and rename, here the completion's id.
-  4. (b) The paged sync of (a) again, after completion: every page is served to its end.
-  5. (c) For `id` in `1`, `b - 1`, `b`: `dav(id)` and both `jmap` calls with `exact(id)` are refused, on the first request.
-  6. Three further events are PUT into the shared calendar, one at a time. `t0`, `t1` and `t2` are the owner's `CalendarEvent/get` `state` after each; `State::parse` gives each as `Exact(id)` with `id > b`. For each of the three: `dav(id)` and both `jmap` calls are served. Since `t1` the grantee's `created` has one id.
-  7. (d) The grantee's `CalendarEvent/changes` from `t0` with `maxChanges: 1` (two changes follow it): every page is served to its end.
-  8. (e) Two requests with `maxChanges: 1` each return a first page and an intermediate state: one from `t0` (state `p`), one from `"n"` (state `q`). Then `mark_boundary_pending`. The second page with `p` is refused. The second page with `q` is served. Then the owner's `Calendar/get` completes the boundary again.
-  9. The owner's `CalendarEvent/changes` since `exact(b)` is not `cannotCalculateChanges`: the owner is never checked.
-  10. The case deletes its three events. The calendar keeps the two of the set-up and a completed boundary, which Task 36's cases start from.
-- [ ] **Step 5: move the gating rows** `Calendar/changes` (`gating.rs:370-373`) and `CalendarEvent/changes` (`:388-391`) to the served loop.
-- [ ] **Step 6: run ZA.** Expected: fails in `jmap_calendar::events`, at `changes_as_upstream`, on `accountNotSupportedByMethod`.
-- [ ] **Step 7: implement** `za_calendar.rs` and the arm at `changes/get.rs:245-254`:
-
-```rust
-MethodObject::Calendar | MethodObject::CalendarEvent => {
-    za_calendar_sync_boundary(self, access_token, request.account_id.document_id(), &request.since_state).await?;
-}
-```
-
-- [ ] **Step 8: flip the rows** `(Calendar, Changes)` and `(CalendarEvent, Changes)` to `Served`, in the function and in `calendar_method_classes`. Run U-ws `sync_boundary_since_ids`, then `calendar_method_classes`. Expected: 1 passed each.
-- [ ] **Step 9: run ZA.** Expected: pass. Proved by `events::changes_as_upstream` and `sharing::sync_boundary_matches_caldav`. `gating` still shows `CalendarEvent/queryChanges` refused: Task 20's call in `changes/query.rs` keeps it so until Task 26.
-- [ ] **Step 10: run JK.** Expected: pass, unchanged.
-- [ ] **Step 11: the closing checks.**
-- [ ] **Step 12: commit.** `Release 6: calendar /changes and the sync boundary for a grantee`
+The independent Astra `xhigh` reviewer checks the codec/context inventory,
+actual collision evidence, legacy owner chain, unchanged ordinary paths,
+and every continuation output. Passing codec tests alone does not close
+D29; Task 26's public queryChanges evidence and final client qualification
+remain separately required.
 
 ---
 
 ### Task 23: `ParticipantIdentity`
 
-**Spec:** 6.9; 6.2 (three rows); 6.11 (the row on identities).
+**Spec:** 6.9; 6.8 (D29 state-context rejection); 6.2 (three rows); 6.11 (the row on identities).
 
 **Files:**
 - Create: `tests/src/za/jmap_calendar/refusals.rs`.
@@ -309,7 +365,7 @@ MethodObject::Calendar | MethodObject::CalendarEvent => {
   - `crates/jmap/src/api/za_calendar.rs` (three rows).
   - `tests/src/za/jmap_calendar/events.rs` (one case); `tests/src/za/jmap_calendar/mod.rs` (`pub mod refusals;`); `tests/src/za/mod.rs` (the call `jmap_calendar::refusals::test`, after `jmap_calendar::sharing::test`).
   - `tests/src/za/gating.rs` (two rows); `tests/src/jmap/za_variants.rs` (two rows and a cleanup).
-- Must not touch: `participant_identity/get.rs`, `changes.rs`.
+- Must not touch: `participant_identity/get.rs`, `changes.rs`; preserve Task 22's explicit `z` rejection in `changes.rs`.
 
 **Interfaces:**
 - Consumes: `Server::za_is_key_account` (`crates/common/src/auth/vault.rs:463`); upstream's `SetRequest::unwrap_create` and `unwrap_update`, each of which takes its map and leaves it empty, and the `will_destroy` the handler collects at `set.rs:53`. Tests: `key_account`, `finish` (I §10).
@@ -321,6 +377,7 @@ The branch: for a key account `za_refuse_identity_edits` moves every create, upd
 
 **Constraints:**
 - `/get` and `/changes` are served by upstream's code as it stands. The first read writes the identities record: the account's own addresses and its registry name, which the registry already holds in the clear.
+- Task 22's D29 state-context rejection remains in force when these methods become served. Add a `z` `sinceState` control to `identity_get_and_changes`: `invalidArguments`, never a calendar continuation.
 - Nothing of a refused request is stored.
 - For an ordinary account the handler costs one cached classification read.
 - Another account's request already gets upstream's `reject_identity_changes` (`set.rs:54-56`), before the fork's branch.
@@ -483,7 +540,7 @@ The branch: for a key account `za_refuse_identity_edits` moves every create, upd
 - Must not touch: upstream's filter building (`query.rs:241-373`), its sorting, its expansion; `changes/query.rs`.
 
 **Interfaces:**
-- Consumes: `ZaEventReader` (I §7.2); `ZaEventTextIndex` (I §3.2). Tests: `pair`, `make_calendar`, `share`, `put_event`, `finish`, `mark_boundary_pending`, `owner_boundary` (I §10); `gating::method_error`.
+- Consumes: `ZaEventReader`, `ZaCalendarOrigin`, `State::ZaCalendarIntermediate` (I §7.2; continuation rules I §7.6); `ZaEventTextIndex` (I §3.2). Tests: `pair`, `make_calendar`, `share`, `put_event`, `finish`, `mark_boundary_pending`, `owner_boundary` (I §10); `gating::method_error`.
 - Produces: `za_resolve_text_leaves` and the private `za_text_candidates` (I §7.2).
 
 What the task relies on, as the code stands: the filter list's top level is an AND (`crates/store/src/search/local.rs:85-88`); with set-only leaves the search store combines them and reads nothing (`crates/store/src/dispatch/search.rs:42-135`); a `metadata` condition of a key account already answers `unsupportedFilter` with `jmap::api::metadata::ZA_METADATA_REFUSED` (`crates/jmap/src/api/metadata/za.rs:69-73`).
@@ -508,7 +565,7 @@ The two points in `query.rs`:
 - The expanded form keeps upstream's matcher (`InstanceTextFilter`) on the view, and upstream's refusal of `NOT`, `OR` and a nested `AND` when expanding. Its phrase and prefix rules differ from the index's for every account; that is not this task's to change.
 - Privacy for a grantee is upstream's: the wrappers (`And(leaf, public ids)`) stay around the replaced leaves.
 - The branch relies on no key account's event carrying `EVENT_HIDE_ATTENDEES` (6.5 refuses the flag; CalDAV has none). Upstream's check for such events (`query.rs:895-1034`) sends an attendee leaf to the search store.
-- `CalendarEvent/queryChanges` calls the query function directly, so the branch sits inside that function. D15 reaches `/queryChanges` through `self.changes(..)`.
+- `CalendarEvent/queryChanges` calls the query function directly, so the branch sits inside that function. D15/D29 reach `/queryChanges` through `self.changes(..)`: preserve the explicit origin in `sinceQueryState`, `oldQueryState` and `newQueryState`; no range-derived origin or extra boundary predicate.
 - For an ordinary account the function costs one cached classification read (`ZaEventReader::new`).
 - The insertions in `query.rs` stay at the two points; everything else is in `query/za.rs`. This path charges no memory budget for the views it opens.
 
@@ -573,6 +630,24 @@ The two points in `query.rs`:
   - `s` is `CalendarEvent/query`'s `queryState` with the filter `{ "title": "veiled" }`. A second event with that word is written. `CalendarEvent/queryChanges` with that filter and `sinceQueryState: s`: no method error; `added` holds exactly the second event's id.
   - On the calendar `grantee_privacy` shared: `mark_boundary_pending`, then the owner's `Calendar/get` completes it. `b` is `owner_boundary(..).rename_change_id`. With `sinceQueryState: State::new_exact(b)`: `key2`'s `CalendarEvent/queryChanges` is `cannotCalculateChanges`; the owner's is not.
 
+  `query_changes_paged_origin` (D29; Task 22's public-path acceptance).
+  - Use the shared calendar with enough visible events for at least three
+    pages and `maxChanges: 1`. From Initial and separately a valid exact
+    state after the completed boundary, every intermediate `newQueryState`
+    is `z` with the unchanged original origin; each `oldQueryState` equals
+    the submitted token. Continue while the returned state is intermediate
+    (QueryChanges has no `hasMoreChanges` field); final state stays exact.
+  - Produce both first pages before marking the boundary pending. The
+    exact-origin continuation is `cannotCalculateChanges`; Initial origin
+    is served. Complete a rename and assert the same distinction against
+    its new boundary. Restore a completed boundary after the case.
+  - A legacy grantee `r` continuation requires restart. A key owner's valid
+    legacy chain remains `r` until completion. An ordinary calendar
+    `sinceQueryState: z` gives `invalidArguments`; its existing exact/legacy
+    states retain their behavior. Malformed `z` is `invalidArguments`.
+  - Preserve upstream's `expandRecurrences: true` refusal and the existing
+    access/keyless errors. The origin never grants access to another account.
+
   `metadata_condition_refused`. `Account::jmap_request` with the `using` list `urn:ietf:params:jmap:core`, `urn:ietf:params:jmap:calendars`, `urn:ietf:params:jmap:metadata`, and `CalendarEvent/query` with `filter: { "metadataExists": "example.com/note" }`: the method error `unsupportedFilter`; its `description` is `ZA_METADATA_REFUSED`.
 
   `text_query_cost` (review focus 5). 300 events in a calendar of their own, each with SUMMARY "jmapcal bulk <n>"; one also holds "needleword". Event `n` is one hour long and starts at 10:00 UTC on day `n % 30` of a 30-day span, ten a day. They are written with `uid_lease::put`, one after another.
@@ -586,7 +661,7 @@ The two points in `query.rs`:
 - [ ] **Step 5: run ZA.** Expected: fails in `jmap_calendar::query`, at `two_accounts_same_answers`, on `accountNotSupportedByMethod` for the key account's first query.
 - [ ] **Step 6: implement** `query/za.rs` and the two points in `query.rs`.
 - [ ] **Step 7: flip the rows** `(CalendarEvent, Query)` and `(CalendarEvent, QueryChanges)` to `Served`, in the function and in `calendar_method_classes`. Run U-ws `text_candidates_narrow_only_under_and`, then `calendar_method_classes`. Expected: 1 passed each.
-- [ ] **Step 8: run ZA.** Expected: pass. Proved by the seven cases of `jmap_calendar::query`. Copy the two `text_query_cost` lines into the ledger; Task 43 puts them in the outcome note.
+- [ ] **Step 8: run ZA.** Expected: pass. Proved by the eight cases of `jmap_calendar::query`, including `query_changes_paged_origin`. Copy the two `text_query_cost` lines into the ledger; Task 43 puts them in the outcome note. D29's public queryChanges gate is complete only with this case's actual result.
 - [ ] **Step 9: run JK.** Expected: pass.
 - [ ] **Step 10: the closing checks.**
 - [ ] **Step 11: commit.** `Release 6: CalendarEvent/query and queryChanges for key accounts`

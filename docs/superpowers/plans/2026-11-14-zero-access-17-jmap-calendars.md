@@ -8,7 +8,14 @@
 
 **Tech Stack:** Rust 2024 on upstream Stalwart v1.0.3 with release 7 (fork `0.4.0-beta.1`; internal crates `1.0.3`, `vault` `0.16.25`); `vault::keys` (HKDF sub-keys, `wrap_key`, XChaCha20-Poly1305) and rkyv for the token record; upstream's OAuth code (`seal_token`, `rotate_oauth_grant`, the in-memory store's code entries); upstream's JSCalendar converter in `calcard` and its JMAP calendar handlers; release 7's in-memory content part (`store::za_search::content::ContentPart`); the `tests` crate harness (`TestServer`, `DummyWebDavClient`, the JMAP helpers of `tests/src/utils/jmap.rs`, the SMTP sink, `HookParked`, `DrainOn`).
 
-**Spec:** [`docs/superpowers/specs/2026-11-13-zero-access-jmap-calendars-design.md`](../specs/2026-11-13-zero-access-jmap-calendars-design.md), revision 6 (decisions D1 to D29, invariants 57 to 76). Executors read the spec with the plan: a task names the sections it implements, and where the plan and the spec disagree the spec wins. Every name a task uses is fixed by the interface sheet; a task cites its sections and copies no signature. A name that turns out wrong is reported, not renamed.
+**Spec:** [`docs/superpowers/specs/2026-11-13-zero-access-jmap-calendars-design.md`](../specs/2026-11-13-zero-access-jmap-calendars-design.md), revision 7 (decisions D1 to D29, invariants 57 to 76). Executors read the spec with the plan: a task names the sections it implements, and where the plan and the spec disagree the spec wins. Every name a task uses is fixed by the interface sheet; a task cites its sections and copies no signature. A name that turns out wrong is reported, not renamed.
+
+**D29 approval incorporated, 2026-11-15:** Jay approved the
+[explicit-origin amendment](../specs/2026-11-14-zero-access-jmap-paged-sync-amendment.md)
+and its implementation. Task 22 and I §§7.2/7.6 now carry that contract;
+the former origin-inference prerequisite is superseded. Task 22 runs
+after Task 21 under the existing task/review order. This document update
+is not implementation or runtime acceptance evidence.
 
 **Plan files:** the plan is this file, the interface sheet [`2026-11-14-zero-access-17-jmap-calendars-interfaces.md`](2026-11-14-zero-access-17-jmap-calendars-interfaces.md) ("the sheet", cited as I §n) and six task files `2026-11-14-zero-access-17-jmap-calendars-tasks-{a,b,c,d1,d2,e}.md`, all beside it in `docs/superpowers/plans/`. [`-tasks-a`](2026-11-14-zero-access-17-jmap-calendars-tasks-a.md) holds Tasks 1 to 9, [`-tasks-b`](2026-11-14-zero-access-17-jmap-calendars-tasks-b.md) 10 to 12, [`-tasks-c`](2026-11-14-zero-access-17-jmap-calendars-tasks-c.md) 13 to 19, [`-tasks-d1`](2026-11-14-zero-access-17-jmap-calendars-tasks-d1.md) 20 to 27, [`-tasks-d2`](2026-11-14-zero-access-17-jmap-calendars-tasks-d2.md) 28 to 37, [`-tasks-e`](2026-11-14-zero-access-17-jmap-calendars-tasks-e.md) 38 to 44.
 
@@ -26,7 +33,7 @@ Every shell command that uses cargo starts with `export PATH="/opt/homebrew/opt/
 | U-vault, U-groupware | `cargo test -p vault -p groupware --features vault/test_mode <name> -- --nocapture` | the named tests pass |
 | U-common | `cargo test -p common --lib <name>` | the same |
 | U-http | `cargo test -p http@1.0.3 --lib --bins --features test_mode,enterprise <name>` | the same |
-| U-ws | `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --features "$UNIT_TEST_FEATURES" -- <name>`, with `UNIT_TEST_FEATURES` set to the value at `.github/workflows/test.yml:51-67`. For `jmap` and `dav` unit tests. | the same |
+| U-ws | `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --features "$UNIT_TEST_FEATURES" -- <name>`, with `UNIT_TEST_FEATURES` set to the value at `.github/workflows/test.yml:51-67`. For `jmap-proto`, `jmap` and `dav` unit tests. | the same |
 | ZA | `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture` | `test result: ok. 1 passed` |
 | ZA-FS | ZA with `BLOB_STORE=FileSystem` | the same |
 | SWAP | `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::cache_swap::cache_swap_tests -- --exact --nocapture`, alone and never with `BLOB_STORE` | the same |
@@ -41,7 +48,7 @@ Every shell command that uses cargo starts with `export PATH="/opt/homebrew/opt/
 ```bash
 log="${TMPDIR:-/tmp}/za-check.log"
 if cargo check -p stalwart --no-default-features --features rocks > "$log" 2>&1; then
-  grep -E "^(warning|error)" -A3 "$log" | grep -E "crates/(groupware|dav|jmap|vault|types|services)/|crates/common/src/(za|auth)/|crates/http/src/auth/" || echo clean
+  grep -E "^(warning|error)" -A3 "$log" | grep -E "crates/(groupware|dav|jmap|jmap-proto|vault|types|services)/|crates/common/src/(za|auth)/|crates/http/src/auth/" || echo clean
 else
   tail -40 "$log"; echo BUILD FAILED; false
 fi
@@ -73,6 +80,7 @@ SHIP, TM and FMT run at the end of every task that changes a file. A task does n
 - Key material, a token secret, a hand-off secret, an authorization code, a secret's tag and a token string never reach a log, a trace or an error; traces of the new paths carry account, grant and document ids, counts and fixed reasons only (spec 8).
 - No type that holds a wrap, a secret, MK or a plaintext tree derives `Debug`. A set error or a trace carries ids, counts and fixed texts.
 - A fork insertion in an upstream file is one call or one short branch. In an upstream handler it is one `mod` line and one branch at the handler's head, or one call. A key writer is a child module that calls upstream's private helpers in upstream's order.
+- D29's explicit exception is the transient `State` enum/codec, parser context checks, exhaustive consumer arms and the calendar continuation adapter enumerated in Task 22. The log reader, retention, filtering and pagination algorithm stay unchanged; the parser adds no account lookup or permission check.
 - An upstream validation step is neither copied into `groupware` nor moved out of its handler; a fork step of a key account's calendar write exists once, in the pipeline (invariant 68).
 - For a key account no JMAP path calls upstream's event or calendar writers, `ItipMessages::queue` or `notify_direct_change` (invariant 57).
 - A moved function keeps its body, its trace strings, its hook order, its lease releases and its mail-guard settlements. The only changes are the ones its task lists. The reviewer compares it with the base line by line.
@@ -97,6 +105,7 @@ SHIP, TM and FMT run at the end of every task that changes a file. A task does n
 - The keyless calendar description is `Calendars in this account are encrypted at rest and are not available to this session.`
 - A store error on one object of a `/set` answers that object and every later one with the set error `forbidden` and `The server could not complete this change, try again.`; the method does not fail (D28).
 - A write of the token record that stores a wrap asserts the record's previous bytes and the vault record's bytes; a write that only removes entries asserts the record alone; a writer retries a lost assertion at most three times and never under a changed binding.
+- A key-calendar continuation uses `z`, version `1`, origin tag `0` (Initial) or `1` (Exact), the nonzero original exact ID only for tag `1`, then `from_id`, `to_id - from_id` and positive `items_sent`, in STALWART base32/LEB128. Preserve that origin on every page. Legacy grantee `r` requires a restart; a key owner's legacy chain stays `r` until completion. Ordinary `n`/`s`/`r` bytes stay unchanged.
 
 ### Suite rules
 
@@ -136,6 +145,7 @@ Tasks 21 to 24, 26, 28 and 30 each serve methods that existing tests assert as r
 - A rebase is `git fetch origin main` then `git rebase origin/main`. If the base did not move, nothing is done. After a rebase that changed anything: SHIP, TM and one ZA run pass before the next task starts, and the ledger records the new base commit and the new commit of every finished task.
 - Files that release 7 changed and this plan changes too, where a later change on `main` is most likely to conflict or to change meaning silently: `crates/jmap/src/api/request.rs`, `crates/jmap/src/changes/{get,mod}.rs`, `crates/jmap/Cargo.toml`, `crates/types/src/field.rs`, `crates/vault/src/keys.rs`, `crates/common/src/za/{mod,test_hooks}.rs`, `crates/common/src/auth/vault.rs`, `tests/src/za/{mod,leak,websocket}.rs`, `tests/src/utils/{za,cleanup,storage}.rs`, `tests/src/jmap/za_variants.rs`, `tests/qualification/dispositions.json`, `.github/workflows/test.yml`, `scripts/tests/ci_steps.py`, `CLAUDE.md`, `docs/README-dev.md` and `docs/zero-access/manual-checklist.md`.
 - A change on the base to `crates/store/src/za_search/content.rs` or `crates/store/src/search/leaf.rs` needs a re-read of Task 25, which calls them without changing them.
+- D29 adds merge hotspots in `crates/jmap-proto/src/types/state.rs`, `request/parser.rs`, `crates/jmap/src/changes/{get,query,za}.rs` and `participant_identity/changes.rs`. Re-read `changes/{page,state}.rs`, the `ExpectedState` consumers and the Task 22 inventory after a relevant upstream change. State handling must retain the origin across range/count changes and early returns without changing ordinary state bytes or request-validation order.
 - A conflict in a file of the list is resolved by the agent that owns the task whose lines conflict, and reviewed as that task's diff.
 - The release's pull request targets `main`.
 
@@ -149,6 +159,7 @@ Tasks 21 to 24, 26, 28 and 30 each serve methods that existing tests assert as r
 - A reviewer gets the same three things, the diff and the spec sections the task names. Its brief carries no severity filter: every finding comes back with a confidence and a severity, and the controller filters.
 - A task that finds the sheet wrong stops and reports. The controller rules (`Ruling:` in the ledger) and corrects the sheet in a commit of its own before the task goes on.
 - Tasks run in number order.
+- Task 22 is a state/ordering contract: Sol implements at `high`, an independent Astra reviews at `xhigh`. Its actual-handler collision, legacy-chain and context-error tests are required. Task 26 owns the externally served `/queryChanges` continuation tests; Task 37 verifies the completed refusal/precondition matrix. The final fresh Astra `xhigh` review includes D29.
 - Group A changes no file under `tests/`; each of Tasks 2 to 8 ends with `git status --short tests/` printing nothing.
 - The plan ends with one whole-branch review by a fresh Astra agent (`gpt-6-astra`, `xhigh`) with a clean context (Task 44), which the project owner authorized for this plan on 2026-11-14. A second whole-branch pass runs only on the project owner's word; this does not restrict the focused Astra reviews of tasks and fixes.
 - The ledger is `.superpowers/sdd/2026-11-14-zero-access-17-jmap-calendars/progress.md`, git-ignored: one line per task with its commit, its review's verdict and each `Ruling:` the controller made.
@@ -212,8 +223,8 @@ Group files: A [`-tasks-a.md`](2026-11-14-zero-access-17-jmap-calendars-tasks-a.
 | 19 | C | The sweep; account destruction | 4.7 | 18 |
 | 20 | D1 | The calendar refusal text and the admission table | 6.1, 6.2 | 2 |
 | 21 | D1 | `CalendarEvent/get`, `Calendar/get`, `Calendar/query` | 6.1 to 6.3, 6.7 | 10, 16, 20 |
-| 22 | D1 | `/changes` and the sync boundary | 6.8 | 21 |
-| 23 | D1 | `ParticipantIdentity` | 6.9, 6.11 | 21 |
+| 22 | D1 | `/changes`, explicit sync origin and the sharing boundary | 6.8, 9.1, 9.2 | 21 |
+| 23 | D1 | `ParticipantIdentity` | 6.8, 6.9, 6.11 | 21, 22 |
 | 24 | D1 | `CalendarEvent/parse` | 6.6 | 23 |
 | 25 | D1 | The event text index | 6.4, 9.1 | 1 |
 | 26 | D1 | `CalendarEvent/query` and `/queryChanges` | 6.4, 6.8, 9.2 | 22, 25 |
@@ -227,7 +238,7 @@ Group files: A [`-tasks-a.md`](2026-11-14-zero-access-17-jmap-calendars-tasks-a.
 | 34 | D2 | The drain hook | 5.5 | 31 |
 | 35 | D2 | The session and principal objects | 6.10 | 20 |
 | 36 | D2 | The `jmap_calendar::sharing` module | 6.1, 6.5, 6.7, 9.2 | 22, 28, 33, 35 |
-| 37 | D2 | The `jmap_calendar::refusals` module | 6.1, 6.11, 9.2 | 24, 26, 28, 30 |
+| 37 | D2 | The `jmap_calendar::refusals` module | 6.1, 6.8, 6.11, 9.2 | 22, 24, 26, 28, 30 |
 | 38 | E | The differential oracle | 3.5, 3.6, 9.3 | 34 |
 | 39 | E | Upstream's JMAP calendar tests in key mode | 9.4 | 35 |
 | 40 | E | Leak coverage | 9.5 | 19, 33 |
@@ -299,15 +310,21 @@ The plan, in `docs/superpowers/plans/`, each name after the prefix `2026-11-14-z
 - `src/auth/oauth/auth.rs`: the keys of the password step, the hand-off at the code and the consent token.
 - `src/auth/oauth/token.rs`: the code exchange, the refresh grant, the untraced granted answer.
 
+`crates/jmap-proto`:
+- `src/types/{state,state_restored_tests}.rs`: the transient D29 origin/continuation codec, expected-state handling and compatibility tests.
+- `src/request/{parser,parser_restored_tests}.rs`: method-context rejection of out-of-scope continuations, without account/permission lookup.
+
 `crates/jmap`:
 - `src/api/za_calendar.rs` (new): the admission of calendar methods, the method table, the fixed JMAP texts.
 - `src/calendar_event/za_read.rs` (new): the per-request reader of unsealed event views.
 - `src/calendar_event/query/za.rs` (new): the text leaves of a key account's query.
 - `src/calendar_event/set/za.rs` (new): the key writer of `CalendarEvent/set`.
 - `src/calendar/set/za.rs` (new): the key writer of `Calendar/set`.
-- `src/changes/za_calendar.rs` (new): the sync boundary of `/changes` and `/queryChanges`.
-- `src/api/{request,session,mod}.rs`, `src/changes/{get,mod}.rs`, `src/calendar_event/{get,query,set,mod}.rs`, `src/calendar/{get,set}.rs`, `src/participant_identity/set.rs`, `src/principal/get.rs`: one branch or call each.
-- `src/changes/query.rs`: the `/queryChanges` admission.
+- `src/changes/za_calendar.rs` (new): the sync boundary and original-origin extraction/reattachment for `/changes` and `/queryChanges`.
+- `src/api/{request,session,mod}.rs`, `src/changes/mod.rs`, `src/calendar_event/{get,query,set,mod}.rs`, `src/calendar/{get,set}.rs`, `src/participant_identity/set.rs`, `src/principal/get.rs`: one branch or call each.
+- `src/changes/get.rs`: admission/boundary handling, the D29 range arm and response-origin reattachment.
+- `src/changes/query.rs`: `/queryChanges` admission, unchanged calendar state forwarding and fallible keyed-mail state handling.
+- `src/changes/za.rs`, `src/participant_identity/changes.rs`: explicit rejection of calendar continuations on other state consumers.
 - `src/api/metadata/za.rs`: one unit test.
 - `Cargo.toml`: `test_mode` enables `groupware/test_mode`.
 

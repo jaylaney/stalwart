@@ -882,7 +882,7 @@ Catcher for Task 42 (spec 9.7): the drain hook is removed: `scheduling::drain_ru
 
 ### Task 37: the `jmap_calendar::refusals` module
 
-**Spec:** 6.1 (D25), 6.2, 6.11, 9.2; invariant 66.
+**Spec:** 6.1 (D25), 6.2, 6.8 (D29), 6.11, 9.2; invariants 66, 76.
 
 **Files:**
 - Test: `tests/src/za/jmap_calendar/refusals.rs` (Task 23's file; cases added).
@@ -898,6 +898,9 @@ Catcher for Task 42 (spec 9.7): the drain hook is removed: `scheduling::drain_ru
 - Invariant 66: a scheduling inbox item is never listed, opened or destroyed through JMAP. The destroy case reads the store before and after.
 - The refusals here are method errors over an authenticated channel, not authentication failures, so no `X-Forwarded-For` address is needed.
 - The module's checker is `assert_calendar_keyless`: `za_variants::assert_keyless` is another function, which the retention gate tracks.
+- Task 22 owns the state codec/context behavior. This test-only task adds
+  coverage once calendar writers are served; it does not change admission
+  or turn `ExpectedState` preconditions into parser errors.
 
 **Tests.** `served(account)` is the thirteen methods section 6.2 serves, each with `accountId`:
 
@@ -929,9 +932,21 @@ Catcher for Task 42 (spec 9.7): the drain hook is removed: `scheduling::drain_ru
   - `CalendarEventNotification/get` with `ids: [item]`: the method error `accountNotSupportedByMethod`.
   - Cleanup: `Party::delete_items` on key; key2's event deleted with `fanout::NO_REPLY`.
 
+- `calendar_continuation_is_not_a_write_precondition` (D29). Produce valid
+  `z` states with each origin using the served calendar changes path.
+  On otherwise authorized `Calendar/set` and `CalendarEvent/set`, submit
+  each as `ifInState` with an observable update: `stateMismatch`, and
+  readback confirms nothing changed. Repeat with malformed `z`. Preserve
+  the Task 22 matrix for Email/import and copy's `ifInState`,
+  `ifFromInState`, `destroyFromIfInState`; unsupported key-calendar copy
+  retains its earlier admission refusal. Normal out-of-scope state slots
+  (ParticipantIdentity and ordinary calendar changes/queryChanges) give
+  `invalidArguments`. Keyless/unauthorized controls retain the established
+  validation/admission precedence; a `z` origin never supplies keys or rights.
+
 **Steps:**
 - [ ] 1. Add `Keyless::call_using`.
-- [ ] 2. Write the four cases, each called from `test()` after Task 23's and Task 24's.
+- [ ] 2. Write the five cases, each called from `test()` after Task 23's and Task 24's.
 - [ ] 3. Run ZA. Expected: pass. A failing case is reported against the owning task (Task 20 for admission and its text; Tasks 21 to 24, 26, 28, 30 for a served method).
 - [ ] 4. Kill check for `notification_destroy_leaves_the_item` (spec 9.7, "a notification destroy is let through"): in `crates/jmap/src/api/za_calendar.rs`, make `za_calendar_method(MethodObject::CalendarEventNotification, MethodFunction::Set)` return `Served`. Run ZA. Expected: FAIL in `jmap_calendar::refusals` at `notification_destroy_leaves_the_item` (no method error, or the item is gone). Revert.
 - [ ] 5. The closing checks.

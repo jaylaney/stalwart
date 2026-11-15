@@ -1,6 +1,9 @@
 # Zero-access calendar: JMAP calendars and browser sign-in (release 6) design spec
 
-Date: 2026-11-13. Status: revision 6. Revision 6 applies Jay's decision
+Date: 2026-11-13. Status: revision 7. Revision 7 incorporates Jay's
+approved [D29 amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md),
+recorded 2026-11-15: key-calendar continuations carry their original sync
+start explicitly (6.8, 9.1, 9.2, 9.8 and 10 to 12). Revision 6 applies Jay's decision
 of 2026-11-14 on when a key account's browser sessions end (2, 4.3 to
 4.7, 7, 9.1, 9.2, 9.7 and 10 to 12): only a credential change ends
 them, and D19 is rewritten for it. Revision 5 applied what the plan's
@@ -1230,19 +1233,50 @@ calendars. A JMAP state and a CalDAV sync token are the same change id,
 so the comparison is the same.
 
 **D29. A paged sync.** The predicate is applied to the state the sync
-started from, with the same comparison on every page. A page of a sync
-that started from an initial state is never refused. Upstream's
-intermediate state holds the first and the last change id of the range
-its first page read, and a count. It does not record how the sync
-started. A later page therefore compares the state's first change id
-with the log's first retained change id. Equal means the sync started
-from an initial state, and the page is served. Otherwise the start lies
-below that first change id, and the page is checked as the change id
-before it. The reason is that CalDAV's paged token carries its start and
-never checks an initial sync, paged or not, while JMAP's state has to be
-read for the same answer. The plan confirms this reading against the
-code before it relies on it, and stops if the two starts cannot be told
-apart (Jay, 2026-11-14).
+started from, with the same comparison on every page. A key-account
+`Calendar/changes` or `CalendarEvent/changes` continuation carries the
+existing range/count plus its original start, `Initial` or `Exact(s)`.
+Every later page preserves that start unchanged. For a grantee, an
+initial-origin page stays exempt from the sharing-boundary check; an
+exact-origin page calls `ZaSyncBoundary::refuses(s)`, including D15's
+pending-boundary rule. The owner remains exempt. `/queryChanges` uses
+the same checked changes path and preserves origin in every continuation
+it consumes or produces.
+
+The origin is never inferred from `from_id`, retained records or the
+current boundary. Source review found that an initial sync and a valid
+incremental sync can yield identical legacy continuations after normal
+log retention, then require different answers after a rename. The
+[approved amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md)
+records that collision; it replaces revision 6's inference rule.
+
+Use a new transient `State` variant, not a stored archive. Its opaque
+string has prefix `z` and STALWART base32/LEB128 fields in this order:
+version `1`; origin tag (`0` Initial, `1` Exact); the original nonzero
+exact ID only for tag `1`; `from_id`; `to_id - from_id`; and positive
+`items_sent`. Reject unknown versions/tags, missing or trailing fields,
+zero exact IDs, zero counts and arithmetic overflow. Budget the encoding
+buffer for the extra fields. Ordinary `n`, `s` and `r` encodings stay
+byte-for-byte unchanged.
+
+Only key-calendar changes emit `z`. A legacy `r` continuation without
+origin is `cannotCalculateChanges` for a grantee of a key calendar, so
+the client restarts from Initial. A key owner's existing `r` chain keeps
+emitting `r` until completion, without inventing an origin; its next
+Initial/Exact start emits `z` if paged. Ordinary accounts retain their
+existing state handling. No released key-calendar JMAP continuation is
+being migrated: these methods were refused before this release.
+
+An out-of-scope `z` in a normal state request slot (`sinceState` or
+`sinceQueryState`) gives `invalidArguments`. In an `ExpectedState`
+precondition slot (`ifInState`, `ifFromInState`, `destroyFromIfInState`)
+it gives `stateMismatch`, as an invalid string already does. Keep the
+existing validation and authorization order; add no global account
+lookup or parser permission path. Origin changes only the boundary
+check, never access rights. Upstream's log reader, retention, filtering
+and pagination remain unchanged, including their independent validity
+checks. No stored layout, database field, secret, setting or client code
+is added. Reference-client qualification remains a separate gate.
 
 ### 6.9 `ParticipantIdentity`
 
@@ -1385,6 +1419,10 @@ leave an ordinary account's tokens in the trace, which is no better.
 - The sync-boundary predicate (D15), the
   rights and refusals of a placement change (5.2), and the eviction
   choice of the cap (D20).
+- D29's versioned state codec: both origins round-trip; malformed,
+  overflowing and trailing fields are refused; ordinary `n`/`s`/`r`
+  fixtures stay byte-identical. Out-of-scope state slots and expected
+  state preconditions keep their distinct errors from 6.8.
 - The hand-off: taken once, expired, wrong secret, stale binding.
 - D11's alert replacement and the property rulings of 6.5.
 - The error mapping of section 8.
@@ -1477,9 +1515,18 @@ trace modules. They reserve the fixture families `token-*` and
   drain; no `CalendarItipMessage` task for a key account, ever.
 - **`jmap_calendar::sharing`**: a grantee's reads and writes at both
   levels, the delegated reply with `SENT-BY`, `shareWith` refused,
-  revoke, the sync boundary (D15), a non-grantee refused.
+  revoke, the sync boundary (D15), a non-grantee refused. D29's actual
+  changes-handler tests reproduce the retention-marker collision: the
+  first pages carry distinct origins; after rename the initial-origin
+  page is served and the exact-origin page is `cannotCalculateChanges`.
+  Cover pending boundaries, more than two pages, trimming between pages,
+  insert/delete folding, both calendar object types, unchanged ordinary
+  accounts, legacy grantee restart and the legacy owner `r` chain.
+  `jmap_calendar::query` repeats the origin/boundary cases through
+  `/queryChanges` once that method is served.
 - **`jmap_calendar::refusals`**: every row of 6.11, a keyless token on
-  each served method, impersonation.
+  each served method, impersonation, and D29's out-of-scope `z` state
+  and expected-state precondition errors without bypassing admission.
 
 ### 9.3 The differential oracle
 
@@ -1566,6 +1613,12 @@ key account with and without a second factor, with a second key account
 as grantee and invitee and an outside address at the sink. It is a
 manual gate, as the native-client checklists are.
 
+D29's part of that gate verifies the unmodified client's opaque state
+round trip across multiple pages, initial-sync continuation across a
+sharing-boundary change, and restart after an incremental
+`cannotCalculateChanges`. Record these observations on the tested client
+and server versions; codec and handler tests alone do not qualify them.
+
 ## 10. Invariants for implementers
 
 57. A key account's calendar data is written only by the pipeline,
@@ -1620,7 +1673,9 @@ manual gate, as the native-client checklists are.
     answered on that object and every later one. It never fails the
     method once the first object was reached (D28).
 76. A page of a sync that started from an initial state is never
-    refused at a sharing boundary (D29).
+    refused at a sharing boundary. Every new key-calendar continuation
+    preserves its original start explicitly; incremental pages check
+    that original exact state (D29).
 
 Amendments:
 
@@ -1657,6 +1712,12 @@ Amendments:
   read at a code exchange, at a refresh and at a grant's deletion; one
   in-memory delete at a consent confirmation that carries no secret; one
   cached classification read in each calendar method.
+  D29 adds state-codec fields and context checks, with no global account
+  lookup or additional ordinary-account store I/O. Key-calendar pages
+  carry the extra origin fields and classify the account even for an
+  owner's or initial request when choosing the continuation format;
+  reuse the calendar admission classification where available. There is
+  no per-page log read to infer the origin.
 
 ## 11. Merge hotspots and silent dependencies
 
@@ -1691,6 +1752,13 @@ New fork insertions in upstream files:
   their key branches become calls into `groupware`.
   `crates/dav/Cargo.toml` and `crates/jmap/Cargo.toml` enable
   `groupware`'s test hooks from their own `test_mode` feature.
+- D29: `crates/jmap-proto/src/types/state.rs` (the `z` codec and
+  `ExpectedState` handling), `request/parser.rs` (method context),
+  `crates/jmap/src/changes/{get,query,za}.rs` and
+  `participant_identity/changes.rs` (state consumers and rejection).
+  The small insertion rule permits these state-enum arms and the
+  calendar continuation adapter. `changes/page.rs` remains upstream's
+  range/count algorithm; its output is wrapped only for key calendars.
 
 Silent dependencies:
 
@@ -1752,10 +1820,12 @@ Silent dependencies:
 - D26 relies on upstream's token header (`TOKEN_HEADER`,
   `crates/common/src/auth/oauth/token.rs`) opening every token the
   server issues and no token of another issuer.
-- D29 relies on what an intermediate state holds: the first and the last
-  change id of the range its first page read, and a count
-  (`crates/jmap/src/changes/page.rs`). A change there needs a re-read of
-  6.8.
+- D29 relies on preserving the original origin while upstream's range
+  and count advance (`crates/jmap/src/changes/page.rs`), on `/queryChanges`
+  forwarding the state unchanged, and on every `State` consumer keeping
+  `z` within its key-calendar scope. Changes to the codec, request-slot
+  parsing, expected-state checks, early returns or pagination require
+  the collision, legacy-state and context-error cases of 9.1 and 9.2.
 - The query branch of 6.4 relies on no key account's event carrying
   the hide-attendees flag, which 6.5 refuses. Upstream's check for such
   events sends an attendee condition to the search store.
@@ -1820,7 +1890,9 @@ Calls of this spec that change what a user or an operator sees:
 - **D28**: a store error during a `/set` is reported on the objects it
   stopped, not as a failed method.
 - **D29**: a paged first sync of a shared calendar is never refused
-  part-way.
+  at a sharing boundary. The explicit-origin `z` continuation, legacy
+  handling and context errors of 6.8 were approved by Jay, recorded
+  2026-11-15; the earlier origin-inference candidate is superseded.
 - **6.7**: a grantee at the `view` level cannot rename or recolour its
   own entry of a shared calendar from a JMAP client.
 - **D11**: the `/set` answer does not carry the alerts the server wrote.

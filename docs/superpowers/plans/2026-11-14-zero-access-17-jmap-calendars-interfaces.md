@@ -5,11 +5,16 @@ This sheet belongs to [zero-access plan 17: JMAP calendars and browser sign-in](
 Every task of the plan uses the names on this sheet. Line numbers are at
 the commit that adds the plan, on `main` at `cc8b50a9b`; they were read at
 `82b8984aa`, release 7's last commit, and the one file that differs between
-the two is `tests/caldav_client/requirements.txt`. Spec sections are those of the release 6 spec, revision 6
+the two is `tests/caldav_client/requirements.txt`. Spec sections are those of the release 6 spec, revision 7
 (decisions D1 to D29, invariants 57 to 76). "dav wrapper" means `dav` keeps an item of
 the same name and visibility that calls the `groupware` one and maps the
 error, so handler bodies and `dav` unit tests change only where a task
 says.
+
+The approved D29 amendment was incorporated on 2026-11-15. Its state
+consumer inventory in Task 22 names symbols rather than relying on the
+original line numbers. Sections 7.2 and 7.6 supersede the first-retained
+log inference and the former `since_change_id` helper.
 
 Parameters written `server`, `token`, `resources` without a type are
 `&Server`, `&AccessToken`, `&GroupwareResources`. Ids are `u32` unless
@@ -1089,20 +1094,41 @@ impl ZaEventReader {
 pub(super) async fn za_resolve_text_leaves(server: &Server, access_token: &AccessToken, reader: &mut ZaEventReader,
     cache: &GroupwareResources, account_id: u32, mask: &RoaringBitmap, filters: &mut Vec<SearchFilter>) -> trc::Result<()>;
 
+// crates/jmap-proto/src/types/state.rs (transient protocol types; Task 22)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZaCalendarOrigin { Initial, Exact(u64) }
+// Add to the existing State enum:
+// ZaCalendarIntermediate { range: JMAPIntermediateState, origin: ZaCalendarOrigin }
+
 // crates/jmap/src/changes/za_calendar.rs (new)
-/// D15. Checks nothing for the owner, an ordinary account or `State::Initial`. `Exact(id)` is checked as `id`;
-/// `Intermediate` by the rule of D29 (§7.6). `Err(JmapEvent::CannotCalculateChanges)` when a
-/// calendar of `za_foreign_calendar_contexts` refuses.
+/// D15/D29. Classify the account to select the wire format, then apply §7.6.
+/// Some(origin): a key-calendar Initial/Exact start or a z continuation.
+/// None: an ordinary account or a key owner's legacy r continuation.
+/// No sharing-boundary check for owner/ordinary/Initial origin. An exact-origin
+/// grantee calls ZaSyncBoundary::refuses(original_id); legacy grantee r is refused.
+/// An ordinary account's z is InvalidArguments, not an exemption.
 pub(crate) async fn za_calendar_sync_boundary(server: &Server, access_token: &AccessToken, account_id: u32,
-    since: &State) -> trc::Result<()>;
+    since: &State) -> trc::Result<Option<ZaCalendarOrigin>>;
+/// Pure extraction: Initial/Exact/z yield their original origin; legacy r yields None.
+fn za_calendar_sync_origin(since: &State) -> Option<ZaCalendarOrigin>;
+/// Wrap only an upstream Intermediate result when origin is Some; preserve all other states.
+pub(crate) fn za_calendar_reattach_origin(state: State, origin: Option<ZaCalendarOrigin>) -> State;
+
+// crates/jmap/src/changes/za.rs (existing mail helper; Task 22)
+// Change the existing constructor to be fallible; z returns InvalidArguments.
+// Both call sites in changes/get.rs and changes/query.rs propagate with ?.
+// ZaChangesSince::new(state: State) -> trc::Result<Self>
 ```
 
 Insertion points: `calendar_event/get.rs:258-261` (the content handed to
 the projector), `calendar/get.rs:159-175` (`za_read_calendar_view`),
 `calendar_event/query.rs` between `:373` and `:417` and at `:483-498`,
-`changes/get.rs:245-254` (one arm in the fork's `match object` block), and
-`changes/query.rs:308-313` for the admission of `/queryChanges`. For
-`Intermediate`, see §7.6.
+`changes/get.rs` (calendar admission/boundary arm, the range-match arm and
+reattachment after `LogBounds::new_state`), and `changes/query.rs` for
+the admission of `/queryChanges`. Keep `old_state` equal to the exact
+request token; never normalize it to legacy `r` in the response. Task
+22 inventories the additional codec/parser/state consumers. For the
+continuation contract, see §7.6.
 
 ### 7.3 Writes
 
@@ -1223,15 +1249,31 @@ destroyed; only the default identity can be switched."
 - §7.2, a read-scope error on the JMAP side: `Store(error)` fails the
   method; a `DataCorruption` item is not found; any other refusal is not
   found or, for the boundary, `cannotCalculateChanges`.
-- §7.2, `Intermediate` (D29): a page of a sync that started from an
-  initial state is never refused. A later page compares the state's
-  `from_id` with the log's first retained change id: equal means an
-  initial start, and the page is served; otherwise it is checked as
-  `refuses(from_id - 1)`. `JMAPIntermediateState` is `{ from_id, to_id,
-  items_sent }` (`crates/jmap-proto/src/types/state.rs:19-23`, built at
-  `crates/jmap/src/changes/page.rs:278-279`). Task 22 confirms this from
-  the code first, and stops and reports if the two starts cannot be told
-  apart.
+- §7.2 (D29): `ZaCalendarIntermediate` holds the existing range/count
+  and the original `ZaCalendarOrigin`. Prefix `z`, version `1`, origin
+  tag `0`/`1`, nonzero exact ID only for tag `1`, then `from_id`,
+  `to_id - from_id`, positive `items_sent`, in STALWART base32/LEB128.
+  Reject unknown version/tag, missing/trailing fields, zero exact IDs,
+  zero counts and overflow; preserve ordinary codec bytes. The origin
+  is never derived from the range, retained log or current boundary.
+  `get_change_id` returns the range's `to_id`; it grants no access.
+- §7.2: classify the calendar account once (reuse admission's cached
+  result where available), including owner/Initial starts so new pages
+  emit the right format. Ordinary `z` is `invalidArguments`; ordinary
+  existing states return `None`. For a key account, extract the origin.
+  A legacy `r` is `None` for the owner, `cannotCalculateChanges` for a
+  grantee. Owner or Initial origin returns without the sharing check;
+  an exact-origin grantee checks `ZaSyncBoundary::refuses(s)` on the
+  visible foreign calendar contexts, with the §7.2 error mapping.
+- §7.2: borrow the range of `z` for the existing intermediate log/page
+  algorithm, then wrap each intermediate response with the unchanged
+  origin. Preserve legacy owner `r` output and final exact states.
+  Upstream retention, filtering, validity checks and `changes/page.rs`
+  stay unchanged. `/queryChanges` forwards origins unchanged in both
+  request and response. Out-of-scope normal state slots are
+  `invalidArguments`; `ExpectedState` maps `z` to its existing invalid
+  sentinel, so precondition slots retain `stateMismatch` at the usual
+  check. The parser performs no account lookup or permission check.
 - §7.2: `za_resolve_text_leaves` opens the mask intersected with the sets
   under AND only (private `za_text_candidates(mask, filters)`). The query
   path charges no memory budget for the views it opens.
@@ -1253,9 +1295,6 @@ destroyed; only the default identity can be switched."
 - §7.3: `ZaEventReader::new` sits in the handler's head. `Calendar/set`
   resolves `za_roles` in the head when the call has destroys. So only a
   head error fails the method (D28).
-- §7.2: the private helper of the paged sync, in `changes/za_calendar.rs`,
-  is `since_change_id(since: &State, first_retained: Option<u64>) ->
-  Option<u64>`.
 - §7.5, who produces each text: Task 28, `ZA_CALENDAR_SET_INCOMPLETE`,
   `za_set_incomplete` and the `shareWith` text; Task 30, the three ruling
   texts and `ZA_INTERIM`; Task 23, the identities text, which Task 37
