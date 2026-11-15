@@ -1,0 +1,37 @@
+name: Probe retention cache budget
+
+on:
+  push:
+    branches: [codex/retention-cache-budget-probe]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  cache-read:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Compare the two read endpoints using the workflow token
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for endpoint in usage storage-limit; do
+            printf 'Read cache %s\n' "$endpoint"
+            gh api "repos/$GITHUB_REPOSITORY/actions/cache/$endpoint" \
+              --jq '(.active_caches_size_in_bytes // .max_cache_size_gb)' || true
+          done
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read the retention cache budget without saving
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export CARGO_HOME="$RUNNER_TEMP/retention-cache-probe/.cargo"
+          mkdir -p "$CARGO_HOME/registry/cache"
+          printf 'Disposable size sentinel\n' > "$CARGO_HOME/registry/cache/fixture"
+          bash scripts/tests/retention_ci_setup.sh cache-budget
