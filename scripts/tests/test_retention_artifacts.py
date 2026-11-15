@@ -16,10 +16,14 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().with_name("retention_artifacts.py")
 MTIME = 1_790_000_000_123_456_789
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(SCRIPT.parent))
+from retention_artifacts import pack_build, unpack_build
 
 
 def run_tool(*args, env=None):
@@ -270,6 +274,53 @@ class BuildSnapshotTests(unittest.TestCase):
         self.assertEqual((self.consumer / header.relative_to(self.target)).read_bytes(),
                          header.read_bytes())
 
+    def test_public_sqlite_bindings_and_type_declarations_are_preserved(self):
+        bindings = self.make(
+            "debug/build/fixture-111/out/bindgen.rs",
+            'pub const FTS5_TOKENIZE_QUERY: i32 = 1;\n'
+            'pub const FTS5_TOKENIZER: &str = "unicode61";\n'
+            'pub pToken: *const ::std::os::raw::c_char,\n'
+            '// Bearer authentication is supported.\n',
+        )
+        packed = self.pack()
+        self.assertEqual(packed.returncode, 0, packed.stderr)
+        restored = self.unpack()
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual((self.consumer / bindings.relative_to(self.target)).read_bytes(),
+                         bindings.read_bytes())
+
+    def test_generated_sources_with_quoted_credentials_block_upload(self):
+        credential = "fixture_never_print_generated_source_value"
+        declarations = (
+            f'const API_TOKEN: &\'static str = "{credential}";',
+            f'const char *clientSecret = "{credential}";',
+            f'let header = "Authorization: Bearer {credential}";',
+        )
+        for declaration in declarations:
+            with self.subTest(assignment=declaration.split('"')[0]):
+                self.archive.unlink(missing_ok=True)
+                bindings = self.make("debug/build/fixture-111/out/bindgen.rs", declaration)
+                result = self.pack()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(bindings.name, result.stderr)
+                self.assertNotIn(credential, result.stdout + result.stderr)
+                self.assertFalse(self.archive.exists())
+
+    def test_snapshot_reports_multiple_flagged_paths_before_starting_compression(self):
+        credential = "fixture_report_preflight_never_print_this"
+        first = self.make("debug/build/fixture-111/out/first.rs", f'const TOKEN: &str = "{credential}";')
+        second = self.make("debug/build/fixture-111/out/second.txt", f"password={credential}")
+        with mock.patch("retention_artifacts.subprocess.Popen", side_effect=AssertionError(
+            "compression started before credential preflight"
+        )):
+            with self.assertRaises(ValueError) as raised:
+                pack_build(self.manifest, self.target, self.archive, [])
+        message = str(raised.exception)
+        for path in (first, second):
+            self.assertIn(str(path.relative_to(self.target)), message)
+        self.assertNotIn(credential, message)
+        self.assertFalse(self.archive.exists())
+
     def test_basic_user_password_credential_blocks_upload_without_leaking_value(self):
         encoded = base64.b64encode(b"fixture-user:synthetic-password").decode()
         self.assertTrue(encoded.endswith("="))
@@ -303,6 +354,39 @@ class BuildSnapshotTests(unittest.TestCase):
         result = self.unpack()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(stale.read_text(), "keep me")
+        self.assertFalse(self.restored_manifest.exists())
+
+    def test_precreated_target_restores_under_read_only_parent(self):
+        packed = self.pack()
+        self.assertEqual(packed.returncode, 0, packed.stderr)
+        parent = self.root / "read-only-parent"
+        self.consumer = parent / "consumer"
+        self.consumer.mkdir(parents=True)
+        self.addCleanup(parent.chmod, stat.S_IMODE(parent.stat().st_mode))
+        parent.chmod(0o555)
+        if os.access(parent, os.W_OK):
+            self.skipTest("process can write to a directory with no write permission bits")
+
+        restored = self.unpack()
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual(sorted(path.name for path in self.consumer.iterdir()), ["llvm-cov-target"])
+        self.assertEqual(self.restored_manifest.read_bytes(), self.manifest.read_bytes())
+
+    def test_manifest_publication_failure_rolls_back_build(self):
+        packed = self.pack()
+        self.assertEqual(packed.returncode, 0, packed.stderr)
+        self.consumer.mkdir()
+        replace = os.replace
+
+        def fail_manifest(source, destination):
+            if destination == self.restored_manifest:
+                raise PermissionError("fixture publication failure")
+            return replace(source, destination)
+
+        with mock.patch("retention_artifacts.os.replace", side_effect=fail_manifest):
+            with self.assertRaisesRegex(PermissionError, "fixture publication failure"):
+                unpack_build(self.archive, self.consumer, self.restored_manifest)
+        self.assertEqual(list(self.consumer.iterdir()), [])
         self.assertFalse(self.restored_manifest.exists())
 
     def test_manifest_output_cannot_replace_the_target_directory(self):

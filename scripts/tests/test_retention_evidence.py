@@ -22,6 +22,10 @@ import capture_listings
 import ci_steps
 import retention_evidence as evidence
 
+LIBTEST_EMPTY = (
+    "     Running unittests src/lib.rs (target/debug/deps/sample-1234)\n"
+    "0 tests, 0 benchmarks\n"
+)
 COMMIT = "1" * 40
 RUN = dict(commit=COMMIT, run_id="21", producer_attempt=1)
 FEATURES = "test/feature test/other"
@@ -100,7 +104,8 @@ class ReceiptTests(unittest.TestCase):
                 continue
             text = f'# config: {config["label"]}\n# env: {config["environment"]}\n# started: now\n'
             for (title, cmd), result in zip(sections, statuses):
-                text += f"{title}\n## command: {' '.join(cmd)}\nBearer bad-listing\n## exit: {result}\n"
+                text += (f"{title}\n## command: {' '.join(cmd)}\n"
+                         f"{LIBTEST_EMPTY}Bearer bad-listing\n## exit: {result}\n")
             write(source / rel, text.encode())
         identity = {"rustc": "rustc test", "cargo": "cargo test"}
         write_json(source / "listing.json", dict(schema=1, identity=identity, unit_features=FEATURES,
@@ -278,12 +283,79 @@ class ReceiptTests(unittest.TestCase):
         summary = read_json(self.output / "collection.json")
         self.assertIn("contradicts its capture contract", summary["errors"][0])
 
+    def test_bodyless_ignored_listing_fails_even_with_a_matching_digest(self):
+        self.all()
+        relative = "ign/exists__nlp__default--ignored-only.txt"
+        directory = self.inputs / "listings"
+        path = directory / relative
+        path.write_text("\n".join(
+            line for line in path.read_text().splitlines() if line.startswith("#")
+        ) + "\n")
+        receipt_path = directory / "receipt.json"
+        receipt = read_json(receipt_path)
+        receipt["files"][relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        write_json(receipt_path, receipt)
+        self.assertIntegrityError()
+        self.assertIn("incomplete libtest listing",
+                      read_json(self.output / "collection.json")["errors"][0])
+
+    def test_successful_listing_cannot_end_with_an_unfinished_target(self):
+        self.all()
+        relative = "list/exists__nlp__default.txt"
+        directory = self.inputs / "listings"
+        path = directory / relative
+        path.write_text(path.read_text().replace(
+            "## exit: 0",
+            "     Running tests/integration.rs (target/debug/deps/integration-5678)\n## exit: 0",
+        ))
+        receipt_path = directory / "receipt.json"
+        receipt = read_json(receipt_path)
+        receipt["files"][relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        write_json(receipt_path, receipt)
+        self.assertIntegrityError()
+
     def test_stale_output_is_rejected_without_overwriting(self):
         self.all()
         stale = self.output / "unrelated"
         write(stale, b"old")
         self.assertIntegrityError()
         self.assertEqual(stale.read_bytes(), b"old")
+
+
+class ListingBodyTests(unittest.TestCase):
+    def validate(self, body, status=0):
+        relative = "list/exists__nlp__default.txt"
+        spec = capture_listings.capture_contract(FEATURES)[relative]
+        title, cmd = spec["sections"][0]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "capture.txt"
+            path.write_text(f'# config: {spec["label"]}\n# env: {spec["environment"]}\n'
+                            f"{title}\n## command: {' '.join(cmd)}\n"
+                            f"{body}## exit: {status}\n")
+            evidence.validate_listing(path, relative, spec, [status])
+
+    def test_typical_cargo_targets_and_singular_footer(self):
+        self.validate(
+            LIBTEST_EMPTY
+            + "     Running tests/integration.rs (target/debug/deps/integration-5678)\n"
+            + "suite::single: test\nsuite::benchmark: benchmark\n\n1 test, 1 benchmark\n"
+        )
+
+    def test_standalone_zero_test_footer_is_complete(self):
+        self.validate("0 tests, 0 benchmarks\n")
+
+    def test_intermediate_target_must_also_settle(self):
+        with self.assertRaisesRegex(ValueError, "incomplete libtest listing"):
+            self.validate("     Running unittests src/lib.rs (target/debug/deps/first-1234)\n"
+                          + LIBTEST_EMPTY)
+
+    def test_footer_counts_must_match_discovered_entries(self):
+        with self.assertRaisesRegex(ValueError, "incomplete libtest listing"):
+            self.validate("1 test, 0 benchmarks\n")
+
+    def test_timeout_can_preserve_a_partial_target_listing(self):
+        self.validate("     Running unittests src/lib.rs (target/debug/deps/first-1234)\n"
+                      "suite::single: test\n", status="timeout")
 
 
 class ListingDeadlineTests(unittest.TestCase):

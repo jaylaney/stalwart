@@ -18,6 +18,7 @@ import capture_listings
 from capture_listings import run_identity
 import ci_steps
 from coverage_net import STEPS, canonical_json, write_json
+from gate_common import ENTRY, RUNNING
 
 SCHEMA = 1
 LISTINGS = "listings"
@@ -27,6 +28,7 @@ AUTH = re.compile(rb"((?:Basic|Bearer) )[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 ASSIGNMENT = re.compile(rb'''((?:password|secret|token)[A-Za-z_]*["']?[=:] *["']?)[^"' ,}\s]+''',
                         re.IGNORECASE)
 SHA256 = re.compile(r"[a-f0-9]{64}")
+LISTING_FOOTER = re.compile(r"([0-9]+) tests?, ([0-9]+) benchmarks?")
 
 
 def require(condition, message):
@@ -260,14 +262,45 @@ def validate_coverage(root, names):
                     f"{name}: malformed region-level LLVM export")
 
 
+def listing_complete(lines):
+    """Recognize finished pretty libtest output within one Cargo listing command."""
+    completed = False
+    target_open = False
+    tests = benchmarks = 0
+    for line in lines:
+        if RUNNING.fullmatch(line):
+            if target_open or tests or benchmarks:
+                return False
+            target_open = True
+        elif entry := ENTRY.fullmatch(line):
+            if entry.group(2) == "test":
+                tests += 1
+            else:
+                benchmarks += 1
+        elif footer := LISTING_FOOTER.fullmatch(line):
+            if tuple(map(int, footer.groups())) != (tests, benchmarks):
+                return False
+            completed = True
+            target_open = False
+            tests = benchmarks = 0
+    return completed and not target_open and tests == benchmarks == 0
+
+
 def validate_listing(path, name, spec, statuses):
     lines = path.read_text(encoding="utf-8").splitlines()
     marker = ("# config:", "# env:", "## SELECTED", "## UNFILTERED", "## command:", "## exit:")
-    actual = [line for line in lines if line.startswith(marker)]
+    actual = [(index, line) for index, line in enumerate(lines) if line.startswith(marker)]
     expected = [f'# config: {spec["label"]}', f'# env: {spec["environment"]}']
     for (title, cmd), status in zip(spec["sections"], statuses):
         expected.extend([title, "## command: " + " ".join(cmd), f"## exit: {status}"])
-    require(actual == expected, f"{name}: listing text contradicts its capture contract")
+    require([line for _, line in actual] == expected,
+            f"{name}: listing text contradicts its capture contract")
+    commands = (index for index, line in actual if line.startswith("## command:"))
+    outcomes = (index for index, line in actual if line.startswith("## exit:"))
+    for section, (start, end, status) in enumerate(zip(commands, outcomes, statuses), start=1):
+        if status == 0:
+            require(listing_complete(lines[start + 1:end]),
+                    f"{name}: incomplete libtest listing in section {section}")
 
 
 def validate_ledger(receipt, producer, run, build, snapshot, features, contract):
@@ -341,6 +374,9 @@ def stage(kind, producer, status, source, out, manifest=None, snapshot=None):
         if kind == "listings":
             require(source_files(source, ("list", "ign")) == names,
                     "listing files disagree with section outcomes")
+            for name in names:
+                validate_listing(source / name, name, contract[name],
+                                 candidate["ledger"]["captures"][name])
         else:
             # The driver retains indexed per-attempt data locally. Only the merged
             # profile of each step belongs in the artifact.

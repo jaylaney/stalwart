@@ -36,6 +36,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1086,6 +1087,37 @@ class CoverageNetTests(unittest.TestCase):
                                str(marker)])
         self.assertEqual(result.returncode, "deadline")
         self.assertFalse(marker.exists())
+
+    def test_timeout_kills_residual_group_when_leader_exits_on_term(self):
+        command = ["cargo", "test"]
+        child = mock.MagicMock(pid=1234)
+        child.__enter__.return_value = child
+        child.communicate.side_effect = [subprocess.TimeoutExpired(command, 1), (None, None)]
+        log = self.net.out / "attempt.log"
+        with mock.patch.object(subprocess, "Popen", return_value=child), \
+             mock.patch.object(os, "killpg") as kill, log.open("wb") as output:
+            result = self.net.run(command, timeout=1, output=output, work=True)
+        self.assertEqual(result.returncode, "timeout")
+        self.assertEqual(kill.call_args_list, [mock.call(child.pid, signal.SIGTERM),
+                                               mock.call(child.pid, signal.SIGKILL)])
+
+    def test_timeout_bounds_communicate_after_killing_group(self):
+        command = ["cargo", "metadata"]
+        child = mock.MagicMock(pid=1234)
+        child.__enter__.return_value = child
+        child.communicate.side_effect = [subprocess.TimeoutExpired(command, 1),
+                                         subprocess.TimeoutExpired(command, 60),
+                                         subprocess.TimeoutExpired(command, 5, b"partial", b"error")]
+        with mock.patch.object(subprocess, "Popen", return_value=child), \
+             mock.patch.object(os, "killpg") as kill:
+            result = self.net.run(command, timeout=1)
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         ("timeout", "partial", "error"))
+        self.assertEqual(kill.call_args_list, [mock.call(child.pid, signal.SIGTERM),
+                                               mock.call(child.pid, signal.SIGKILL)])
+        self.assertEqual(child.communicate.call_args_list, [mock.call(timeout=1),
+                                                            mock.call(timeout=60),
+                                                            mock.call(timeout=5)])
 
     def test_shard_settles_earlier_steps_after_work_cutoff(self):
         self.net.deadline = time.monotonic() + 600
