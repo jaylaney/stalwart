@@ -52,7 +52,7 @@ jobs:
       run: |
         test "$(git symbolic-ref HEAD)" = "$SOURCE_REF"
         test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-        git diff --exit-code HEAD --
+        git -c diff.autoRefreshIndex=false diff --exit-code HEAD --
     - name: Install pinned coverage tools
       id: tools
       shell: bash
@@ -274,7 +274,7 @@ jobs:
         COVERAGE_OUTCOME: "${{ steps.coverage.outcome }}"
         BUILD_OUTCOME: "${{ steps.unpack.outcome }}"
       run: |
-        git diff --exit-code HEAD --
+        git -c diff.autoRefreshIndex=false diff --exit-code HEAD --
         status=0
         for outcome in BUILD LISTINGS COLLECT MERGE FUNCTIONS INVENTORY COVERAGE; do
           key="${outcome}_OUTCOME"
