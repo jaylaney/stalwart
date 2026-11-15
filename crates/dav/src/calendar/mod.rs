@@ -26,7 +26,7 @@ use calcard::icalendar::{
 };
 use common::{
     ArchivedDavName, GroupwareResources, Server,
-    auth::{AccessToken, AccountInfo},
+    auth::AccessToken,
     za::lease::{ZaUidLease, ZaUidLeaseGuard},
 };
 use dav_proto::schema::{
@@ -40,7 +40,7 @@ use groupware::{
         alarm::ExpandAlarm,
         alerts::{DefaultAlertsResolver, DefaultAlertsView, ICalendarDefaultAlerts},
         compare::{ComparisonScope, RecurrenceComponents},
-        pipeline::error::ZaPipelineError,
+        pipeline::{admission, context, error::ZaPipelineError},
         privacy::{EventPrivacy, EventViewer, ICalendarPrivacy, PrivacyDenied},
         user::{ICalendarUserData, UserDataError, UserDataView},
     },
@@ -797,17 +797,7 @@ pub(crate) fn za_calendar_error(
     owner_id: u32,
     document_id: u32,
 ) -> DavError {
-    use groupware::calendar::sharing::resolve::ZaCalendarError;
-    match error {
-        ZaCalendarError::Forbidden => DavError::Code(StatusCode::FORBIDDEN),
-        ZaCalendarError::LinkedEvent => DavError::Code(StatusCode::CONFLICT),
-        ZaCalendarError::Store(error)
-            if error.matches(trc::EventType::Store(trc::StoreEvent::NotFound)) =>
-        {
-            DavError::Code(StatusCode::NOT_FOUND)
-        }
-        error => error.into_store_error(owner_id, document_id).into(),
-    }
+    ZaPipelineError::from_calendar(error, owner_id, document_id).into()
 }
 
 pub(crate) async fn za_write_contexts(
@@ -818,23 +808,7 @@ pub(crate) async fn za_write_contexts(
     calendar_id: u32,
     required: types::acl::Acl,
 ) -> crate::Result<Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>> {
-    let contexts = groupware::calendar::sharing::resolve::za_event_contexts(
-        server,
-        token,
-        owner_id,
-        event,
-        calendar_id,
-        utils::map::bitmap::Bitmap::new().with_item(required),
-    )
-    .await
-    .map_err(|error| za_calendar_error(error, owner_id, calendar_id))?;
-    if let Some(keys) = token.session_keys() {
-        groupware::calendar::sharing::boundary::za_repair_owned_contexts(server, keys, contexts)
-            .await
-            .map_err(|error| za_calendar_error(error, owner_id, calendar_id))
-    } else {
-        Ok(contexts)
-    }
+    Ok(context::za_write_contexts(server, token, owner_id, event, calendar_id, required).await?)
 }
 
 /// Called once after an ambiguous assertion loss. Keep the original event
@@ -848,17 +822,16 @@ pub(crate) async fn za_refresh_event(
     before: &[groupware::calendar::sharing::resolve::ZaCalendarContext],
     sealed: &mut groupware::calendar::seal::ZaEvent,
 ) -> crate::Result<Option<Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>>> {
-    if before.is_empty() {
-        return Ok(None);
-    }
-    let after =
-        za_write_contexts(server, token, owner_id, &sealed.meta, calendar_id, required).await?;
-    if !groupware::calendar::sharing::resolve::calendars_changed(before, &after) {
-        return Ok(None);
-    }
-    groupware::calendar::seal::rewrap_event(sealed, &before[0].domain, &after[0].domain)
-        .map_err(|error| groupware::calendar::seal::seal_error(error, owner_id, calendar_id))?;
-    Ok(Some(after))
+    Ok(context::za_refresh_event(
+        server,
+        token,
+        owner_id,
+        calendar_id,
+        required,
+        before,
+        sealed,
+    )
+    .await?)
 }
 
 /// Event writers keep the authenticated writer's keys. The fresh calendar
@@ -868,57 +841,17 @@ pub(crate) async fn za_writer_keys(
     token: &common::auth::AccessToken,
     owner_id: u32,
 ) -> crate::Result<Option<std::sync::Arc<vault::session::SessionKeys>>> {
-    if !server.za_is_key_account(owner_id).await? {
-        return Ok(None);
-    }
-    token
-        .session_keys()
-        .filter(|keys| keys.account_id == token.account_id() && !token.za_is_impersonated())
-        .cloned()
-        .map(Some)
-        .ok_or(DavError::Code(StatusCode::FORBIDDEN))
+    Ok(admission::za_writer_keys(server, token, owner_id).await?)
 }
 
-/// The scheduling roles of a key account's write (release 4 delegated
-/// scheduling): the sender is the writer's account info with the owner's
-/// addresses added (0.16's `scheduling_account_info`, which 1.0 removed; its
-/// handlers now pass the owner's), the writer's and the owner's own infos.
-pub(crate) struct ZaRoles {
-    pub sender: AccountInfo,
-    pub writer: AccountInfo,
-    pub owner: AccountInfo,
-}
+pub(crate) use groupware::calendar::pipeline::admission::ZaRoles;
 
 pub(crate) async fn za_roles(
     server: &Server,
     token: &AccessToken,
     owner_id: u32,
 ) -> crate::Result<ZaRoles> {
-    let writer = server
-        .account_info(token.account_id())
-        .await
-        .caused_by(trc::location!())?;
-    let owner = if owner_id == token.account_id() {
-        writer.clone()
-    } else {
-        server
-            .account_info(owner_id)
-            .await
-            .caused_by(trc::location!())?
-    };
-    let mut sender = writer.clone();
-    if owner_id != token.account_id() {
-        for address in &owner.addresses {
-            if !sender.addresses.contains(address) {
-                sender.addresses.push(address.clone());
-            }
-        }
-    }
-    Ok(ZaRoles {
-        sender,
-        writer,
-        owner,
-    })
+    Ok(admission::za_roles(server, token, owner_id).await?)
 }
 
 /// Exercise the actual private event MOVE helper before foreign DAV URI admission

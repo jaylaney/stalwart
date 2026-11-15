@@ -76,6 +76,13 @@ pub struct ZaSyncBoundary {
     pub pending: bool,
 }
 
+impl ZaSyncBoundary {
+    /// A pending boundary or a token at or before the latest grant or rename.
+    pub fn refuses(&self, since: u64) -> bool {
+        self.pending || since <= self.grant_change_id.max(self.rename_change_id)
+    }
+}
+
 /// The original stored calendar is an assertion source, never a response view.
 pub struct ZaCalendarContext {
     pub owner_id: u32,
@@ -548,6 +555,36 @@ mod tests {
     const OWNER: u32 = 8301;
     const READER: u32 = 8302;
     const CALENDAR: u32 = 8303;
+
+    #[test]
+    fn sync_boundary_refuses_as_caldav() {
+        let pending = ZaSyncBoundary {
+            grant_change_id: 10,
+            rename_change_id: 20,
+            pending: true,
+        };
+        for since in [0, 10, 20, 21, u64::MAX] {
+            assert!(pending.refuses(since), "since {since}");
+        }
+
+        let renamed = ZaSyncBoundary {
+            grant_change_id: 10,
+            rename_change_id: 20,
+            pending: false,
+        };
+        for since in [0, 19, 20] {
+            assert!(renamed.refuses(since), "since {since}");
+        }
+        assert!(!renamed.refuses(21));
+
+        let granted = ZaSyncBoundary {
+            grant_change_id: 30,
+            rename_change_id: 20,
+            pending: false,
+        };
+        assert!(granted.refuses(30));
+        assert!(!granted.refuses(31));
+    }
 
     fn token(id: u32, keys: Arc<SessionKeys>, impersonate: bool) -> AccessToken {
         AccessToken::from_permissions(
