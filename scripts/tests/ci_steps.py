@@ -42,6 +42,14 @@ WORKFLOW = REPO / ".github" / "workflows" / "test.yml"
 
 # Every gated job sets these for all its steps.
 BASE_ENV = {"STORE": "RocksDb", "RUST_MIN_STACK": "16777216"}
+COVERAGE_SHARDS = {
+    "za-rocks": ("za-tests",),
+    "za-filesystem": ("za-tests-fs-blob",),
+    "short": ("leak-unit-test", "unit-tests", "webdav-plain", "webdav-key", "imap-plain",
+              "imap-key", "jmap-plain", "jmap-key", "smtp", "system-tests", "store-tests",
+              "blob-tests", "lookup-tests", "search-tests", "telemetry-tests", "cal-query-tests",
+              "automation-tests"),
+}
 # Kept separate from the historical capture/net environment; no arbitrary extras are allowed.
 JOB_DIAGNOSTIC_ENV = {"zero-access": {"RUST_BACKTRACE": "1"}}
 SPAM_URL = ("https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.4/"

@@ -34,11 +34,14 @@ import copy
 import io
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 import warnings
 
 sys.dont_write_bytecode = True
@@ -887,6 +890,212 @@ class WorkflowTests(unittest.TestCase):
             if "--" not in argv:
                 argv = argv + ["--"]
             self.assertEqual(cmd, [a for a in argv if a not in ci_steps.LISTING_TARGETS], name)
+
+
+# ====================================================================== the coverage driver
+class CoverageNetTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.net = object.__new__(coverage_net.Net)
+        directory = Path(self.directory.name).resolve()
+        self.net.out = directory / "net"
+        self.net.target = directory / "target"
+        self.net.target.mkdir()
+        for name in ("steps", "logs", "profdata"):
+            (self.net.out / name).mkdir(parents=True)
+        self.net.failed = []
+        self.net.deadline = None
+        self.net.run_identity = lambda: {
+            "commit": "a" * 40, "run_id": "12", "producer_attempt": 3,
+        }
+        self.net.build_identity = lambda: {"llvm_cov": "LLVM 23.1.1"}
+
+    def attempt(self, number, status, profile_status, names=()):
+        profile = None
+        if profile_status == "collected":
+            profile = self.net.out / "profdata" / f"fixture-{number}"
+            profile.write_text(str(number))
+        return dict(attempt=number, status=status, profile=profile,
+                    profile_status=profile_status, names=list(names))
+
+    def export(self, step, profiles, destination):
+        combined = "".join(path.read_text() for path in profiles)
+        destination.write_text(combined)
+        (self.net.out / "profdata" / f"{step}.profdata").write_text(combined)
+        return True
+
+    def test_shards_partition_baseline_in_order(self):
+        baseline = json.loads(Path(BASELINE).read_text())["helpers"]["steps"]
+        self.assertEqual(set(ci_steps.COVERAGE_SHARDS), {"za-rocks", "za-filesystem", "short"})
+        self.assertEqual(ci_steps.COVERAGE_SHARDS["za-rocks"], ("za-tests",))
+        self.assertEqual(ci_steps.COVERAGE_SHARDS["za-filesystem"], ("za-tests-fs-blob",))
+        groups = list(ci_steps.COVERAGE_SHARDS.values())
+        self.assertCountEqual([name for group in groups for name in group], baseline)
+        for group in groups:
+            self.assertEqual(list(group), sorted(group, key=coverage_net.ORDER.index))
+
+    def test_build_only_stops_on_first_failed_build(self):
+        for failing in ("build-A", "build-B", None):
+            with self.subTest(failing=failing), contextlib.redirect_stdout(io.StringIO()):
+                steps = []
+                self.net.failed.clear()
+                manifest = self.net.out / "build.json"
+                manifest.unlink(missing_ok=True)
+
+                def attempt(step, *args, **kwargs):
+                    steps.append(step)
+                    return self.attempt("build", int(step == failing), "discarded")
+
+                with mock.patch.object(coverage_net, "Net", return_value=self.net), \
+                     mock.patch.object(self.net, "attempt", side_effect=attempt), \
+                     mock.patch.object(self.net, "build_manifest", create=True,
+                                       return_value={"schema": 1}), \
+                     mock.patch.object(sys, "argv", ["coverage_net.py", "--out",
+                                                     str(self.net.out), "--build-only"]):
+                    try:
+                        status = coverage_net.main()
+                    except SystemExit as error:
+                        status = error.code
+                self.assertEqual(status, int(failing is not None))
+                self.assertEqual(steps, ["build-A"] if failing == "build-A" else
+                                 ["build-A", "build-B"])
+                self.assertEqual(manifest.exists(), failing is None)
+
+    def test_smtp_retries_names_and_merges_both_attempts(self):
+        outcomes = [self.attempt(1, 101, "collected", ["smtp::one", "smtp::two"]),
+                    self.attempt(2, 0, "collected")]
+        with mock.patch.object(self.net, "attempt", side_effect=outcomes) as run_attempt, \
+             mock.patch.object(self.net, "export", side_effect=self.export), \
+             contextlib.redirect_stdout(io.StringIO()):
+            record = self.net.step("smtp")
+        self.assertEqual(record["status"], "success")
+        self.assertEqual([attempt["profile"] for attempt in record["attempts"]],
+                         ["collected", "collected"])
+        self.assertEqual(run_attempt.call_args.args[2], ["cargo", "llvm-cov", "--no-report",
+                         "test", "-p", "tests", "--", "--exact", "--nocapture",
+                         "smtp::one", "smtp::two"])
+        self.assertEqual((self.net.out / "steps" / "smtp.json").read_text(), "12")
+
+    def test_smtp_without_names_keeps_failed_profile_and_does_not_retry(self):
+        with mock.patch.object(self.net, "attempt", return_value=
+                               self.attempt(1, 101, "collected")) as run_attempt, \
+             mock.patch.object(self.net, "export", side_effect=self.export), \
+             contextlib.redirect_stdout(io.StringIO()):
+            record = self.net.step("smtp")
+        self.assertEqual(run_attempt.call_count, 1)
+        self.assertEqual(record["status"], "failure")
+        self.assertEqual(record["export"], "success")
+        self.assertEqual((self.net.out / "steps" / "smtp.json").read_text(), "1")
+
+    def test_normal_retry_uses_original_command_after_timeout(self):
+        outcomes = [self.attempt(1, "timeout", "no-data"),
+                    self.attempt(2, 101, "collected")]
+        with mock.patch.object(self.net, "attempt", side_effect=outcomes) as run_attempt, \
+             mock.patch.object(self.net, "export", side_effect=self.export), \
+             contextlib.redirect_stdout(io.StringIO()):
+            record = self.net.step("za-tests-fs-blob")
+        first, second = [call.args for call in run_attempt.call_args_list]
+        self.assertEqual(first[2:], second[2:])
+        self.assertEqual(record["status"], "failure")
+        self.assertEqual((self.net.out / "steps" / "za-tests-fs-blob.json").read_text(), "2")
+
+    def test_profile_loss_is_reported_even_when_an_export_remains_possible(self):
+        for first, second in (("merge-error", "collected"), ("collected", "no-data")):
+            with self.subTest(first=first, second=second), \
+                 mock.patch.object(self.net, "attempt", side_effect=[self.attempt(1, 101, first),
+                                   self.attempt(2, 0, second)]), \
+                 mock.patch.object(self.net, "export", side_effect=self.export), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                record = self.net.step("za-tests")
+                self.assertEqual(record["status"], "failure")
+                self.assertEqual(record["export"], "success")
+                self.assertEqual([a["profile"] for a in record["attempts"]], [first, second])
+                export = self.net.out / "steps" / "za-tests.json"
+                self.assertEqual(export.read_text(), "1" if first == "collected" else "2")
+                export.unlink()
+
+    def test_unit_listing_supplies_sorted_skip_arguments(self):
+        names = [f"tests::n{i:03}" for i in range(90)]
+        output = "\n".join(f"{name}: test" for name in reversed(names + names[:1]))
+        listing = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+        outcome = self.attempt(1, 0, "collected")
+        with mock.patch.object(coverage_net, "run", return_value=listing) as cargo, \
+             mock.patch.object(self.net, "attempt", return_value=outcome) as run_attempt, \
+             mock.patch.object(self.net, "export", side_effect=self.export), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.net.step("unit-tests")
+        self.assertEqual(cargo.call_args.args[0][-5:], ["test", "-p", "tests", "--", "--list"])
+        self.assertEqual(run_attempt.call_args.args[2][-180:],
+                         [arg for name in names for arg in ("--skip", name)])
+
+    def test_manifest_rejects_added_missing_and_changed_objects(self):
+        target = self.net.target
+        first, second = target / "first", target / "second"
+        first.write_bytes(b"initial")
+        with mock.patch.object(self.net, "report_objects", create=True,
+                               side_effect=lambda: sorted(target.iterdir())):
+            self.assertTrue(hasattr(self.net, "build_manifest"))
+            manifest = self.net.build_manifest()
+            manifest["build_attempt"] = 2
+            self.net.verify_build(manifest)  # A different producer attempt in this run is valid.
+            second.write_bytes(b"unexpected")
+            with self.assertRaisesRegex(ValueError, "object"):
+                self.net.verify_build(manifest)
+            second.unlink()
+            first.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "object"):
+                self.net.verify_build(manifest)
+            first.unlink()
+            with self.assertRaisesRegex(ValueError, "object"):
+                self.net.verify_build(manifest)
+
+    def test_manifest_rejects_incompatible_inputs(self):
+        first = self.net.target / "first"
+        first.write_bytes(b"compiled")
+        with mock.patch.object(self.net, "report_objects", create=True, return_value=[first]):
+            self.assertTrue(hasattr(self.net, "build_manifest"))
+            manifest = self.net.build_manifest()
+            for key, value in (("commit", "b" * 40), ("run_id", "17"),
+                               ("build_attempt", 4), ("identity", {"llvm_cov": "different"}),
+                               ("object_set_sha256", "0" * 64)):
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    self.net.verify_build({**manifest, key: value})
+
+    def test_object_inventory_accepts_a_symlink_alias_for_target_root(self):
+        first = self.net.target / "first"
+        first.write_bytes(b"compiled")
+        alias = self.net.out / "target-alias"
+        alias.symlink_to(self.net.target, target_is_directory=True)
+        with mock.patch.object(self.net, "report_objects", return_value=[alias / "first"]):
+            try:
+                objects = self.net.object_inventory()
+            except ValueError as error:
+                self.fail(f"target directory alias was rejected: {error}")
+        self.assertEqual([entry["path"] for entry in objects], ["first"])
+
+    def test_deadline_prevents_starting_a_subprocess(self):
+        marker = self.net.out / "launched"
+        self.net.deadline = time.monotonic() - 1
+        self.assertTrue(hasattr(self.net, "run"))
+        result = self.net.run([sys.executable, "-c", "open(__import__('sys').argv[1], 'w')",
+                               str(marker)])
+        self.assertEqual(result.returncode, "deadline")
+        self.assertFalse(marker.exists())
+
+    def test_partial_merge_publishes_diagnostic_with_missing_steps(self):
+        path = self.net.out / "profdata" / "za-tests.profdata"
+        path.write_text("measured")
+        with mock.patch.object(self.net, "export", side_effect=self.export), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.net.merge_all()
+        self.assertTrue(self.net.failed)
+        report = self.net.out / "merged.json"
+        self.assertEqual(report.read_text(), "measured")
+        summary = json.loads((self.net.out / "merge.json").read_text())
+        self.assertFalse(summary["complete"])
+        self.assertEqual(summary["missing_steps"], [name for name in coverage_net.ORDER[2:]
+                                                    if name != "za-tests"])
 
 
 # ====================================================================== the real baseline
