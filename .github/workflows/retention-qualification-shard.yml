@@ -176,3 +176,8 @@ jobs:
           ${{ env.GATES }}/evidence/steps.tsv
         if-no-files-found: ignore
         retention-days: 7
+    - name: Exercise a failed producer after retaining its real evidence
+      if: "${{ !cancelled() && inputs.qualification-lane == 'cold' && inputs.shard-id
+        == 'short' && github.run_attempt == 1 }}"
+      shell: bash
+      run: exit 1
