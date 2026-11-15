@@ -14,7 +14,7 @@ use crate::calendar::{
     sharing::resolve::ZaCalendarContext,
 };
 use common::{
-    Server,
+    DavName, Server,
     auth::{AccessToken, AccountCache},
     storage::metadata::{ContainerChange, MetadataLog},
 };
@@ -73,6 +73,30 @@ impl ZaPlacementPlan {
             content_changed: false,
             overwrite,
             collection,
+        }
+    }
+
+    /// From the stored names and the names after the update.
+    pub fn jmap(old: &[DavName], new: &[DavName], content_changed: bool) -> Self {
+        let old_parents: BTreeSet<_> = old.iter().map(|name| name.parent_id).collect();
+        let new_parents: BTreeSet<_> = new.iter().map(|name| name.parent_id).collect();
+        let left = old_parents.difference(&new_parents).copied().collect();
+        let mut seen = old_parents.clone();
+        let entered = new
+            .iter()
+            .map(|name| name.parent_id)
+            .filter(|&parent| seen.insert(parent))
+            .collect();
+
+        Self {
+            parents: old_parents.into_iter().collect(),
+            names: old.len(),
+            source: None,
+            left,
+            entered,
+            content_changed,
+            overwrite: false,
+            collection: false,
         }
     }
 
@@ -291,6 +315,119 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn jmap_plans() {
+        let read = Bitmap::new().with_item(Acl::ReadItems);
+        let remove = Bitmap::new().with_item(Acl::RemoveItems);
+        let add = Bitmap::new().with_item(Acl::AddItems);
+        let copy = Some(ZaRefusal::SharedCopy);
+        let linked = Some(ZaRefusal::LinkedMove);
+
+        let rows = [
+            (
+                &[1][..],
+                &[2][..],
+                false,
+                &[1][..],
+                &[1][..],
+                &[2][..],
+                Some((remove, None, None)),
+            ),
+            (
+                &[1],
+                &[1, 2],
+                false,
+                &[1],
+                &[],
+                &[2],
+                Some((read, copy, copy)),
+            ),
+            (
+                &[1, 2],
+                &[1],
+                false,
+                &[1, 2],
+                &[2],
+                &[],
+                Some((remove, linked, linked)),
+            ),
+            (
+                &[1],
+                &[2],
+                true,
+                &[1],
+                &[1],
+                &[2],
+                Some((remove.with_item(Acl::ModifyItems), None, None)),
+            ),
+            (
+                &[1],
+                &[1, 2],
+                true,
+                &[1],
+                &[],
+                &[2],
+                Some((read.with_item(Acl::ModifyItems), copy, copy)),
+            ),
+            (
+                &[1, 2],
+                &[1, 3],
+                false,
+                &[1, 2],
+                &[2],
+                &[3],
+                Some((remove, linked, linked)),
+            ),
+            (
+                &[1],
+                &[2, 3],
+                false,
+                &[1],
+                &[1],
+                &[2, 3],
+                Some((remove, None, linked)),
+            ),
+            (&[1, 2], &[2, 1], false, &[1, 2], &[], &[], None),
+            (&[1], &[1], true, &[1], &[], &[], None),
+        ];
+
+        for (old, new, content_changed, parents, left, entered, rights) in rows {
+            let plan = ZaPlacementPlan::jmap(
+                &event_with_parents(old).names,
+                &event_with_parents(new).names,
+                content_changed,
+            );
+            assert_eq!(plan.parents, parents);
+            assert_eq!(plan.names, old.len());
+            assert_eq!(plan.source, None);
+            assert_eq!(plan.left, left);
+            assert_eq!(plan.entered, entered);
+            assert_eq!(plan.content_changed, content_changed);
+            assert!(!plan.overwrite);
+            assert!(!plan.collection);
+            assert_eq!(plan.is_change(), rights.is_some());
+            if let Some((current, shared_current, shared_entered)) = rights {
+                assert_eq!(plan.parent_rights(), current);
+                assert_eq!(plan.entered_rights(), add);
+                assert_eq!(plan.shared_refusal(false), shared_current);
+                assert_eq!(plan.shared_refusal(true), shared_entered);
+            }
+        }
+
+        let plan = ZaPlacementPlan::jmap(
+            &event_with_parents(&[5, 1, 3]).names,
+            &event_with_parents(&[9, 1, 7, 9]).names,
+            false,
+        );
+        assert_eq!(plan.parents, [1, 3, 5]);
+        assert_eq!(plan.left, [3, 5]);
+        assert_eq!(plan.entered, [9, 7]);
+        assert_eq!(
+            plan.steps().collect::<Vec<_>>(),
+            [(1, false), (3, false), (5, false), (9, true), (7, true)]
+        );
     }
 
     #[test]

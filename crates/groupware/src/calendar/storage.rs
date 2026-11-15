@@ -203,6 +203,35 @@ impl CalendarEvent {
         modified: i64,
         batch: &mut BatchBuilder,
     ) -> trc::Result<String> {
+        let etag = self.enqueue_full_at(
+            content,
+            changed_by,
+            event,
+            event_content,
+            account_id,
+            document_id,
+            parent_id,
+            modified,
+            batch,
+        )?;
+        batch.commit_point();
+        Ok(etag)
+    }
+
+    /// Queue the full update without taking a commit point inside the caller's transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_full_at(
+        self,
+        content: CalendarEventContent,
+        changed_by: ChangedBy,
+        event: Archive<&ArchivedCalendarEvent>,
+        event_content: &ArchivedCalendarEventContent,
+        account_id: u32,
+        document_id: u32,
+        parent_id: Option<Slot>,
+        modified: i64,
+        batch: &mut BatchBuilder,
+    ) -> trc::Result<String> {
         let mut new_event = self;
         new_event.modified = modified;
 
@@ -213,8 +242,7 @@ impl CalendarEvent {
             .with_account_id(account_id)
             .with_collection(Collection::CalendarEvent)
             .with_document(document_id)
-            .custom(update.into_builder(changed_by, parent_id))?
-            .commit_point();
+            .custom(update.into_builder(changed_by, parent_id))?;
 
         Ok(etag)
     }

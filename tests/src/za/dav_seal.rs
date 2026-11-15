@@ -1254,7 +1254,7 @@ pub async fn test_legacy(test: &mut TestServer) {
 
 /// Canaries of the dead-property cases: a sensitive namespace and name, its
 /// value, and the Apple colour and order properties' namespace and name.
-const DEAD_CANARIES: &[&str] = &[
+pub(super) const DEAD_CANARIES: &[&str] = &[
     "deadprop-name-canary",
     "x-deadprop-ns-canary",
     "deadprop-value-canary",
@@ -1264,7 +1264,7 @@ const DEAD_CANARIES: &[&str] = &[
 
 /// A PROPPATCH setting the sensitive custom property to `value`, with the
 /// Apple colour and order.
-fn dead_proppatch(value: &str) -> String {
+pub(super) fn dead_proppatch(value: &str) -> String {
     format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
@@ -1289,7 +1289,7 @@ const DEAD_PROPFIND: &str = concat!(
 
 /// The dead properties of `path` as `client` reads them: the response
 /// body, which must hold every value.
-async fn assert_dead_round_trip(client: &DummyWebDavClient, path: &str, value: &str) {
+pub(super) async fn assert_dead_round_trip(client: &DummyWebDavClient, path: &str, value: &str) {
     let body = client
         .request_with_headers("PROPFIND", path, [("depth", "0")], DEAD_PROPFIND)
         .await

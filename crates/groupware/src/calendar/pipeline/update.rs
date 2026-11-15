@@ -9,26 +9,30 @@ use super::{
     admission::ZaRoles,
     context::{za_refresh_event, za_write_contexts},
     error::{ZaPipelineError, ZaRefusal},
-    placement::{ZaPlacementContexts, ZaPlacementPlan},
+    placement::{
+        ZaPlacementContexts, ZaPlacementPlan, za_placement_contexts, za_reseal_event_container,
+    },
     schedule::ZaScheduled,
+    uid::za_assert_is_unique_uid,
 };
 use crate::{
     calendar::{
-        CalendarEvent, CalendarEventContent,
+        Calendar, CalendarEvent, CalendarEventContent,
         fanout::{ZaFanOut, ZaFanOutKind, ZaSource, za_set_schedule_status},
         schedule::{AlarmTasks, EventAlarmScheduler, EventAlarms},
         seal::{
-            ZaEvent, ZaEventView, event_pairs_in_domain, event_view_in_domain, seal_error,
-            seal_event_in_domain,
+            ZaEvent, ZaEventView, event_pairs_in_domain, event_view_in_domain, rewrap_event,
+            seal_error, seal_event_in_domain,
         },
         sequence_floor::za_set_sequences,
-        sharing::resolve::ZaCalendarContext,
+        sharing::resolve::{ZaCalendarContext, calendars_changed},
     },
     scheduling::recipient::RecipientPolicy,
 };
 use common::{
     GroupwareResources, Server,
     auth::{AccessToken, AccountCache},
+    storage::dav::canonical_calcard_segment,
     za::imip::ZaImipPending,
 };
 use store::write::{Archive, ArchiveBytes, BatchBuilder, now};
@@ -79,7 +83,7 @@ pub struct ZaEventUpdate<'x> {
     pub next_alarms: EventAlarms,
     pub scheduled: ZaScheduled,
     pub contexts: ZaPlacementContexts,
-    /// A placement change is handled by Task 11. CalDAV PUT passes `None`.
+    /// A plan for a change of calendars. CalDAV PUT passes `None`.
     pub placement: Option<ZaPlacementPlan>,
 }
 
@@ -87,21 +91,12 @@ pub struct ZaEventUpdate<'x> {
 pub async fn za_commit_update(
     server: &Server,
     access_token: &AccessToken,
-    _resources: &GroupwareResources,
+    resources: &GroupwareResources,
     account: &AccountCache,
     keys: &SessionKeys,
     roles: &ZaRoles,
     update: ZaEventUpdate<'_>,
 ) -> Result<ZaWritten, ZaPipelineError> {
-    if update.placement.is_some() {
-        return Err(ZaPipelineError::Store(
-            trc::StoreEvent::UnexpectedError
-                .into_err()
-                .details("zero-access: placement change not implemented")
-                .caused_by(trc::location!()),
-        ));
-    }
-
     let ZaEventUpdate {
         document_id,
         addressed,
@@ -114,7 +109,7 @@ pub async fn za_commit_update(
         next_alarms,
         scheduled,
         mut contexts,
-        placement: _,
+        placement,
     } = update;
     let account_id = account.id;
     let event = stored_event
@@ -123,6 +118,21 @@ pub async fn za_commit_update(
     let content = stored_content
         .to_unarchived::<CalendarEventContent>()
         .caused_by(trc::location!())?;
+
+    let uid = event.inner.uid.as_str();
+    if let Some(plan) = &placement {
+        for &calendar_id in &plan.entered {
+            za_assert_is_unique_uid(
+                server,
+                resources,
+                access_token,
+                account_id,
+                calendar_id,
+                uid,
+            )
+            .await?;
+        }
+    }
 
     // Invitations spec 3.3: every rewrite carries the stored pairs.
     let mut pairs = event_pairs_in_domain(
@@ -149,10 +159,7 @@ pub async fn za_commit_update(
                 messages,
                 pairs,
                 &new_content.data.event,
-                ZaSource {
-                    document_id,
-                    uid: event.inner.uid.as_str(),
-                },
+                ZaSource { document_id, uid },
                 ZaFanOutKind::Change,
                 false,
                 RecipientPolicy::new(&server.core.groupware, new_event.flags),
@@ -176,25 +183,48 @@ pub async fn za_commit_update(
     // The same event and alarm intent is rebuilt once, without
     // scheduling, after a calendar change.
     let timestamp = now() as i64;
+    let write_full = if placement.is_some() {
+        CalendarEvent::enqueue_full_at
+    } else {
+        CalendarEvent::update_full_at
+    };
     for attempt in 0..=1 {
         let mut batch = BatchBuilder::new();
         batch.with_account_id(account_id);
         server.limit_disk_quota(&mut batch, account);
         contexts.assert_in(&mut batch);
+        if placement.is_some() {
+            let from = contexts.from_domain();
+            let to = contexts.to_domain();
+            if (from.calendar_id(), from.domain_id()) != (to.calendar_id(), to.domain_id()) {
+                za_reseal_event_container(
+                    server,
+                    account,
+                    document_id,
+                    uid,
+                    event.inner.metadata_kinds(),
+                    from,
+                    to,
+                    &mut batch,
+                )
+                .await
+                .caused_by(trc::location!())?;
+            }
+        }
         let (meta, sealed_content) = sealed.clone().into_parts();
-        let etag = meta
-            .update_full_at(
-                sealed_content,
-                access_token.changed_by(),
-                event.clone(),
-                content.inner,
-                account_id,
-                document_id,
-                None,
-                timestamp,
-                &mut batch,
-            )
-            .caused_by(trc::location!())?;
+        let etag = write_full(
+            meta,
+            sealed_content,
+            access_token.changed_by(),
+            event.clone(),
+            content.inner,
+            account_id,
+            document_id,
+            None,
+            timestamp,
+            &mut batch,
+        )
+        .caused_by(trc::location!())?;
         server
             .replace_event_alarms(
                 account_id,
@@ -206,6 +236,36 @@ pub async fn za_commit_update(
             )
             .await
             .caused_by(trc::location!())?;
+        if placement.is_some() {
+            for name in event.inner.names.iter() {
+                let parent_id = name.parent_id.to_native();
+                if sealed
+                    .meta
+                    .names
+                    .iter()
+                    .any(|new| new.parent_id == parent_id && new.name == name.name.as_str())
+                    || resources.container_resource_path_by_id(parent_id).is_none()
+                {
+                    continue;
+                }
+                // Use the parent archive fenced by this attempt, including after a rename.
+                let parent = contexts
+                    .parents
+                    .iter()
+                    .find(|context| context.calendar_id == parent_id)
+                    .expect("placement must resolve every stored parent");
+                let calendar = parent
+                    .stored
+                    .unarchive::<Calendar>()
+                    .caused_by(trc::location!())?;
+                let calendar = canonical_calcard_segment(calendar.name.as_str());
+                let name = canonical_calcard_segment(name.name.as_str());
+                batch.log_calendar_vanished(
+                    parent_id,
+                    resources.format_item(&format!("{calendar}/{name}")),
+                );
+            }
+        }
         #[cfg(feature = "test_mode")]
         common::za::test_hooks::update_commit_pause_point(account_id).await;
         #[cfg(feature = "test_mode")]
@@ -231,18 +291,33 @@ pub async fn za_commit_update(
                 });
             }
             Err(error) if error.is_assertion_failure() && attempt == 0 => {
-                if let Some(fresh) = za_refresh_event(
-                    server,
-                    access_token,
-                    account_id,
-                    addressed,
-                    Acl::ModifyItems,
-                    &contexts.parents,
-                    &mut sealed,
-                )
-                .await?
-                {
-                    contexts = ZaPlacementContexts::unchanged(fresh);
+                let fresh = if let Some(plan) = &placement {
+                    let fresh =
+                        za_placement_contexts(server, access_token, account_id, plan).await?;
+                    if calendars_changed(&contexts.parents, &fresh.parents)
+                        || calendars_changed(&contexts.entered, &fresh.entered)
+                    {
+                        rewrap_event(&mut sealed, contexts.to_domain(), fresh.to_domain())
+                            .map_err(|err| seal_error(err, account_id, document_id))?;
+                        Some(fresh)
+                    } else {
+                        None
+                    }
+                } else {
+                    za_refresh_event(
+                        server,
+                        access_token,
+                        account_id,
+                        addressed,
+                        Acl::ModifyItems,
+                        &contexts.parents,
+                        &mut sealed,
+                    )
+                    .await?
+                    .map(ZaPlacementContexts::unchanged)
+                };
+                if let Some(fresh) = fresh {
+                    contexts = fresh;
                 } else {
                     za_mail.dropped();
                     return Err(error.caused_by(trc::location!()).into());

@@ -29,7 +29,6 @@ pub(super) struct Pair {
     pub key_id: u32,
     pub key2_id: u32,
     pub dav: DummyWebDavClient,
-    #[allow(dead_code)]
     pub dav2: DummyWebDavClient,
 }
 
