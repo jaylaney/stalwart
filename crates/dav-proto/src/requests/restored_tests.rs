@@ -44,6 +44,7 @@ fn parse_address_data_version() {
 
 #[test]
 fn parse_requests() {
+    let output_dir = tempfile::tempdir().unwrap();
     for entry in std::fs::read_dir("resources/requests").unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
@@ -54,7 +55,7 @@ fn parse_requests() {
             let xml = std::fs::read_to_string(&path).unwrap();
             let mut tokenizer = Tokenizer::new(xml.as_bytes());
 
-            let json_path = path.with_extension("json");
+            let json_path = output_dir.path().join(filename).with_extension("json");
             let json_output = match filename.split_once('-').unwrap().0 {
                 "propfind" => match PropFind::parse(&mut tokenizer) {
                     Ok(propfind) => serde_json::to_string_pretty(&propfind).unwrap(),
@@ -81,12 +82,7 @@ fn parse_requests() {
                 }
             };
 
-            /*if json_path.exists() {
-                let expected = std::fs::read_to_string(json_path).unwrap();
-                assert_eq!(json_output, expected);
-            } else {*/
             std::fs::write(json_path, json_output).unwrap();
-            //}
         }
     }
 }
