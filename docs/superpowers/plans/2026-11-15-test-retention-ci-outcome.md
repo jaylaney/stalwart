@@ -14,7 +14,7 @@ same inputs as on the serial workflow. [Issue #86](https://github.com/jaylaney/s
 | [Transport trial 1](https://github.com/jaylaney/stalwart/actions/runs/43744029033) | 20m 42s | 19,280,751,439 | Packaging stopped on a public AWS-LC header comment that matched the Basic credential pattern. |
 | [Transport trial 2](https://github.com/jaylaney/stalwart/actions/runs/43746550649) | 17m 21s | 19,281,070,126 | Packaging stopped on type declarations in SQLite's generated bindings. |
 | [Transport trial 3](https://github.com/jaylaney/stalwart/actions/runs/43748806097) | 14m 40s | 19,281,070,127 | Restored all expected coverage objects. Cargo rebuilt after finding three missing custom build-script executables. |
-| [Transport trial 4](https://github.com/jaylaney/stalwart/actions/runs/43751500051) | 15m 58s | 19,281,070,346 | Both restored Cargo build shapes were fresh. The coverage runner ran and exported the leak test. Reporter check pending. |
+| [Transport trial 4](https://github.com/jaylaney/stalwart/actions/runs/43751500051) | 15m 58s | 19,281,070,346 | Both restored Cargo build shapes were fresh. The reporter reproduced the leak-test export and rejected the one-step matrix as incomplete. |
 
 The first two transport trials compiled both build configurations. Their times describe build-only
 work and provide no comparison with the serial gate's total. The local instrumented
@@ -40,6 +40,9 @@ coverage runner downloaded the archive in 6m 7s, unpacked it in 76 seconds, and 
 both build shapes in under two seconds with zero compilation. The existing leak test
 and export took seven seconds. Minimum free space during the two-second sampling was
 69,132,685,312 bytes while packing and 70,227,390,464 bytes while unpacking.
+The reporter downloaded the build in 5m 19s, unpacked it in 77 seconds with at least
+70,237,106,176 free bytes, and re-exported the fresh leak profile in 14 seconds. Both
+consumers verified the restored toolchain and report-object hashes.
 
 A [hosted artifact fixture](https://github.com/jaylaney/stalwart/actions/runs/43746694042)
 validated evidence from a failed reusable shard and kept its first report red. On
@@ -57,6 +60,8 @@ cache storage-limit endpoint. A separate hosted check identified the endpoint an
 scheduled producers use live usage and the verified 10 GB budget before a save.
 Qualification of warm restores depends on observing both scoped writes and corresponding
 hits. [Workflow token check](https://github.com/jaylaney/stalwart/actions/runs/43754170815)
+The [updated guard](https://github.com/jaylaney/stalwart/actions/runs/43754588999)
+read the same live usage and skipped because there was insufficient room.
 
 The existing ordinary unit-test cache restored an exact key in 41 seconds in its original
 Ubuntu 26.04 layout. Its 1,994,370,095-byte archive added 7,771,141,421 apparent bytes after
@@ -73,6 +78,15 @@ warm cache results, invalidation, wall time, summed runner time, transfer and di
 the results of negative paths. The retention jobs are gated to the weekly schedule and
 manual dispatch.
 
-The [same-commit comparison](https://github.com/jaylaney/stalwart/actions/runs/43752266663)
-uses `4d5fee1930338b494b0c148aa0252bcf4ab36eb1` on the disposable branch. It contains the
-production candidate `3fb4c0384` plus the two harness workflows and the comparison script.
+The [first same-commit comparison](https://github.com/jaylaney/stalwart/actions/runs/43752266663)
+used `4d5fee1930338b494b0c148aa0252bcf4ab36eb1`. Cold listing capture finished in 35m 15s.
+All 17 short-shard test commands passed. The shard stayed red because the workspace unit
+test `dav_proto::requests::tests::parse_requests` rewrote tracked JSON fixtures and the
+next WebDAV command rebuilt coverage objects. The test now writes to a private
+temporary directory and still exercises parsing, serialization and file writes.
+[Short-shard result](https://github.com/jaylaney/stalwart/actions/runs/43752266663/job/132933900954)
+
+The first [production dispatch](https://github.com/jaylaney/stalwart/actions/runs/43754819285)
+and [intentional-failure trial](https://github.com/jaylaney/stalwart/actions/runs/43754934544)
+used the earlier unit test. Both were cancelled before the retention report so that
+validation can run with the corrected fixture writer.
