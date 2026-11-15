@@ -1,0 +1,45 @@
+name: Retention rerun probe shard
+on:
+  workflow_call:
+    inputs:
+      snapshot-id:
+        type: string
+        required: true
+    outputs:
+      evidence-id:
+        value: ${{ jobs.shard.outputs.evidence-id }}
+
+jobs:
+  shard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      evidence-id: ${{ steps.evidence.outputs.artifact-id }}
+    steps:
+      - name: Require an exact snapshot ID
+        env:
+          SNAPSHOT_ID: ${{ inputs.snapshot-id }}
+        run: |
+          [[ "$SNAPSHOT_ID" =~ ^[0-9]+$ ]]
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ inputs.snapshot-id }}
+          path: ${{ runner.temp }}/snapshot
+          digest-mismatch: error
+      - name: Generate fresh evidence
+        run: |
+          set -e
+          read -r run build_attempt < "$RUNNER_TEMP/snapshot/build.txt"
+          test "$run" = "$GITHUB_RUN_ID"
+          test "$build_attempt" = 1
+          printf '%s %s %s\n' "$run" "$GITHUB_RUN_ATTEMPT" "$build_attempt" > "$RUNNER_TEMP/shard.txt"
+      - uses: actions/upload-artifact@v7.0.1
+        id: evidence
+        with:
+          name: rerun-probe-shard-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shard.txt
+          if-no-files-found: error
+          retention-days: 1
+      - name: Fail the first attempt after publishing usable evidence
+        if: ${{ github.run_attempt == 1 }}
+        run: exit 1

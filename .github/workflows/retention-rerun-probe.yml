@@ -1,0 +1,55 @@
+name: Retention artifact rerun probe
+on:
+  push:
+    branches: [codex/retention-rerun-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      snapshot-id: ${{ steps.snapshot.outputs.artifact-id }}
+    steps:
+      - run: printf '%s %s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/build.txt"
+      - uses: actions/upload-artifact@v7.0.1
+        id: snapshot
+        with:
+          name: rerun-probe-build-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/build.txt
+          if-no-files-found: error
+          retention-days: 1
+  shard:
+    needs: build
+    uses: ./.github/workflows/retention-rerun-shard.yml
+    with:
+      snapshot-id: ${{ needs.build.outputs.snapshot-id }}
+  report:
+    needs: [build, shard]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the reusable job's evidence ID
+        env:
+          EVIDENCE_ID: ${{ needs.shard.outputs.evidence-id }}
+        run: |
+          [[ "$EVIDENCE_ID" =~ ^[0-9]+$ ]]
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.shard.outputs.evidence-id }}
+          path: ${{ runner.temp }}/evidence
+          digest-mismatch: error
+      - name: Verify evidence before requiring a passing producer
+        env:
+          SHARD_OUTCOME: ${{ needs.shard.result }}
+        run: |
+          set -e
+          read -r run attempt build_attempt < "$RUNNER_TEMP/evidence/shard.txt"
+          test "$run" = "$GITHUB_RUN_ID"
+          test "$attempt" = "$GITHUB_RUN_ATTEMPT"
+          test "$build_attempt" = 1
+          printf 'Validated shard attempt %s using build attempt %s\n' "$attempt" "$build_attempt"
+          test "$SHARD_OUTCOME" = success
