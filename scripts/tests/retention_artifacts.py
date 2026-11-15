@@ -55,7 +55,13 @@ QUOTED_ASSIGNMENT = re.compile(
 SENSITIVE_IDENTIFIER = re.compile(
     rb"(?i:(?:^|_)(?:password|secret|token)(?:$|_))"
     rb"|(?<=[a-z0-9])(?:Password|Secret|Token)(?=$|[A-Z_])"
+    rb"|(?:^|_)(?:password|secret|token)(?=[A-Z])"
 )
+SOURCE_TOKEN = re.compile(
+    rb'''(?P<string>r(?P<hash>#*)"[^\r\n]*?"(?P=hash)|"(?:\\.|[^"\\\r\n])*")'''
+    rb"|(?P<char>'(?:\\.|[^'\\\r\n])')|(?P<line>//)|(?P<block>/\*)"
+)
+BLOCK_TOKEN = re.compile(rb"/\*|\*/")
 
 
 def git(repo, *args):
@@ -164,13 +170,51 @@ def is_text_state(path):
     )
 
 
-def has_credential_shape(line, source_code=False):
-    if source_code:
+def source_code_lines(lines, nested_blocks):
+    """Yield code and string literals without scanning quotes in source comments."""
+    depth = 0
+    for line in lines:
+        offset = 0
+        code = []
+        literals = []
+        while offset < len(line):
+            if depth:
+                end = BLOCK_TOKEN.search(line, offset)
+                if end is None:
+                    break
+                if end[0] == b"*/":
+                    depth -= 1
+                elif nested_blocks:
+                    depth += 1
+                offset = end.end()
+                continue
+            token = SOURCE_TOKEN.search(line, offset)
+            if token is None:
+                code.append(line[offset:])
+                break
+            code.append(line[offset:token.start()])
+            offset = token.end()
+            if token.lastgroup == "line":
+                break
+            if token.lastgroup == "block":
+                depth = 1
+                code.append(b" ")
+            else:
+                code.append(token[0])
+                if token["string"] is not None:
+                    literals.append(token[0])
+        yield line, b"".join(code), literals
+
+
+def has_credential_shape(line, code=None, literals=()):
+    if code is not None:
         # Generated source commonly contains token type declarations and integer
         # constants. Look for sensitive names assigned nonempty string literals.
-        if SOURCE_BEARER.search(line) or any(
+        if any(CREDENTIAL_SHAPE.search(literal) for literal in literals) or SOURCE_BEARER.search(line):
+            return True
+        if any(
             SENSITIVE_IDENTIFIER.search(assignment[1])
-            for assignment in QUOTED_ASSIGNMENT.finditer(line)
+            for assignment in QUOTED_ASSIGNMENT.finditer(code)
         ):
             return True
     elif CREDENTIAL_SHAPE.search(line):
@@ -191,8 +235,12 @@ def has_credential_shape(line, source_code=False):
 def credential_match(path, credential_values):
     if is_text_state(path):
         with path.open("rb") as source:
-            source_code = path.suffix in SOURCE_SUFFIXES
-            if any(has_credential_shape(line, source_code) for line in source):
+            if path.suffix in SOURCE_SUFFIXES:
+                lines = source_code_lines(source, nested_blocks=path.suffix == ".rs")
+                found = any(has_credential_shape(line, code, literals) for line, code, literals in lines)
+            else:
+                found = any(has_credential_shape(line) for line in source)
+            if found:
                 return "credential pattern"
     if credential_values:
         overlap = max(map(len, credential_values)) - 1

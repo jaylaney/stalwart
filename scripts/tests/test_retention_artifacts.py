@@ -280,7 +280,11 @@ class BuildSnapshotTests(unittest.TestCase):
             'pub const FTS5_TOKENIZE_QUERY: i32 = 1;\n'
             'pub const FTS5_TOKENIZER: &str = "unicode61";\n'
             'pub pToken: *const ::std::os::raw::c_char,\n'
-            '// Bearer authentication is supported.\n',
+            '// Bearer authentication is supported.\n'
+            '// Example string: "Bearer sample_token"\n'
+            '/* Sample value:\n'
+            '  "password=example"\n'
+            '*/\n',
         )
         packed = self.pack()
         self.assertEqual(packed.returncode, 0, packed.stderr)
@@ -295,6 +299,10 @@ class BuildSnapshotTests(unittest.TestCase):
             f'const API_TOKEN: &\'static str = "{credential}";',
             f'const char *clientSecret = "{credential}";',
             f'let header = "Authorization: Bearer {credential}";',
+            f'let header = "Bearer {credential}";',
+            f'let config = "password={credential}";',
+            f'let secretKey = "{credential}";',
+            f'let passwordValue = "{credential}";',
         )
         for declaration in declarations:
             with self.subTest(assignment=declaration.split('"')[0]):
