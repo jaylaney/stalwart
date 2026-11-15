@@ -26,7 +26,8 @@
 //!   the key commit follows fan-out and sealing
 //!   (`groupware::calendar::pipeline::update::za_commit_update`).
 //! - `DELETE_COMMIT_PAUSE`: immediately before an event DELETE commit,
-//!   after fan-out, keyed by the event owner.
+//!   after fan-out, keyed by the event owner
+//!   (`groupware::calendar::pipeline::delete`).
 //! - `COMMIT_FAIL_ONCE`: the commit of a key account's PUT create fails once
 //!   with an internal error after its fan-out, keyed by the account
 //!   (`groupware::calendar::pipeline::uid::za_commit_create`).
@@ -37,7 +38,7 @@
 //! - `DELETE_COMMIT_FAIL_ONCE`: the commit of a key account's event or
 //!   collection DELETE fails once with an internal error after its
 //!   fan-outs, in place of `commit_batch`'s result, keyed by the event owner
-//!   (`dav::calendar::delete`, iMIP spec 8.2).
+//!   (`groupware::calendar::pipeline::delete`, iMIP spec 8.2).
 //! - `IMIP_SUBMIT_FAIL_ONCE`: the account's next iMIP submission answers
 //!   `Failed` without reaching the submitter, keyed by the event's account
 //!   (`common::za::imip::za_imip_submit`, iMIP spec 5.3).

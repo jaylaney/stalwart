@@ -7,6 +7,7 @@
 pub mod admission;
 pub mod context;
 pub mod create;
+pub mod delete;
 pub mod error;
 pub mod placement;
 pub mod schedule;
@@ -43,5 +44,7 @@ pub struct ZaWritten {
 }
 
 pub struct ZaDeleted {
+    /// The assigned Calendar change id, or 0 for an assertion-only CalDAV no-op
+    /// when a concurrent unlink already removed the addressed parent.
     pub change_id: u64,
 }

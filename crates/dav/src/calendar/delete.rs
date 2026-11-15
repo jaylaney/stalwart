@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{assert_event_privacy_access, za_calendar_error};
+use super::assert_event_privacy_access;
 use crate::{
     DavError, DavMethod,
     common::{
@@ -13,25 +13,18 @@ use crate::{
         uri::DavUriResource,
     },
 };
-use common::{
-    Server, auth::AccessToken, cache::invalidate::CacheInvalidationBuilder, ipc::CacheInvalidation,
-    sharing::EffectiveAcl,
-};
+use common::{Server, auth::AccessToken, sharing::EffectiveAcl};
 use dav_proto::RequestHeaders;
 use groupware::{
     DestroyArchive,
     cache::GroupwareCache,
     calendar::{
         Calendar, CalendarEvent, CalendarEventContent, EVENT_HAS_ALARMS,
-        delegation::{
-            ZaSelfOperation, za_combine_delegated, za_resolve_delegation, za_self_cancel,
-        },
-        fanout::{ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaSource},
         identity::ParticipantIdentityAddresses,
         notification::{NotificationAudience, may_have_viewers},
+        pipeline::delete::{za_calendar_delete_target, za_delete_calendar, za_delete_event},
         privacy::EventViewer,
         rights::EventAcl,
-        sharing::resolve::calendars_changed,
         storage::{DirectChange, DirectChangeNotification, NotificationQuota},
     },
 };
@@ -100,12 +93,6 @@ impl CalendarDeleteRequestHandler for Server {
             && !headers.no_schedule_reply
             && !account_info.addresses().is_empty()
             && access_token.has_permission(Permission::CalendarSchedulingSend);
-        // Invitations spec 5.5: a key account's CANCELs and declines are
-        // built from the unsealed stored tree and go to the fan-out.
-        let mut za_messages = Vec::new();
-        let mut retry_event = None;
-        let mut contexts = Vec::new();
-        let mut deleted_grantees = Vec::new();
 
         // Fetch entry
         let mut batch = BatchBuilder::new();
@@ -160,35 +147,13 @@ impl CalendarDeleteRequestHandler for Server {
                 EventViewer::new(is_owner),
             )?;
 
-            // Even collection deletion uses the fresh exact-principal grant.
-            let repaired = crate::common::za::za_mutation_context(
-                self,
-                access_token,
-                account_id,
-                document_id,
-                utils::map::bitmap::Bitmap::new()
-                    .with_item(Acl::Delete)
-                    .with_item(Acl::RemoveItems),
-            )
-            .await
-            .map_err(|error| za_calendar_error(error, account_id, document_id))?;
-            let was_shared = repaired
-                .as_ref()
-                .is_some_and(|context| context.domain.calendar_id().is_some());
-            let calendar_ = repaired.map(|context| context.stored).unwrap_or(calendar_);
-            let calendar = calendar_
+            let target =
+                za_calendar_delete_target(self, access_token, account_id, document_id, calendar_)
+                    .await?;
+            let calendar = target
+                .stored
                 .to_unarchived::<Calendar>()
                 .caused_by(trc::location!())?;
-            if was_shared {
-                deleted_grantees.extend(
-                    calendar
-                        .inner
-                        .acls
-                        .iter()
-                        .map(|grant| grant.account_id.to_native())
-                        .filter(|grantee| *grantee != account_id),
-                );
-            }
 
             // Validate headers
             self.validate_headers(
@@ -225,42 +190,40 @@ impl CalendarDeleteRequestHandler for Server {
                 )
                 .await
                 .caused_by(trc::location!())?;
-            if let Some(roles) = &za_roles {
-                za_messages = DestroyArchive(calendar)
-                    .delete_with_events_za(
-                        self,
-                        access_token,
-                        &roles.sender,
-                        account_id,
-                        document_id,
-                        children_ids,
-                        &resources.event_ids_with_flags(EVENT_HAS_ALARMS),
-                        &cleanup,
-                        resources.format_resource(delete_resource).into(),
-                        send_itip,
-                        za_keys.as_deref(),
-                        &mut batch,
-                    )
-                    .await
-                    .caused_by(trc::location!())?;
-            } else {
-                DestroyArchive(calendar)
-                    .delete_with_events(
-                        self,
-                        access_token,
-                        &account_info,
-                        account_id,
-                        document_id,
-                        children_ids,
-                        &resources.event_ids_with_flags(EVENT_HAS_ALARMS),
-                        &cleanup,
-                        resources.format_resource(delete_resource).into(),
-                        send_itip,
-                        &mut batch,
-                    )
-                    .await
-                    .caused_by(trc::location!())?;
+            if let (Some(keys), Some(roles)) = (&za_keys, &za_roles) {
+                za_delete_calendar(
+                    self,
+                    access_token,
+                    &resources,
+                    keys,
+                    roles,
+                    account_id,
+                    document_id,
+                    target,
+                    children_ids,
+                    &cleanup,
+                    resources.format_resource(delete_resource).into(),
+                    send_itip,
+                )
+                .await?;
+                return Ok(HttpResponse::new(StatusCode::NO_CONTENT));
             }
+            DestroyArchive(calendar)
+                .delete_with_events(
+                    self,
+                    access_token,
+                    &account_info,
+                    account_id,
+                    document_id,
+                    children_ids,
+                    &resources.event_ids_with_flags(EVENT_HAS_ALARMS),
+                    &cleanup,
+                    resources.format_resource(delete_resource).into(),
+                    send_itip,
+                    &mut batch,
+                )
+                .await
+                .caused_by(trc::location!())?;
 
             // Reset default calendar id
             batch
@@ -365,32 +328,23 @@ impl CalendarDeleteRequestHandler for Server {
                 return Err(DavError::Code(StatusCode::PRECONDITION_FAILED));
             }
 
-            if za_keys.is_some() {
-                if let Some(context) = crate::common::za::za_mutation_context(
+            if let (Some(keys), Some(roles)) = (&za_keys, &za_roles) {
+                za_delete_event(
                     self,
                     access_token,
+                    &resources,
+                    keys,
+                    roles,
                     account_id,
+                    document_id,
                     calendar_id,
-                    utils::map::bitmap::Bitmap::new().with_item(Acl::RemoveItems),
+                    event_,
+                    content_,
+                    resources.format_resource(delete_resource).into(),
+                    send_itip,
                 )
-                .await
-                .map_err(|error| za_calendar_error(error, account_id, calendar_id))?
-                {
-                    context.assert_in(&mut batch);
-                    contexts.push(context);
-                } else {
-                    // Upgrade ruling 176 (B-M2): a key account's delete needs
-                    // its key domain; it never takes upstream's queueing.
-                    return Err(za_calendar_error(
-                        groupware::calendar::sharing::resolve::ZaCalendarError::Forbidden,
-                        account_id,
-                        calendar_id,
-                    ));
-                }
-            }
-            let cutoff = store::write::now() as i64;
-            if za_keys.is_some() {
-                retry_event = Some((event_.clone(), calendar_id, cutoff));
+                .await?;
+                return Ok(HttpResponse::new(StatusCode::NO_CONTENT));
             }
 
             // Delete event
@@ -411,194 +365,23 @@ impl CalendarDeleteRequestHandler for Server {
                 .await
                 .caused_by(trc::location!())?;
             }
-            if let Some(roles) = &za_roles {
-                za_messages.extend(
-                    DestroyArchive(event)
-                        .delete_za_at(
-                            self,
-                            &roles.sender,
-                            account_id,
-                            document_id,
-                            calendar_id,
-                            content_,
-                            resources.format_resource(delete_resource).into(),
-                            send_itip,
-                            contexts.first().map(|context| &context.domain),
-                            cutoff,
-                            &mut batch,
-                        )
-                        .await
-                        .caused_by(trc::location!())?,
-                );
-            } else {
-                DestroyArchive(event)
-                    .delete(
-                        self,
-                        &account_info,
-                        account_id,
-                        document_id,
-                        calendar_id,
-                        content_,
-                        resources.format_resource(delete_resource).into(),
-                        send_itip,
-                        &mut batch,
-                    )
-                    .await
-                    .caused_by(trc::location!())?;
-            }
-        }
-
-        // iMIP spec 5.4, decision 9: each fan-out's mail attempts wait for
-        // the deletion's one commit.
-        let mut za_mail = common::za::imip::ZaImipPending::default();
-        if let (Some(keys), Some(roles)) = (&za_keys, &za_roles) {
-            // Spec 5.4: the items first, immediately before the commit.
-            for message in za_messages {
-                let resolution = za_resolve_delegation(
+            DestroyArchive(event)
+                .delete(
                     self,
-                    &roles.sender,
-                    &roles.writer,
-                    &roles.owner,
-                    ZaSelfOperation::Delete,
-                    Some(&message.event),
-                    None,
+                    &account_info,
+                    account_id,
+                    document_id,
+                    calendar_id,
+                    content_,
+                    resources.format_resource(delete_resource).into(),
+                    send_itip,
+                    &mut batch,
                 )
                 .await
                 .caused_by(trc::location!())?;
-                let first = message.messages.unwrap_or_default();
-                let messages = if let Some(resolution) = &resolution {
-                    let second = za_self_cancel(
-                        &message.event,
-                        &roles.writer,
-                        &roles.owner,
-                        resolution,
-                        message.policy,
-                    )
-                    .ok()
-                    .flatten();
-                    za_combine_delegated(first, second, resolution)
-                } else {
-                    first.into_iter().map(ZaFanOutMessage::upstream).collect()
-                };
-                za_mail.extend(
-                    self.za_fan_out(
-                        &roles.sender,
-                        &roles.writer,
-                        &roles.owner,
-                        keys,
-                        messages,
-                        message.pairs,
-                        &message.event,
-                        ZaSource {
-                            document_id: message.document_id,
-                            uid: &message.uid,
-                        },
-                        ZaFanOutKind::Deletion,
-                        false,
-                        message.policy,
-                        None,
-                        resolution.as_ref(),
-                    )
-                    .await
-                    .caused_by(trc::location!())?
-                    .mail,
-                );
-            }
         }
 
-        #[cfg(feature = "test_mode")]
-        if retry_event.is_some() {
-            common::za::test_hooks::delete_commit_pause_point(account_id).await;
-        }
-        #[cfg(feature = "test_mode")]
-        if za_keys.is_some() && common::za::test_hooks::take_delete_commit_fail(account_id) {
-            za_mail.dropped();
-            return Err(trc::StoreEvent::UnexpectedError
-                .into_err()
-                .details("zero-access test hook: delete commit failure")
-                .into());
-        }
-        // iMIP spec 5.4: every error return of the commit drops the mail
-        // attempts, traced, before returning.
-        let committed: crate::Result<()> = async {
-            match self.commit_batch(batch).await {
-                Ok(_) => {}
-                Err(error) if error.is_assertion_failure() && !contexts.is_empty() => {
-                    // A calendar change (a grant, a rotation or a conversion) lost
-                    // the assertion: one bounded retry in the fresh domain, with
-                    // scheduling off (its items already went out).
-                    let (original, calendar_id, cutoff) = retry_event.as_ref().unwrap();
-                    let fresh = crate::common::za::za_mutation_context(
-                        self,
-                        access_token,
-                        account_id,
-                        *calendar_id,
-                        utils::map::bitmap::Bitmap::new().with_item(Acl::RemoveItems),
-                    )
-                    .await
-                    .map_err(|error| za_calendar_error(error, account_id, *calendar_id))?
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                    if !calendars_changed(&contexts, &fresh) {
-                        return Err(error.caused_by(trc::location!()).into());
-                    }
-                    let mut batch = BatchBuilder::new();
-                    for context in &fresh {
-                        context.assert_in(&mut batch);
-                    }
-                    let roles = za_roles.as_ref().unwrap();
-                    DestroyArchive(
-                        original
-                            .to_unarchived::<CalendarEvent>()
-                            .caused_by(trc::location!())?,
-                    )
-                    .delete_za_at(
-                        self,
-                        &roles.sender,
-                        account_id,
-                        document_id,
-                        *calendar_id,
-                        None,
-                        resources.format_resource(delete_resource).into(),
-                        false,
-                        fresh.first().map(|context| &context.domain),
-                        *cutoff,
-                        &mut batch,
-                    )
-                    .await
-                    .caused_by(trc::location!())?;
-                    self.commit_batch(batch).await.caused_by(trc::location!())?;
-                }
-                Err(error) => return Err(error.caused_by(trc::location!()).into()),
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(error) = committed {
-            za_mail.dropped();
-            return Err(error);
-        }
-        // The committed deletion retires every grant. Evict the grantees'
-        // resident collection-key sessions and authorization only after that
-        // commit succeeds, using the same channel as share mutations.
-        let invalidated = if !deleted_grantees.is_empty() {
-            let mut invalidation = CacheInvalidationBuilder::default();
-            for grantee in deleted_grantees {
-                invalidation.invalidate(CacheInvalidation::AccessToken(grantee));
-            }
-            self.invalidate_caches(invalidation).await
-        } else {
-            Ok(())
-        };
-        if invalidated.is_ok() && za_keys.is_some() {
-            self.notify_task_queue();
-        }
-        // iMIP spec 5.4, section 7: the deletion (or its retry) committed, so
-        // its mail goes whether or not the invalidation failed; the
-        // invalidation's error is returned after.
-        za_mail.submit(self).await;
-        invalidated?;
-
+        self.commit_batch(batch).await.caused_by(trc::location!())?;
         Ok(HttpResponse::new(StatusCode::NO_CONTENT))
     }
 }
