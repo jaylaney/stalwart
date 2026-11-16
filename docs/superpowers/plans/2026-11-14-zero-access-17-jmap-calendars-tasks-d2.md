@@ -44,7 +44,7 @@ Head, once per call:
 2. U `:90-91`: `SetResponse::from_request(..)?.with_state(sampled.assert_state(cache.get_state(true), &request.if_in_state)?)`.
 3. U `:92-95`, `:99`: `MetadataWriter::new`, `will_destroy`, `is_shared`, `personal_id`, `RequestDefaultAlerts::default()`.
 4. U `:101-109`: the calendar-count quota.
-5. F: `za_writer_keys(server, access_token, account_id)`. `Ok(Some(keys))` goes on. `Ok(None)` or `Err(_)` returns `Err(za_calendar_keyless_refusal().account_id(account_id))`, the method error of 6.1. When `will_destroy` is not empty, `za_roles(server, access_token, account_id)`.
+5. F: `za_writer_keys(server, access_token, account_id)`. `Ok(Some(keys))` goes on. `Err(Store(e))` returns `Err(e)`: a store error before the first object fails the method (spec 8). `Ok(None)` or any other `Err(_)` returns `Err(za_calendar_keyless_refusal().account_id(account_id))`, the method error of 6.1. When `will_destroy` is not empty, `za_roles(server, access_token, account_id)`.
 6. Not taken from upstream: the batch and its provisioning fence (`:112-114`), `PendingCreates`, `reject_uncommitted`.
 
 Create, per object, in request order:
@@ -55,7 +55,7 @@ Create, per object, in request order:
 5. U `:151-158`: `metadata_writer.extract(MetadataPatches::for_create(), &mut object)`. `Err(e)`: `e`. `Ok(Some(_))`: `forbidden` with `crate::api::metadata::ZA_METADATA_REFUSED`.
 6. U `:159-177`: `client_properties`, the subscribed flag, `update_calendar(None, object, &mut calendar, access_token, account_id)`, `sync_owner_preferences`.
 7. U `:178-192`: `assert_unique_default_alerts`.
-8. U `:233-234`: `server_set_values(personal_id, &client_properties)` and `request_alerts.accept(None, ..)`, both before sealing: they read the plaintext entry.
+8. U `:233-234`: `server_set_values(personal_id, &client_properties)` and `request_alerts.accept(None, ..)`, both on the plaintext entry, before sealing; `accept` runs only after step 10's commit returns `Ok` (D3).
 9. F: `seal_calendar(&mut calendar, &keys, account_id)`, its error through `seal_error(err, account_id, u32::MAX)` (MKCOL's form, `crates/dav/src/calendar/mkcol.rs:175-178`): a store failure.
 10. F: a batch of its own: `reserve_document_id(account_id, Collection::Calendar)`, U `:245-252` `calendar.insert(access_token.changed_by(), account_id, slot, &mut batch)`, `commit_batch`. The id is `assigned_ids.slot(slot)`.
 11. U `:254-262`, `:840-846`: `response.created(id, document_id)`; the server-set properties are added after the last object, with `isDefault` ("Default" below). `newState` is `assigned_ids.change_id(account_id, SyncCollection::Calendar)`.
@@ -72,7 +72,7 @@ Update, per object:
 9. F: the edited value starts from `calendar_view_in_domain(&context.stored, &context.domain, context.personal_id)`, deserialised; its error through `seal_error(err, account_id, document_id)`.
 10. U `:351-369`: `inherit_owner_preferences` (when not shared), `update_calendar(Some(id), object, &mut new_calendar, access_token, account_id)`, `sync_owner_preferences` (when not shared).
 11. U `:383-397`: `assert_unique_default_alerts(.., Some(document_id), ..)`.
-12. F, in PROPPATCH's order (`proppatch.rs:322-366`): a new batch; `context.assert_in(&mut batch)`; `seal_calendar_changes(&stored, &new_calendar, &context.domain, context.personal_id)`, its error through `seal_error`; U `:445-454` `reschedule_calendar_alarms` with the stored and the sealed settings; U `:455` `request_alerts.accept(Some(document_id), ..)`; U `:467-475` `update(access_token.changed_by(), <context.stored unarchived>, account_id, document_id, &mut batch)`; `commit_batch`.
+12. F, in PROPPATCH's order (`proppatch.rs:322-366`): a new batch; `context.assert_in(&mut batch)`; `seal_calendar_changes(&stored, &new_calendar, &context.domain, context.personal_id)`, its error through `seal_error`; U `:445-454` `reschedule_calendar_alarms` with the stored and the sealed settings; U `:467-475` `update(access_token.changed_by(), <context.stored unarchived>, account_id, document_id, &mut batch)`; `commit_batch`; U `:455` `request_alerts.accept(Some(document_id), ..)` only after that commit returns `Ok` (D3).
 13. An assertion failure of that commit is the set error `forbidden` with "Another process modified this calendar, please try again." (`:808`). There is no retry, as PROPPATCH has none. Any other error is a store failure.
 14. U `:476`: `response.updated.append(id, None)`; `newState` as in create.
 
@@ -102,7 +102,7 @@ Default, after the objects (U `:749-798`, `:816-867`): upstream's rule decides t
 | `Forbidden(_)`, `LinkedEvent`, `Store(e)` with `Security(Unauthorized)` | set error `forbidden`, no description |
 | `NotFound` | set error `notFound` |
 | `Busy(_)`; `Store(e)` with `e.is_assertion_failure()` | set error `forbidden`, "Another process modified this calendar, please try again." |
-| `Store(e)` with `Limit(Quota)` or `Limit(TenantQuota)` | `overQuota` |
+| `Store(e)` with `Limit(Quota)` (`TenantQuota` exists only under the `enterprise` feature and takes the store-failure path) | `overQuota` |
 | `UidConflict`, `TooManyRecipients`, `Scheduling(_)`, `SchedulingDenied(_)` | not produced on these paths; set error `forbidden`, no description, so the match names every variant |
 | `Store(e)`, anything else | `Err(e)`: a store failure; the object and every later one answer `forbidden`, "The server could not complete this change, try again." |
 | every upstream check of the order lists | upstream's answer and text |
@@ -110,7 +110,7 @@ Default, after the objects (U `:749-798`, `:816-867`): upstream's rule decides t
 **Tests.**
 
 `jmap` unit, in `calendar/set/za.rs`:
-- `calendar_set_error_table`: the pipeline rows above, row by row, each answer compared as JSON. `Forbidden(Context)`, `Forbidden(SharedCopy)`, `LinkedEvent` and `Store(Security(Unauthorized))` give `{ "type": "forbidden" }`. `NotFound` gives type `notFound`. `Busy(LeaseBusy)`, `Busy(CreateLost)` and `Store(AssertValueFailed)` give `forbidden` with "Another process modified this calendar, please try again." `Store(Limit(Quota))` and `Store(Limit(TenantQuota))` give `overQuota`. `UidConflict { href: None }`, `TooManyRecipients`, `Scheduling(_)` for one `ItipError` and `SchedulingDenied("x")` give `{ "type": "forbidden" }`. `Store(StoreEvent::UnexpectedError)` gives `Err`.
+- `calendar_set_error_table`: the pipeline rows above, row by row, each answer compared as JSON. `Forbidden(Context)`, `Forbidden(SharedCopy)`, `LinkedEvent` and `Store(Security(Unauthorized))` give `{ "type": "forbidden" }`. `NotFound` gives type `notFound`. `Busy(LeaseBusy)`, `Busy(CreateLost)` and `Store(AssertValueFailed)` give `forbidden` with "Another process modified this calendar, please try again." `Store(Limit(Quota))` gives `overQuota` (`TenantQuota` exists only under the `enterprise` feature and takes the store-failure path). `UidConflict { href: None }`, `TooManyRecipients`, `Scheduling(_)` for one `ItipError` and `SchedulingDenied("x")` give `{ "type": "forbidden" }`. `Store(StoreEvent::UnexpectedError)` gives `Err`.
 
 za cases in `calendars.rs`, on the module's `Pair`. `stored(id)` is a module-private read this task adds: the `Calendar` at `ValueKey::archive(key_id, Collection::Calendar, id)`, deserialised. A calendar a case shares is made with `make_calendar` and granted with `share`; its JMAP id is the `Calendar/get` entry whose `name` is the slug.
 - `create_seals_name_description_colour`. Create `{ "name": "Name canary", "description": "Description canary", "color": "#ff8800", "sortOrder": 7, "timeZone": "Europe/Vienna", "isVisible": false }`.
@@ -355,7 +355,7 @@ Blob ids are found as upstream finds them: `BlobProperties::from_patch(object, |
 | `TooManyRecipients` | `invalidProperties` on `participants`, "The number of scheduling message recipients exceeds the maximum allowed." |
 | `Scheduling(err)` | `invalidProperties` on `participants`, `err.to_string()` |
 | `Busy(_)`; `Store(e)` with `e.is_assertion_failure()` | set error `forbidden`, "Another process modified this calendar event, please try again." |
-| `Store(e)` with `Limit(Quota)` or `Limit(TenantQuota)` | `overQuota` |
+| `Store(e)` with `Limit(Quota)` (`TenantQuota` exists only under the `enterprise` feature and takes the store-failure path) | `overQuota` |
 | `Store(e)` with `Security(Unauthorized)` | set error `forbidden`, no description |
 | `Store(e)`, anything else | `Err(e)`, which the writer turns into the store-failure answer: `forbidden`, "The server could not complete this change, try again.", for the object and every later one |
 
@@ -379,7 +379,7 @@ An object that fails does not undo the objects before it.
   - `TooManyRecipients`: `invalidProperties`, properties `["participants"]`, "The number of scheduling message recipients exceeds the maximum allowed."
   - `Scheduling(err)` for one `ItipError`: `invalidProperties`, properties `["participants"]`, `err.to_string()`.
   - `SchedulingDenied("This account is not allowed to send calendar scheduling messages.")`: `forbidden` with that text.
-  - `Store(Limit(Quota))`, `Store(Limit(TenantQuota))`: type `overQuota`.
+  - `Store(Limit(Quota))`: type `overQuota` (`TenantQuota` exists only under the `enterprise` feature and takes the store-failure path).
   - `Store(Security(Unauthorized))`: `{ "type": "forbidden" }`.
   - `Store(StoreEvent::UnexpectedError)`: `Err(e)`, which the writer turns into the store-failure answer.
 

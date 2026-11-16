@@ -159,7 +159,7 @@ they do today, with the same `Details` strings; a mapping adds none.
 | `Scheduling(err)` | `invalidProperties` on `participants`, `err.to_string()` |
 | `SchedulingDenied(reason)` | set error `forbidden`, `reason` |
 | `Store(e)`, assertion failure | set error `forbidden`, the "Another process modified" text |
-| `Store(e)`, `Limit(Quota \| TenantQuota)` | `overQuota` |
+| `Store(e)`, `Limit(Quota)` (`TenantQuota` exists only under the `enterprise` feature and takes the store-failure path) | `overQuota` |
 | `Store(e)`, `Security(Unauthorized)` | set error `forbidden` |
 | `Store(e)`, anything else | a store failure (§7.5): this object and every later object of the call answer `za_set_incomplete()`; the method does not fail (D28) |
 
