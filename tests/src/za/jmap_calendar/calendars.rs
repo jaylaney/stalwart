@@ -6,22 +6,46 @@
 
 use super::{Pair, finish, make_calendar, pair, share};
 use crate::{
-    utils::{server::TestServer, webdav::DummyWebDavClient, za::za_post},
+    utils::{
+        account::Account,
+        http::HttpRequest,
+        jmap::JmapResponse,
+        server::TestServer,
+        smtp_sink::sink,
+        webdav::DummyWebDavClient,
+        za::{
+            delete_inbox_item, inbox_ids, item_method, open_pending_item_as, wait_for_queue,
+            za_post,
+        },
+    },
     za::{
         STRONG,
         dav_seal::{raw_calendar, resource_id},
-        fanout::NO_REPLY,
+        fanout::{NO_REPLY, invite, uid_copies},
         gating::method_error,
+        uid_lease::put,
     },
 };
-use hyper::StatusCode;
-use serde_json::json;
-use types::id::Id;
+use calcard::icalendar::ICalendarMethod;
+use common::za::test_hooks::set_delete_commit_fail_once;
+use groupware::calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences, Timezone};
+use hyper::{Method, StatusCode};
+use serde_json::{Value, json};
+use store::{
+    ValueKey,
+    write::{Archive, ArchiveBytes, BatchBuilder, ValueClass},
+};
+use types::{collection::Collection, field::PrincipalField, id::Id};
 
 const SLUG: &str = "jmapcal-work";
 const PATH: &str = "/dav/cal/jmapcal-calendars%40example.com/jmapcal-work/";
+const HOME: &str = "/dav/cal/jmapcal-calendars%40example.com/";
 const OWNER_NAME: &str = "jmapcal owner name";
 const READER_NAME: &str = "jmapcal reader name";
+const OUTSIDE: &str = "jmapcal-calendars-out@remote.test";
+const SHARE_TEXT: &str = "Calendar sharing is managed on the account page.";
+const INCOMPLETE: &str = "The server could not complete this change, try again.";
+const NOT_ALLOWED: &str = "You are not allowed to modify this calendar.";
 
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access JMAP calendar tests...");
@@ -31,6 +55,18 @@ pub async fn test(test: &mut TestServer) {
         .request_with_headers("DELETE", PATH, [NO_REPLY], "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+    let created = create_seals_name_description_colour(test, &pair).await;
+    update_own_entry(test, &pair, &created).await;
+    grantee_updates_only_its_entry(test, &pair).await;
+    update_without_entry_refused(test, &pair).await;
+    colour_before_and_after_sharing(test, &pair).await;
+    destroy_with_events_sends_cancellations(test, &pair).await;
+    destroy_non_empty_without_flag_refused(test, &pair).await;
+    grantee_destroy_refused(test, &pair).await;
+    on_success_set_is_default(test, &pair).await;
+    share_with_refused(test, &pair).await;
+    per_object_commits(&pair).await;
+    store_failure_stops_the_call(test, &pair).await;
     finish(test, "calendars").await;
 }
 
@@ -114,4 +150,768 @@ async fn get_shows_own_entry(test: &TestServer, pair: &Pair) {
         )
         .await;
     assert_eq!(method_error(&reply), Some("accountNotFound"), "{reply:?}");
+}
+
+/// The stored calendar, deserialised. Never printed: it holds sealed bytes.
+async fn stored(test: &TestServer, owner_id: u32, document_id: u32) -> Calendar {
+    test.server
+        .store()
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+            owner_id,
+            Collection::Calendar,
+            document_id,
+        ))
+        .await
+        .unwrap()
+        .expect("calendar archive")
+        .deserialize::<Calendar>()
+        .unwrap()
+}
+
+/// The stored default calendar id of the account.
+async fn stored_default(test: &TestServer, account_id: u32) -> Option<u32> {
+    test.server
+        .store()
+        .get_value::<u32>(ValueKey {
+            account_id,
+            collection: Collection::Principal.into(),
+            document_id: 0,
+            class: ValueClass::Property(PrincipalField::DefaultCalendarId.into()),
+        })
+        .await
+        .unwrap()
+}
+
+async fn calendar_set(caller: &Account, owner: &Account, mut args: Value) -> JmapResponse {
+    args["accountId"] = json!(owner.id_string());
+    caller.jmap_method_call("Calendar/set", args).await
+}
+
+async fn calendar_get(caller: &Account, owner: &Account) -> JmapResponse {
+    let reply = caller
+        .jmap_method_call(
+            "Calendar/get",
+            json!({ "accountId": owner.id_string(), "ids": null }),
+        )
+        .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    reply
+}
+
+/// The `Calendar/get` entry of `id`, as `caller` reads it in `owner`'s account.
+async fn calendar_entry(caller: &Account, owner: &Account, id: &str) -> Value {
+    let reply = caller
+        .jmap_method_call(
+            "Calendar/get",
+            json!({ "accountId": owner.id_string(), "ids": [id] }),
+        )
+        .await;
+    let [entry] = reply.list() else {
+        panic!("Expected calendar {id}: {reply:?}");
+    };
+    entry.clone()
+}
+
+/// The JMAP id of the `Calendar/get` entry whose name is `name`.
+async fn calendar_named(caller: &Account, owner: &Account, name: &str) -> String {
+    let reply = calendar_get(caller, owner).await;
+    reply
+        .list()
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("no calendar named {name}: {reply:?}"))["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn listed(reply: &JmapResponse, id: &str) -> bool {
+    reply.list().iter().any(|entry| entry["id"] == id)
+}
+
+fn set_error(value: &Value) -> (&str, Option<&str>) {
+    (
+        value["type"].as_str().unwrap_or_default(),
+        value["description"].as_str(),
+    )
+}
+
+async fn destroy(pair: &Pair, id: &str) {
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "destroy": [id], "onDestroyRemoveEvents": true }),
+    )
+    .await;
+    assert_eq!(reply.destroyed().collect::<Vec<_>>(), [id], "{reply:?}");
+}
+
+async fn dav_delete(pair: &Pair, slug: &str) {
+    pair.dav
+        .request_with_headers("DELETE", &format!("{HOME}{slug}/"), [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+}
+
+async fn regrant(pair: &Pair, slug: &str, level: &str) {
+    za_post(
+        "shares/grant",
+        &json!({
+            "username": pair.key.name(), "password": STRONG,
+            "calendar": slug, "address": pair.key2.name(), "level": level,
+        }),
+    )
+    .await
+    .expect(200);
+}
+
+/// Spec 6.7: a create seals the name, description and colour under the
+/// owner's keys; the visible values stay in the clear.
+async fn create_seals_name_description_colour(test: &TestServer, pair: &Pair) -> String {
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "create": { "i0": {
+            "name": "Name canary",
+            "description": "Description canary",
+            "color": "#ff8800",
+            "sortOrder": 7,
+            "timeZone": "Europe/Vienna",
+            "isVisible": false,
+        } } }),
+    )
+    .await;
+    let id = reply.created_id(0).to_string();
+    let entry = calendar_entry(&pair.key, &pair.key, &id).await;
+    assert_eq!(entry["name"], "Name canary", "{entry}");
+    assert_eq!(entry["description"], "Description canary", "{entry}");
+    assert_eq!(entry["color"], "#ff8800", "{entry}");
+    assert_eq!(entry["sortOrder"], 7, "{entry}");
+    assert_eq!(entry["timeZone"], "Europe/Vienna", "{entry}");
+    assert_eq!(entry["isVisible"], false, "{entry}");
+
+    let calendar = stored(test, pair.key_id, document_id(&id)).await;
+    let [entry] = calendar.preferences.as_slice() else {
+        panic!(
+            "create_seals_name_description_colour: {} stored entries",
+            calendar.preferences.len()
+        );
+    };
+    assert_eq!(entry.account_id, pair.key_id);
+    assert!(
+        entry.name.starts_with("$za$"),
+        "the stored name is not sealed"
+    );
+    assert!(entry.description.is_none(), "a stored description");
+    assert!(entry.color.is_none(), "a stored colour");
+    assert_eq!(entry.sort_order, 7);
+    assert!(calendar.acls.is_empty(), "stored grants");
+    let debug = format!("{calendar:?}");
+    for canary in ["Name canary", "Description canary", "#ff8800"] {
+        assert!(!debug.contains(canary), "{canary} is stored in the clear");
+    }
+
+    let path = format!("{HOME}{}/", calendar.name);
+    let props = pair.dav.propfind(&path, ["D:displayname"]).await;
+    props
+        .properties(&path)
+        .get("D:displayname")
+        .with_values(["Name canary"]);
+    id
+}
+
+/// Spec 6.7: an update edits the caller's own entry and reseals it.
+async fn update_own_entry(test: &TestServer, pair: &Pair, id: &str) {
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "update": { id: {
+            "name": "Renamed canary",
+            "description": null,
+            "color": "#112233",
+            "sortOrder": 9,
+        } } }),
+    )
+    .await;
+    reply.updated(id);
+    let before = reply.response_at(0)["oldState"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let new_state = reply.new_state().to_string();
+
+    let get = calendar_get(&pair.key, &pair.key).await;
+    let entry = get
+        .list()
+        .iter()
+        .find(|entry| entry["id"] == id)
+        .expect("updated calendar");
+    assert_eq!(entry["name"], "Renamed canary", "{entry}");
+    assert_eq!(entry["description"], Value::Null, "{entry}");
+    assert_eq!(entry["color"], "#112233", "{entry}");
+    assert_eq!(entry["sortOrder"], 9, "{entry}");
+    assert_ne!(new_state, before);
+    assert_eq!(new_state, get.state());
+
+    let calendar = stored(test, pair.key_id, document_id(id)).await;
+    let [entry] = calendar.preferences.as_slice() else {
+        panic!(
+            "update_own_entry: {} stored entries",
+            calendar.preferences.len()
+        );
+    };
+    assert!(
+        entry.name.starts_with("$za$"),
+        "the stored name is not sealed"
+    );
+    assert_eq!(entry.sort_order, 9);
+    let debug = format!("{calendar:?}");
+    for canary in ["Renamed canary", "#112233"] {
+        assert!(!debug.contains(canary), "{canary} is stored in the clear");
+    }
+    destroy(pair, id).await;
+}
+
+/// Spec 6.7: a grantee changes only its own entry, and only at `edit`.
+async fn grantee_updates_only_its_entry(test: &TestServer, pair: &Pair) {
+    const OWN: &str = "jmapcal-own-entry";
+    let document_id = make_calendar(test, &pair.key, &pair.dav, OWN).await;
+    share(test, &pair.key, &pair.key2, pair.key2_id, OWN, "edit").await;
+    let id = Id::from(document_id).to_string();
+    let owner_before = stored(test, pair.key_id, document_id)
+        .await
+        .personal_preferences(pair.key_id)
+        .cloned()
+        .expect("owner entry");
+
+    let update = json!({ "update": { &id: { "name": "Reader name canary", "sortOrder": 3 } } });
+    let reply = calendar_set(&pair.key2, &pair.key, update.clone()).await;
+    reply.updated(&id);
+
+    let calendar = stored(test, pair.key_id, document_id).await;
+    assert!(
+        calendar.personal_preferences(pair.key_id) == Some(&owner_before),
+        "grantee_updates_only_its_entry: the owner's entry changed"
+    );
+    assert_eq!(calendar.preferences.len(), 2, "a third entry");
+    assert!(
+        calendar
+            .preferences
+            .iter()
+            .all(|entry| entry.name.starts_with("$za$")),
+        "an entry is not sealed"
+    );
+    assert_eq!(
+        calendar_entry(&pair.key2, &pair.key, &id).await["name"],
+        "Reader name canary"
+    );
+    assert_eq!(calendar_entry(&pair.key, &pair.key, &id).await["name"], OWN);
+
+    regrant(pair, OWN, "view").await;
+    let reply = calendar_set(&pair.key2, &pair.key, update).await;
+    assert_eq!(
+        set_error(reply.not_updated(&id)).0,
+        "forbidden",
+        "{reply:?}"
+    );
+    dav_delete(pair, OWN).await;
+}
+
+/// Plants a calendar shaped like upstream's `create_default_calendar`
+/// (`tests/src/za/setup.rs`), then empties its stored preferences, which
+/// `Calendar::insert` would refill.
+async fn insert_calendar_without_entry(test: &TestServer, account_id: u32) -> u32 {
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let mut batch = BatchBuilder::new();
+    let slot = batch.reserve_document_id(account_id, Collection::Calendar);
+    Calendar {
+        name: "jmapcal-no-entry".to_string(),
+        preferences: vec![CalendarPreferences {
+            account_id,
+            name: "jmapcal-no-entry".to_string(),
+            flags: CALENDAR_SUBSCRIBED,
+            time_zone: Timezone::Default,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+    .insert(account_info.changed_by(), account_id, slot, &mut batch)
+    .unwrap();
+    let document_id = test.server.commit_batch(batch).await.unwrap().slot(slot);
+
+    let archive = test
+        .server
+        .store()
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+            account_id,
+            Collection::Calendar,
+            document_id,
+        ))
+        .await
+        .unwrap()
+        .expect("calendar archive");
+    let mut calendar = archive.deserialize::<Calendar>().unwrap();
+    calendar.preferences.clear();
+    let mut batch = BatchBuilder::new();
+    calendar
+        .update(
+            account_info.changed_by(),
+            archive.to_unarchived::<Calendar>().unwrap(),
+            account_id,
+            document_id,
+            &mut batch,
+        )
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    document_id
+}
+
+async fn remove_calendar(test: &TestServer, account_id: u32, document_id: u32) {
+    use groupware::DestroyArchive;
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let archive = test
+        .server
+        .store()
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+            account_id,
+            Collection::Calendar,
+            document_id,
+        ))
+        .await
+        .unwrap()
+        .expect("calendar archive");
+    let mut batch = BatchBuilder::new();
+    DestroyArchive(archive.to_unarchived::<Calendar>().unwrap())
+        .delete(
+            &test.server,
+            account_info.changed_by(),
+            account_id,
+            document_id,
+            None,
+            &mut batch,
+        )
+        .await
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+}
+
+/// Spec 6.7: the handler never adds a preference entry.
+async fn update_without_entry_refused(test: &TestServer, pair: &Pair) {
+    let document_id = insert_calendar_without_entry(test, pair.key_id).await;
+    let id = Id::from(document_id).to_string();
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "update": { &id: { "name": "x" } } }),
+    )
+    .await;
+    assert_eq!(
+        set_error(reply.not_updated(&id)),
+        ("forbidden", Some(NOT_ALLOWED)),
+        "{reply:?}"
+    );
+    assert!(
+        stored(test, pair.key_id, document_id)
+            .await
+            .preferences
+            .is_empty(),
+        "update_without_entry_refused: an entry was added"
+    );
+    remove_calendar(test, pair.key_id, document_id).await;
+}
+
+async fn set_colour(caller: &Account, owner: &Account, id: &str, colour: &str) {
+    calendar_set(
+        caller,
+        owner,
+        json!({ "update": { id: { "color": colour } } }),
+    )
+    .await
+    .updated(id);
+}
+
+/// D14: a shared calendar's colour, before and after the grant.
+async fn colour_before_and_after_sharing(test: &TestServer, pair: &Pair) {
+    const COLOUR: &str = "jmapcal-colour";
+    let document_id = make_calendar(test, &pair.key, &pair.dav, COLOUR).await;
+    let id = Id::from(document_id).to_string();
+    set_colour(&pair.key, &pair.key, &id, "#00aa55").await;
+    share(test, &pair.key, &pair.key2, pair.key2_id, COLOUR, "edit").await;
+    assert_eq!(calendar_named(&pair.key2, &pair.key, COLOUR).await, id);
+
+    // 1. and 2.
+    assert_eq!(
+        calendar_entry(&pair.key, &pair.key, &id).await["color"],
+        "#00aa55"
+    );
+    let entry = calendar_entry(&pair.key2, &pair.key, &id).await;
+    assert_eq!(entry["color"], "#00aa55", "{entry}");
+    assert_eq!(entry["name"], COLOUR, "{entry}");
+
+    // 3.
+    set_colour(&pair.key, &pair.key, &id, "#112233").await;
+    assert_eq!(
+        calendar_entry(&pair.key, &pair.key, &id).await["color"],
+        "#112233"
+    );
+
+    // 4.
+    set_colour(&pair.key2, &pair.key, &id, "#abcdef").await;
+    assert_eq!(
+        calendar_entry(&pair.key2, &pair.key, &id).await["color"],
+        "#abcdef"
+    );
+    assert_eq!(
+        calendar_entry(&pair.key, &pair.key, &id).await["color"],
+        "#112233"
+    );
+
+    // 5.
+    let calendar = stored(test, pair.key_id, document_id).await;
+    assert!(
+        calendar
+            .preferences
+            .iter()
+            .all(|entry| entry.color.is_none() && entry.name.starts_with("$za$")),
+        "colour_before_and_after_sharing: an entry holds a clear colour or name"
+    );
+    dav_delete(pair, COLOUR).await;
+}
+
+fn organized_invite(pair: &Pair, uid: &str) -> String {
+    invite(uid, "20990301T100000Z", &[pair.key2.name(), OUTSIDE])
+        .replace("key1@example.com", pair.key.name())
+}
+
+async fn put_invite(pair: &Pair, slug: &str, uid: &str) {
+    assert_eq!(
+        put(
+            pair.key.name(),
+            STRONG,
+            format!("{HOME}{slug}/{uid}.ics"),
+            organized_invite(pair, uid),
+        )
+        .await,
+        StatusCode::CREATED.as_u16(),
+        "{uid}"
+    );
+}
+
+async fn delete_new_items(test: &TestServer, pair: &Pair, start: &[u32]) {
+    for id in inbox_ids(test, pair.key2_id).await {
+        if !start.contains(&id) {
+            delete_inbox_item(test, &pair.dav2, pair.key2_id, id).await;
+        }
+    }
+}
+
+/// D16: destroying a calendar sends cancellations, as the CalDAV
+/// collection DELETE does.
+async fn destroy_with_events_sends_cancellations(test: &TestServer, pair: &Pair) {
+    const JMAP: &str = "jmapcal-destroy-jmap";
+    const DAV: &str = "jmapcal-destroy-dav";
+    const UID_J: &str = "jmapcal-cal-destroy-j";
+    const UID_D: &str = "jmapcal-cal-destroy-d";
+    let start = inbox_ids(test, pair.key2_id).await;
+    let jmap_id = Id::from(make_calendar(test, &pair.key, &pair.dav, JMAP).await).to_string();
+    make_calendar(test, &pair.key, &pair.dav, DAV).await;
+    put_invite(pair, JMAP, UID_J).await;
+    put_invite(pair, DAV, UID_D).await;
+    wait_for_queue(test).await;
+    sink().clear();
+    let before = inbox_ids(test, pair.key2_id).await;
+
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "destroy": [&jmap_id], "onDestroyRemoveEvents": true }),
+    )
+    .await;
+    assert_eq!(
+        reply.destroyed().collect::<Vec<_>>(),
+        [jmap_id.as_str()],
+        "{reply:?}"
+    );
+    let response = HttpRequest::with_credentials(8899, pair.key.name(), STRONG)
+        .send_full(Method::DELETE, &format!("{HOME}{DAV}/"), None, None)
+        .await;
+    assert_eq!(response.status, StatusCode::NO_CONTENT);
+    wait_for_queue(test).await;
+
+    let mut cancelled = Vec::new();
+    for id in inbox_ids(test, pair.key2_id).await {
+        if before.contains(&id) {
+            continue;
+        }
+        let (ical, _) = open_pending_item_as(test, pair.key2_id, STRONG, id).await;
+        assert_eq!(item_method(&ical), Some(ICalendarMethod::Cancel));
+        cancelled.push(ical.uids().next().expect("item UID").to_string());
+    }
+    cancelled.sort();
+    assert_eq!(cancelled, [UID_D, UID_J], "key2's new items");
+
+    let mail = sink().take_to(OUTSIDE);
+    assert_eq!(mail.len(), 2, "outside attendee's cancellation mail");
+    for uid in [UID_J, UID_D] {
+        let uid_line = format!("UID:{uid}");
+        let matching = mail
+            .iter()
+            .filter(|message| {
+                message
+                    .calendar_part()
+                    .is_some_and(|part| part.lines().any(|line| line == uid_line))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{uid}: cancellation mail");
+        assert_eq!(matching[0].calendar_method().as_deref(), Some("CANCEL"));
+    }
+    assert_eq!(uid_copies(test, pair.key_id, UID_J).await, 0);
+    delete_new_items(test, pair, &start).await;
+}
+
+/// Upstream's refusal of a non-empty calendar stays, and sends nothing.
+async fn destroy_non_empty_without_flag_refused(test: &TestServer, pair: &Pair) {
+    const KEPT: &str = "jmapcal-destroy-kept";
+    const UID: &str = "jmapcal-cal-destroy-k";
+    let start = inbox_ids(test, pair.key2_id).await;
+    let id = Id::from(make_calendar(test, &pair.key, &pair.dav, KEPT).await).to_string();
+    put_invite(pair, KEPT, UID).await;
+    wait_for_queue(test).await;
+    sink().clear();
+    let before = inbox_ids(test, pair.key2_id).await;
+
+    let reply = calendar_set(&pair.key, &pair.key, json!({ "destroy": [&id] })).await;
+    assert_eq!(
+        set_error(reply.not_destroyed(&id)).0,
+        "calendarHasEvent",
+        "{reply:?}"
+    );
+    assert_eq!(uid_copies(test, pair.key_id, UID).await, 1);
+    wait_for_queue(test).await;
+    assert_eq!(inbox_ids(test, pair.key2_id).await, before, "key2's items");
+    assert!(sink().messages().is_empty(), "mail after a refused destroy");
+    dav_delete(pair, KEPT).await;
+    delete_new_items(test, pair, &start).await;
+}
+
+/// A grantee cannot destroy a shared calendar, as on CalDAV.
+async fn grantee_destroy_refused(test: &TestServer, pair: &Pair) {
+    const SHARED: &str = "jmapcal-grantee-destroy";
+    make_calendar(test, &pair.key, &pair.dav, SHARED).await;
+    share(test, &pair.key, &pair.key2, pair.key2_id, SHARED, "edit").await;
+    let id = calendar_named(&pair.key, &pair.key, SHARED).await;
+    let reply = calendar_set(
+        &pair.key2,
+        &pair.key,
+        json!({ "destroy": [&id], "onDestroyRemoveEvents": true }),
+    )
+    .await;
+    assert_eq!(
+        set_error(reply.not_destroyed(&id)).0,
+        "forbidden",
+        "{reply:?}"
+    );
+    assert!(listed(&calendar_get(&pair.key, &pair.key).await, &id));
+    assert!(listed(&calendar_get(&pair.key2, &pair.key).await, &id));
+    dav_delete(pair, SHARED).await;
+}
+
+async fn the_default(pair: &Pair) -> String {
+    let reply = calendar_get(&pair.key, &pair.key).await;
+    let defaults = reply
+        .list()
+        .iter()
+        .filter(|entry| entry["isDefault"] == true)
+        .map(|entry| entry["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let [id] = defaults.as_slice() else {
+        panic!("Expected exactly one default: {reply:?}");
+    };
+    id.clone()
+}
+
+/// Spec 6.7: `onSuccessSetIsDefault` writes the default calendar id.
+async fn on_success_set_is_default(test: &TestServer, pair: &Pair) {
+    let former = the_default(pair).await;
+
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({
+            "create": { "i0": { "name": "jmapcal-default" } },
+            "onSuccessSetIsDefault": "#i0",
+        }),
+    )
+    .await;
+    assert_eq!(reply.created(0)["isDefault"], true, "{reply:?}");
+    let created = reply.created_id(0).to_string();
+    assert_eq!(the_default(pair).await, created);
+    assert_eq!(
+        stored_default(test, pair.key_id).await,
+        Some(document_id(&created))
+    );
+
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({
+            "create": { "i0": { "color": "#000000" } },
+            "onSuccessSetIsDefault": &former,
+        }),
+    )
+    .await;
+    reply.not_created(0);
+    assert_eq!(the_default(pair).await, created);
+    assert_eq!(
+        stored_default(test, pair.key_id).await,
+        Some(document_id(&created))
+    );
+
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "onSuccessSetIsDefault": &former }),
+    )
+    .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    assert_eq!(the_default(pair).await, former);
+    assert_eq!(
+        stored_default(test, pair.key_id).await,
+        Some(document_id(&former))
+    );
+    destroy(pair, &created).await;
+}
+
+/// Spec 6.11: `shareWith` is refused, as a property or a patch pointer.
+async fn share_with_refused(test: &TestServer, pair: &Pair) {
+    const TARGET: &str = "jmapcal-share";
+    let key2 = pair.key2.id_string().to_string();
+    let grant = json!({ &key2: { "mayReadItems": true } });
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "create": { "i0": { "name": TARGET, "shareWith": grant } } }),
+    )
+    .await;
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        ("forbidden", Some(SHARE_TEXT)),
+        "{reply:?}"
+    );
+
+    let document_id = make_calendar(test, &pair.key, &pair.dav, TARGET).await;
+    let id = Id::from(document_id).to_string();
+    for update in [
+        json!({ "shareWith": grant }),
+        json!({ format!("shareWith/{key2}"): { "mayReadItems": true } }),
+    ] {
+        let reply = calendar_set(&pair.key, &pair.key, json!({ "update": { &id: update } })).await;
+        assert_eq!(
+            set_error(reply.not_updated(&id)),
+            ("forbidden", Some(SHARE_TEXT)),
+            "{reply:?}"
+        );
+    }
+    assert!(
+        stored(test, pair.key_id, document_id).await.acls.is_empty(),
+        "share_with_refused: stored grants"
+    );
+    dav_delete(pair, TARGET).await;
+}
+
+/// D3: each object is its own commit.
+async fn per_object_commits(pair: &Pair) {
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "create": {
+            "i0": { "name": "jmapcal-first" },
+            "i1": { "color": "#000000" },
+        } }),
+    )
+    .await;
+    let first = reply.created_id(0).to_string();
+    assert_eq!(
+        set_error(reply.not_created(1)).0,
+        "invalidProperties",
+        "{reply:?}"
+    );
+    let new_state = reply.new_state().to_string();
+    let get = calendar_get(&pair.key, &pair.key).await;
+    assert!(listed(&get, &first));
+    assert_eq!(new_state, get.state());
+
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "create": { "i0": { "color": "#000000" } } }),
+    )
+    .await;
+    reply.not_created(0);
+    assert_eq!(
+        reply.new_state(),
+        reply.response_at(0)["oldState"].as_str().unwrap()
+    );
+
+    let missing = Id::from(1_000_000u32).to_string();
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({
+            "create": { "i0": { "name": "jmapcal-second" } },
+            "update": { &missing: { "name": "x" } },
+            "destroy": [&first],
+        }),
+    )
+    .await;
+    let second = reply.created_id(0).to_string();
+    reply.not_updated(&missing);
+    assert_eq!(
+        reply.destroyed().collect::<Vec<_>>(),
+        [first.as_str()],
+        "{reply:?}"
+    );
+    let get = calendar_get(&pair.key, &pair.key).await;
+    assert!(listed(&get, &second) && !listed(&get, &first), "{get:?}");
+    destroy(pair, &second).await;
+}
+
+/// 5.3 (D28): a store error on one object answers it and every later one.
+async fn store_failure_stops_the_call(test: &TestServer, pair: &Pair) {
+    let x = Id::from(make_calendar(test, &pair.key, &pair.dav, "jmapcal-fail-x").await).to_string();
+    let y = Id::from(make_calendar(test, &pair.key, &pair.dav, "jmapcal-fail-y").await).to_string();
+    set_delete_commit_fail_once(Some(pair.key_id));
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({
+            "create": { "i0": { "name": "jmapcal-fail-new" } },
+            "destroy": [&x, &y],
+        }),
+    )
+    .await;
+    set_delete_commit_fail_once(None);
+
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let created = reply.created_id(0).to_string();
+    for id in [&x, &y] {
+        assert_eq!(
+            set_error(reply.not_destroyed(id)),
+            ("forbidden", Some(INCOMPLETE)),
+            "{reply:?}"
+        );
+    }
+    let new_state = reply.new_state().to_string();
+    let get = calendar_get(&pair.key, &pair.key).await;
+    assert!(listed(&get, &created) && listed(&get, &x) && listed(&get, &y));
+    assert_eq!(new_state, get.state());
+    for id in [&created, &x, &y] {
+        destroy(pair, id).await;
+    }
+}
+
+fn document_id(id: &str) -> u32 {
+    id.parse::<Id>()
+        .unwrap_or_else(|_| panic!("invalid id {id}"))
+        .document_id()
 }

@@ -3576,11 +3576,33 @@ pub async fn calendars(test: &TestServer) {
     assert_eq!(reply.error_type_at(0), None, "{reply:?}");
     assert_eq!(reply.response_at(0)["ids"], json!([]), "{reply:?}");
 
-    for (method, args) in [
-        (
+    // Release 6 spec 6.2: Calendar/set is served; the calendar it creates is
+    // destroyed again, so the store stays empty for `assert_is_empty`.
+    let reply = account
+        .jmap_method_call(
             "Calendar/set",
             json!({ "accountId": id, "create": { "c": { "name": "Test Calendar" } } }),
-        ),
+        )
+        .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    let created = reply
+        .pointer("/methodResponses/0/1/created/c/id")
+        .and_then(|id| id.as_str())
+        .unwrap_or_else(|| panic!("Calendar/set created nothing: {reply:?}"))
+        .to_string();
+    let reply = account
+        .jmap_method_call(
+            "Calendar/set",
+            json!({ "accountId": id, "destroy": [&created] }),
+        )
+        .await;
+    assert_eq!(
+        reply.destroyed().collect::<Vec<_>>(),
+        [created.as_str()],
+        "{reply:?}"
+    );
+
+    for (method, args) in [
         (
             "CalendarEvent/set",
             json!({ "accountId": id, "create": { "e": {

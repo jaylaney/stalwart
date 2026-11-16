@@ -6,10 +6,27 @@
 
 use common::{Server, auth::AccessToken, za::calendar::za_calendar_keyless_refusal};
 use groupware::calendar::pipeline::{admission::za_calendar_admission, error::ZaPipelineError};
-use jmap_proto::request::method::{MethodFunction, MethodObject};
+use jmap_proto::{
+    error::set::SetError,
+    request::method::{MethodFunction, MethodObject},
+};
+use jmap_tools::Property;
 use std::future::Future;
 use trc::{EventType, Key};
 use types::id::Id;
+
+/// Release 6 spec 8 (D28): the description of a `/set` object that a store
+/// failure answered, or left unattempted after one.
+pub(crate) const ZA_CALENDAR_SET_INCOMPLETE: &str =
+    "The server could not complete this change, try again.";
+
+/// Release 6 spec 6.11: the description of a refused `shareWith`.
+pub(crate) const ZA_CALENDAR_SHARE_WITH: &str = "Calendar sharing is managed on the account page.";
+
+/// Set error `forbidden` with `ZA_CALENDAR_SET_INCOMPLETE`.
+pub(crate) fn za_set_incomplete<P: Property>() -> SetError<P> {
+    SetError::forbidden().with_description(ZA_CALENDAR_SET_INCOMPLETE)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ZaCalendarMethod {
@@ -118,7 +135,8 @@ pub(crate) fn za_calendar_method(obj: MethodObject, function: MethodFunction) ->
         (Calendar, Query) => Served,
         // Release 6 spec 6.2: Calendar/changes and CalendarEvent/changes are served.
         (Calendar, Changes) => Served,
-        (Calendar, Set) => Refused,
+        // Release 6 spec 6.2: Calendar/set is served, less `shareWith`.
+        (Calendar, Set) => Served,
         (CalendarEvent, Get) => Served,
         (CalendarEvent, Changes) => Served,
         // Release 6 spec 6.2: CalendarEvent/parse admits the owner with keys only.
@@ -247,7 +265,8 @@ mod tests {
             (Calendar, Query, Served),
             // Release 6 spec 6.2: both /changes rows are served.
             (Calendar, Changes, Served),
-            (Calendar, Set, Refused),
+            // Release 6 spec 6.2: Calendar/set is served, less `shareWith`.
+            (Calendar, Set, Served),
             (CalendarEvent, Get, Served),
             (CalendarEvent, Changes, Served),
             // Release 6 spec 6.2: CalendarEvent/parse admits the owner with keys only.

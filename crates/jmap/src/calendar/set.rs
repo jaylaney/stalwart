@@ -59,6 +59,8 @@ use types::{
     id::Id,
 };
 
+mod za;
+
 pub trait CalendarSet: Sync + Send {
     fn calendar_set(
         &self,
@@ -78,6 +80,10 @@ impl CalendarSet for Server {
         using: CapabilityIds,
     ) -> trc::Result<SetResponse<calendar::Calendar>> {
         let account_id = request.account_id.document_id();
+        // Release 6 spec 6.7: a key account's calendars are written by the pipeline.
+        if self.za_is_key_account(account_id).await? {
+            return za::za_calendar_set(self, request, access_token, using).await;
+        }
         let metadata = ObjectMetadata::new(self, access_token, using, MetadataType::Calendar);
         let sampled = metadata.viewer_change_id(self, account_id).await?;
         let cache = self
