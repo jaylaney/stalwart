@@ -1064,6 +1064,11 @@ pub(crate) enum ZaCalendarMethod {
 /// `za_calendar_keyless_refusal().account_id(account_id)`.
 pub(crate) async fn za_admit_calendar_method(server: &Server, access_token: &AccessToken, account_id: Id,
     method: ZaCalendarMethod) -> trc::Result<()>;
+/// Task 21, spec 8: classification/admission before polling a calendar read. The captured key-target
+/// decision also governs its Store-error context; no post-error reclassification of a keyed request.
+pub(crate) async fn za_serve_calendar_read<T>(server: &Server, access_token: &AccessToken,
+    account_id: Id, method: ZaCalendarMethod,
+    read: impl std::future::Future<Output = trc::Result<T>> + Send) -> trc::Result<T>;
 /// The class of each calendar method. Every method starts `Refused`; a task flips the ones it serves.
 pub(crate) fn za_calendar_method(obj: MethodObject, function: MethodFunction) -> ZaCalendarMethod;
 /// Calendar | CalendarEvent | ParticipantIdentity: the methods that trigger the drain.
@@ -1074,6 +1079,20 @@ Named `za_admit_calendar_method` so it does not collide with
 `groupware`'s `za_calendar_admission`. Call sites: `api/request.rs:536,
 543,552,561,652,659,668,776,785,794,803,891-892,943` and
 `changes/get.rs:203,209,215,228`.
+
+`za_serve_calendar_read` replaces the separate admission and handler call for
+Task 21's `Calendar/get`, `CalendarEvent/get` and `Calendar/query` dispatcher
+arms only, after their existing account resolution and access checks. It
+classifies once at the same admission point, shares the existing keyed
+admission implementation, and never polls the read after refused admission.
+For a target classified as keyed, any `Store` error returned by admission or the
+read is rebuilt with the same event type, the resolved account id, a numeric
+document id when present and representable as `u32`, and the fixed details
+`zero-access: calendar read failed`; all original context is dropped. It
+emits no trace: the dispatcher remains the one method-error trace producer.
+Ordinary results and errors, non-Store errors, and existing public admission
+callers remain unchanged. No extra classification occurs after the read.
+Store errors retain their existing fixed wire serialization.
 
 ### 7.2 Reads
 

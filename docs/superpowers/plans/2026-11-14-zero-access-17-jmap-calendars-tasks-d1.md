@@ -105,13 +105,14 @@ za_admit_calendar_method(self, access_token, request.account_id,
   - `crates/jmap/src/calendar_event/mod.rs:36-45` (`pub mod za_read;`).
   - `crates/jmap/src/calendar_event/get.rs:184-188` (the reader, beside the projector) and `:251-270` (the content handed to the projector; the expression at `:258-261`).
   - `crates/jmap/src/calendar/get.rs:98-102` (a grantee's calendars) and `:159-175` (the stored archive becomes the view).
-  - `crates/jmap/src/api/za_calendar.rs` (three rows; the allow on `Served` goes).
+  - `crates/jmap/src/api/za_calendar.rs` (three rows; the allow on `Served` goes; the read-result boundary of I §7.1).
+  - `crates/jmap/src/api/request.rs`: only the `Calendar/get`, `CalendarEvent/get` and `Calendar/query` arms, replacing their separate admission/handler calls with `za_serve_calendar_read`.
   - `tests/src/za/jmap_calendar/mod.rs` (declares `events` and `calendars`; two helpers); `tests/src/za/mod.rs` (two calls, after `jmap_calendar::pipeline::test(&mut test).await;`).
   - `tests/src/za/gating.rs:44` (`method_error` becomes `pub(crate)`, visibility only) and `:361-432`; `tests/src/za/websocket.rs:74-81`; `tests/src/jmap/za_variants.rs:3510-3574`.
 
 **Interfaces:**
 - Consumes: `ZaReadMemo`, `za_read_event_view`, `za_read_calendar_view`, `za_foreign_calendar_contexts` (I §2.4); `ZaPipelineError` (I §2.2); `ZaCalendarMethod::Served` (I §7.1). Tests: `pair`, `make_calendar`, `share`, `event_ics`, `put_event`, `finish`, `za_bearer_jmap`, `CALENDAR_JMAP_USING` (I §10); existing `za_grant_token`, `za_revoke_grant`, `plant_event`, `stored_event`, `write_stored_event`, `delete_event_records` (`tests/src/utils/za.rs`).
-- Produces: `ZaEventReader` (I §7.2); `mark_boundary_pending`, `owner_boundary` (I §10); `gating::method_error` as `pub(crate)` (I §10).
+- Produces: `ZaEventReader` (I §7.2); `za_serve_calendar_read` (I §7.1); `mark_boundary_pending`, `owner_boundary` (I §10); `gating::method_error` as `pub(crate)` (I §10).
 
 The rule of `ZaEventReader::view`. A memoised view of `document_id` is returned at once. Otherwise, for each id of `calendar_ids` in order, it calls `za_read_event_view`:
 
@@ -119,7 +120,7 @@ The rule of `ZaEventReader::view`. A memoised view of `document_id` is returned 
 |---|---|
 | `Ok(Ok(Some(view)))` | memoises it and returns it |
 | `Ok(Ok(None))` | returns `Ok(None)` |
-| `Ok(Err(error))`, a `StoreEvent::DataCorruption` | `trc::error!(error)`, returns `Ok(None)`. The error holds the account id, the document id and a fixed reason. |
+| `Ok(Err(error))`, a `StoreEvent::DataCorruption` | Traces a fresh `StoreEvent::DataCorruption` with the account id, document id and a fixed reason, dropping the original context, which may carry archive bytes. Returns `Ok(None)`. |
 | `Ok(Err(error))`, anything else | returns `Err(error)` |
 | `Err(ZaPipelineError::Store(error))` | returns `Err(error)` |
 | any other `Err` (a refusal) | tries the next calendar; after the last, `Ok(None)` |
@@ -134,6 +135,7 @@ The rule of `ZaEventReader::view`. A memoised view of `document_id` is returned 
 - `Calendar/query` lists ids from the cache, as upstream does, and opens nothing. It needs its row only.
 - `view` leaves the row read to its caller, so the branch at `get.rs:258-261` is longer than a call. Keep all of it inside that one expression and add no other line there.
 - `calendar_event_get` charges each opened view to the method's memory budget.
+- Spec 8 also applies to method failures before a view exists: archive reads, decompression and row validation can attach raw bytes to Store errors. The three newly served reads use I §7.1's result boundary, with the key-target decision captured before polling the handler. Keep account-access checks and admission order, ordinary-account behavior and fixed Store wire errors unchanged; do not log twice or reclassify an initially keyed request after its error.
 
 - [ ] **Step 1: write the failing za cases.** Declare the two modules, add the two helpers, make `gating::method_error` `pub(crate)` and import it, register `jmap_calendar::events::test` then `jmap_calendar::calendars::test`.
 
@@ -164,6 +166,20 @@ The rule of `ZaEventReader::view`. A memoised view of `document_id` is returned 
     - the owner's `CalendarEvent/get` of the event;
     - `owner_boundary(..).pending` is false (spec 6.3).
 
+  - `read_store_errors_are_payload_free` (controller correction R21-1, spec 8).
+    Warm an isolated fixture's read cache, save exact raw property bytes,
+    and replace the event Content archive and, separately, its calendar
+    archive with invalid archives containing only inert synthetic canaries.
+    Call the corresponding actual JMAP getter, restore the exact bytes
+    before final assertions/cleanup, and inspect an account-scoped test
+    subscriber. Require the existing method-level `serverUnavailable`
+    response and a positive Store-error trace observation with the fixed
+    reason, account id and no raw `Value` or other original payload context.
+    Keep a keyless admission control and a successful restored read.
+    No real secret or original archive payload is printed or used as a
+    disclosure canary. Preserve the actual first RED failure; later rows
+    need not be reached before that failure.
+
   `calendars.rs`. Banner: `Running zero-access JMAP calendar tests...`. Set-up: `pair(test, "calendars")`. End: the calendar deleted, `finish(test, "calendars")`.
 
   - `get_shows_own_entry`. `make_calendar(.., "jmapcal-work")`; the owner sets its display name over CalDAV (PROPPATCH of `D:displayname`) to "jmapcal owner name"; `share(.., "jmapcal-work", "edit")`; `key2` sets its own display name on the shared calendar the same way to "jmapcal reader name".
@@ -183,8 +199,9 @@ The rule of `ZaEventReader::view`. A memoised view of `document_id` is returned 
   - at the content expression (`:258-261`): when `za_reader` is `Some` and the archive was read, read the stored row (`ValueKey::archive(account_id, Collection::CalendarEvent, document_id)`), call `view` with the parents of `resource.child_names()`, charge the view (`budget.add_archive(view.content.as_bytes().len(), 1)?`), and hand `view.content.unarchive::<CalendarEventContent>()` to the projector. A missing row, or `Ok(None)` from `view`, is `results.push_not_found(group); continue;`. Otherwise the expression is upstream's.
 - [ ] **Step 6: insert the views in `calendar/get.rs`.**
   - after `calendar_ids` (`:98-102`): a `ZaReadMemo` and `let za_key = self.za_is_key_account(account_id).await?;`. When `za_key && !is_owner`, `calendar_ids` becomes the keys of `za_foreign_calendar_contexts(self, access_token, account_id, calendar_ids.iter(), None)`, and each returned context goes into the memo under `(account_id, calendar_id)`. `Err(ZaPipelineError::Store(error))` is `Err(error)`; any other `Err` leaves the set empty.
-  - at `:159-175`, when `za_key`: the archive upstream just read is replaced by the view of `za_read_calendar_view(.., &mut memo)`. A `DataCorruption` item error is traced and the id is not found. Any other item error, and an outer `Store(error)`, fail the method. Any other outer error is `response.push_not_found(id); continue;`.
+  - at `:159-175`, when `za_key`: the archive upstream just read is replaced by the view of `za_read_calendar_view(.., &mut memo)`. A `DataCorruption` item error is traced as a fresh event of the same kind with the account id, document id and a fixed reason, dropping the original context, which may carry archive bytes; the id is not found. Any other item error, and an outer `Store(error)`, fail the method. Any other outer error is `response.push_not_found(id); continue;`.
 - [ ] **Step 7: flip the rows** `(Calendar, Get)`, `(Calendar, Query)` and `(CalendarEvent, Get)` to `Served`, in the function and in `calendar_method_classes`, and remove the allow on `Served`. Run U-ws `calendar_method_classes`. Expected: 1 passed.
+- [ ] **Step 7a: protect read method-error traces (R21-1).** Before adding the result boundary, run the new `read_store_errors_are_payload_free` regression with the reads served: RED must observe the synthetic archive payload reaching the method-error trace. Add a focused unit test `calendar_read_error_context` for Store-error normalization (DataCorruption, DeserializeError and DecompressError), preservation of event type and numeric document identity, ordinary/non-Store error preservation, and unchanged Store wire serialization; keep its test present for RED. Implement `za_serve_calendar_read` and the three dispatcher wrappers per I §7.1, sharing the existing keyed admission match without changing `za_admit_calendar_method`'s public contract. Run U-ws `calendar_read_error_context` and `calendar_method_classes`; then use the full ZA and JK gates below for the corrected source. Preserve the original candidate's results separately; do not claim its passing tests cover this correction.
 - [ ] **Step 8: run ZA.** Expected: pass. Proved by `jmap_calendar::events`, `jmap_calendar::calendars`, `gating` and `websocket`.
 - [ ] **Step 9: run JK.** Expected: pass, with the store empty at the end of `za_variants::calendars`.
 - [ ] **Step 10: the closing checks.**
