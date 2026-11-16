@@ -41,7 +41,7 @@ const BUSY_EVENT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\n
 const OUTBOX_FREEBUSY: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nBEGIN:VFREEBUSY\r\nUID:fb-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20240101T000000Z\r\nDTEND:20240131T000000Z\r\nORGANIZER:mailto:plain@example.com\r\nATTENDEE:mailto:key1@example.com\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n";
 
 /// The `type` of a single method-level error, or `None` for a method result.
-fn method_error(response: &JmapResponse) -> Option<&str> {
+pub(crate) fn method_error(response: &JmapResponse) -> Option<&str> {
     let call = &response.0["methodResponses"][0];
     (call[0] == "error").then(|| call[1]["type"].as_str().unwrap_or_default())
 }
@@ -358,11 +358,9 @@ pub async fn test(test: &mut TestServer) {
     );
     set_directory_queries(false).await;
 
-    // JMAP calendar methods on the key account are refused.
+    // Release 6 spec 6.2: some methods remain refused as the served rows move below.
     let key1_account = key1.id_string();
     for (method, args) in [
-        ("Calendar/get", json!({ "accountId": key1_account })),
-        ("Calendar/query", json!({ "accountId": key1_account })),
         (
             "Calendar/set",
             json!({ "accountId": key1_account, "create": {} }),
@@ -371,7 +369,6 @@ pub async fn test(test: &mut TestServer) {
             "Calendar/changes",
             json!({ "accountId": key1_account, "sinceState": "n" }),
         ),
-        ("CalendarEvent/get", json!({ "accountId": key1_account })),
         ("CalendarEvent/query", json!({ "accountId": key1_account })),
         (
             "CalendarEvent/set",
@@ -426,6 +423,21 @@ pub async fn test(test: &mut TestServer) {
         assert_eq!(
             method_error(&response),
             Some("accountNotSupportedByMethod"),
+            "{method}: {:?}",
+            response.0
+        );
+    }
+    for (method, args) in [
+        ("Calendar/get", json!({ "accountId": key1_account })),
+        ("Calendar/query", json!({ "accountId": key1_account })),
+        ("CalendarEvent/get", json!({ "accountId": key1_account })),
+    ] {
+        let response = key1.jmap_method_call(method, args).await;
+        assert!(
+            !matches!(
+                method_error(&response),
+                Some("accountNotSupportedByMethod" | "forbidden")
+            ),
             "{method}: {:?}",
             response.0
         );

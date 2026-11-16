@@ -192,6 +192,8 @@ pub async fn za_tests() {
     sharing_races::test(&mut test).await;
     tokens::test(&mut test).await;
     jmap_calendar::pipeline::test(&mut test).await;
+    jmap_calendar::events::test(&mut test).await;
+    jmap_calendar::calendars::test(&mut test).await;
     sweep::test(&mut test).await;
     tracing::test(&mut test).await;
     raw_input::test(&mut test).await;

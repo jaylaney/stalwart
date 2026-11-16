@@ -8,7 +8,7 @@
 //! Keyed search and threading use upstream's results (release 7 spec 9.3).
 //! The remaining differences cover keyless mail calls, cross-account copy,
 //! sharing, raw sealed sources and push content. The admin and Sales group
-//! stay plain. The calendar variants assert the key-account refusal.
+//! stay plain. The calendar variants cover served and refused key-account calls.
 
 use crate::{
     jmap::{
@@ -3508,21 +3508,32 @@ pub async fn file_node(test: &TestServer) {
 }
 
 /// The `calendar::*` modules and `principal::availability` in key mode:
-/// JMAP calendars are not offered to key accounts in this release (release
-/// 1 spec 9, plan 3), so every calendar method on a key account answers
-/// `accountNotSupportedByMethod`, its availability is empty and nothing is
-/// stored.
+/// Release 6 spec 6.2 serves calendar and event reads for key accounts.
+/// The remaining methods below are still refused and availability stays empty.
 pub async fn calendars(test: &TestServer) {
     println!("Running key-account Calendar tests...");
     let account = test.account("jdoe@example.com");
     let id = account.id_string();
+    let reply = account
+        .jmap_method_call("Calendar/get", json!({ "accountId": id, "ids": null }))
+        .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    let [calendar] = reply.list() else {
+        panic!("Expected the default calendar: {reply:?}");
+    };
+    assert_eq!(calendar["isDefault"], true);
+
+    let reply = account
+        .jmap_method_call("CalendarEvent/get", json!({ "accountId": id, "ids": null }))
+        .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    reply.list_array().assert_is_equal(json!([]));
+
     for (method, args) in [
-        ("Calendar/get", json!({ "accountId": id, "ids": null })),
         (
             "Calendar/set",
             json!({ "accountId": id, "create": { "c": { "name": "Test Calendar" } } }),
         ),
-        ("CalendarEvent/get", json!({ "accountId": id, "ids": null })),
         ("CalendarEvent/query", json!({ "accountId": id })),
         (
             "CalendarEvent/set",
@@ -3556,8 +3567,7 @@ pub async fn calendars(test: &TestServer) {
             "{method}: {reply:?}"
         );
     }
-    // A key account holds no JMAP-visible calendar, so its availability is
-    // empty.
+    // A key principal's availability remains empty.
     let reply = account
         .jmap_method_call(
             "Principal/getAvailability",
@@ -3570,6 +3580,11 @@ pub async fn calendars(test: &TestServer) {
         )
         .await;
     reply.list_array().assert_is_equal(json!([]));
+    account
+        .webdav_client()
+        .request("DELETE", "/dav/cal/jdoe%40example.com/default", "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
     test.assert_is_empty().await;
 }
 

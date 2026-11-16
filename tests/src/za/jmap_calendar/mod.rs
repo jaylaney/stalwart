@@ -18,8 +18,18 @@ use crate::utils::{
 };
 use ::registry::schema::enums::Permission;
 use common::auth::AccessToken;
+use groupware::calendar::{
+    Calendar,
+    sharing::{
+        boundary::mark_boundary_pending as mark_pending,
+        resolve::{ZaSyncBoundary, za_owned_calendar_context},
+    },
+};
 use hyper::StatusCode;
+use store::write::BatchBuilder;
 
+pub mod calendars;
+pub mod events;
 pub mod pipeline;
 
 /// A module's two key accounts and their CalDAV clients.
@@ -160,4 +170,38 @@ pub(super) async fn session_token(test: &TestServer, account_id: u32) -> AccessT
 pub(super) async fn finish(test: &TestServer, module: &str) {
     assert_eq!(za_uid_leases(test).await, 0, "{module} left UID leases");
     test.wait_for_tasks().await;
+}
+
+pub(super) async fn mark_boundary_pending(test: &TestServer, owner_id: u32, calendar_id: u32) {
+    let keys = za_unlock(test, owner_id, STRONG).await;
+    let context = za_owned_calendar_context(&test.server, &keys, calendar_id)
+        .await
+        .unwrap();
+    let mut calendar = context.stored.deserialize::<Calendar>().unwrap();
+    mark_pending(&mut calendar, &context.domain).unwrap();
+    let account = test.server.account_info(owner_id).await.unwrap();
+    let mut batch = BatchBuilder::new();
+    calendar
+        .update(
+            account.changed_by(),
+            context.stored.to_unarchived::<Calendar>().unwrap(),
+            owner_id,
+            calendar_id,
+            &mut batch,
+        )
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+}
+
+pub(super) async fn owner_boundary(
+    test: &TestServer,
+    owner_id: u32,
+    calendar_id: u32,
+) -> ZaSyncBoundary {
+    let keys = za_unlock(test, owner_id, STRONG).await;
+    za_owned_calendar_context(&test.server, &keys, calendar_id)
+        .await
+        .unwrap()
+        .boundary
+        .unwrap()
 }
