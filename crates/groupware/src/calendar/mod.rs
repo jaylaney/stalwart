@@ -33,6 +33,7 @@ pub mod sequence_floor;
 pub mod sharing;
 pub mod storage;
 pub mod user;
+pub mod za_text;
 
 use crate::metadata::tracked_kinds;
 use calcard::icalendar::{
