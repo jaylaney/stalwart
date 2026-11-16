@@ -87,6 +87,7 @@ use store::{
 use tokio::sync::mpsc;
 use types::{
     collection::{Collection, SyncCollection},
+    field::PrincipalField,
     id::Id,
     keyword::Keyword,
 };
@@ -3538,6 +3539,36 @@ pub async fn calendars(test: &TestServer) {
         assert_eq!(reply.response_at(0)["hasMoreChanges"], false, "{reply:?}");
     }
 
+    // Release 6 spec 6.2 and 6.9: the identities are served. The get writes the
+    // account's identities record, so it is cleared as upstream's own test does
+    // (`calendar::identity`) before the CalDAV delete below.
+    for (method, args) in [
+        (
+            "ParticipantIdentity/get",
+            json!({ "accountId": id, "ids": null }),
+        ),
+        (
+            "ParticipantIdentity/changes",
+            json!({ "accountId": id, "sinceState": "n" }),
+        ),
+    ] {
+        let reply = account.jmap_method_call(method, args).await;
+        assert!(
+            !matches!(
+                reply.error_type_at(0),
+                Some("accountNotSupportedByMethod" | "forbidden")
+            ),
+            "{method}: {reply:?}"
+        );
+    }
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account.id().document_id())
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .clear(PrincipalField::ParticipantIdentities);
+    test.server.commit_batch(batch).await.unwrap();
+
     for (method, args) in [
         (
             "Calendar/set",
@@ -3557,16 +3588,6 @@ pub async fn calendars(test: &TestServer) {
         (
             "CalendarEventNotification/get",
             json!({ "accountId": id, "ids": null }),
-        ),
-        (
-            "ParticipantIdentity/get",
-            json!({ "accountId": id, "ids": null }),
-        ),
-        // New at 1.0 (0.16 answered `cannotCalculateChanges`): refused as
-        // `/get` and `/set` are, naming the request's account.
-        (
-            "ParticipantIdentity/changes",
-            json!({ "accountId": id, "sinceState": "n" }),
         ),
     ] {
         let reply = account.jmap_method_call(method, args).await;

@@ -577,17 +577,15 @@ impl RequestHandler for Server {
                 GetRequestMethod::ParticipantIdentity(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
-                    za_admit_calendar_method(
+                    super::za_calendar::za_serve_calendar_read(
                         self,
                         access_token,
                         req.account_id,
                         za_calendar_method(method_name.obj, method_name.fnc),
+                        self.participant_identity_get(*req, access_token),
                     )
-                    .await?;
-
-                    self.participant_identity_get(*req, access_token)
-                        .await?
-                        .into()
+                    .await?
+                    .into()
                 }
                 GetRequestMethod::ShareNotification(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -861,17 +859,15 @@ impl RequestHandler for Server {
                 SetRequestMethod::ParticipantIdentity(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
-                    za_admit_calendar_method(
+                    super::za_calendar::za_serve_calendar_read(
                         self,
                         access_token,
                         req.account_id,
                         za_calendar_method(method_name.obj, method_name.fnc),
+                        self.participant_identity_set(*req, access_token),
                     )
-                    .await?;
-
-                    self.participant_identity_set(*req, access_token)
-                        .await?
-                        .into()
+                    .await?
+                    .into()
                 }
                 SetRequestMethod::Registry(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;

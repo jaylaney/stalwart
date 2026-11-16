@@ -28,7 +28,7 @@ use common::{auth::oauth::scope::OAuthScopes, za::ZA_CALENDAR_KEYLESS};
 use futures::FutureExt;
 use groupware::calendar::seal::tree::{KEY_PROP, is_carrier};
 use hyper::StatusCode;
-use jmap_proto::types::state::State;
+use jmap_proto::types::state::{JMAPIntermediateState, State, ZaCalendarOrigin};
 use serde_json::{Value, json};
 use std::{panic::AssertUnwindSafe, time::Duration};
 use store::{
@@ -66,6 +66,7 @@ pub async fn test(test: &mut TestServer) {
     get_completes_pending_boundary(test, &pair, shared).await;
     read_store_errors_are_payload_free(test, &pair).await;
     changes_as_upstream(test, &pair).await;
+    identity_get_and_changes(&pair).await;
     pair.dav
         .request_with_headers("DELETE", &event_path("jmapcal-shared/"), [NO_REPLY], "")
         .await
@@ -532,4 +533,80 @@ async fn changes_as_upstream(test: &TestServer, pair: &Pair) {
         .await
         .with_status(StatusCode::NO_CONTENT);
     delete_event(pair, &format!("default/{A}.ics")).await;
+}
+
+/// Release 6 spec 6.9 and 6.8 (D29): the identities are served as upstream
+/// serves them, a grantee gets its own, and a `z` state is not a calendar
+/// continuation here.
+async fn identity_get_and_changes(pair: &Pair) {
+    let owner = pair.key.id_string();
+    let identity = |name: &str| {
+        json!({
+            "id": "a",
+            "name": name,
+            "calendarAddress": format!("mailto:{name}@example.com"),
+            "isDefault": true,
+        })
+    };
+
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "ParticipantIdentity/get",
+            json!({ "accountId": owner, "ids": null }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(reply.list(), [identity("jmapcal-events")], "{reply:?}");
+    let state = reply.response_at(0)["state"].as_str().unwrap().to_string();
+
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "ParticipantIdentity/changes",
+            json!({ "accountId": owner, "sinceState": state }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let response = reply.response_at(0);
+    for key in ["created", "updated", "destroyed"] {
+        assert_eq!(response[key], json!([]), "{key}: {reply:?}");
+    }
+
+    // A `z` state is never a calendar continuation here.
+    for origin in [ZaCalendarOrigin::Initial, ZaCalendarOrigin::Exact(41)] {
+        let z = State::ZaCalendarIntermediate {
+            range: JMAPIntermediateState {
+                from_id: 42,
+                to_id: 50,
+                items_sent: 3,
+            },
+            origin,
+        }
+        .to_string();
+        let reply = pair
+            .key
+            .jmap_method_call(
+                "ParticipantIdentity/changes",
+                json!({ "accountId": owner, "sinceState": z }),
+            )
+            .await;
+        assert_eq!(method_error(&reply), Some("invalidArguments"), "{reply:?}");
+    }
+
+    // A grantee asking for the owner's account gets its own identities, as
+    // upstream answers.
+    let reply = pair
+        .key2
+        .jmap_method_call(
+            "ParticipantIdentity/get",
+            json!({ "accountId": owner, "ids": null }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        reply.list()[0]["calendarAddress"],
+        "mailto:jmapcal-events-2@example.com",
+        "{reply:?}"
+    );
 }

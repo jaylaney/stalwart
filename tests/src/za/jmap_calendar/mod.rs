@@ -31,6 +31,7 @@ use store::write::BatchBuilder;
 pub mod calendars;
 pub mod events;
 pub mod pipeline;
+pub mod refusals;
 pub mod sharing;
 
 /// A module's two key accounts and their CalDAV clients.

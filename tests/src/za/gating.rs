@@ -383,14 +383,6 @@ pub async fn test(test: &mut TestServer) {
             json!({ "accountId": key1_account, "sinceQueryState": "n" }),
         ),
         (
-            "ParticipantIdentity/get",
-            json!({ "accountId": key1_account }),
-        ),
-        (
-            "ParticipantIdentity/set",
-            json!({ "accountId": key1_account, "create": {} }),
-        ),
-        (
             "CalendarEventNotification/get",
             json!({ "accountId": key1_account }),
         ),
@@ -430,6 +422,16 @@ pub async fn test(test: &mut TestServer) {
         (
             "CalendarEvent/changes",
             json!({ "accountId": key1_account, "sinceState": "n" }),
+        ),
+        // Release 6 spec 6.9: the identities are served; /set refuses each edit
+        // as a set error, not as a method error.
+        (
+            "ParticipantIdentity/get",
+            json!({ "accountId": key1_account }),
+        ),
+        (
+            "ParticipantIdentity/set",
+            json!({ "accountId": key1_account, "create": {} }),
         ),
     ] {
         let response = key1.jmap_method_call(method, args).await;
