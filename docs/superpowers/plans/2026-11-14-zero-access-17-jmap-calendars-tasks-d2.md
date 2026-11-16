@@ -285,7 +285,7 @@ Head, once per call:
 6. U `:236-244`: the object-count quota.
 7. U `:250`: `send_scheduling_messages`.
 8. U `:276-285`: `DefaultAlertsResolver::with_resources(account_id, cache.clone())`, the disk quota budget, `MetadataWriter::new(metadata, account_id)`.
-9. F: `za_writer_keys(server, access_token, account_id)`: `Ok(Some(keys))` goes on; anything else returns `Err(za_calendar_keyless_refusal().account_id(account_id))`. Then `za_roles(..)` and `server.account(account_id)` (the `AccountCache` the pipeline takes); their errors fail the method.
+9. F: `za_writer_keys(server, access_token, account_id)`: `Ok(Some(keys))` goes on; `Err(Store(e))` returns `Err(e)`: a store error before the first object fails the method (spec 8); `Ok(None)` or any other `Err(_)` returns `Err(za_calendar_keyless_refusal().account_id(account_id))`. Then `za_roles(..)` and `server.account(account_id)` (the `AccountCache` the pipeline takes); their errors fail the method.
 10. Not taken from upstream: the batch and its provisioning fence (`:246-249`), `PendingCreates`, `UidIndex`, `EventSetContext`, `reject_uncommitted`.
 
 Create, per object, in request order:
@@ -535,7 +535,7 @@ za cases in `events.rs`:
   - `fanout::stored_pairs` of key's copy is `Some` before the update and equal after it.
   - A PROPFIND of `D:displayname` on the event still returns "Display canary".
   - The CalDAV body holds `DESCRIPTION:Edited canary`; key2 got no new item.
-- `update_applies_sequence_floor`. `jmapcal-events-floor`: PUT over CalDAV with `SEQUENCE:5`, organizer key, one outside attendee (the sink is cleared afterwards). `floor = fanout::stored_sequence(..)`, at least 5. Update `{ "sequence": 1, "description": "floor" }`: `updated`; `fanout::stored_sequence(..)` is `floor`, not 1.
+- `update_applies_sequence_floor`. The calendar `jmapcal-floor` is shared with key2 at `edit`. `jmapcal-events-floor`: key2 PUTs it there over CalDAV with `SEQUENCE:5`, organizer key2, one outside attendee (the sink is cleared afterwards). `floor = fanout::stored_sequence(..)`, 5. key2 updates it over JMAP with `{ "sequence": 1, "description": "floor" }` and no scheduling flag: `updated`; `fanout::stored_sequence(..)` equals `floor`. Upstream's increment tests the organizer against the owner's addresses and so does not run for an event key2 organizes, while the floor's addresses are the writer's and the owner's: without the floor the stored SEQUENCE is 1. An event the owner organizes cannot show the floor, because upstream's increment already stores the stored SEQUENCE plus one. The case deletes the event and the calendar.
 - `update_recurrence_by_synthetic_id`. `jmapcal-events-rec`: a daily event, five occurrences, created over JMAP. `second` is the id `CalendarEvent/query` with `expandRecurrences` returns for the second occurrence. Update `second` with `{ "title": "Override canary" }`: `updated`; the CalDAV body has two `BEGIN:VEVENT`, a `RECURRENCE-ID` and `SUMMARY:Override canary`.
 - `update_recurrence_by_override`. The third occurrence through the base id: `recurrenceOverrides/<its local start>` set to `{ "title": "Third canary" }`: `updated`; the body has three `BEGIN:VEVENT` and `SUMMARY:Third canary`.
 - `update_occurrence_flags_get_upstreams_refusal`. `second` patched with `{ "isDraft": true }`, with `{ "mayInviteSelf": true }` and with `{ "useDefaultAlerts": true }`: each `notUpdated` with the description "This property cannot be modified on a single occurrence."
