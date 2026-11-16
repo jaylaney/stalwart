@@ -365,7 +365,6 @@ pub async fn test(test: &mut TestServer) {
             "Calendar/set",
             json!({ "accountId": key1_account, "create": {} }),
         ),
-        ("CalendarEvent/query", json!({ "accountId": key1_account })),
         (
             "CalendarEvent/set",
             json!({ "accountId": key1_account, "create": {} }),
@@ -373,10 +372,6 @@ pub async fn test(test: &mut TestServer) {
         (
             "CalendarEvent/copy",
             json!({ "accountId": key1_account, "fromAccountId": key1_account, "create": {} }),
-        ),
-        (
-            "CalendarEvent/queryChanges",
-            json!({ "accountId": key1_account, "sinceQueryState": "n" }),
         ),
         (
             "CalendarEventNotification/get",
@@ -423,6 +418,12 @@ pub async fn test(test: &mut TestServer) {
         (
             "CalendarEvent/parse",
             json!({ "accountId": key1_account, "blobIds": [] }),
+        ),
+        // Release 6 spec 6.2: CalendarEvent/query and /queryChanges are served.
+        ("CalendarEvent/query", json!({ "accountId": key1_account })),
+        (
+            "CalendarEvent/queryChanges",
+            json!({ "accountId": key1_account, "sinceQueryState": "n" }),
         ),
         // Release 6 spec 6.9: the identities are served; /set refuses each edit
         // as a set error, not as a method error.

@@ -11,6 +11,7 @@ use crate::{
         },
         query::QueryResponseBuilder,
     },
+    calendar_event::za_read::ZaEventReader,
     changes::state::JmapCacheState,
 };
 use calcard::{common::timezone::Tz, icalendar::ArchivedICalendar, jscalendar::JSCalendarDateTime};
@@ -52,6 +53,8 @@ use types::{
     collection::{Collection, SyncCollection},
     field::CalendarEventField,
 };
+
+mod za;
 
 pub trait CalendarEventQuery: Sync + Send {
     fn calendar_event_query(
@@ -414,6 +417,21 @@ impl CalendarEventQuery for Server {
             vec![]
         };
 
+        // Release 6 spec 6.4 (D12): a key account's text leaves become sets, resolved
+        // in memory over the unsealed views, before the search store adds its own leaf.
+        let mut za_reader = ZaEventReader::new(self, access_token, account_id).await?;
+        if let Some(reader) = &mut za_reader {
+            za::za_resolve_text_leaves(
+                self,
+                access_token,
+                reader,
+                &cache,
+                account_id,
+                &mask,
+                &mut filters,
+            )
+            .await?;
+        }
         let results = self
             .search_store()
             .filter_account(
@@ -495,6 +513,45 @@ impl CalendarEventQuery for Server {
                 let content = _content
                     .unarchive::<CalendarEventContent>()
                     .caused_by(trc::location!())?;
+                // Release 6 spec 6.4 (D12): a key account's text conditions match the view.
+                let content = match za_reader.as_mut().filter(|_| !instance_filter.is_empty()) {
+                    Some(reader) => {
+                        let Some(row) = self
+                            .store()
+                            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+                                account_id,
+                                Collection::CalendarEvent,
+                                document_id,
+                            ))
+                            .await?
+                        else {
+                            continue;
+                        };
+                        let calendar_ids = resource
+                            .child_names()
+                            .iter()
+                            .map(|name| name.parent_id)
+                            .collect::<Vec<_>>();
+                        let Some(view) = reader
+                            .view(
+                                self,
+                                access_token,
+                                document_id,
+                                &calendar_ids,
+                                row.unarchive::<groupware::calendar::CalendarEvent>()
+                                    .caused_by(trc::location!())?,
+                                &_content,
+                            )
+                            .await?
+                        else {
+                            continue;
+                        };
+                        view.content
+                            .unarchive::<CalendarEventContent>()
+                            .caused_by(trc::location!())?
+                    }
+                    None => content,
+                };
                 let event = &content.data.event;
                 let mut scheduling_components = event
                     .components

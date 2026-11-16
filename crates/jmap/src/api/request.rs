@@ -685,17 +685,15 @@ impl RequestHandler for Server {
                 QueryRequestMethod::CalendarEvent(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
-                    za_admit_calendar_method(
+                    super::za_calendar::za_serve_calendar_read(
                         self,
                         access_token,
                         req.account_id,
                         za_calendar_method(method_name.obj, method_name.fnc),
+                        self.calendar_event_query(*req, access_token, using),
                     )
-                    .await?;
-
-                    self.calendar_event_query(*req, access_token, using)
-                        .await?
-                        .into()
+                    .await?
+                    .into()
                 }
                 QueryRequestMethod::CalendarEventNotification(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;

@@ -3569,12 +3569,18 @@ pub async fn calendars(test: &TestServer) {
         .clear(PrincipalField::ParticipantIdentities);
     test.server.commit_batch(batch).await.unwrap();
 
+    // Release 6 spec 6.2: CalendarEvent/query is served.
+    let reply = account
+        .jmap_method_call("CalendarEvent/query", json!({ "accountId": id }))
+        .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    assert_eq!(reply.response_at(0)["ids"], json!([]), "{reply:?}");
+
     for (method, args) in [
         (
             "Calendar/set",
             json!({ "accountId": id, "create": { "c": { "name": "Test Calendar" } } }),
         ),
-        ("CalendarEvent/query", json!({ "accountId": id })),
         (
             "CalendarEvent/set",
             json!({ "accountId": id, "create": { "e": {

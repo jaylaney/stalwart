@@ -123,8 +123,9 @@ pub(crate) fn za_calendar_method(obj: MethodObject, function: MethodFunction) ->
         (CalendarEvent, Changes) => Served,
         // Release 6 spec 6.2: CalendarEvent/parse admits the owner with keys only.
         (CalendarEvent, Parse) => OwnerOnly,
-        (CalendarEvent, Query) => Refused,
-        (CalendarEvent, QueryChanges) => Refused,
+        // Release 6 spec 6.2: CalendarEvent/query and /queryChanges are served.
+        (CalendarEvent, Query) => Served,
+        (CalendarEvent, QueryChanges) => Served,
         (CalendarEvent, Set) => Refused,
         (CalendarEvent, Copy) => Refused,
         // Release 6 spec 6.2: the identities are served; /set only switches the default.
@@ -251,8 +252,9 @@ mod tests {
             (CalendarEvent, Changes, Served),
             // Release 6 spec 6.2: CalendarEvent/parse admits the owner with keys only.
             (CalendarEvent, Parse, OwnerOnly),
-            (CalendarEvent, Query, Refused),
-            (CalendarEvent, QueryChanges, Refused),
+            // Release 6 spec 6.2: CalendarEvent/query and /queryChanges are served.
+            (CalendarEvent, Query, Served),
+            (CalendarEvent, QueryChanges, Served),
             (CalendarEvent, Set, Refused),
             (CalendarEvent, Copy, Refused),
             // Release 6 spec 6.2: the identities are served.

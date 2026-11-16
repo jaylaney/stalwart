@@ -194,6 +194,7 @@ pub async fn za_tests() {
     jmap_calendar::pipeline::test(&mut test).await;
     jmap_calendar::events::test(&mut test).await;
     jmap_calendar::calendars::test(&mut test).await;
+    jmap_calendar::query::test(&mut test).await;
     jmap_calendar::sharing::test(&mut test).await;
     jmap_calendar::refusals::test(&mut test).await;
     sweep::test(&mut test).await;
