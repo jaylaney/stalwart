@@ -19,9 +19,9 @@ use crate::{
         za::{
             CALENDAR_JMAP_USING, ZaClientKind, clear_received_scheduling, copy_href, event_records,
             hold_task_consumer, inbox_ids, item_method, item_partstat, itip_tasks_for,
-            new_inbox_items, open_pending_item_as, token_record, trigger_drain, wait_for_queue,
-            za_bearer_jmap, za_drop_oauth_client, za_oauth_client, za_refresh, za_revoke_token,
-            za_sign_in, za_uid_leases, za_unlock,
+            new_inbox_items, open_pending_item_as, pending_ids, token_record, trigger_drain,
+            wait_for_queue, za_bearer_jmap, za_drop_oauth_client, za_oauth_client, za_refresh,
+            za_revoke_token, za_sign_in, za_uid_leases, za_unlock,
         },
     },
     za::{
@@ -29,6 +29,7 @@ use crate::{
         drain::{DrainOn, body, relative, set_partstat},
         fanout::{NO_REPLY, Party, attendee_statuses, invite, stored_pairs, uid_copies},
         gating::method_error,
+        imip::{add_contact, delete_contact, deliver, event, itip_mail},
         mail::Traced,
         uid_lease::put,
         user_permissions,
@@ -110,6 +111,10 @@ pub async fn test(test: &mut TestServer) {
     cancel_and_decline_on_destroy(&s).await;
     mail_guard_on_failed_delete(&s).await;
     no_itip_task_ever(&s).await;
+    drain_runs_from_jmap(&s).await;
+    mail_only_request_does_not_drain(&s).await;
+    invitation_by_email_found_by_uid(&s).await;
+    drain_failure_does_not_fail_the_request(&s).await;
 
     wait_for_queue(test).await;
     Party::new(test, pair.key2.name())
@@ -1298,4 +1303,305 @@ async fn no_itip_task_ever(s: &Scheduling<'_>) {
         "no_itip_task_ever: an iTIP task was queued"
     );
     drop(held);
+}
+
+/// The ids of the account's `Calendar/get` of its own calendars: the request
+/// that triggers the drain, whatever it asks for.
+async fn calendar_get(account: &Account) -> JmapResponse {
+    account
+        .jmap_method_call(
+            "Calendar/get",
+            json!({ "accountId": account.id_string(), "ids": null }),
+        )
+        .await
+}
+
+/// Empties both accounts' scheduling inboxes, so the drain cases below see
+/// only their own pending items (the cases before them leave some).
+async fn clear_inboxes(s: &Scheduling<'_>) {
+    let (test, pair) = (s.test, s.pair);
+    wait_for_queue(test).await;
+    for (id, name) in [
+        (pair.key_id, pair.key.name()),
+        (pair.key2_id, pair.key2.name()),
+    ] {
+        Party::new(test, name)
+            .delete_items(test, inbox_ids(test, id).await)
+            .await;
+    }
+    assert!(pending_ids(test, pair.key_id).await.is_empty());
+    assert!(pending_ids(test, pair.key2_id).await.is_empty());
+}
+
+/// Deletes key2's imported copy of `uid` without scheduling.
+async fn destroy_copy(s: &Scheduling<'_>, uid: &str) {
+    let (test, pair) = (s.test, s.pair);
+    let id = event_id(test, pair.key2_id, uid).await;
+    let reply = s.destroy(&pair.key2, &id, none()).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(destroyed(&reply), [id], "{reply:?}");
+    assert_eq!(uid_copies(test, pair.key2_id, uid).await, 0);
+}
+
+/// Spec 5.5: a JMAP request of calendar methods drains the caller's inbox
+/// before dispatch.
+async fn drain_runs_from_jmap(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-drain";
+    let (test, pair) = (s.test, s.pair);
+    let _drain = DrainOn::new();
+    clear_inboxes(s).await;
+
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(pair.key.name(), &s.cal, UID, &[pair.key2.name()]),
+            send(),
+        )
+        .await;
+    reply.created_id(0);
+    s.leaves(pair.key_id, UID);
+    wait_for_queue(test).await;
+    assert_eq!(
+        pending_ids(test, pair.key2_id).await.len(),
+        1,
+        "drain_runs_from_jmap: key2's pending item before the request"
+    );
+    let reply = calendar_get(&pair.key2).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert!(
+        pending_ids(test, pair.key2_id).await.is_empty(),
+        "drain_runs_from_jmap: the item is still pending after Calendar/get"
+    );
+    assert_eq!(uid_copies(test, pair.key2_id, UID).await, 1);
+    destroy_copy(s, UID).await;
+}
+
+/// Spec 5.5: a request of mail methods only, or of `CalendarEventNotification`
+/// methods only, does not drain; `ParticipantIdentity` does.
+async fn mail_only_request_does_not_drain(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-nodrain";
+    let (test, pair) = (s.test, s.pair);
+    let _drain = DrainOn::new();
+    clear_inboxes(s).await;
+    let account = pair.key2.id_string();
+
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(pair.key.name(), &s.cal, UID, &[pair.key2.name()]),
+            send(),
+        )
+        .await;
+    reply.created_id(0);
+    s.leaves(pair.key_id, UID);
+    wait_for_queue(test).await;
+    assert_eq!(
+        pending_ids(test, pair.key2_id).await.len(),
+        1,
+        "mail_only_request_does_not_drain: key2's pending item"
+    );
+    let reply = pair
+        .key2
+        .jmap_method_call("Mailbox/get", json!({ "accountId": account, "ids": null }))
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        pending_ids(test, pair.key2_id).await.len(),
+        1,
+        "mail_only_request_does_not_drain: Mailbox/get drained"
+    );
+    // The notification methods are served or refused as the table says; the
+    // request does not drain either way.
+    pair.key2
+        .jmap_method_call(
+            "CalendarEventNotification/get",
+            json!({ "accountId": account, "ids": null }),
+        )
+        .await;
+    assert_eq!(
+        pending_ids(test, pair.key2_id).await.len(),
+        1,
+        "mail_only_request_does_not_drain: CalendarEventNotification/get drained"
+    );
+    let reply = pair
+        .key2
+        .jmap_method_call(
+            "ParticipantIdentity/get",
+            json!({ "accountId": account, "ids": null }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert!(
+        pending_ids(test, pair.key2_id).await.is_empty(),
+        "mail_only_request_does_not_drain: ParticipantIdentity/get did not drain"
+    );
+    assert_eq!(uid_copies(test, pair.key2_id, UID).await, 1);
+    destroy_copy(s, UID).await;
+}
+
+/// Spec 5.5 and 9.2: an invitation that arrived by email is drained by the
+/// request that queries it, and the attendee's reply goes to the outside
+/// organizer.
+async fn invitation_by_email_found_by_uid(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-mail";
+    let (test, pair) = (s.test, s.pair);
+    let _drain = DrainOn::new();
+    clear_inboxes(s).await;
+    let account = pair.key.id_string();
+    let address = pair.key.name();
+
+    // A new UID from an outside organizer needs it in the address book.
+    let card = add_contact(&pair.dav, address, OUT).await;
+    sink().clear();
+    // The envelope sender passes the test-mode DMARC check by its prefix.
+    deliver(
+        &format!("dmarc-{OUT}"),
+        address,
+        &itip_mail(OUT, address, "REQUEST", &event(UID, OUT, &[address], 0, "")),
+    )
+    .await;
+    wait_for_queue(test).await;
+    sink().clear();
+
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/query",
+            json!({ "accountId": account, "filter": { "uid": UID } }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let ids = reply.response_at(0)["ids"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        ids.len(),
+        1,
+        "the query did not find the invitation: {reply:?}"
+    );
+    let id = ids[0].as_str().unwrap_or_default().to_string();
+    s.leaves(pair.key_id, UID);
+
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({ "accountId": account, "ids": [id], "properties": ["participants"] }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let own = calendar_address(address);
+    let participant = reply.list()[0]["participants"]
+        .as_object()
+        .and_then(|participants| {
+            participants
+                .iter()
+                .find(|(_, value)| {
+                    value["calendarAddress"]
+                        .as_str()
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&own))
+                })
+                .map(|(key, _)| key.clone())
+        })
+        .unwrap_or_else(|| panic!("no participant for {address}: {reply:?}"));
+    let path = format!("participants/{participant}/participationStatus");
+    let reply = s
+        .update(&pair.key, &id, json!({ path: "accepted" }), send())
+        .await;
+    assert_updated(&reply, &id);
+    wait_for_queue(test).await;
+    let mail = sink().take_to(OUT);
+    assert_eq!(
+        mail.len(),
+        1,
+        "invitation_by_email_found_by_uid: mail to OUT"
+    );
+    assert_eq!(mail[0].calendar_method().as_deref(), Some("REPLY"));
+    let calendar = mail[0]
+        .calendar_part()
+        .unwrap_or_default()
+        .replace("\r\n ", "");
+    assert!(
+        calendar.lines().any(|line| line.starts_with("ATTENDEE")
+            && line.contains("PARTSTAT=ACCEPTED")
+            && line
+                .to_ascii_lowercase()
+                .contains(&address.to_ascii_lowercase())),
+        "invitation_by_email_found_by_uid: the reply's ATTENDEE line: {calendar}"
+    );
+
+    // What the case left: the contact and the delivered message.
+    delete_contact(&pair.dav, &card).await;
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "Email/get",
+            json!({ "accountId": account, "ids": null, "properties": ["id", "subject"] }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let mails: Vec<Value> = reply
+        .list()
+        .iter()
+        .filter(|email| email["subject"] == "iMIP REQUEST")
+        .map(|email| email["id"].clone())
+        .collect();
+    assert_eq!(mails.len(), 1, "the delivered message: {reply:?}");
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "Email/set",
+            json!({ "accountId": account, "destroy": mails.clone() }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(reply.response_at(0)["destroyed"], json!(mails), "{reply:?}");
+    sink().clear();
+}
+
+/// Invariant 14: a drain that fails does not fail the request, and the item
+/// drains on a later request after the backoff.
+async fn drain_failure_does_not_fail_the_request(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-drainfail";
+    let (test, pair) = (s.test, s.pair);
+    let _drain = DrainOn::new();
+    clear_inboxes(s).await;
+
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(pair.key.name(), &s.cal, UID, &[pair.key2.name()]),
+            send(),
+        )
+        .await;
+    reply.created_id(0);
+    s.leaves(pair.key_id, UID);
+    wait_for_queue(test).await;
+    assert_eq!(pending_ids(test, pair.key2_id).await.len(), 1);
+
+    // The deferral is an absolute deadline taken at the failing pass, so the
+    // short backoff is set before the failure.
+    test_hooks::set_drain_retry_override(Some(2));
+    test_hooks::set_drain_fail_once(Some(pair.key2_id));
+    let reply = calendar_get(&pair.key2).await;
+    assert_eq!(
+        method_error(&reply),
+        None,
+        "a drain failure failed the request: {reply:?}"
+    );
+    assert_eq!(
+        pending_ids(test, pair.key2_id).await.len(),
+        1,
+        "drain_failure_does_not_fail_the_request: the failed pass drained the item"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let reply = calendar_get(&pair.key2).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert!(
+        pending_ids(test, pair.key2_id).await.is_empty(),
+        "drain_failure_does_not_fail_the_request: no drain after the backoff"
+    );
+    test_hooks::set_drain_retry_override(None);
+    destroy_copy(s, UID).await;
 }

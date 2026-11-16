@@ -8,7 +8,7 @@ use crate::{
     addressbook::{get::AddressBookGet, set::AddressBookSet},
     api::{
         auth::JmapAuthorization,
-        za_calendar::{za_admit_calendar_method, za_calendar_method},
+        za_calendar::{is_calendar_method, za_admit_calendar_method, za_calendar_method},
     },
     blob::{copy::BlobCopy, get::BlobOperations, upload::BlobUpload},
     calendar::{get::CalendarGet, set::CalendarSet},
@@ -58,6 +58,7 @@ use email::message::{
     ingest::IngestedEmail,
     za::{search::ensure::ZaSearchEnsure, view::ZaMailView},
 };
+use groupware::calendar::drain::ZaDrain;
 use http_proto::HttpSessionData;
 #[cfg(feature = "test_mode")]
 use jmap_proto::request::method::MethodFunction;
@@ -194,6 +195,17 @@ impl RequestHandler for Server {
             }
             _ => None,
         };
+        // Release 6 spec 5.5: a calendar method of a key account's own request
+        // drains its inbox first, as a CalDAV request does. The drain never
+        // fails the request.
+        if let Some(keys) = access_token.za_keys_for(owner)
+            && request
+                .method_calls
+                .iter()
+                .any(|call| is_calendar_method(call.name.obj))
+        {
+            self.za_drain(keys).await;
+        }
         let last_adding = if let Some(keys) = keys {
             if request
                 .method_calls

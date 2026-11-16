@@ -173,7 +173,6 @@ pub(crate) fn za_calendar_method(obj: MethodObject, function: MethodFunction) ->
 }
 
 /// Whether the object's methods trigger the calendar drain.
-#[allow(dead_code)] // Task 34 adds the drain call.
 pub(crate) fn is_calendar_method(obj: MethodObject) -> bool {
     matches!(
         obj,
