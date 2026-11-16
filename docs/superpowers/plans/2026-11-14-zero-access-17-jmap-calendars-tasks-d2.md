@@ -698,7 +698,7 @@ za cases in `events.rs`:
 za cases in `scheduling.rs`:
 - `cancel_and_decline_on_destroy`.
   - Organizer: `jmapcal-sched-cancel` with key2 and `OUT`, created with `send()`; sink cleared. Destroy with `send()`: `destroyed`; after `wait_for_queue` key2 holds exactly one new item, `METHOD:CANCEL`, and the sink exactly one `CANCEL` to `OUT`.
-  - Attendee: `jmapcal-sched-decline`, key invites key2; under a `DrainOn` guard `trigger_drain(key2's name, STRONG)` imports it. key2 destroys its copy with `send()`: key gets exactly one new item, `METHOD:REPLY`, with `item_partstat(&item, key2's address) == "DECLINED"`.
+  - Attendee: `jmapcal-sched-decline`, key invites key2; under a `DrainOn` guard `trigger_drain(key2's name, STRONG)` imports it. key2 accepts over CalDAV first: a destroy of an unanswered invitation sends no reply, on JMAP as on CalDAV's DELETE (upstream's `attendee_decline` skips a `NEEDS-ACTION` attendee on a deletion), and D18 gives the destroy CalDAV's condition. key's items are read after the acceptance. key2 then destroys its copy with `send()`: key gets exactly one new item, `METHOD:REPLY`, with `item_partstat(&item, key2's address) == "DECLINED"`.
   - Without the flag: a third event destroyed by its organizer leaves no item and no mail.
   - Denied: `noperm` destroys one of its events with `send()`: `notDestroyed`, `forbidden`, "This account is not allowed to send calendar scheduling messages."; the event is still there.
 - `mail_guard_on_failed_delete` (5.3). Three events `jmapcal-sched-delguard-1`, `-2`, `-3`, each created with `send()` and `OUT` as attendee; `wait_for_queue`; `sink().clear()`; `state` is the `CalendarEvent` state. One call destroys `[first, second, third]` with `send()`.
