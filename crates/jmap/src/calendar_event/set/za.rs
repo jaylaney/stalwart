@@ -14,9 +14,12 @@
 //! Updates are grouped as upstream groups them and written by the pipeline's
 //! update commit with the stored token pairs, display name and SEQUENCE floor
 //! (spec 5.4). A change of an event's calendars is a placement plan the
-//! pipeline resolves and commits with the update (spec 5.2). Until Task 33
-//! lands, destroys are answered `forbidden` with `ZA_INTERIM` and never reach
-//! upstream's path (I §7.3).
+//! pipeline resolves and commits with the update (spec 5.2).
+//!
+//! A destroy is the pipeline's delete of the event and every one of its
+//! names, scheduled through CalDAV's delete condition (D18), one commit per
+//! event; one occurrence's destroy is upstream's conversion to an update
+//! (spec 6.5). No destroy reaches upstream's path (invariant 57).
 
 use super::{
     ComponentSequences, DEFAULTED_FLAGS, EVENT_METADATA_FLAGS, EventOp, EventOps, EventUpdate,
@@ -54,6 +57,7 @@ use crate::{
 };
 use calcard::{
     common::timezone::Tz,
+    icalendar::ICalendar,
     jscalendar::{JSCALENDAR_VERSION, JSCalendar, JSCalendarProperty},
 };
 use common::{
@@ -66,7 +70,7 @@ use groupware::{
     SizeWriter,
     cache::GroupwareCache,
     calendar::{
-        CalendarEvent, CalendarEventContent, CalendarEventData,
+        ArchivedCalendarEvent, CalendarEvent, CalendarEventContent, CalendarEventData,
         alerts::{DefaultAlerts, DefaultAlertsResolver},
         identity::{CalendarAddresses, ParticipantIdentityAddresses},
         index::ICalendarObjectUid,
@@ -75,9 +79,10 @@ use groupware::{
             admission::{ZaRoles, za_roles, za_writer_keys},
             context::za_write_contexts,
             create::{ZaEventCreate, za_create_event},
+            delete::za_destroy_event,
             error::ZaPipelineError,
             placement::{ZaPlacementContexts, ZaPlacementPlan, za_placement_contexts},
-            schedule::{ZaScheduled, za_schedule_create, za_schedule_update},
+            schedule::{ZaScheduled, za_delete_send_itip, za_schedule_create, za_schedule_update},
             uid::za_take_uid_lease,
             update::{ZaEventUpdate, za_commit_update},
         },
@@ -105,7 +110,7 @@ use std::sync::Arc;
 use store::{
     ValueKey,
     roaring::RoaringBitmap,
-    write::{Archive, ArchiveBytes, now},
+    write::{Archive, ArchiveBytes, now, serialize::rkyv_deserialize},
 };
 use trc::{AddContext, EventType, LimitEvent, SecurityEvent};
 use types::{
@@ -116,9 +121,6 @@ use types::{
     id::Id,
 };
 use vault::session::SessionKeys;
-
-/// I §7.3: the answer to a destroy until Task 33.
-pub(super) const ZA_INTERIM: &str = "This operation is not available for this account yet.";
 
 /// Upstream's text for a lost assertion (`calendar_event/set.rs:1611`).
 const ZA_MODIFIED: &str = "Another process modified this calendar event, please try again.";
@@ -434,16 +436,27 @@ pub(super) async fn za_calendar_event_set(
         }
     }
 
-    // I §7.3: destroys wait for Task 33.
+    // Process deletions (upstream's `calendar_event/set.rs:1416-1605`): the
+    // pipeline's delete, one commit per event (D3). The container cleanup
+    // preload (`:1417-1433`) is not taken (invariant 57).
     for id in destroy_events {
-        response.not_destroyed.append(
-            id,
-            if failed {
-                za_set_incomplete()
-            } else {
-                SetError::forbidden().with_description(ZA_INTERIM)
-            },
-        );
+        if failed {
+            response.not_destroyed.append(id, za_set_incomplete());
+            continue;
+        }
+        match writer.destroy(&mut reader, id).await {
+            Ok(Ok(change_id)) => {
+                response.destroyed.push(id);
+                // D3: the change id of the last commit.
+                response.new_state = State::Exact(change_id).into();
+            }
+            Ok(Err(err)) => response.not_destroyed.append(id, err),
+            Err(err) => {
+                za_trace_set_failure(account_id, Some(id.document_id()), &err);
+                failed = true;
+                response.not_destroyed.append(id, za_set_incomplete());
+            }
+        }
     }
 
     Ok(response)
@@ -1445,6 +1458,151 @@ impl ZaEventWriter<'_> {
         // D3: the change id of the last commit.
         response.new_state = State::Exact(written.change_id).into();
         Ok(())
+    }
+
+    /// One destroy, in upstream's order (`calendar_event/set.rs:1434-1605`),
+    /// deleted by the pipeline (spec 6.5). `Ok(Ok(_))` is the commit's change
+    /// id; `Err` is a store failure, which the caller answers under D28.
+    async fn destroy(&mut self, reader: &mut ZaEventReader, id: Id) -> Answer<u64> {
+        let server = self.server;
+        let access_token = self.access_token;
+        let account_id = self.account_id;
+        let document_id = id.document_id();
+        let is_owner = access_token.is_member(account_id);
+
+        if !self.cache.has_item_id(&document_id) {
+            return Ok(Err(SetError::not_found()));
+        }
+        let Some(calendar_event_) = server
+            .store()
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+                account_id,
+                Collection::CalendarEvent,
+                document_id,
+            ))
+            .await
+            .caused_by(trc::location!())?
+        else {
+            return Ok(Err(SetError::not_found()));
+        };
+        let calendar_event = calendar_event_
+            .to_unarchived::<CalendarEvent>()
+            .caused_by(trc::location!())?;
+
+        // Validate ACLs
+        if let Err(err) = assert_privacy_access(
+            EventPrivacy::from_flags(calendar_event.inner.flags.to_native()),
+            EventViewer::new(is_owner),
+        ) {
+            return Ok(Err(err));
+        }
+        // The notification audience and the stored content (`:1468-1498`)
+        // are not taken: the ownership is read from the event's view, once,
+        // and only for a calendar that asks for it.
+        if let Some(can_delete_calendars) = &self.can_delete_calendars {
+            let calendar_ids = calendar_event.inner.calendar_ids().collect::<Vec<_>>();
+            let mut may_write_own = None;
+            for &parent_id in &calendar_ids {
+                if can_delete_calendars.contains(parent_id) {
+                    continue;
+                }
+                if EventAcl::for_calendar(&self.cache, access_token, parent_id)
+                    .may_manage_own_items()
+                {
+                    let owns = match may_write_own {
+                        Some(owns) => owns,
+                        None => *may_write_own.insert(
+                            self.may_write_own(
+                                reader,
+                                document_id,
+                                &calendar_ids,
+                                calendar_event.inner,
+                            )
+                            .await?,
+                        ),
+                    };
+                    if owns {
+                        continue;
+                    }
+                }
+                return Ok(Err(SetError::forbidden().with_description(format!(
+                    "You are not allowed to remove events from calendar {}.",
+                    Id::from(parent_id)
+                ))));
+            }
+        }
+
+        // D18: CalDAV's delete condition, with the owner's addresses, in
+        // place of `:1525-1552`.
+        let send_itip =
+            match za_delete_send_itip(server, access_token, &self.roles.owner, self.schedule) {
+                Ok(send_itip) => send_itip,
+                Err(err) => return za_event_set_error(err, None).map(Err),
+            };
+
+        // Invariant 57: the pipeline deletes the event, in place of `:1554-1602`.
+        match za_destroy_event(
+            server,
+            access_token,
+            &self.cache,
+            &self.keys,
+            &self.roles,
+            account_id,
+            document_id,
+            calendar_event_,
+            send_itip,
+        )
+        .await
+        {
+            Ok(deleted) => Ok(Ok(deleted.change_id)),
+            Err(err) => za_event_set_error(err, None).map(Err),
+        }
+    }
+
+    /// Upstream's ownership test (`calendar_event/set.rs:1506-1510`) on the
+    /// event's view, never on the sealed stored tree. A missing content or
+    /// view owns nothing, as upstream's missing content.
+    async fn may_write_own(
+        &self,
+        reader: &mut ZaEventReader,
+        document_id: u32,
+        calendar_ids: &[u32],
+        meta: &ArchivedCalendarEvent,
+    ) -> trc::Result<bool> {
+        let server = self.server;
+        let Some(content_) = server
+            .store()
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+                self.account_id,
+                Collection::CalendarEvent,
+                document_id,
+                CalendarEventField::Content,
+            ))
+            .await
+            .caused_by(trc::location!())?
+        else {
+            return Ok(false);
+        };
+        let Some(view) = reader
+            .view(
+                server,
+                self.access_token,
+                document_id,
+                calendar_ids,
+                meta,
+                &content_,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        let content = view
+            .content
+            .unarchive::<CalendarEventContent>()
+            .caused_by(trc::location!())?;
+        let event =
+            rkyv_deserialize::<_, ICalendar>(&content.data.event).caused_by(trc::location!())?;
+        Ok(self.identities.event_ownership(&event).may_write_own())
     }
 }
 

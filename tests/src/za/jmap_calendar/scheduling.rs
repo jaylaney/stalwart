@@ -18,15 +18,15 @@ use crate::{
         webdav::DummyWebDavClient,
         za::{
             CALENDAR_JMAP_USING, ZaClientKind, clear_received_scheduling, copy_href, event_records,
-            hold_task_consumer, inbox_ids, item_method, itip_tasks_for, new_inbox_items,
-            open_pending_item_as, token_record, wait_for_queue, za_bearer_jmap,
-            za_drop_oauth_client, za_oauth_client, za_refresh, za_revoke_token, za_sign_in,
-            za_uid_leases, za_unlock,
+            hold_task_consumer, inbox_ids, item_method, item_partstat, itip_tasks_for,
+            new_inbox_items, open_pending_item_as, token_record, trigger_drain, wait_for_queue,
+            za_bearer_jmap, za_drop_oauth_client, za_oauth_client, za_refresh, za_revoke_token,
+            za_sign_in, za_uid_leases, za_unlock,
         },
     },
     za::{
         STRONG,
-        drain::{body, relative},
+        drain::{DrainOn, body, relative, set_partstat},
         fanout::{NO_REPLY, Party, attendee_statuses, invite, stored_pairs, uid_copies},
         gating::method_error,
         mail::Traced,
@@ -55,7 +55,7 @@ use std::{
     time::Duration,
 };
 use trc::{CalendarEvent as TrcCalendarEvent, EventType, Key};
-use types::id::Id;
+use types::{collection::Collection, field::CalendarEventField, id::Id};
 use vault::record::za_session_binding;
 
 const OUT: &str = "jmapcal-scheduling-out@remote.test";
@@ -107,6 +107,8 @@ pub async fn test(test: &mut TestServer) {
     past_event_saved_unsent(&s).await;
     withheld_and_unreachable_statuses(&s).await;
     mail_guard_on_failed_commit(&s).await;
+    cancel_and_decline_on_destroy(&s).await;
+    mail_guard_on_failed_delete(&s).await;
     no_itip_task_ever(&s).await;
 
     wait_for_queue(test).await;
@@ -290,6 +292,10 @@ impl<'x> Scheduling<'x> {
         account
             .jmap_update("CalendarEvent", [(id.to_string(), patch)], args)
             .await
+    }
+
+    async fn destroy(&self, account: &Account, id: &str, args: Vec<(&str, Value)>) -> JmapResponse {
+        account.jmap_destroy("CalendarEvent", [id], args).await
     }
 
     async fn href(&self, account_id: u32, uid: &str) -> String {
@@ -904,6 +910,350 @@ async fn mail_guard_on_failed_commit(s: &Scheduling<'_>) {
         dropped,
         [second.0.document_id()],
         "mail_guard_on_failed_commit: ZA_IMIP_DROPPED"
+    );
+}
+
+/// The ids a `/set` answer lists under `destroyed`, empty when it lists none.
+fn destroyed(reply: &JmapResponse) -> Vec<String> {
+    reply
+        .pointer("/methodResponses/0/1/destroyed")
+        .and_then(|ids| ids.as_array())
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The JMAP id of the account's one event with `uid` (a drained copy is
+/// named by the drain, so it is found by UID).
+async fn event_id(test: &TestServer, account_id: u32, uid: &str) -> String {
+    let ids = test
+        .server
+        .document_ids_matching(
+            account_id,
+            Collection::CalendarEvent,
+            CalendarEventField::Uid,
+            uid.as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 1, "{uid}: {} copies", ids.len());
+    Id::from(ids.min().unwrap()).to_string()
+}
+
+/// Spec 6.5, D4, D18: a destroy with `sendSchedulingMessages: true` runs the
+/// pipeline's delete with scheduling, so an organizer's cancels and an
+/// attendee's decline go through the fan-out; without the flag nothing is
+/// sent; a denied status refuses the destroy before anything is deleted.
+async fn cancel_and_decline_on_destroy(s: &Scheduling<'_>) {
+    const CANCEL: &str = "jmapcal-sched-cancel";
+    const DECLINE: &str = "jmapcal-sched-decline";
+    const UNSENT: &str = "jmapcal-sched-unsent";
+    const REFUSED: &str = "jmapcal-sched-destroy-denied";
+    let (test, pair) = (s.test, s.pair);
+
+    // The organizer cancels.
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(pair.key.name(), &s.cal, CANCEL, &[pair.key2.name(), OUT]),
+            send(),
+        )
+        .await;
+    let id = reply.created_id(0).to_string();
+    s.leaves(pair.key_id, CANCEL);
+    wait_for_queue(test).await;
+    sink().clear();
+    let before = inbox_ids(test, pair.key2_id).await;
+    let reply = s.destroy(&pair.key, &id, send()).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(destroyed(&reply), [id.clone()], "{reply:?}");
+    s.forget(CANCEL);
+    assert_eq!(uid_copies(test, pair.key_id, CANCEL).await, 0);
+    wait_for_queue(test).await;
+    let items = new_inbox_items(test, pair.key2_id, &before).await;
+    assert_eq!(
+        items.len(),
+        1,
+        "cancel_and_decline_on_destroy: key2's items after the organizer's destroy"
+    );
+    let (ical, _) = open_pending_item_as(test, pair.key2_id, STRONG, items[0].0).await;
+    assert_eq!(item_method(&ical), Some(ICalendarMethod::Cancel));
+    assert_eq!(
+        sink().messages().len(),
+        1,
+        "cancel_and_decline_on_destroy: the organizer's mail"
+    );
+    let mail = sink().take_to(OUT);
+    assert_eq!(mail.len(), 1, "cancel_and_decline_on_destroy: mail to OUT");
+    assert_eq!(mail[0].calendar_method().as_deref(), Some("CANCEL"));
+
+    // The attendee declines.
+    let before = inbox_ids(test, pair.key2_id).await;
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(pair.key.name(), &s.cal, DECLINE, &[pair.key2.name()]),
+            send(),
+        )
+        .await;
+    reply.created_id(0);
+    s.leaves(pair.key_id, DECLINE);
+    wait_for_queue(test).await;
+    let items = new_inbox_items(test, pair.key2_id, &before).await;
+    assert_eq!(
+        items.len(),
+        1,
+        "cancel_and_decline_on_destroy: key2's invitation"
+    );
+    // The drain applies every pending item of key2's inbox: the earlier
+    // steps' items go first, so it imports this invitation alone.
+    Party::new(test, pair.key2.name())
+        .delete_items_since(test, &[items[0].0])
+        .await;
+    {
+        let _drain = DrainOn::new();
+        assert_eq!(trigger_drain(pair.key2.name(), STRONG).await, 207);
+    }
+    let copy = event_id(test, pair.key2_id, DECLINE).await;
+    // Upstream declines on a deletion only for an attendee that answered
+    // (`attendee_decline` skips NEEDS-ACTION when `is_deletion`), so key2
+    // accepts first, as the CalDAV twin does (`za::reply`).
+    set_partstat(
+        &pair.dav2,
+        &s.href(pair.key2_id, DECLINE).await,
+        pair.key2.name(),
+        "ACCEPTED",
+    )
+    .await;
+    let key_before = inbox_ids(test, pair.key_id).await;
+    let reply = s.destroy(&pair.key2, &copy, send()).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(destroyed(&reply), [copy.clone()], "{reply:?}");
+    assert_eq!(uid_copies(test, pair.key2_id, DECLINE).await, 0);
+    wait_for_queue(test).await;
+    let items = new_inbox_items(test, pair.key_id, &key_before).await;
+    assert_eq!(
+        items.len(),
+        1,
+        "cancel_and_decline_on_destroy: key's items after the attendee's destroy"
+    );
+    let (ical, _) = open_pending_item_as(test, pair.key_id, STRONG, items[0].0).await;
+    assert_eq!(item_method(&ical), Some(ICalendarMethod::Reply));
+    assert_eq!(
+        item_partstat(&ical, pair.key2.name()).as_deref(),
+        Some("DECLINED")
+    );
+
+    // Without the flag nothing is sent.
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(pair.key.name(), &s.cal, UNSENT, &[pair.key2.name(), OUT]),
+            send(),
+        )
+        .await;
+    let id = reply.created_id(0).to_string();
+    s.leaves(pair.key_id, UNSENT);
+    wait_for_queue(test).await;
+    sink().clear();
+    let before = inbox_ids(test, pair.key2_id).await;
+    let key_before = inbox_ids(test, pair.key_id).await;
+    let reply = s.destroy(&pair.key, &id, none()).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(destroyed(&reply), [id.clone()], "{reply:?}");
+    s.forget(UNSENT);
+    assert_eq!(uid_copies(test, pair.key_id, UNSENT).await, 0);
+    wait_for_queue(test).await;
+    assert!(
+        new_inbox_items(test, pair.key2_id, &before)
+            .await
+            .is_empty(),
+        "cancel_and_decline_on_destroy: an item without the flag"
+    );
+    assert!(
+        new_inbox_items(test, pair.key_id, &key_before)
+            .await
+            .is_empty(),
+        "cancel_and_decline_on_destroy: an organizer's item without the flag"
+    );
+    assert!(
+        sink().messages().is_empty(),
+        "cancel_and_decline_on_destroy: mail without the flag"
+    );
+
+    // A denied status refuses the destroy.
+    let reply = s
+        .create(
+            s.noperm,
+            invitation(s.noperm.name(), &s.noperm_cal, REFUSED, &[OUT]),
+            none(),
+        )
+        .await;
+    let document_id = reply.created_id(0).document_id();
+    let id = Id::from(document_id).to_string();
+    s.leaves(s.noperm_id, REFUSED);
+    let (meta, content) = event_records(test, s.noperm_id, document_id).await;
+    let reply = s.destroy(s.noperm, &id, send()).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        set_error(reply.not_destroyed(&id)),
+        ("forbidden", Some(DENIED), Value::Null),
+        "{reply:?}"
+    );
+    assert_eq!(uid_copies(test, s.noperm_id, REFUSED).await, 1);
+    let (meta_after, content_after) = event_records(test, s.noperm_id, document_id).await;
+    assert!(
+        meta.as_bytes() == meta_after.as_bytes() && content.as_bytes() == content_after.as_bytes(),
+        "cancel_and_decline_on_destroy: the refused destroy changed the event"
+    );
+    wait_for_queue(test).await;
+    assert!(
+        sink().messages().is_empty(),
+        "cancel_and_decline_on_destroy: mail from a refused destroy"
+    );
+}
+
+/// Spec 5.3 (D3, D28), release 5 invariant 46: a destroy whose commit fails
+/// drops its mail; the destroy before it keeps its commit and its mail, the
+/// one after it is not attempted.
+async fn mail_guard_on_failed_delete(s: &Scheduling<'_>) {
+    const UIDS: [&str; 3] = [
+        "jmapcal-sched-delguard-1",
+        "jmapcal-sched-delguard-2",
+        "jmapcal-sched-delguard-3",
+    ];
+    let (test, pair) = (s.test, s.pair);
+    let key_id = pair.key_id;
+    let mut created = Vec::new();
+    for uid in UIDS {
+        let reply = s
+            .create(
+                &pair.key,
+                invitation(pair.key.name(), &s.cal, uid, &[OUT]),
+                send(),
+            )
+            .await;
+        created.push((reply.created_id(0), uid));
+        s.leaves(key_id, uid);
+    }
+    wait_for_queue(test).await;
+    sink().clear();
+    let account = pair.key.id_string().to_string();
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({ "accountId": account, "ids": [] }),
+        )
+        .await;
+    let state = reply.state().to_string();
+    let [first, second, third] = [created[0], created[1], created[2]];
+    let third_before = event_records(test, key_id, third.0.document_id()).await;
+
+    // The first object reaches its commit; the second pause is armed before
+    // the first is released, and the failure once the call is in the second.
+    let traced = Traced::start(&[EventType::Calendar(TrcCalendarEvent::ItipMessageError)]);
+    let first_pause = Arc::new(Pause::new(key_id));
+    test_hooks::set_delete_commit_pause(Some(first_pause.clone()));
+    let caller = pair.key.clone();
+    let args = json!({
+        "accountId": account,
+        "sendSchedulingMessages": true,
+        "destroy": [first.0.to_string(), second.0.to_string(), third.0.to_string()],
+    });
+    let call =
+        tokio::spawn(async move { caller.jmap_method_call("CalendarEvent/set", args).await });
+    tokio::time::timeout(Duration::from_secs(5), first_pause.arrived.notified())
+        .await
+        .expect("mail_guard_on_failed_delete: the first object did not reach its commit");
+    let second_pause = Arc::new(Pause::new(key_id));
+    test_hooks::set_delete_commit_pause(Some(second_pause.clone()));
+    first_pause.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), second_pause.arrived.notified())
+        .await
+        .expect("mail_guard_on_failed_delete: the second object did not reach its commit");
+    test_hooks::set_delete_commit_fail_once(Some(key_id));
+    second_pause.release.notify_one();
+    let reply = call.await.unwrap();
+    test_hooks::set_delete_commit_pause(None);
+    test_hooks::set_delete_commit_fail_once(None);
+    let dropped = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| {
+            event.details == ZA_IMIP_DROPPED && event.account_id == Some(u64::from(key_id))
+        })
+        .map(|event| {
+            event
+                .keys
+                .iter()
+                .find_map(|(key, value)| match (key, value) {
+                    (Key::DocumentId, trc::Value::UInt(id)) => Some(*id as u32),
+                    _ => None,
+                })
+                .expect("a document id")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(destroyed(&reply), [first.0.to_string()], "{reply:?}");
+    s.forget(first.1);
+    for (id, _) in [second, third] {
+        assert_eq!(
+            set_error(reply.not_destroyed(&id.to_string())),
+            ("forbidden", Some(INCOMPLETE), Value::Null),
+            "{reply:?}"
+        );
+    }
+    let copies = [
+        uid_copies(test, key_id, first.1).await,
+        uid_copies(test, key_id, second.1).await,
+        uid_copies(test, key_id, third.1).await,
+    ];
+    assert_eq!(copies, [0, 1, 1], "mail_guard_on_failed_delete: uid copies");
+    let third_after = event_records(test, key_id, third.0.document_id()).await;
+    assert!(
+        third_before.0.as_bytes() == third_after.0.as_bytes()
+            && third_before.1.as_bytes() == third_after.1.as_bytes(),
+        "mail_guard_on_failed_delete: the third object was written"
+    );
+
+    let changes = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/changes",
+            json!({ "accountId": account, "sinceState": state }),
+        )
+        .await;
+    let response = changes.response_at(0);
+    assert_eq!(
+        response["destroyed"],
+        json!([first.0.to_string()]),
+        "{changes:?}"
+    );
+    assert_eq!(response["created"], json!([]), "{changes:?}");
+    assert_eq!(response["updated"], json!([]), "{changes:?}");
+    assert_eq!(response["newState"], reply.response_at(0)["newState"]);
+
+    wait_for_queue(test).await;
+    let mail = sink().take_to(OUT);
+    assert_eq!(mail.len(), 1, "mail_guard_on_failed_delete: mail to OUT");
+    assert_eq!(mail[0].calendar_method().as_deref(), Some("CANCEL"));
+    let uid_line = format!("UID:{}", first.1);
+    assert!(
+        mail[0]
+            .calendar_part()
+            .is_some_and(|part| part.lines().any(|line| line == uid_line)),
+        "mail_guard_on_failed_delete: the mail is not the first event's"
+    );
+    assert_eq!(
+        dropped,
+        [second.0.document_id()],
+        "mail_guard_on_failed_delete: ZA_IMIP_DROPPED"
     );
 }
 

@@ -113,6 +113,11 @@ pub async fn test(test: &mut TestServer) {
     placement_refusals(&events, &places).await;
     calendar_id_that_does_not_exist(&events).await;
     places.finish(&events).await;
+    // Release 6 spec 6.5: CalendarEvent/set destroys (Task 33).
+    destroy_and_destroy_linked(&events).await;
+    let series = Series::create(&events).await;
+    destroy_occurrence_is_an_update(&events, &series).await;
+    events.delete(series.document_id).await;
     events.finish().await;
     pair.dav
         .request_with_headers("DELETE", &event_path("jmapcal-shared/"), [NO_REPLY], "")
@@ -904,8 +909,16 @@ impl<'x> Events<'x> {
         drain::body(&self.pair.dav, &hrefs[0]).await
     }
 
-    /// The JMAP destroy arrives in Task 33: events are deleted over CalDAV,
-    /// each of their names in turn.
+    /// `destroy` of the account's events, no scheduling flag.
+    async fn destroy(&self, ids: &[&str]) -> JmapResponse {
+        self.pair
+            .key
+            .jmap_destroy("CalendarEvent", ids.iter().copied(), none())
+            .await
+    }
+
+    /// The cleanup of the cases of Tasks 30 to 32: events are deleted over
+    /// CalDAV, each of their names in turn.
     async fn delete(&self, document_id: u32) {
         for href in self.hrefs(document_id).await {
             self.pair
@@ -2230,4 +2243,160 @@ async fn calendar_id_that_does_not_exist(events: &Events<'_>) {
     );
     assert_eq!(uid_copies(events.test, events.pair.key_id, UID).await, 0);
     events.delete(document_id).await;
+}
+
+/// The ids a `/set` answer lists under `destroyed`, empty when it lists none.
+fn destroyed(reply: &JmapResponse) -> Vec<String> {
+    reply
+        .pointer("/methodResponses/0/1/destroyed")
+        .and_then(|ids| ids.as_array())
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `CalendarEvent` state of the account now.
+async fn event_state(events: &Events<'_>) -> String {
+    let reply = get_events(events.pair, false, json!([])).await;
+    reply.state().to_string()
+}
+
+/// Spec 6.5: a destroy runs the pipeline's delete over every name of the
+/// event; an id that does not exist is `notFound`.
+async fn destroy_and_destroy_linked(events: &Events<'_>) {
+    const SINGLE: &str = "jmapcal-events-destroy";
+    const LINKED: &str = "jmapcal-events-destroy-linked";
+    let (test, pair) = (events.test, events.pair);
+    let dav = &pair.dav;
+
+    // An event with one name.
+    let reply = events.create(vec![events.event(SINGLE)]).await;
+    let document_id = Events::created_document(&reply, 0);
+    let id = Id::from(document_id).to_string();
+    let hrefs = events.hrefs(document_id).await;
+    assert_eq!(hrefs.len(), 1, "{hrefs:?}");
+    let reply = events.destroy(&[&id]).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        destroyed(&reply),
+        [id.clone()],
+        "destroy_and_destroy_linked: one name: {reply:?}"
+    );
+    assert_eq!(uid_copies(test, pair.key_id, SINGLE).await, 0);
+    dav.request("GET", &hrefs[0], "")
+        .await
+        .with_status(StatusCode::NOT_FOUND);
+
+    // An event linked into two calendars.
+    let mut object = events.event(LINKED);
+    object["calendarIds"] = calendar_ids(&[events.cal.as_str(), events.second.as_str()]);
+    let reply = events.create(vec![object]).await;
+    let document_id = Events::created_document(&reply, 0);
+    let id = Id::from(document_id).to_string();
+    let hrefs = events.hrefs(document_id).await;
+    assert_eq!(hrefs.len(), 2, "{hrefs:?}");
+    let a_href = events.calendar_href(&events.cal).await;
+    let b_href = events.calendar_href(&events.second).await;
+    let a_token = sync_token(dav, &a_href).await;
+    let b_token = sync_token(dav, &b_href).await;
+    let state = event_state(events).await;
+
+    let reply = events.destroy(&[&id]).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        destroyed(&reply),
+        [id.clone()],
+        "destroy_and_destroy_linked: two names: {reply:?}"
+    );
+    assert_eq!(uid_copies(test, pair.key_id, LINKED).await, 0);
+    let changes = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/changes",
+            json!({ "accountId": pair.key.id_string(), "sinceState": state }),
+        )
+        .await;
+    assert_eq!(method_error(&changes), None, "{changes:?}");
+    let response = changes.response_at(0);
+    assert_eq!(response["created"], json!([]), "{changes:?}");
+    assert_eq!(response["updated"], json!([]), "{changes:?}");
+    assert_eq!(response["destroyed"], json!([id]), "{changes:?}");
+    assert_eq!(
+        response["newState"],
+        reply.response_at(0)["newState"],
+        "{changes:?} {reply:?}"
+    );
+    for (calendar, token) in [(&a_href, &a_token), (&b_href, &b_token)] {
+        let name = hrefs
+            .iter()
+            .filter(|href| href.starts_with(calendar.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(name.len(), 1, "{calendar}: {hrefs:?}");
+        assert_eq!(
+            tombstones_since(dav, calendar, token).await,
+            name,
+            "destroy_and_destroy_linked: {calendar}"
+        );
+    }
+
+    // An id that does not exist.
+    let missing = Id::from(999_999u32).to_string();
+    let reply = events.destroy(&[&missing]).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        reply.not_destroyed(&missing)["type"],
+        "notFound",
+        "{reply:?}"
+    );
+    assert_eq!(za_uid_leases(test).await, 0);
+}
+
+/// Spec 6.5: destroying one occurrence through its synthetic id is
+/// upstream's conversion to an update of the event, which stays.
+async fn destroy_occurrence_is_an_update(events: &Events<'_>, series: &Series) {
+    let (test, pair) = (events.test, events.pair);
+    let reply = events.destroy(&[series.second.as_str()]).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        destroyed(&reply),
+        [series.second.clone()],
+        "destroy_occurrence_is_an_update: {reply:?}"
+    );
+    assert_eq!(uid_copies(test, pair.key_id, Series::UID).await, 1);
+
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/query",
+            json!({
+                "accountId": pair.key.id_string(),
+                "filter": { "after": "2031-03-01T00:00:00", "before": "2031-03-31T00:00:00" },
+                "expandRecurrences": true,
+            }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let ids = reply.ids().collect::<Vec<_>>();
+    assert!(
+        !ids.contains(&series.second.as_str()),
+        "destroy_occurrence_is_an_update: the occurrence is still listed: {reply:?}"
+    );
+    assert!(!ids.is_empty(), "the series is gone: {reply:?}");
+
+    let body = events.body(series.document_id).await;
+    assert!(
+        body.lines()
+            .any(|line| line.starts_with("EXDATE") && line.contains("20310305")),
+        "destroy_occurrence_is_an_update: no EXDATE of the occurrence: {body}"
+    );
+    assert!(
+        !body
+            .lines()
+            .any(|line| line.starts_with("RECURRENCE-ID") && line.contains("20310305")),
+        "destroy_occurrence_is_an_update: the occurrence is still overridden: {body}"
+    );
 }
