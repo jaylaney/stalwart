@@ -18,6 +18,11 @@
 //! container outside the record (`seal::container`), so the bundle no longer
 //! carries them; a shared collection keeps its shared bundle, now always
 //! empty, so the five-part ring format is unchanged.
+//!
+//! A shared collection's personal bundle, one per principal, carries that
+//! principal's name, description and colour (release 6 spec 6.7, D14). A
+//! personal bundle written before release 6 holds no colour and reads as
+//! none; the stored entry's `color` field stays empty for every principal.
 
 use super::domain::ZaKeyDomain;
 use super::tree::{
@@ -212,7 +217,7 @@ pub(crate) fn seal_personal_entry(
     let bundle = Bundle {
         name: entry.name.clone(),
         description: entry.description.clone(),
-        color: None,
+        color: entry.color.clone(),
     };
     let plain = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).map_err(|_| SealError::Format)?;
     let envelope = domain.seal_ck(&dek, "ck-bundle", Some(&principal))?;
@@ -315,15 +320,12 @@ fn open_personal(
         &domain.bundle_aad("ck-calendar-bundle", Some(entry.account_id))?,
         parts[2],
     )?;
-    if bundle.color.is_some() {
-        return Err(SealError::Format);
-    }
     if let Timezone::Custom(tree) = &mut entry.time_zone {
         unseal_tree(tree, &dek, domain.owner_id(), TZ_SCOPE)?;
     }
     entry.name = bundle.name;
     entry.description = bundle.description;
-    entry.color = None;
+    entry.color = bundle.color;
     Ok(())
 }
 
@@ -453,6 +455,7 @@ pub fn seal_calendar_changes(
     let before = &opened.preferences[personal];
     if edited_personal.name != before.name
         || edited_personal.description != before.description
+        || edited_personal.color != before.color
         || edited_personal.time_zone != before.time_zone
     {
         let ring = STANDARD
@@ -470,9 +473,6 @@ pub fn seal_calendar_changes(
         target.sort_order = edited_personal.sort_order;
         target.flags = edited_personal.flags;
         target.default_alerts = edited_personal.default_alerts.clone();
-    }
-    if edited_personal.color.is_some() {
-        return Err(SealError::Structure("personal color"));
     }
     // Validate exactly the same assembly contract as explicit share mutations.
     shared_parts(&changed, domain)?;
@@ -637,6 +637,14 @@ mod tests {
         (c, owner, grantee)
     }
 
+    /// `calendar_view_in_domain` of the archived calendar, deserialized.
+    fn view(calendar: &Calendar, domain: &super::super::domain::ZaKeyDomain, id: u32) -> Calendar {
+        calendar_view_in_domain(&archive(calendar), domain, id)
+            .unwrap()
+            .deserialize::<Calendar>()
+            .unwrap()
+    }
+
     #[test]
     fn shared_bundles_interoperate_with_literal_content_aad() {
         let (c, _, grantee) = shared_fixture();
@@ -684,7 +692,8 @@ mod tests {
         assert_eq!(view.version, stored.version);
         let opened = view.deserialize::<Calendar>().unwrap();
         assert_eq!(opened.preferences[0].name, "Work canary");
-        assert!(opened.preferences[0].color.is_none());
+        // Release 6 spec 6.7, D14: the owner's personal bundle carries its colour.
+        assert_eq!(opened.preferences[0].color.as_deref(), Some("#ff0000"));
         assert_eq!(opened.preferences[1], c.preferences[1]);
         let opened = calendar_view_in_domain(&stored, &grantee, 8)
             .unwrap()
@@ -807,6 +816,84 @@ mod tests {
             unchanged, stored,
             "no edited bundles means no new ciphertext"
         );
+    }
+
+    /// Release 6 spec 6.7, D14: each principal's colour of a shared calendar
+    /// is sealed in its own personal bundle and never sits in the clear.
+    #[test]
+    fn personal_bundle_carries_colour() {
+        let in_the_clear = |calendar: &Calendar, colour: &str| {
+            calendar
+                .preferences
+                .iter()
+                .any(|entry| entry.color.is_some() || entry.name.contains(colour))
+        };
+        let (stored, owner, grantee) = shared_fixture();
+        assert_eq!(
+            view(&stored, &owner, 4).preferences[0].color.as_deref(),
+            Some("#ff0000")
+        );
+        assert!(
+            !in_the_clear(&stored, "ff0000"),
+            "the owner's colour is only inside its sealed bundle"
+        );
+
+        let mut edited = view(&stored, &grantee, 8);
+        edited.preferences[1].color = Some("#00ff00".into());
+        let result = seal_calendar_changes(&stored, &edited, &grantee, 8);
+        assert!(result.is_ok(), "a grantee may set its own colour");
+        let result = result.unwrap();
+        assert_eq!(
+            view(&result, &grantee, 8).preferences[1].color.as_deref(),
+            Some("#00ff00")
+        );
+        assert!(
+            !in_the_clear(&result, "00ff00"),
+            "the grantee's colour is only inside its sealed bundle"
+        );
+        assert!(
+            result.preferences[0] == stored.preferences[0],
+            "a grantee's colour leaves the owner's entry untouched"
+        );
+        assert!(
+            result.preferences[1].name != stored.preferences[1].name,
+            "a colour change reseals the grantee's bundle"
+        );
+        assert_eq!(
+            view(&result, &owner, 4).preferences[0].color.as_deref(),
+            Some("#ff0000")
+        );
+
+        let mut edited = view(&result, &owner, 4);
+        edited.preferences[0].color = None;
+        let cleared = seal_calendar_changes(&result, &edited, &owner, 4).unwrap();
+        assert_eq!(view(&cleared, &owner, 4).preferences[0].color, None);
+        assert!(
+            cleared.preferences[1] == result.preferences[1],
+            "the owner's colour leaves the grantee's entry untouched"
+        );
+        assert_eq!(
+            view(&cleared, &grantee, 8).preferences[1].color.as_deref(),
+            Some("#00ff00")
+        );
+    }
+
+    /// Release 6 spec 6.7, D14: a personal bundle written before release 6
+    /// holds no colour (the fixture's grantee bundle is such a bundle) and
+    /// reads as no colour; a visible preference still reseals nothing.
+    #[test]
+    fn bundle_without_colour_reads_none() {
+        let (stored, _, grantee) = shared_fixture();
+        let mut edited = view(&stored, &grantee, 8);
+        assert_eq!(edited.preferences[1].color, None);
+        edited.preferences[1].sort_order = 9;
+        let changed = seal_calendar_changes(&stored, &edited, &grantee, 8).unwrap();
+        assert!(
+            changed.preferences[1].name == stored.preferences[1].name,
+            "a visible preference reseals nothing"
+        );
+        assert_eq!(changed.preferences[1].sort_order, 9);
+        assert_eq!(view(&changed, &grantee, 8).preferences[1].color, None);
     }
 
     #[test]
