@@ -230,17 +230,20 @@ pub async fn test(test: &mut TestServer) {
         "{response:?}"
     );
 
-    // JMAP: calendars are not advertised for the key account, and stay
-    // advertised for a non-key account (also as key1's secondary account).
+    // JMAP: calendars are advertised for the key account, for every token
+    // (spec 6.10, D13; a keyless token meets the refusal per method), and
+    // stay advertised for a non-key account (also as key1's secondary
+    // account).
     let session = key1.jmap_session_object().await.into_inner();
     let caps = &session["accounts"][key1.id_string()]["accountCapabilities"];
     for capability in [
         "urn:ietf:params:jmap:calendars",
         "urn:ietf:params:jmap:calendars:parse",
     ] {
-        assert!(caps.get(capability).is_none(), "{capability}: {caps}");
-        assert!(
-            session["primaryAccounts"].get(capability).is_none(),
+        assert!(caps.get(capability).is_some(), "{capability}: {caps}");
+        assert_eq!(
+            session["primaryAccounts"][capability],
+            key1.id_string(),
             "{capability}: {session}"
         );
     }
@@ -268,8 +271,9 @@ pub async fn test(test: &mut TestServer) {
         "{plain_session}"
     );
 
-    // Principal/get: a key account's principal advertises no calendars
-    // capability; a non-key account's does. 1.0 hides other principals
+    // Principal/get: a key account's principal advertises the calendars
+    // capability block with `mayGetAvailability` false (spec 6.10); a
+    // non-key account's is upstream's. 1.0 hides other principals
     // unless directory queries are allowed (`Sharing.allowDirectoryQueries`,
     // off by default; 0.16 listed them), so the query runs with them on.
     let set_directory_queries = async |allow: bool| {
@@ -305,8 +309,16 @@ pub async fn test(test: &mut TestServer) {
     };
     let calendars = "urn:ietf:params:jmap:calendars";
     let key_principal = principal(key1.id_string());
-    assert!(
-        key_principal["capabilities"].get(calendars).is_none(),
+    // Spec 6.10: the caller `plain` has no access to the account, so
+    // `accountId` is null; `mayGetAvailability` is false for a key principal.
+    assert_eq!(
+        key_principal["capabilities"][calendars],
+        json!({
+            "accountId": null,
+            "mayGetAvailability": false,
+            "mayShareWith": true,
+            "calendarAddress": "mailto:key1@example.com",
+        }),
         "{key_principal}"
     );
     // 1.0 fills `accounts` only for a principal the caller can access, so
@@ -329,14 +341,23 @@ pub async fn test(test: &mut TestServer) {
         .find(|principal| principal["id"] == key1.id_string())
         .unwrap_or_else(|| panic!("own principal: {:?}", own.0))
         .clone();
-    assert!(
-        key_principal["capabilities"].get(calendars).is_none(),
+    // Spec 6.10: the account's own principal shows its calendar capability
+    // block (`accountId` its own, `mayShareWith` false, `mayGetAvailability`
+    // false) and its account object offers the calendar capability.
+    assert_eq!(
+        key_principal["capabilities"][calendars],
+        json!({
+            "accountId": key1.id_string(),
+            "mayGetAvailability": false,
+            "mayShareWith": false,
+            "calendarAddress": "mailto:key1@example.com",
+        }),
         "{key_principal}"
     );
     assert!(
         key_principal["accounts"][key1.id_string()]["accountCapabilities"]
             .get(calendars)
-            .is_none(),
+            .is_some(),
         "{key_principal}"
     );
     assert!(

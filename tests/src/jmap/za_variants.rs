@@ -3662,9 +3662,9 @@ pub async fn calendars(test: &TestServer) {
 }
 
 /// `principal::get::test` in key mode: the session object and the principal
-/// objects of key accounts do not advertise JMAP calendars (release 1 spec
-/// 9); everything else, and the plain Sales group's principal, are
-/// upstream's.
+/// objects of key accounts are upstream's, less object metadata (upgrade
+/// ruling 66), with `mayGetAvailability` false for key principals (release 6
+/// spec 6.10); the plain Sales group's principal is upstream's.
 pub async fn principal_get(test: &TestServer) {
     println!("Running key-account Principal get/query tests...");
     let john = test.account("jdoe@example.com");
@@ -3681,8 +3681,9 @@ pub async fn principal_get(test: &TestServer) {
     // options and the node types, CalendarEvent and ContactCard blobs and the
     // principals:owner capability, and drops imapsieve from the Sieve
     // extensions.
-    // Validate session object capabilities: upstream's object, minus the
-    // account's calendar capabilities (release 1 spec 9).
+    // Validate session object capabilities: upstream's object, which a key
+    // account's session now includes with the calendar capabilities (release
+    // 6 spec 6.10, D13).
     let response = john.jmap_session_object().await.into_inner();
     let john_account = response["accounts"][john_id.to_string().as_str()].clone();
     let application_server_key =
@@ -3775,6 +3776,17 @@ pub async fn principal_get(test: &TestServer) {
             },
             "urn:ietf:params:jmap:contacts:parse": {},
             "urn:ietf:params:jmap:emailpush": {},
+            // Release 6 spec 6.10: the account's calendar capability is
+            // upstream's object, as `tests/src/jmap/principal/get.rs` has it.
+            "urn:ietf:params:jmap:calendars": {
+              "maxCalendarsPerEvent": 10,
+              "minDateTime": "0001-01-01T00:00:00Z",
+              "maxDateTime": "9999-12-31T23:59:59Z",
+              "maxExpandedQueryDuration": "P52W1D",
+              "maxParticipantsPerEvent": 20,
+              "mayCreateCalendar": true
+            },
+            "urn:ietf:params:jmap:calendars:parse": {},
             "urn:ietf:params:jmap:websocket": {},
             "urn:ietf:params:jmap:sieve": {
               "maxSizeScriptName": 512,
@@ -3924,6 +3936,10 @@ pub async fn principal_get(test: &TestServer) {
         "urn:ietf:params:jmap:vacationresponse": john_id,
         "urn:ietf:params:jmap:contacts": john_id,
         "urn:ietf:params:jmap:contacts:parse": john_id,
+        // Release 6 spec 6.10 (D13): the calendar capabilities are primary
+        // for a key account; `urn:ietf:params:jmap:metadata` stays absent.
+        "urn:ietf:params:jmap:calendars": john_id,
+        "urn:ietf:params:jmap:calendars:parse": john_id,
         "urn:ietf:params:jmap:emailpush": john_id,
         "urn:ietf:params:jmap:websocket": john_id,
         "urn:ietf:params:jmap:sieve": john_id,
@@ -3996,10 +4012,32 @@ pub async fn principal_get(test: &TestServer) {
     // account is the one the session object above describes, and the other
     // principals list none. The time zone is `timeZone`. 0.16 listed every
     // principal's account capabilities and named the field `timezone`.
-    for (item, (id, email, description)) in list.iter().zip([
-        (john_id, "jdoe@example.com", "John Doe"),
-        (jane_id, "jane.smith@example.com", "Jane Smith"),
-        (bill_id, "bill@example.com", "Bill Foobar"),
+    // Release 6 spec 6.10: a key principal shows its calendar capability
+    // block with `mayGetAvailability` false. `accountId` is the principal's
+    // own account for the caller (John), null for the others; `mayShareWith`
+    // is false for the caller's own principal.
+    for (item, (id, email, description, calendar_account, may_share_with)) in list.iter().zip([
+        (
+            john_id,
+            "jdoe@example.com",
+            "John Doe",
+            json!(john_id),
+            false,
+        ),
+        (
+            jane_id,
+            "jane.smith@example.com",
+            "Jane Smith",
+            Value::Null,
+            true,
+        ),
+        (
+            bill_id,
+            "bill@example.com",
+            "Bill Foobar",
+            Value::Null,
+            true,
+        ),
     ]) {
         let accounts = if id == john_id {
             json!({ id: john_account.clone() })
@@ -4016,6 +4054,12 @@ pub async fn principal_get(test: &TestServer) {
           "capabilities": {
             "urn:ietf:params:jmap:mail": {},
             "urn:ietf:params:jmap:contacts": {},
+            "urn:ietf:params:jmap:calendars": {
+              "accountId": calendar_account,
+              "mayGetAvailability": false,
+              "mayShareWith": may_share_with,
+              "calendarAddress": format!("mailto:{email}")
+            },
             "urn:ietf:params:jmap:filenode": {},
             "urn:ietf:params:jmap:principals": {}
           },

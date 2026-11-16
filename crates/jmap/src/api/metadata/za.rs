@@ -112,20 +112,17 @@ mod tests {
         for capability in Capability::all_capabilities() {
             // Ordinary account, ordinary caller: upstream's capabilities.
             assert!(!za_hidden_capability(false, false, *capability));
-            let calendars = matches!(
-                capability,
-                Capability::Calendars | Capability::CalendarsParse
-            );
             let metadata = *capability == Capability::Metadata;
-            // A key account: no calendars (spec 9), no metadata.
+            // A key account: no metadata. Spec 6.10: the calendar
+            // capabilities are offered, so nothing but metadata is hidden.
             assert_eq!(
                 za_hidden_capability(true, false, *capability),
-                calendars || metadata,
+                metadata,
                 "{capability:?}"
             );
             assert_eq!(
                 za_hidden_capability(true, true, *capability),
-                calendars || metadata,
+                metadata,
                 "{capability:?}"
             );
             // An ordinary account read by a key account: no metadata only.
