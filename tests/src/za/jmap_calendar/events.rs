@@ -1447,20 +1447,27 @@ async fn update_keeps_pairs_and_display_name(events: &Events<'_>) {
     }
 }
 
-/// Spec 5.4: the SEQUENCE floor follows upstream's increment on every
-/// update, so a client's lower SEQUENCE never lowers the stored one.
+/// Spec 5.4: the SEQUENCE floor applies on every update, also where
+/// upstream's increment does not. A grantee with write access organizes the
+/// event: the increment runs only for the owner's addresses
+/// (`calendar_event/set.rs:916-926`, `is_origin`), while the floor's are the
+/// writer's and the owner's (`sequence_floor.rs`, `roles.sender`). Without the
+/// floor the client's `sequence: 1` would be stored.
 async fn update_applies_sequence_floor(events: &Events<'_>) {
+    const SLUG: &str = "jmapcal-floor";
     const UID: &str = "jmapcal-events-floor";
-    const PATH: &str = "default/jmapcal-events-floor.ics";
+    const PATH: &str = "jmapcal-floor/jmapcal-events-floor.ics";
     const OUT: &str = "jmapcal-events-out@remote.test";
     let (test, pair) = (events.test, events.pair);
+    make_calendar(test, &pair.key, &pair.dav, SLUG).await;
+    share(test, &pair.key, &pair.key2, pair.key2_id, SLUG, "edit").await;
     assert_eq!(
         put(
-            pair.key.name(),
+            pair.key2.name(),
             STRONG,
             event_path(PATH),
             invite(UID, "20990301T100000Z", &[OUT])
-                .replace("key1@example.com", pair.key.name())
+                .replace("key1@example.com", pair.key2.name())
                 .replace("SEQUENCE:0", "SEQUENCE:5"),
         )
         .await,
@@ -1469,27 +1476,29 @@ async fn update_applies_sequence_floor(events: &Events<'_>) {
     wait_for_queue(test).await;
     sink().clear();
     let floor = stored_sequence(&pair.dav, &event_path(PATH)).await;
-    assert!(floor >= 5, "{floor}");
-    let document_id = resource_id(test, pair.key_id, PATH).await;
+    assert_eq!(floor, 5);
+    let id = Id::from(resource_id(test, pair.key_id, PATH).await).to_string();
 
-    let reply = update_event(
-        events,
-        document_id,
-        json!({ "sequence": 1, "description": "floor" }),
-    )
-    .await;
-    assert_updated(&reply, &Id::from(document_id).to_string());
-    let after = stored_sequence(&pair.dav, &event_path(PATH)).await;
-    println!("  update_applies_sequence_floor: stored {floor}, after the update {after}");
-    // Upstream's increment (`calendar_event/set.rs:916-926`) runs first and
-    // the floor after it; the stored SEQUENCE is never lowered to the
-    // client's value.
-    assert!(
-        after >= floor && after != 1,
-        "update_applies_sequence_floor: {after} below the floor {floor}"
+    let reply = pair
+        .key2
+        .jmap_update_account(
+            &pair.key,
+            "CalendarEvent",
+            [(id.clone(), json!({ "sequence": 1, "description": "floor" }))],
+            none(),
+        )
+        .await;
+    assert_updated(&reply, &id);
+    assert_eq!(
+        stored_sequence(&pair.dav, &event_path(PATH)).await,
+        floor,
+        "update_applies_sequence_floor: the stored SEQUENCE is not the floor"
     );
+    let body = drain::body(&pair.dav, &event_path(PATH)).await;
+    assert!(body.contains("DESCRIPTION:floor"), "{body}");
 
     delete_event(pair, PATH).await;
+    delete_event(pair, &format!("{SLUG}/")).await;
     wait_for_queue(test).await;
     sink().clear();
 }
@@ -1646,6 +1655,26 @@ async fn update_uid_change_refused(events: &Events<'_>) {
     const UID: &str = "jmapcal-events-uid-change";
     let reply = events.create(vec![events.event(UID)]).await;
     let document_id = Events::created_document(&reply, 0);
+
+    // Spec 6.5 (R26-8): `hideAttendees: true` on the event's own patch is
+    // refused before any write, as on a create.
+    let before = stored_event(events.test, events.pair.key_id, document_id).await;
+    let reply = update_event(events, document_id, json!({ "hideAttendees": true })).await;
+    assert_eq!(
+        set_error(reply.not_updated(&Id::from(document_id).to_string())),
+        (
+            "invalidProperties",
+            Some(UNAVAILABLE),
+            json!(["hideAttendees"])
+        ),
+        "{reply:?}"
+    );
+    let after = stored_event(events.test, events.pair.key_id, document_id).await;
+    assert!(
+        before.as_bytes() == after.as_bytes(),
+        "update_uid_change_refused: the refused hideAttendees update changed the event"
+    );
+
     let reply = update_event(
         events,
         document_id,
