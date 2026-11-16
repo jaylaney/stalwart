@@ -345,6 +345,48 @@ class BuildSnapshotTests(unittest.TestCase):
             self.assertEqual((self.consumer / path.relative_to(self.target)).read_bytes(),
                              path.read_bytes())
 
+    def encoder_without_reader(self):
+        # Leave enough space for tar output to stay in Python's buffer until stdin.close().
+        encoder = subprocess.Popen(
+            [sys.executable, "-c", "import os; os.close(0); print('ready', flush=True)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=1024 * 1024,
+        )
+        self.addCleanup(encoder.wait)
+        self.addCleanup(encoder.kill)
+        self.addCleanup(encoder.stdout.close)
+        self.addCleanup(encoder.stdin.close)
+        self.assertEqual(encoder.stdout.readline(), b"ready\n")
+        return encoder
+
+    def assert_failed_pack_cleaned_up(self, encoder, prior_paths):
+        self.assertEqual(set(self.root.iterdir()), prior_paths)
+        self.assertFalse(self.archive.exists())
+        self.assertTrue(encoder.stdin.closed)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(encoder.pid, os.WNOHANG)
+
+    def test_pack_preserves_primary_error_when_encoder_close_also_fails(self):
+        encoder = self.encoder_without_reader()
+        prior_paths = set(self.root.iterdir())
+
+        def fail_target(*_):
+            encoder.stdin.write(b"pending")
+            raise PermissionError("fixture target read failure")
+
+        with mock.patch("retention_artifacts.subprocess.Popen", return_value=encoder), \
+             mock.patch("retention_artifacts.add_target", side_effect=fail_target), \
+             self.assertRaisesRegex(PermissionError, "fixture target read failure"):
+            pack_build(self.manifest, self.target, self.archive, [])
+        self.assert_failed_pack_cleaned_up(encoder, prior_paths)
+
+    def test_pack_reports_broken_pipe_when_only_encoder_close_fails(self):
+        encoder = self.encoder_without_reader()
+        prior_paths = set(self.root.iterdir())
+        with mock.patch("retention_artifacts.subprocess.Popen", return_value=encoder), \
+             self.assertRaises(BrokenPipeError):
+            pack_build(self.manifest, self.target, self.archive, [])
+        self.assert_failed_pack_cleaned_up(encoder, prior_paths)
+
     def test_missing_build_script_state_cannot_be_packed(self):
         self.output.unlink()
         result = self.pack()

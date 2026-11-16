@@ -58,6 +58,7 @@ import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import capture_listings  # noqa: E402
 import ci_steps  # noqa: E402
 
 REPO = ci_steps.REPO
@@ -200,14 +201,7 @@ class Net:
         return env
 
     def run_identity(self):
-        commit = self.run(["git", "rev-parse", "HEAD"], check=True).stdout.strip()
-        if os.environ.get("GITHUB_SHA", commit) != commit:
-            raise ValueError("checked-out commit differs from GITHUB_SHA")
-        run_id = os.environ.get("GITHUB_RUN_ID", "local")
-        attempt = int(os.environ.get("GITHUB_RUN_ATTEMPT", "0"))
-        if not run_id or attempt < 0 or (run_id != "local" and attempt == 0):
-            raise ValueError("invalid GitHub workflow run identity")
-        return dict(commit=commit, run_id=run_id, producer_attempt=attempt)
+        return capture_listings.run_identity(self.deadline, allow_local=True)
 
     def build_identity(self):
         # Hash the instrumentation environment without adding arbitrary environment values
@@ -606,7 +600,7 @@ def main():
             return execute(args, args.out.resolve())
         with tempfile.TemporaryDirectory() as directory:
             return execute(args, Path(directory))
-    except (OSError, RuntimeError, ValueError) as error:
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         print(f"FAILED: {error}", file=sys.stderr, flush=True)
         return 1
 

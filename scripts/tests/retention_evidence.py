@@ -142,11 +142,19 @@ def diagnostic_names(producer, root):
         names.add(net.name)
     logs = root / "logs"
     if logs.is_dir() and not logs.is_symlink():
-        steps = "|".join(map(re.escape, ci_steps.COVERAGE_SHARDS[producer]))
+        owned = ci_steps.COVERAGE_SHARDS[producer]
+        steps = "|".join(map(re.escape, owned))
         pattern = re.compile(rf"(?:{steps})(?:\.attempt[12])?(?:\.(?:export|profdata-merge))?\.log")
+        listing = {"unit-tests.listing.log"} if "unit-tests" in owned else set()
         names.update(f"logs/{p.name}" for p in logs.iterdir()
-                     if p.is_file() and not p.is_symlink() and pattern.fullmatch(p.name))
+                     if p.is_file() and not p.is_symlink()
+                     and (p.name in listing or pattern.fullmatch(p.name)))
     return names
+
+
+def stage_shard_diagnostics(producer, source, out):
+    fresh(out)
+    transfer(source, out, diagnostic_names(producer, source), redact=True)
 
 
 def valid_status(value, labels):
@@ -518,6 +526,14 @@ def register_evidence_commands(commands):
     producer.set_defaults(handler=lambda args: stage(
         args.kind, args.producer, args.status, args.source, args.out,
         args.build_manifest, args.snapshot_artifact_id,
+    ))
+
+    diagnostics = commands.add_parser("stage-shard-diagnostics")
+    diagnostics.add_argument("--producer", choices=ci_steps.COVERAGE_SHARDS, required=True)
+    diagnostics.add_argument("--source", type=Path, required=True)
+    diagnostics.add_argument("--out", type=Path, required=True)
+    diagnostics.set_defaults(handler=lambda args: stage_shard_diagnostics(
+        args.producer, args.source, args.out,
     ))
 
     report = commands.add_parser("collect")

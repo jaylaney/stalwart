@@ -918,8 +918,26 @@ class WorkflowTests(unittest.TestCase):
                 self.assertReports(self.edited(old, new), f"job gates, step {step}", field)
 
     def test_reporter_requires_each_successful_transport(self):
-        old = "          steps.download-za-rocks.outcome == 'success' &&\n"
-        self.assertReports(self.edited(old, ""), "job gates, step collect", "if")
+        def condition(predicates):
+            return "          ${{ !cancelled() && " + " &&\n          ".join(predicates) + " }}\n"
+
+        downloads = (
+            "steps.download-short.outcome == 'success'",
+            "steps.download-za-rocks.outcome == 'success'",
+            "steps.download-za-filesystem.outcome == 'success'",
+            "steps.download-listings.outcome == 'success'",
+        )
+        for step, prerequisite in (
+            ("snapshot-download", ("steps.artifact-ids.outcome == 'success'",
+                                   "steps.artifact-ids.outputs.snapshot == 'true'")),
+            ("collect", ("steps.unpack.outcome == 'success'",)),
+        ):
+            predicates = prerequisite + downloads
+            for predicate in predicates:
+                with self.subTest(step=step, predicate=predicate):
+                    remaining = tuple(test for test in predicates if test != predicate)
+                    self.assertReports(self.edited(condition(predicates), condition(remaining)),
+                                       f"job gates, step {step}", "if")
 
     def test_native_download_limits_and_work_budget_checks_are_required(self):
         old = ("      - name: Download short evidence\n"
@@ -965,14 +983,28 @@ class WorkflowTests(unittest.TestCase):
                            "gates-listings", "Retain sanitized listing receipt", "if")
 
     def test_seven_day_shard_diagnostics_keep_receipt_and_sanitized_logs(self):
-        original = "            ${{ env.GATES }}/evidence/receipt.json\n"
-        for replacement in ("", "            ${{ env.GATES }}/evidence/profdata/\n"):
+        original = "          path: ${{ runner.temp }}/shard-diagnostics/\n"
+        for replacement in ("", "          path: ${{ env.GATES }}/evidence/profdata/\n",
+                            "          path: ${{ env.GATES }}/net/logs/\n"):
             with self.subTest(replacement=replacement):
                 self.assertReports(self.edited_shard(original, replacement),
                                    "Retain sanitized shard diagnostics", "with.path")
-        old = ("      - name: Retain sanitized shard diagnostics\n"
-               "        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}\n")
-        self.assertReports(self.edited_shard(old, old.replace("!cancelled()", "success()")),
+        days = original + "          if-no-files-found: ignore\n          retention-days: 7\n"
+        shortened = days.replace("retention-days: 7", "retention-days: 1")
+        self.assertReports(self.edited_shard(days, shortened),
+                           "Retain sanitized shard diagnostics", "retention-days")
+        stage = ("      - name: Stage sanitized shard diagnostics\n"
+                 "        id: shard-diagnostics\n"
+                 "        if: ${{ !cancelled() }}\n")
+        self.assertReports(self.edited_shard(stage, stage.replace("!cancelled()", "success()")),
+                           "step shard-diagnostics", "if")
+        receipt_guard = '          if [[ "$STAGE_OUTCOME" == success ]]; then\n'
+        self.assertReports(self.edited_shard(receipt_guard, "          if true; then\n"),
+                           "step shard-diagnostics", "run")
+        upload = ("      - name: Retain sanitized shard diagnostics\n"
+                  "        if: ${{ !cancelled() && "
+                  "steps.shard-diagnostics.outcome == 'success' }}\n")
+        self.assertReports(self.edited_shard(upload, upload.replace("!cancelled()", "success()")),
                            "Retain sanitized shard diagnostics", "if")
 
     def test_gate_pipelines_keep_failure_status(self):
@@ -1036,6 +1068,110 @@ class WorkflowTests(unittest.TestCase):
             if "--" not in argv:
                 argv = argv + ["--"]
             self.assertEqual(cmd, [a for a in argv if a not in ci_steps.LISTING_TARGETS], name)
+
+
+# ====================================================================== the retention drivers
+class CaptureDriverTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+
+    def install_version_tool(self, name, output, status=0):
+        path = self.root / name
+        path.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\n"
+                        f"printf '%s\\n' '{name} setup diagnostic' >&2\nexit {status}\n")
+        path.chmod(0o755)
+
+    def test_toolchain_identity_uses_only_stdout(self):
+        self.install_version_tool("cargo", "cargo 9.8.7")
+        self.install_version_tool("rustc", "rustc 9.8.7\nrelease: 9.8.7")
+        with mock.patch.dict(os.environ, {"PATH": str(self.root)}), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()) as diagnostics:
+            identity = capture_listings.build_identity(None)
+        self.assertIn("cargo setup diagnostic", diagnostics.getvalue())
+        self.assertIn("rustc setup diagnostic", diagnostics.getvalue())
+        self.assertEqual(identity["cargo"], "cargo 9.8.7")
+        self.assertEqual(identity["rustc"], "rustc 9.8.7\nrelease: 9.8.7")
+
+    def test_listing_capture_keeps_both_streams_on_failure(self):
+        command = [sys.executable, "-c", "import sys; print('case: test', flush=True); "
+                   "sys.stderr.write('compilation diagnostic\\n'); sys.exit(1)"]
+        path = self.root / "capture.txt"
+        spec = dict(label="fixture", environment="", sections=[("## SELECTED", command)], env={})
+        with contextlib.redirect_stdout(io.StringIO()):
+            statuses = capture_listings.capture(path, spec)
+        self.assertEqual(statuses, [1])
+        self.assertIn("case: test\ncompilation diagnostic\n## exit: 1", path.read_text())
+
+    def test_toolchain_identity_keeps_exit_status(self):
+        self.install_version_tool("cargo", "cargo 9.8.7", 3)
+        with mock.patch.dict(os.environ, {"PATH": str(self.root)}), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()) as diagnostics, \
+             self.assertRaisesRegex(ValueError, r"cargo identity unavailable \(3\)"):
+            capture_listings.build_identity(None)
+        self.assertIn("cargo setup diagnostic", diagnostics.getvalue())
+
+    def test_toolchain_identity_does_not_start_after_deadline(self):
+        self.install_version_tool("cargo", "cargo 9.8.7", 3)
+        with mock.patch.dict(os.environ, {"PATH": str(self.root)}), \
+             self.assertRaisesRegex(ValueError, r"cargo identity unavailable \(not-run\)"):
+            capture_listings.build_identity(time.monotonic() - 1)
+
+
+class RunIdentityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
+        ).strip()
+
+    def setUp(self):
+        self.net = object.__new__(coverage_net.Net)
+        self.net.deadline = None
+        self.environment = {"PATH": os.environ["PATH"]}
+
+    def test_net_and_listings_agree_on_hosted_identity(self):
+        for sha_env in ({}, {"GITHUB_SHA": self.commit}):
+            with self.subTest(sha_env=sha_env), mock.patch.dict(
+                os.environ, {**self.environment, **sha_env, "GITHUB_RUN_ID": "193",
+                             "GITHUB_RUN_ATTEMPT": "2"}, clear=True,
+            ):
+                expected = dict(commit=self.commit, run_id="193", producer_attempt=2)
+                self.assertEqual(self.net.run_identity(), expected)
+                self.assertEqual(capture_listings.run_identity(), expected)
+
+    def test_hosted_identity_rejects_invalid_run_id_or_attempt(self):
+        for run_id, attempt in (("local", "0"), ("001", "1"), ("+1", "1"), ("x", "1"),
+                                ("12", "01"), ("12", "+1"), ("12", "0"), ("12", "")):
+            with self.subTest(run_id=run_id, attempt=attempt), \
+                 mock.patch.dict(os.environ, {**self.environment, "GITHUB_RUN_ID": run_id,
+                                              "GITHUB_RUN_ATTEMPT": attempt}, clear=True):
+                with self.assertRaises(ValueError):
+                    self.net.run_identity()
+                with self.assertRaises(ValueError):
+                    capture_listings.run_identity()
+
+    def test_net_does_not_treat_partial_hosted_identity_as_local(self):
+        for env in ({"GITHUB_RUN_ATTEMPT": "1"}, {"GITHUB_ACTIONS": "true"}):
+            with self.subTest(env=env), \
+                 mock.patch.dict(os.environ, {**self.environment, **env}, clear=True), \
+                 self.assertRaises(ValueError):
+                self.net.run_identity()
+
+    def test_net_keeps_local_identity_with_a_future_deadline(self):
+        self.net.deadline = time.monotonic() + 60
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertEqual(self.net.run_identity(),
+                             dict(commit=self.commit, run_id="local", producer_attempt=0))
+
+    def test_net_rejects_a_deadline_passed_before_identity_check(self):
+        self.net.deadline = time.monotonic() - 1
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+             self.assertRaisesRegex(ValueError, "deadline"):
+            self.net.run_identity()
 
 
 # ====================================================================== the coverage driver

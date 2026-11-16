@@ -1058,7 +1058,13 @@ jobs:
           digest-mismatch: error
 
       - name: Download the selected build snapshot
-        if: ${{ !cancelled() && steps.artifact-ids.outputs.snapshot == 'true' }}
+        if: >-
+          ${{ !cancelled() && steps.artifact-ids.outcome == 'success' &&
+          steps.artifact-ids.outputs.snapshot == 'true' &&
+          steps.download-short.outcome == 'success' &&
+          steps.download-za-rocks.outcome == 'success' &&
+          steps.download-za-filesystem.outcome == 'success' &&
+          steps.download-listings.outcome == 'success' }}
         uses: actions/download-artifact@v8
         with:
           artifact-ids: ${{ needs.gates-build.outputs.snapshot-artifact-id }}
@@ -1155,6 +1161,9 @@ jobs:
           if [[ -s "$GATES/reports/net/merged.json" ]]; then
             printf 'available=true\n' >> "$GITHUB_OUTPUT"
           fi
+          jq -r '.missing_exports | select(length > 0) |
+            "Missing per-step coverage exports: \(join(", "))"' \
+            "$GATES/reports/collection.json" | tee -a "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
       - name: Executed functions

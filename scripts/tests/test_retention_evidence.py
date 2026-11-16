@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture_listings
 import ci_steps
 import retention_evidence as evidence
+import retention_workflow
 
 LIBTEST_EMPTY = (
     "     Running unittests src/lib.rs (target/debug/deps/sample-1234)\n"
@@ -194,6 +195,41 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(result["missing_captures"], [capture])
         self.assertFalse((self.output / "net" / "profdata" / "za-tests.profdata").exists())
 
+    def test_failed_export_keeps_its_indexed_profile_for_diagnosis(self):
+        def fail(steps):
+            steps["unit-tests"].update(status="failure", export="failure")
+
+        self.all({"short": ("failure", fail)})
+        self.assertEqual(self.collect(), 1)
+        result = read_json(self.output / "collection.json")
+        self.assertEqual(result["missing_exports"], ["unit-tests"])
+        self.assertEqual(result["missing_profiles"], [])
+        self.assertEqual((self.output / "net" / "profdata" / "unit-tests.profdata").read_bytes(),
+                         PROFILE)
+        self.assertFalse((self.output / "net" / "steps" / "unit-tests.json").exists())
+
+    def test_unit_listing_failure_with_no_attempts_keeps_only_the_owned_log(self):
+        relative = "logs/unit-tests.listing.log"
+
+        def fail(steps):
+            steps["unit-tests"].update(status="failure", attempts=[], profile=False,
+                                       export="not-attempted")
+
+        for shard in ("short", "za-rocks"):
+            write(self.root / "source" / shard / relative, b"Bearer bad-listing\n")
+            write(self.root / "source" / shard / "logs/unit-tests.attempt1.listing.log",
+                  b"Unexpected log\n")
+        self.all({"short": ("failure", fail)})
+        owned = self.inputs / "short"
+        self.assertTrue((owned / relative).is_file())
+        self.assertEqual((owned / relative).read_text(), "Bearer [REDACTED]\n")
+        self.assertIn(relative, read_json(owned / "receipt.json")["files"])
+        for directory in (owned, self.inputs / "za-rocks"):
+            self.assertFalse((directory / "logs/unit-tests.attempt1.listing.log").exists())
+        self.assertFalse((self.inputs / "za-rocks" / relative).exists())
+        self.assertFalse((owned / "logs/unit-tests.attempt1.log").exists())
+        self.assertEqual(self.collect(), 1)
+
     def test_smtp_failing_names_retry_passes_with_combined_evidence(self):
         def retry(steps):
             steps["smtp"]["attempts"] = [attempt(101, names=["smtp::flaky"]), attempt(0, 2)]
@@ -353,6 +389,59 @@ class ReceiptTests(unittest.TestCase):
         write(stale, b"old")
         self.assertIntegrityError()
         self.assertEqual(stale.read_bytes(), b"old")
+
+
+class ShardDiagnosticTests(unittest.TestCase):
+    def test_stage_safe_diagnostics_without_usable_receipt_inputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "net"
+            out = Path(temp) / "diagnostics"
+            write(source / "steps.tsv", b"password=bad-password\n")
+            write(source / "logs/za-tests.attempt1.log", b"Bearer bad-za\n")
+            write(source / "logs/unit-tests.listing.log", b"token=bad-token\n")
+            write(source / "logs/unit-tests.extra.log", b"unowned-filename\n")
+            write(source / "profdata/unit-tests.profdata", PROFILE)
+            write(source / "shard.json", b"unsettled")
+            (source / "logs/za-tests.export.log").symlink_to(source / "shard.json")
+            driver = Path(__file__).with_name("retention_artifacts.py")
+            command = [sys.executable, "-I", str(driver), "stage-shard-diagnostics", "--source",
+                       str(source), "--out", str(out)]
+            for shard, expected in {
+                "short": {"logs/unit-tests.listing.log": "token=[REDACTED]\n"},
+                "za-rocks": {"logs/za-tests.attempt1.log": "Bearer [REDACTED]\n"},
+            }.items():
+                with self.subTest(shard=shard):
+                    result = subprocess.run(command + ["--producer", shard], capture_output=True,
+                                            text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    staged = {str(file.relative_to(out)): file.read_text()
+                              for file in out.rglob("*") if file.is_file()}
+                    self.assertEqual(staged, {"steps.tsv": "password=[REDACTED]\n", **expected})
+                    shutil.rmtree(out)
+
+
+class RetentionTriggerTests(unittest.TestCase):
+    def setUp(self):
+        self.workflow = ci_steps.load_yaml(ci_steps.WORKFLOW.read_text())
+        callee = ci_steps.WORKFLOW.with_name(retention_workflow.SHARD_WORKFLOW_NAME)
+        self.callee = ci_steps.load_yaml(callee.read_text())
+
+    def check(self, triggers):
+        return retention_workflow.check({**self.workflow, "on": triggers}, self.callee,
+                                        ci_steps.BASE_ENV, ci_steps.COVERAGE_SHARDS)
+
+    def test_an_extra_event_cannot_run_the_ordinary_jobs(self):
+        problems = self.check({**self.workflow["on"], "repository_dispatch": None})
+        self.assertIn("test.yml: on.repository_dispatch: unexpected", problems)
+
+    def test_ordinary_trigger_filter_edits_preserve_retention_contract(self):
+        for event in ("push", "pull_request"):
+            with self.subTest(event=event):
+                triggers = dict(self.workflow["on"])
+                triggers[event] = {"branches": ["main", "feature"], "paths": ["crates/**"]}
+                self.assertEqual(self.check(triggers), [])
+                del triggers[event]
+                self.assertIn(f"test.yml: on.{event}: missing", self.check(triggers))
 
 
 class ListingBodyTests(unittest.TestCase):

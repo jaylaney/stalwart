@@ -67,7 +67,7 @@ def now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def run(cmd, extra, deadline=None):
+def run(cmd, extra, deadline=None, *, stdout_only=False):
     remaining = None if deadline is None else deadline - time.monotonic()
     if remaining is not None and remaining <= 0:
         return "not-run", ""
@@ -80,18 +80,21 @@ def run(cmd, extra, deadline=None):
     env.update(extra)
     print(f"{now()} start: {' '.join(cmd)[:200]}", flush=True)
     child = subprocess.Popen(cmd, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             start_new_session=True)
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE if stdout_only else subprocess.STDOUT,
+                             text=True, start_new_session=True)
     try:
-        output, _ = child.communicate(timeout=timeout)
+        output, diagnostics = child.communicate(timeout=timeout)
         status = child.returncode
     except subprocess.TimeoutExpired:
         try:
             os.killpg(child.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        output, _ = child.communicate()
+        output, diagnostics = child.communicate()
         status = "deadline" if budget_limited else "timeout"
+    if diagnostics:
+        print(diagnostics, end="", file=sys.stderr, flush=True)
     print(f"{now()} exit {status}", flush=True)
     return status, output
 
@@ -136,7 +139,8 @@ def capture(path, spec, deadline=None):
     return statuses
 
 
-def run_identity(deadline=None):
+def run_identity(deadline=None, *, allow_local=False):
+    """Read the checked-out commit and validate the workflow run, if any."""
     remaining = 15 if deadline is None else min(15, deadline - time.monotonic())
     if remaining <= 0:
         raise ValueError("deadline before reading the checked-out commit")
@@ -145,9 +149,12 @@ def run_identity(deadline=None):
     if (not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit)
             or commit != os.environ.get("GITHUB_SHA", commit)):
         raise ValueError("checkout does not match GITHUB_SHA")
-    run_id = os.environ.get("GITHUB_RUN_ID", "")
-    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
-    if not all(re.fullmatch(r"[1-9][0-9]*", value) for value in (run_id, attempt)):
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT")
+    if (allow_local and run_id is None and attempt is None
+            and os.environ.get("GITHUB_ACTIONS") != "true"):
+        return dict(commit=commit, run_id="local", producer_attempt=0)
+    if not all(re.fullmatch(r"[1-9][0-9]*", value or "") for value in (run_id, attempt)):
         raise ValueError("invalid GitHub workflow run identity")
     return dict(commit=commit, run_id=run_id, producer_attempt=int(attempt))
 
@@ -155,7 +162,7 @@ def run_identity(deadline=None):
 def build_identity(deadline):
     identity = {}
     for tool, flag in (("cargo", "-V"), ("rustc", "-vV")):
-        status, output = run([tool, flag], {}, deadline)
+        status, output = run([tool, flag], {}, deadline, stdout_only=True)
         if status != 0:
             raise ValueError(f"{tool} identity unavailable ({status})")
         identity[tool] = output.strip()

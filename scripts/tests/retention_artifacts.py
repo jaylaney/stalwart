@@ -7,6 +7,7 @@
 import argparse
 import base64
 import binascii
+from contextlib import suppress
 from decimal import Decimal
 import hashlib
 import json
@@ -414,9 +415,11 @@ def pack_build(manifest, target, destination, credentials):
                             add_target(archive, path, relative)
                 except BaseException:
                     encoder.kill()
+                    # A broken pipe while flushing after kill must not hide the pack error.
+                    with suppress(BrokenPipeError):
+                        encoder.stdin.close()
                     raise
-                finally:
-                    encoder.stdin.close()
+                encoder.stdin.close()
                 if encoder.wait() != 0:
                     raise ValueError("snapshot compression failed")
         os.replace(pending, destination)

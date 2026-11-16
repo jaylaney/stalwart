@@ -79,8 +79,8 @@ The [first same-commit comparison](https://github.com/jaylaney/stalwart/actions/
 used `4d5fee1930338b494b0c148aa0252bcf4ab36eb1`. Cold listing capture finished in 35m 15s.
 All 17 short-shard test commands passed. The shard stayed red because the workspace unit
 test `dav_proto::requests::tests::parse_requests` rewrote tracked JSON fixtures and the
-next WebDAV command rebuilt coverage objects. The test now writes to a private
-temporary directory and still exercises parsing, serialization and file writes.
+next WebDAV command rebuilt coverage objects. For the corrected qualification runs, the test wrote to a
+private temporary directory and exercised parsing, serialization and file writes.
 [Short-shard result](https://github.com/jaylaney/stalwart/actions/runs/43752266663/job/132933900954)
 Replaying that snapshot on another hosted runner found 47 fixture timestamp changes and
 26 content changes. Cargo named `crates/dav-proto/resources/requests/acl-001.json` as the

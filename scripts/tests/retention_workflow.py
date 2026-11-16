@@ -28,10 +28,8 @@ REPORTS = "$GATES/reports"
 REPORT_INPUTS_OK = "(steps.collect.outputs.code == '0' || steps.collect.outputs.code == '1')"
 READ_ONLY = {"contents": "read"}
 READ_ACTIONS = {**READ_ONLY, "actions": "read"}
-TRIGGERS = {
+RETENTION_TRIGGERS = {
     "workflow_dispatch": None,
-    "push": {"branches": "[main]", "paths-ignore": ["docs/**", "**.md"]},
-    "pull_request": {"branches": "[main]", "paths-ignore": ["docs/**", "**.md"]},
     "schedule": [{"cron": "0 7 * * 1"}],
 }
 
@@ -289,11 +287,18 @@ def shard_callee(base_env):
                 upload("Upload coverage evidence", "retention-${{ inputs.shard-id }}-${{ github.run_attempt }}",
                        f"{ARTIFACT_PATH}/evidence/", "1", "5", step_id="receipt",
                        condition=f"{AFTER_FAILURE} && steps.stage.outcome == 'success'"),
+                shell("Stage sanitized shard diagnostics", "shard-diagnostics", f"""
+                    {ARTIFACTS} stage-shard-diagnostics --producer "$SHARD_ID" \\
+                      --source "$GATES/net" --out "$RUNNER_TEMP/shard-diagnostics"
+                    if [[ "$STAGE_OUTCOME" == success ]]; then
+                      cp -- "$GATES/evidence/receipt.json" "$RUNNER_TEMP/shard-diagnostics/receipt.json"
+                    fi
+                """, condition=AFTER_FAILURE, timeout="1",
+                      env={"SHARD_ID": shard_id, "STAGE_OUTCOME": expression("steps.stage.outcome")}),
                 upload("Retain sanitized shard diagnostics",
                        "retention-${{ inputs.shard-id }}-diagnostics-${{ github.run_attempt }}",
-                       f"{ARTIFACT_PATH}/evidence/receipt.json\n"
-                       f"{ARTIFACT_PATH}/evidence/logs/\n{ARTIFACT_PATH}/evidence/steps.tsv",
-                       "7", "2", condition=f"{AFTER_FAILURE} && steps.stage.outcome == 'success'"),
+                       "${{ runner.temp }}/shard-diagnostics/", "7", "2",
+                       condition=f"{AFTER_FAILURE} && steps.shard-diagnostics.outcome == 'success'"),
             ],
         }},
     }
@@ -352,7 +357,8 @@ def reporter_job(base_env):
                        step_id=f"download-{slot}", timeout="5")
               for slot in slots),
             download("Download the selected build snapshot", SNAPSHOT_ID, "snapshot",
-                     condition=f"{AFTER_FAILURE} && steps.artifact-ids.outputs.snapshot == 'true'",
+                     condition=(f"{AFTER_FAILURE} && steps.artifact-ids.outcome == 'success' &&"
+                                f" steps.artifact-ids.outputs.snapshot == 'true' && {download_checks}"),
                      step_id="snapshot-download", timeout="20"),
             unpack_step(f"{AFTER_FAILURE} && steps.snapshot-download.outcome == 'success' &&"
                         " steps.normalize.outcome == 'success'"),
@@ -380,6 +386,9 @@ def reporter_job(base_env):
                 if [[ -s "{REPORTS}/net/merged.json" ]]; then
                   printf 'available=true\\n' >> "$GITHUB_OUTPUT"
                 fi
+                jq -r '.missing_exports | select(length > 0) |
+                  "Missing per-step coverage exports: \\(join(", "))"' \\
+                  "{REPORTS}/collection.json" | tee -a "$GITHUB_STEP_SUMMARY"
                 exit "$status"
             """, condition=f"{AFTER_FAILURE} && {REPORT_INPUTS_OK} && steps.fetch.outcome == 'success'"),
             shell("Executed functions", "functions", f"""
@@ -460,7 +469,19 @@ def compare(actual, expected, where):
 
 
 def check(workflow, callee, base_env, shard_names):
-    problems = list(compare(workflow.get("on"), TRIGGERS, "test.yml: on"))
+    triggers = workflow.get("on")
+    if isinstance(triggers, dict):
+        ordinary_events = ("push", "pull_request")
+        other_triggers = {event: config for event, config in triggers.items()
+                          if event not in ordinary_events}
+        problems = list(compare(other_triggers, RETENTION_TRIGGERS, "test.yml: on"))
+        for event in ordinary_events:
+            if event not in triggers:
+                problems.append(f"test.yml: on.{event}: missing")
+            elif triggers[event] is not None and not isinstance(triggers[event], dict):
+                problems.append(f"test.yml: on.{event}: expected an event mapping")
+    else:
+        problems = ["test.yml: on: expected a workflow trigger mapping"]
     expected = producer_jobs(base_env)
     if set(shard_names) != set(SHARD_TIMEOUTS):
         problems.append("test.yml: coverage shard partition and workflow callers disagree")

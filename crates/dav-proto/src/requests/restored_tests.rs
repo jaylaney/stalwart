@@ -7,7 +7,7 @@
 use calcard::vcard::VCardVersion;
 
 use crate::{
-    parser::{DavParser, tokenizer::Tokenizer},
+    parser::{DavParser, Error, tokenizer::Tokenizer},
     schema::{
         property::{CardDavProperty, DavProperty},
         request::{Acl, LockInfo, MkCol, PropFind, PropertyUpdate, Report},
@@ -44,7 +44,6 @@ fn parse_address_data_version() {
 
 #[test]
 fn parse_requests() {
-    let output_dir = tempfile::tempdir().unwrap();
     for entry in std::fs::read_dir("resources/requests").unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
@@ -55,34 +54,36 @@ fn parse_requests() {
             let xml = std::fs::read_to_string(&path).unwrap();
             let mut tokenizer = Tokenizer::new(xml.as_bytes());
 
-            let json_path = output_dir.path().join(filename).with_extension("json");
-            let json_output = match filename.split_once('-').unwrap().0 {
-                "propfind" => match PropFind::parse(&mut tokenizer) {
-                    Ok(propfind) => serde_json::to_string_pretty(&propfind).unwrap(),
-                    Err(_) => String::new(),
-                },
+            // This fixture binds a prefix to an empty namespace.
+            if filename == "propfind-009.xml" {
+                let Err(Error::Xml(error)) = PropFind::parse(&mut tokenizer) else {
+                    panic!("Expected an XML namespace error in {filename}");
+                };
+                assert!(
+                    matches!(*error, quick_xml::Error::Namespace(_)),
+                    "Expected an XML namespace error in {filename}, got {error}"
+                );
+                continue;
+            }
+
+            match filename.split_once('-').unwrap().0 {
+                "propfind" => {
+                    serde_json::to_string_pretty(&PropFind::parse(&mut tokenizer).unwrap())
+                }
                 "propertyupdate" => {
                     serde_json::to_string_pretty(&PropertyUpdate::parse(&mut tokenizer).unwrap())
-                        .unwrap()
                 }
-                "mkcol" => {
-                    serde_json::to_string_pretty(&MkCol::parse(&mut tokenizer).unwrap()).unwrap()
-                }
+                "mkcol" => serde_json::to_string_pretty(&MkCol::parse(&mut tokenizer).unwrap()),
                 "lockinfo" => {
-                    serde_json::to_string_pretty(&LockInfo::parse(&mut tokenizer).unwrap()).unwrap()
+                    serde_json::to_string_pretty(&LockInfo::parse(&mut tokenizer).unwrap())
                 }
-                "report" => {
-                    serde_json::to_string_pretty(&Report::parse(&mut tokenizer).unwrap()).unwrap()
-                }
-                "acl" => {
-                    serde_json::to_string_pretty(&Acl::parse(&mut tokenizer).unwrap()).unwrap()
-                }
+                "report" => serde_json::to_string_pretty(&Report::parse(&mut tokenizer).unwrap()),
+                "acl" => serde_json::to_string_pretty(&Acl::parse(&mut tokenizer).unwrap()),
                 _ => {
                     panic!("Unknown method: {}", filename);
                 }
-            };
-
-            std::fs::write(json_path, json_output).unwrap();
+            }
+            .unwrap_or_else(|error| panic!("Could not serialize {filename}: {error}"));
         }
     }
 }
