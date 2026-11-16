@@ -34,11 +34,15 @@ import copy
 import io
 import json
 import os
+from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 import warnings
 
 sys.dont_write_bytecode = True
@@ -704,17 +708,18 @@ class WorkflowTests(unittest.TestCase):
     def setUpClass(cls):
         with open(ci_steps.WORKFLOW, encoding="utf-8") as f:
             cls.text = f.read()
+        cls.shard = ci_steps.WORKFLOW.with_name("test-retention-shard.yml").read_text()
 
     def edited(self, old, new):
         self.assertEqual(self.text.count(old), 1, f"anchor not unique in test.yml: {old!r}")
-        return ci_steps.check_workflow(self.text.replace(old, new))
+        return ci_steps.check_workflow(self.text.replace(old, new), self.shard)
 
     def assertReports(self, problems, *parts):
         self.assertTrue(any(all(part in problem for part in parts) for problem in problems),
                         f"no problem names {parts}: {problems}")
 
     def test_the_committed_workflow_matches_the_table(self):
-        self.assertEqual(ci_steps.check_workflow(self.text), [])
+        self.assertEqual(ci_steps.check_workflow(self.text, self.shard), [])
 
     def test_a_narrowed_filter_fails(self):
         problems = self.edited(
@@ -768,7 +773,7 @@ class WorkflowTests(unittest.TestCase):
     def test_zero_access_backtraces_are_required_at_job_and_step_scope(self):
         # Removing the job setting must be rejected even when no step overrides it.
         without_backtrace = self.text.replace('      RUST_BACKTRACE: "1"\n', "")
-        problems = ci_steps.check_workflow(without_backtrace)
+        problems = ci_steps.check_workflow(without_backtrace, self.shard)
         self.assertReports(problems, "job zero-access", "RUST_BACKTRACE")
         self.assertReports(problems, "'Zero-access Tests'", "RUST_BACKTRACE")
         for value in ("0", "full"):
@@ -827,20 +832,257 @@ class WorkflowTests(unittest.TestCase):
             "      - name: CalDAV Tests (plain accounts)\n")
         self.assertReports(problems, "'Extra'", "not in ci_steps.STEPS")
 
-    def test_the_gates_job_runs_the_whole_net_and_every_capture(self):
-        problems = self.edited('coverage_net.py --out "$GATES/net"',
-                               'coverage_net.py --out "$GATES/net" za-tests')
-        self.assertReports(problems, "job gates", "Coverage net")
+    def edited_shard(self, old, new):
+        self.assertEqual(self.shard.count(old), 1, f"anchor not unique in shard workflow: {old!r}")
+        return ci_steps.check_workflow(self.text, self.shard.replace(old, new))
+
+    def test_a_missing_called_workflow_fails_the_api_and_runner_guard(self):
+        problems = ci_steps.check_workflow(self.text)
+        self.assertReports(problems, "test-retention-shard.yml", "missing")
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = Path(directory) / "test.yml"
+            workflow.write_text(self.text)
+            with contextlib.redirect_stderr(io.StringIO()) as report:
+                self.assertTrue(ci_steps.refuse_diverged_workflow(workflow))
+            self.assertIn("test-retention-shard.yml", report.getvalue())
+            code, output = run(str(ci_steps.REPO / "scripts/tests/ci_steps.py"),
+                               "--workflow", workflow)
+            self.assertEqual(code, 1)
+            self.assertIn("test-retention-shard.yml", output)
+
+    def test_a_wrong_shard_selection_or_snapshot_input_fails(self):
+        problems = self.edited("      shard-id: za-filesystem\n", "      shard-id: za-rocks\n")
+        self.assertReports(problems, "gates-za-filesystem", "with.shard-id")
+        problems = self.edited("      shard-id: za-filesystem\n"
+                               "      snapshot-artifact-id: ${{ needs.gates-build.outputs.snapshot-artifact-id }}\n",
+                               "      shard-id: za-filesystem\n"
+                               "      snapshot-artifact-id: 12\n")
+        self.assertReports(problems, "gates-za-filesystem", "with.snapshot-artifact-id")
+
+    def test_called_shard_env_timeout_and_output_must_match(self):
+        for field, original, changed in (
+            ("env.STORE", "      STORE: RocksDb\n", ""),
+            ("env.RUST_MIN_STACK", '      RUST_MIN_STACK: "16777216"\n', ""),
+            ("env.RUSTUP_TOOLCHAIN", '      RUSTUP_TOOLCHAIN: "${{ inputs.rust-toolchain }}"\n',
+             '      RUSTUP_TOOLCHAIN: "stable"\n'),
+            ("timeout-minutes", "    timeout-minutes: ${{ inputs.timeout-minutes }}\n",
+             "    timeout-minutes: 20\n"),
+            ("outputs.receipt-artifact-id.value",
+             "        value: ${{ jobs.shard.outputs.receipt-artifact-id }}\n",
+             "        value: ${{ jobs.shard.outputs.other }}\n"),
+        ):
+            with self.subTest(field=field):
+                self.assertReports(self.edited_shard(original, changed), "shard", field)
+
+    def test_retention_trigger_and_style_requirements_are_not_optional(self):
+        checks = (
+            ("      - style\n      - gates-build\n", "      - gates-build\n", "needs"),
+            (" && needs.style.result == 'success'", "", "if"),
+            (" && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')",
+             "", "if"),
+        )
+        for old, new, field in checks:
+            with self.subTest(field=field, old=old):
+                self.assertReports(self.edited(old, new), "job gates", field)
+        self.assertReports(self.edited('  schedule:\n    - cron: "0 7 * * 1"\n', ""),
+                           "test.yml", "on.schedule")
+
+    def test_all_listing_commands_are_required(self):
         problems = self.edited('capture_listings.py --out "$GATES/listings"',
                                'capture_listings.py --out "$GATES/listings" '
                                "test.yml__test__imap-tests")
-        self.assertReports(problems, "job gates", "Capture CI step listings")
+        self.assertReports(problems, "gates-listings", "step capture", "run")
+
+    def test_report_downloads_complete_by_exact_artifact_ids(self):
+        download = "          artifact-ids: ${{ needs.gates-za-filesystem.outputs.receipt-artifact-id }}\n"
+        for replacement in ("", "          name: retention-za-filesystem\n",
+                            "          artifact-ids: ${{ needs.gates-za-rocks.outputs.receipt-artifact-id }}\n"):
+            with self.subTest(replacement=replacement):
+                self.assertReports(self.edited(download, replacement), "job gates", "with.artifact-ids")
+        problems = self.edited('          check_id za-rocks "$ZA_ROCKS_ID"\n', "")
+        self.assertReports(problems, "artifact-ids", "run")
+
+    def test_collector_and_qualification_cannot_be_disabled_or_bypassed(self):
+        for old, new, step, field in (
+            ("          ${{ !cancelled() && steps.unpack.outcome == 'success' &&\n",
+             "          ${{ false && steps.unpack.outcome == 'success' &&\n",
+             "collect", "if"),
+            ("            --build-manifest \"$GATES/build.json\" --out \"$GATES/reports\" || status=$?\n",
+             "            --build-manifest \"$GATES/build.json\" --out \"$GATES/reports\" || true\n",
+             "collect", "run"),
+            ('            if [[ "${!key}" != success ]]; then\n',
+             '            if [[ "${!key}" != success && "${!key}" != skipped ]]; then\n',
+             "qualify", "run"),
+        ):
+            with self.subTest(step=step, field=field):
+                self.assertReports(self.edited(old, new), f"job gates, step {step}", field)
+
+    def test_reporter_requires_each_successful_transport(self):
+        def condition(predicates):
+            return "          ${{ !cancelled() && " + " &&\n          ".join(predicates) + " }}\n"
+
+        downloads = (
+            "steps.download-short.outcome == 'success'",
+            "steps.download-za-rocks.outcome == 'success'",
+            "steps.download-za-filesystem.outcome == 'success'",
+            "steps.download-listings.outcome == 'success'",
+        )
+        for step, prerequisite in (
+            ("snapshot-download", ("steps.artifact-ids.outcome == 'success'",
+                                   "steps.artifact-ids.outputs.snapshot == 'true'")),
+            ("collect", ("steps.unpack.outcome == 'success'",)),
+        ):
+            predicates = prerequisite + downloads
+            for predicate in predicates:
+                with self.subTest(step=step, predicate=predicate):
+                    remaining = tuple(test for test in predicates if test != predicate)
+                    self.assertReports(self.edited(condition(predicates), condition(remaining)),
+                                       f"job gates, step {step}", "if")
+
+    def test_native_download_limits_and_work_budget_checks_are_required(self):
+        old = ("      - name: Download short evidence\n"
+               "        id: download-short\n"
+               "        timeout-minutes: 5\n")
+        self.assertReports(self.edited(old, old.replace("        timeout-minutes: 5\n", "")),
+                           "job gates, step download-short", "timeout-minutes")
+        old = "          if (( remaining < 41 * 60 )); then\n"
+        self.assertReports(self.edited(old, "          if (( remaining < 1 )); then\n"),
+                           "job gates, step artifact-ids", "run")
+        old = "          if (( remaining < 21 * 60 )); then\n"
+        self.assertReports(self.edited_shard(old, "          if (( remaining < 1 )); then\n"),
+                           "job shard, step artifact-id", "run")
+
+    def test_reporter_does_not_remove_work_budget_from_gate_commands(self):
+        old = ("          bash scripts/tests/retention_ci_setup.sh within-budget \\\n"
+               "            python3 -I scripts/tests/check_coverage.py")
+        new = "          python3 -I scripts/tests/check_coverage.py"
+        self.assertReports(self.edited(old, new), "job gates, step coverage", "run")
+
+    def test_shard_artifact_is_uploaded_even_if_coverage_failed(self):
+        old = ("      - name: Upload coverage evidence\n"
+               "        id: receipt\n"
+               "        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}\n")
+        new = old.replace("!cancelled()", "success()")
+        self.assertReports(self.edited_shard(old, new), "job shard, step receipt", "if")
+        problems = self.edited_shard("          SHARD_OUTCOME: ${{ steps.coverage.outcome }}\n",
+                                     "          SHARD_OUTCOME: success\n")
+        self.assertReports(problems, "job shard, step stage", "env.SHARD_OUTCOME")
+
+    def test_seven_day_listing_diagnostics_allowlist_the_receipt(self):
+        original = "          path: ${{ env.GATES }}/evidence/receipt.json\n"
+        for replacement in ("", "          path: ${{ env.GATES }}/evidence/\n"):
+            with self.subTest(replacement=replacement):
+                self.assertReports(self.edited(original, replacement), "gates-listings",
+                                   "Retain sanitized listing receipt", "with.path")
+        days = original + "          if-no-files-found: ignore\n          retention-days: 7\n"
+        self.assertReports(self.edited(days, days.replace("retention-days: 7", "retention-days: 1")),
+                           "gates-listings", "Retain sanitized listing receipt", "retention-days")
+        old = ("      - name: Retain sanitized listing receipt\n"
+               "        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}\n")
+        self.assertReports(self.edited(old, old.replace("!cancelled()", "success()")),
+                           "gates-listings", "Retain sanitized listing receipt", "if")
+
+    def test_seven_day_shard_receipt_upload_uses_staged_allowlist(self):
+        steps = {step["name"]: step
+                 for step in ci_steps.load_yaml(self.shard)["jobs"]["shard"]["steps"]}
+        name = "Retain sanitized shard receipt"
+        self.assertIn(name, list(steps))
+        self.assertEqual(steps[name]["if"], "${{ !cancelled() && steps.stage.outcome == 'success' }}")
+        self.assertEqual(steps[name]["timeout-minutes"], "2")
+        self.assertEqual(steps[name]["with"]["retention-days"], "7")
+        self.assertEqual(steps[name]["with"]["path"].splitlines(), [
+            "${{ env.GATES }}/evidence/receipt.json",
+            "${{ env.GATES }}/evidence/logs/",
+            "${{ env.GATES }}/evidence/steps.tsv",
+        ])
+        path = ("          path: |-\n"
+                "            ${{ env.GATES }}/evidence/receipt.json\n"
+                "            ${{ env.GATES }}/evidence/logs/\n"
+                "            ${{ env.GATES }}/evidence/steps.tsv\n")
+        self.assertReports(self.edited_shard(path, "          path: ${{ env.GATES }}/evidence/\n"),
+                           name, "with.path")
+
+    def test_seven_day_shard_fallback_retains_only_sanitized_diagnostics(self):
+        original = "          path: ${{ runner.temp }}/shard-diagnostics/\n"
+        for replacement in ("", "          path: ${{ env.GATES }}/evidence/profdata/\n",
+                            "          path: ${{ env.GATES }}/net/logs/\n"):
+            with self.subTest(replacement=replacement):
+                self.assertReports(self.edited_shard(original, replacement),
+                                   "Retain sanitized shard diagnostics", "with.path")
+        days = original + "          if-no-files-found: ignore\n          retention-days: 7\n"
+        shortened = days.replace("retention-days: 7", "retention-days: 1")
+        self.assertReports(self.edited_shard(days, shortened),
+                           "Retain sanitized shard diagnostics", "retention-days")
+        stage = ("      - name: Stage sanitized shard diagnostics\n"
+                 "        id: shard-diagnostics\n"
+                 "        if: ${{ !cancelled() && steps.stage.outcome != 'success' }}\n")
+        self.assertReports(self.edited_shard(stage, stage.replace(" && steps.stage.outcome != 'success'", "")),
+                           "step shard-diagnostics", "if")
+        timed_stage = stage + "        timeout-minutes: 3\n"
+        self.assertReports(self.edited_shard(timed_stage, timed_stage.replace("3\n", "1\n")),
+                           "step shard-diagnostics", "timeout-minutes")
+        upload = ("      - name: Retain sanitized shard diagnostics\n"
+                  "        if: ${{ !cancelled() && "
+                  "steps.shard-diagnostics.outcome == 'success' }}\n")
+        self.assertReports(self.edited_shard(upload, upload.replace("!cancelled()", "success()")),
+                           "Retain sanitized shard diagnostics", "if")
+
+    @unittest.skipUnless(shutil.which("bash") and shutil.which("jq"), "requires bash and jq")
+    def test_merge_summary_distinguishes_profiles_without_exports(self):
+        steps = ci_steps.load_yaml(self.text)["jobs"]["gates"]["steps"]
+        command = next(step["run"] for step in steps if step.get("id") == "merge")
+        for merged, missing_exports, code, summary in (
+            ("{}", ["imap-plain", "jmap-plain"], 1,
+             "Profiles included in merged coverage without a per-step export: jmap-plain\n"),
+            ("", ["imap-plain", "jmap-plain"], 1,
+             "Validated profiles without a per-step coverage export: jmap-plain\n"),
+            ("{}", ["imap-plain"], 1, ""),
+            ("{}", ["jmap-plain"], 0,
+             "Profiles included in merged coverage without a per-step export: jmap-plain\n"),
+        ):
+            with self.subTest(merged=merged, missing_exports=missing_exports, code=code), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                reports = root / "reports"
+                (reports / "net").mkdir(parents=True)
+                (reports / "collection.json").write_text(json.dumps({
+                    "missing_profiles": ["imap-plain"] if "imap-plain" in missing_exports else [],
+                    "missing_exports": missing_exports,
+                }))
+                fake_merge = root / "scripts/tests/coverage_net.py"
+                fake_merge.parent.mkdir(parents=True)
+                fake_merge.write_text(
+                    "from pathlib import Path\n"
+                    f"Path('reports/net/merged.json').write_text({merged!r})\n"
+                    f"raise SystemExit({code})\n"
+                )
+                output = root / "outputs"
+                output.touch()
+                proc = subprocess.run(
+                    ["bash", "-eo", "pipefail", "-c", command], cwd=root,
+                    env={**os.environ, "GATES": str(root), "RETENTION_DEADLINE_EPOCH": "0",
+                         "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(root / "summary")},
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(proc.returncode, code, proc.stderr)
+                self.assertEqual(output.read_text(), "available=true\n" if merged else "")
+                self.assertEqual((root / "summary").read_text(), summary)
+
+    def test_gate_pipelines_keep_failure_status(self):
+        old = ("        if: ${{ !cancelled() && steps.functions.outcome == 'success' }}\n"
+               '        shell: bash\n')
+        self.assertReports(self.edited(old, old.replace("bash", "sh")),
+                           "job gates, step inventory", "shell")
+        old = '            --out "$GATES/reports/coverage.json" 2>&1 | tee "$GATES/reports/coverage.out"'
+        self.assertReports(self.edited(old, old + " || true"), "job gates, step coverage", "run")
 
     def test_the_style_job_runs_this_check(self):
         # Final review N14: the step that runs the check is itself checked.
         step = ("      - name: Check Gates\n        run: |\n"
                 "          python3 -I scripts/tests/ci_steps.py\n"
-                "          python3 -I scripts/tests/test_gates.py\n")
+                "          python3 -I scripts/tests/test_gates.py\n"
+                "          python3 -I scripts/tests/test_retention_artifacts.py\n"
+                "          python3 -I scripts/tests/test_retention_evidence.py\n")
         problems = self.edited(step, "")
         self.assertReports(problems, "job style", "'Check Gates'", "missing")
         problems = self.edited(step, step.replace("Check Gates", "Gates"))
@@ -887,6 +1129,414 @@ class WorkflowTests(unittest.TestCase):
             if "--" not in argv:
                 argv = argv + ["--"]
             self.assertEqual(cmd, [a for a in argv if a not in ci_steps.LISTING_TARGETS], name)
+
+
+# ====================================================================== the retention drivers
+class CaptureDriverTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+
+    def install_version_tool(self, name, output, status=0):
+        path = self.root / name
+        path.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\n"
+                        f"printf '%s\\n' '{name} setup diagnostic' >&2\nexit {status}\n")
+        path.chmod(0o755)
+
+    def test_toolchain_identity_uses_only_stdout(self):
+        self.install_version_tool("cargo", "cargo 9.8.7")
+        self.install_version_tool("rustc", "rustc 9.8.7\nrelease: 9.8.7")
+        with mock.patch.dict(os.environ, {"PATH": str(self.root)}), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()) as diagnostics:
+            identity = capture_listings.build_identity(None)
+        self.assertIn("cargo setup diagnostic", diagnostics.getvalue())
+        self.assertIn("rustc setup diagnostic", diagnostics.getvalue())
+        self.assertEqual(identity["cargo"], "cargo 9.8.7")
+        self.assertEqual(identity["rustc"], "rustc 9.8.7\nrelease: 9.8.7")
+
+    def test_listing_capture_keeps_both_streams_on_failure(self):
+        command = [sys.executable, "-c", "import sys; print('case: test', flush=True); "
+                   "sys.stderr.write('compilation diagnostic\\n'); sys.exit(1)"]
+        path = self.root / "capture.txt"
+        spec = dict(label="fixture", environment="", sections=[("## SELECTED", command)], env={})
+        with contextlib.redirect_stdout(io.StringIO()):
+            statuses = capture_listings.capture(path, spec)
+        self.assertEqual(statuses, [1])
+        self.assertIn("case: test\ncompilation diagnostic\n## exit: 1", path.read_text())
+
+    def test_toolchain_identity_keeps_exit_status(self):
+        self.install_version_tool("cargo", "cargo 9.8.7", 3)
+        with mock.patch.dict(os.environ, {"PATH": str(self.root)}), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()) as diagnostics, \
+             self.assertRaisesRegex(ValueError, r"cargo identity unavailable \(3\)"):
+            capture_listings.build_identity(None)
+        self.assertIn("cargo setup diagnostic", diagnostics.getvalue())
+
+    def test_toolchain_identity_does_not_start_after_deadline(self):
+        self.install_version_tool("cargo", "cargo 9.8.7", 3)
+        with mock.patch.dict(os.environ, {"PATH": str(self.root)}), \
+             self.assertRaisesRegex(ValueError, r"cargo identity unavailable \(not-run\)"):
+            capture_listings.build_identity(time.monotonic() - 1)
+
+
+class RunIdentityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
+        ).strip()
+
+    def setUp(self):
+        self.net = object.__new__(coverage_net.Net)
+        self.net.deadline = None
+        self.environment = {"PATH": os.environ["PATH"]}
+
+    def test_net_and_listings_agree_on_hosted_identity(self):
+        for sha_env in ({}, {"GITHUB_SHA": self.commit}):
+            with self.subTest(sha_env=sha_env), mock.patch.dict(
+                os.environ, {**self.environment, **sha_env, "GITHUB_RUN_ID": "193",
+                             "GITHUB_RUN_ATTEMPT": "2"}, clear=True,
+            ):
+                expected = dict(commit=self.commit, run_id="193", producer_attempt=2)
+                self.assertEqual(self.net.run_identity(), expected)
+                self.assertEqual(capture_listings.run_identity(), expected)
+
+    def test_hosted_identity_rejects_invalid_run_id_or_attempt(self):
+        for run_id, attempt in (("local", "0"), ("001", "1"), ("+1", "1"), ("x", "1"),
+                                ("12", "01"), ("12", "+1"), ("12", "0"), ("12", "")):
+            with self.subTest(run_id=run_id, attempt=attempt), \
+                 mock.patch.dict(os.environ, {**self.environment, "GITHUB_RUN_ID": run_id,
+                                              "GITHUB_RUN_ATTEMPT": attempt}, clear=True):
+                with self.assertRaises(ValueError):
+                    self.net.run_identity()
+                with self.assertRaises(ValueError):
+                    capture_listings.run_identity()
+
+    def test_net_does_not_treat_partial_hosted_identity_as_local(self):
+        for env in ({"GITHUB_RUN_ATTEMPT": "1"}, {"GITHUB_ACTIONS": "true"}):
+            with self.subTest(env=env), \
+                 mock.patch.dict(os.environ, {**self.environment, **env}, clear=True), \
+                 self.assertRaises(ValueError):
+                self.net.run_identity()
+
+    def test_net_keeps_local_identity_with_a_future_deadline(self):
+        self.net.deadline = time.monotonic() + 60
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertEqual(self.net.run_identity(),
+                             dict(commit=self.commit, run_id="local", producer_attempt=0))
+
+    def test_net_rejects_a_deadline_passed_before_identity_check(self):
+        self.net.deadline = time.monotonic() - 1
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+             self.assertRaisesRegex(ValueError, "deadline"):
+            self.net.run_identity()
+
+
+# ====================================================================== the coverage driver
+class CoverageNetTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.net = object.__new__(coverage_net.Net)
+        directory = Path(self.directory.name).resolve()
+        self.net.out = directory / "net"
+        self.net.target = directory / "target"
+        self.net.target.mkdir()
+        for name in ("steps", "logs", "profdata"):
+            (self.net.out / name).mkdir(parents=True)
+        self.net.failed = []
+        self.net.deadline = None
+        self.net.work_deadline = None
+        self.net.run_identity = lambda: {
+            "commit": "a" * 40, "run_id": "12", "producer_attempt": 3,
+        }
+        self.net.build_identity = lambda: {"llvm_cov": "LLVM 23.1.1"}
+
+    def attempt(self, number, status, profile_status, names=()):
+        profile = None
+        if profile_status == "collected":
+            profile = self.net.out / "profdata" / f"fixture-{number}"
+            profile.write_text(str(number))
+        return dict(attempt=number, status=status, profile=profile,
+                    profile_status=profile_status, names=list(names))
+
+    def export(self, step, profiles, destination):
+        combined = "".join(path.read_text() for path in profiles)
+        destination.write_text(combined)
+        (self.net.out / "profdata" / f"{step}.profdata").write_text(combined)
+        return True
+
+    def test_shards_partition_baseline_in_order(self):
+        baseline = json.loads(Path(BASELINE).read_text())["helpers"]["steps"]
+        self.assertEqual(set(ci_steps.COVERAGE_SHARDS), {"za-rocks", "za-filesystem", "short"})
+        self.assertEqual(ci_steps.COVERAGE_SHARDS["za-rocks"], ("za-tests",))
+        self.assertEqual(ci_steps.COVERAGE_SHARDS["za-filesystem"], ("za-tests-fs-blob",))
+        groups = list(ci_steps.COVERAGE_SHARDS.values())
+        self.assertCountEqual([name for group in groups for name in group], baseline)
+        for group in groups:
+            self.assertEqual(list(group), sorted(group, key=coverage_net.ORDER.index))
+
+    def test_build_only_stops_on_first_failed_build(self):
+        for failing in ("build-A", "build-B", None):
+            with self.subTest(failing=failing), contextlib.redirect_stdout(io.StringIO()):
+                steps = []
+                self.net.failed.clear()
+                manifest = self.net.out / "build.json"
+                manifest.unlink(missing_ok=True)
+
+                def attempt(step, *args, **kwargs):
+                    steps.append(step)
+                    return self.attempt("build", int(step == failing), "discarded")
+
+                with mock.patch.object(coverage_net, "Net", return_value=self.net), \
+                     mock.patch.object(self.net, "attempt", side_effect=attempt), \
+                     mock.patch.object(self.net, "build_manifest", create=True,
+                                       return_value={"schema": 1}), \
+                     mock.patch.object(sys, "argv", ["coverage_net.py", "--out",
+                                                     str(self.net.out), "--build-only"]):
+                    try:
+                        status = coverage_net.main()
+                    except SystemExit as error:
+                        status = error.code
+                self.assertEqual(status, int(failing is not None))
+                self.assertEqual(steps, ["build-A"] if failing == "build-A" else
+                                 ["build-A", "build-B"])
+                self.assertEqual(manifest.exists(), failing is None)
+
+    def test_smtp_retries_names_and_merges_both_attempts(self):
+        outcomes = [self.attempt(1, 101, "collected", ["smtp::one", "smtp::two"]),
+                    self.attempt(2, 0, "collected")]
+        with mock.patch.object(self.net, "attempt", side_effect=outcomes) as run_attempt, \
+             mock.patch.object(self.net, "export", side_effect=self.export), \
+             contextlib.redirect_stdout(io.StringIO()):
+            record = self.net.step("smtp")
+        self.assertEqual(record["status"], "success")
+        self.assertEqual([attempt["profile"] for attempt in record["attempts"]],
+                         ["collected", "collected"])
+        self.assertEqual(run_attempt.call_args.args[2], ["cargo", "llvm-cov", "--no-report",
+                         "test", "-p", "tests", "--", "--exact", "--nocapture",
+                         "smtp::one", "smtp::two"])
+        self.assertEqual((self.net.out / "steps" / "smtp.json").read_text(), "12")
+
+    def test_smtp_without_names_keeps_failed_profile_and_does_not_retry(self):
+        with mock.patch.object(self.net, "attempt", return_value=
+                               self.attempt(1, 101, "collected")) as run_attempt, \
+             mock.patch.object(self.net, "export", side_effect=self.export), \
+             contextlib.redirect_stdout(io.StringIO()):
+            record = self.net.step("smtp")
+        self.assertEqual(run_attempt.call_count, 1)
+        self.assertEqual(record["status"], "failure")
+        self.assertEqual(record["export"], "success")
+        self.assertEqual((self.net.out / "steps" / "smtp.json").read_text(), "1")
+
+    def test_normal_retry_uses_original_command_after_timeout(self):
+        outcomes = [self.attempt(1, "timeout", "no-data"),
+                    self.attempt(2, 101, "collected")]
+        with mock.patch.object(self.net, "attempt", side_effect=outcomes) as run_attempt, \
+             mock.patch.object(self.net, "export", side_effect=self.export), \
+             contextlib.redirect_stdout(io.StringIO()):
+            record = self.net.step("za-tests-fs-blob")
+        first, second = [call.args for call in run_attempt.call_args_list]
+        self.assertEqual(first[2:], second[2:])
+        self.assertEqual(record["status"], "failure")
+        self.assertEqual((self.net.out / "steps" / "za-tests-fs-blob.json").read_text(), "2")
+
+    def test_profile_loss_is_reported_even_when_an_export_remains_possible(self):
+        for first, second in (("merge-error", "collected"), ("collected", "no-data")):
+            with self.subTest(first=first, second=second), \
+                 mock.patch.object(self.net, "attempt", side_effect=[self.attempt(1, 101, first),
+                                   self.attempt(2, 0, second)]), \
+                 mock.patch.object(self.net, "export", side_effect=self.export), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                record = self.net.step("za-tests")
+                self.assertEqual(record["status"], "failure")
+                self.assertEqual(record["export"], "success")
+                self.assertEqual([a["profile"] for a in record["attempts"]], [first, second])
+                export = self.net.out / "steps" / "za-tests.json"
+                self.assertEqual(export.read_text(), "1" if first == "collected" else "2")
+                export.unlink()
+
+    def test_unit_listing_supplies_sorted_skip_arguments(self):
+        names = [f"tests::n{i:03}" for i in range(90)]
+        output = "\n".join(f"{name}: test" for name in reversed(names + names[:1]))
+        listing = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+        outcome = self.attempt(1, 0, "collected")
+        self.net.deadline = time.monotonic() + 600
+        self.net.work_deadline = self.net.deadline - 300
+        with mock.patch.object(coverage_net, "run", return_value=listing) as cargo, \
+             mock.patch.object(self.net, "attempt", return_value=outcome) as run_attempt, \
+             mock.patch.object(self.net, "export", side_effect=self.export), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.net.step("unit-tests")
+        self.assertEqual(cargo.call_args.args[0][-5:], ["test", "-p", "tests", "--", "--list"])
+        self.assertEqual(cargo.call_args.kwargs["deadline"], self.net.work_deadline)
+        self.assertEqual(run_attempt.call_args.args[2][-180:],
+                         [arg for name in names for arg in ("--skip", name)])
+
+    def test_manifest_rejects_added_missing_and_changed_objects(self):
+        target = self.net.target
+        first, second = target / "first", target / "second"
+        first.write_bytes(b"initial")
+        with mock.patch.object(self.net, "report_objects", create=True,
+                               side_effect=lambda: sorted(target.iterdir())):
+            self.assertTrue(hasattr(self.net, "build_manifest"))
+            manifest = self.net.build_manifest()
+            manifest["build_attempt"] = 2
+            self.net.verify_build(manifest)  # A different producer attempt in this run is valid.
+            second.write_bytes(b"unexpected")
+            with self.assertRaisesRegex(ValueError, "object"):
+                self.net.verify_build(manifest)
+            second.unlink()
+            first.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "object"):
+                self.net.verify_build(manifest)
+            first.unlink()
+            with self.assertRaisesRegex(ValueError, "object"):
+                self.net.verify_build(manifest)
+
+    def test_manifest_rejects_incompatible_inputs(self):
+        first = self.net.target / "first"
+        first.write_bytes(b"compiled")
+        with mock.patch.object(self.net, "report_objects", create=True, return_value=[first]):
+            self.assertTrue(hasattr(self.net, "build_manifest"))
+            manifest = self.net.build_manifest()
+            for key, value in (("commit", "b" * 40), ("run_id", "17"),
+                               ("build_attempt", 4), ("identity", {"llvm_cov": "different"}),
+                               ("object_set_sha256", "0" * 64)):
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    self.net.verify_build({**manifest, key: value})
+
+    def test_object_inventory_accepts_a_symlink_alias_for_target_root(self):
+        first = self.net.target / "first"
+        first.write_bytes(b"compiled")
+        alias = self.net.out / "target-alias"
+        alias.symlink_to(self.net.target, target_is_directory=True)
+        with mock.patch.object(self.net, "report_objects", return_value=[alias / "first"]):
+            try:
+                objects = self.net.object_inventory()
+            except ValueError as error:
+                self.fail(f"target directory alias was rejected: {error}")
+        self.assertEqual([entry["path"] for entry in objects], ["first"])
+
+    def test_deadline_prevents_starting_a_subprocess(self):
+        marker = self.net.out / "launched"
+        self.net.deadline = time.monotonic() - 1
+        self.assertTrue(hasattr(self.net, "run"))
+        result = self.net.run([sys.executable, "-c", "open(__import__('sys').argv[1], 'w')",
+                               str(marker)])
+        self.assertEqual(result.returncode, "deadline")
+        self.assertFalse(marker.exists())
+
+    def test_timeout_kills_residual_group_when_leader_exits_on_term(self):
+        command = ["cargo", "test"]
+        child = mock.MagicMock(pid=1234)
+        child.__enter__.return_value = child
+        child.communicate.side_effect = [subprocess.TimeoutExpired(command, 1), (None, None)]
+        log = self.net.out / "attempt.log"
+        with mock.patch.object(subprocess, "Popen", return_value=child), \
+             mock.patch.object(os, "killpg") as kill, log.open("wb") as output:
+            result = self.net.run(command, timeout=1, output=output, work=True)
+        self.assertEqual(result.returncode, "timeout")
+        self.assertEqual(kill.call_args_list, [mock.call(child.pid, signal.SIGTERM),
+                                               mock.call(child.pid, signal.SIGKILL)])
+
+    def test_timeout_bounds_communicate_after_killing_group(self):
+        command = ["cargo", "metadata"]
+        child = mock.MagicMock(pid=1234)
+        child.__enter__.return_value = child
+        child.communicate.side_effect = [subprocess.TimeoutExpired(command, 1),
+                                         subprocess.TimeoutExpired(command, 60),
+                                         subprocess.TimeoutExpired(command, 5, b"partial", b"error")]
+        with mock.patch.object(subprocess, "Popen", return_value=child), \
+             mock.patch.object(os, "killpg") as kill:
+            result = self.net.run(command, timeout=1)
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         ("timeout", "partial", "error"))
+        self.assertEqual(kill.call_args_list, [mock.call(child.pid, signal.SIGTERM),
+                                               mock.call(child.pid, signal.SIGKILL)])
+        self.assertEqual(child.communicate.call_args_list, [mock.call(timeout=1),
+                                                            mock.call(timeout=60),
+                                                            mock.call(timeout=5)])
+
+    def test_shard_settles_earlier_steps_after_work_cutoff(self):
+        self.net.deadline = time.monotonic() + 600
+        self.net.work_deadline = self.net.deadline - 300
+        manifest = {"build_attempt": 2, "object_set_sha256": "f" * 64}
+        ran = []
+
+        def finish_first_step(step):
+            ran.append(step)
+            self.net.work_deadline = time.monotonic() - 1
+            return dict(status="success", attempts=[{"status": 0}], profile=True, export="success")
+
+        with mock.patch.object(self.net, "verify_build") as verify, \
+             mock.patch.object(self.net, "step", side_effect=finish_first_step), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.net.shard("short", manifest)
+        self.assertEqual(ran, ["leak-unit-test"])
+        self.assertEqual(verify.call_count, 2)
+        summary = json.loads((self.net.out / "shard.json").read_text())
+        self.assertTrue(summary["compatible"])
+        self.assertEqual(summary["steps"]["leak-unit-test"]["status"], "success")
+        self.assertEqual(summary["steps"]["unit-tests"]["status"], "not-run")
+        self.assertTrue(self.net.failed)
+
+    def test_raw_profile_is_merged_during_diagnostics_reserve(self):
+        self.net.deadline = time.monotonic() + 600
+        self.net.work_deadline = time.monotonic() - 1
+        self.net.profdata_tool = "llvm-profdata"
+        raw = self.net.target / "profile.profraw"
+
+        def run_phase(cmd, *, deadline, **_):
+            if cmd[0] == "cargo":
+                self.assertEqual(deadline, self.net.work_deadline)
+                raw.write_text("raw profile flushed by terminated cargo process")
+                return subprocess.CompletedProcess(cmd, "deadline", "", "")
+            self.assertEqual(deadline, self.net.deadline)
+            self.assertEqual(Path(cmd[cmd.index("-f") + 1]).read_text(), f"{raw}\n")
+            Path(cmd[cmd.index("-o") + 1]).write_text("indexed profile")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(coverage_net, "run", side_effect=run_phase):
+            attempt = self.net.attempt("za-tests", 1, ["cargo", "test"], {}, 180 * 60)
+        self.assertEqual(attempt["status"], "deadline")
+        self.assertEqual(attempt["profile_status"], "collected")
+        self.assertEqual(attempt["profile"].read_text(), "indexed profile")
+        self.assertFalse(raw.exists())
+
+    def test_hard_deadline_keeps_unmerged_raw_local(self):
+        self.net.deadline = time.monotonic() - 1
+        self.net.work_deadline = self.net.deadline - 300
+        self.net.profdata_tool = "llvm-profdata"
+        raw = self.net.target / "profile.profraw"
+        raw.write_text("unmerged raw profile")
+
+        attempt = self.net.attempt("za-tests", 1, ["cargo", "test"], {}, 180 * 60)
+        self.net.clear_profiles()
+
+        self.assertEqual(attempt["profile_status"], "merge-error")
+        self.assertFalse(raw.exists())
+        preserved = list(self.net.target.rglob("*.profraw"))
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0].read_text(), "unmerged raw profile")
+        self.assertFalse(list(self.net.out.rglob("*.profraw")))
+
+    def test_partial_merge_publishes_diagnostic_with_missing_steps(self):
+        path = self.net.out / "profdata" / "za-tests.profdata"
+        path.write_text("measured")
+        with mock.patch.object(self.net, "export", side_effect=self.export), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.net.merge_all()
+        self.assertTrue(self.net.failed)
+        report = self.net.out / "merged.json"
+        self.assertEqual(report.read_text(), "measured")
+        summary = json.loads((self.net.out / "merge.json").read_text())
+        self.assertFalse(summary["complete"])
+        self.assertEqual(summary["missing_steps"], [name for name in coverage_net.ORDER[2:]
+                                                    if name != "za-tests"])
 
 
 # ====================================================================== the real baseline
