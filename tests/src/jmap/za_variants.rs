@@ -3508,8 +3508,8 @@ pub async fn file_node(test: &TestServer) {
 }
 
 /// The `calendar::*` modules and `principal::availability` in key mode:
-/// Release 6 spec 6.2 serves calendar and event reads for key accounts.
-/// The remaining methods below are still refused and availability stays empty.
+/// Release 6 spec 6.2 serves calendar and event reads and their changes for key
+/// accounts. The remaining methods below are still refused and availability stays empty.
 pub async fn calendars(test: &TestServer) {
     println!("Running key-account Calendar tests...");
     let account = test.account("jdoe@example.com");
@@ -3528,6 +3528,15 @@ pub async fn calendars(test: &TestServer) {
         .await;
     assert_eq!(reply.error_type_at(0), None, "{reply:?}");
     reply.list_array().assert_is_equal(json!([]));
+
+    // Release 6 spec 6.2: Calendar/changes and CalendarEvent/changes are served.
+    for method in ["Calendar/changes", "CalendarEvent/changes"] {
+        let reply = account
+            .jmap_method_call(method, json!({ "accountId": id, "sinceState": "n" }))
+            .await;
+        assert_eq!(reply.error_type_at(0), None, "{method}: {reply:?}");
+        assert_eq!(reply.response_at(0)["hasMoreChanges"], false, "{reply:?}");
+    }
 
     for (method, args) in [
         (

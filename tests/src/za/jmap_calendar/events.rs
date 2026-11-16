@@ -28,6 +28,7 @@ use common::{auth::oauth::scope::OAuthScopes, za::ZA_CALENDAR_KEYLESS};
 use futures::FutureExt;
 use groupware::calendar::seal::tree::{KEY_PROP, is_carrier};
 use hyper::StatusCode;
+use jmap_proto::types::state::State;
 use serde_json::{Value, json};
 use std::{panic::AssertUnwindSafe, time::Duration};
 use store::{
@@ -64,6 +65,7 @@ pub async fn test(test: &mut TestServer) {
     get_unreadable_event_is_not_found(test, &pair).await;
     get_completes_pending_boundary(test, &pair, shared).await;
     read_store_errors_are_payload_free(test, &pair).await;
+    changes_as_upstream(test, &pair).await;
     pair.dav
         .request_with_headers("DELETE", &event_path("jmapcal-shared/"), [NO_REPLY], "")
         .await
@@ -438,4 +440,96 @@ async fn read_store_errors_are_payload_free(test: &TestServer, pair: &Pair) {
             Key::AccountId | Key::DocumentId | Key::Details | Key::SpanId | Key::CausedBy
         )));
     }
+}
+
+/// Release 6 spec 6.8: the change log of a key account is served as upstream
+/// serves it. Every write goes through CalDAV; every read is an HTTP JMAP call.
+async fn changes_as_upstream(test: &TestServer, pair: &Pair) {
+    const A: &str = "jmapcal-events-changes-a";
+    const B: &str = "jmapcal-events-changes-b";
+    const SLUG: &str = "jmapcal-events-changes";
+
+    async fn changes(pair: &Pair, method: &str, since: &State) -> (Vec<Value>, State) {
+        let reply = pair
+            .key
+            .jmap_method_call(
+                method,
+                json!({ "accountId": pair.key.id_string(), "sinceState": since.to_string() }),
+            )
+            .await;
+        assert_eq!(method_error(&reply), None, "{method} {since}: {reply:?}");
+        let response = reply.response_at(0);
+        assert_eq!(response["oldState"], since.to_string(), "{reply:?}");
+        assert_eq!(response["hasMoreChanges"], false, "{reply:?}");
+        let state = response["newState"]
+            .as_str()
+            .and_then(State::parse)
+            .unwrap_or_else(|| panic!("{method}: no newState in {reply:?}"));
+        assert!(matches!(state, State::Exact(_)), "{method}: {state:?}");
+        let ids = ["created", "updated", "destroyed"]
+            .map(|key| response[key].clone())
+            .to_vec();
+        (ids, state)
+    }
+    let ids = |ids: &[u32]| {
+        json!(
+            ids.iter()
+                .map(|id| Id::from(*id).to_string())
+                .collect::<Vec<_>>()
+        )
+    };
+
+    // The initial sync is served and ends at an exact state.
+    let (_, start) = changes(pair, "CalendarEvent/changes", &State::Initial).await;
+    let (_, calendars) = changes(pair, "Calendar/changes", &State::Initial).await;
+
+    let a = put_event(test, &pair.key, &pair.dav, "default", A, "first title").await;
+    let (changed, after_a) = changes(pair, "CalendarEvent/changes", &start).await;
+    assert_eq!(changed, [ids(&[a]), json!([]), json!([])]);
+
+    let b = put_event(test, &pair.key, &pair.dav, "default", B, "second title").await;
+    let (changed, after_b) = changes(pair, "CalendarEvent/changes", &after_a).await;
+    assert_eq!(changed, [ids(&[b]), json!([]), json!([])]);
+
+    pair.dav
+        .request_with_headers(
+            "PUT",
+            &event_path(&format!("default/{A}.ics")),
+            [CONTENT_TYPE],
+            event_ics(A, "changed title"),
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let (changed, after_update) = changes(pair, "CalendarEvent/changes", &after_b).await;
+    assert_eq!(changed, [json!([]), ids(&[a]), json!([])]);
+
+    delete_event(pair, &format!("default/{B}.ics")).await;
+    let (changed, after_delete) = changes(pair, "CalendarEvent/changes", &after_update).await;
+    assert_eq!(changed, [json!([]), json!([]), ids(&[b])]);
+
+    // Upstream's folding over the whole range: b's insert and delete cancel out, and
+    // a's update is folded into its insert.
+    let (changed, end) = changes(pair, "CalendarEvent/changes", &start).await;
+    assert_eq!(changed, [ids(&[a]), json!([]), json!([])]);
+    assert_eq!(end, after_delete);
+    let (changed, same) = changes(pair, "CalendarEvent/changes", &after_delete).await;
+    assert_eq!(changed, [json!([]), json!([]), json!([])]);
+    assert_eq!(same, after_delete);
+    let states = [&start, &after_a, &after_b, &after_update, &after_delete]
+        .map(|state| state.get_change_id())
+        .to_vec();
+    assert!(
+        states.windows(2).all(|pair| pair[0] < pair[1]),
+        "{states:?}"
+    );
+
+    let calendar = make_calendar(test, &pair.key, &pair.dav, SLUG).await;
+    let (changed, _) = changes(pair, "Calendar/changes", &calendars).await;
+    assert_eq!(changed, [ids(&[calendar]), json!([]), json!([])]);
+
+    pair.dav
+        .request_with_headers("DELETE", &event_path(&format!("{SLUG}/")), [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    delete_event(pair, &format!("default/{A}.ics")).await;
 }

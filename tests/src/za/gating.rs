@@ -365,10 +365,6 @@ pub async fn test(test: &mut TestServer) {
             "Calendar/set",
             json!({ "accountId": key1_account, "create": {} }),
         ),
-        (
-            "Calendar/changes",
-            json!({ "accountId": key1_account, "sinceState": "n" }),
-        ),
         ("CalendarEvent/query", json!({ "accountId": key1_account })),
         (
             "CalendarEvent/set",
@@ -381,10 +377,6 @@ pub async fn test(test: &mut TestServer) {
         (
             "CalendarEvent/parse",
             json!({ "accountId": key1_account, "blobIds": [] }),
-        ),
-        (
-            "CalendarEvent/changes",
-            json!({ "accountId": key1_account, "sinceState": "n" }),
         ),
         (
             "CalendarEvent/queryChanges",
@@ -431,6 +423,14 @@ pub async fn test(test: &mut TestServer) {
         ("Calendar/get", json!({ "accountId": key1_account })),
         ("Calendar/query", json!({ "accountId": key1_account })),
         ("CalendarEvent/get", json!({ "accountId": key1_account })),
+        (
+            "Calendar/changes",
+            json!({ "accountId": key1_account, "sinceState": "n" }),
+        ),
+        (
+            "CalendarEvent/changes",
+            json!({ "accountId": key1_account, "sinceState": "n" }),
+        ),
     ] {
         let response = key1.jmap_method_call(method, args).await;
         assert!(

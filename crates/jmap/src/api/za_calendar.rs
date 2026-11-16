@@ -57,7 +57,7 @@ pub(crate) async fn za_serve_calendar_read<T>(
         .map_err(|error| calendar_read_error(za_key, owner, error))
 }
 
-fn calendar_read_error(za_key: bool, owner: u32, error: trc::Error) -> trc::Error {
+pub(crate) fn calendar_read_error(za_key: bool, owner: u32, error: trc::Error) -> trc::Error {
     let event = error.event_type();
     if !za_key || !matches!(event, EventType::Store(_)) {
         return error;
@@ -117,10 +117,11 @@ pub(crate) fn za_calendar_method(obj: MethodObject, function: MethodFunction) ->
     match (obj, function) {
         (Calendar, Get) => Served,
         (Calendar, Query) => Served,
-        (Calendar, Changes) => Refused,
+        // Release 6 spec 6.2: Calendar/changes and CalendarEvent/changes are served.
+        (Calendar, Changes) => Served,
         (Calendar, Set) => Refused,
         (CalendarEvent, Get) => Served,
-        (CalendarEvent, Changes) => Refused,
+        (CalendarEvent, Changes) => Served,
         (CalendarEvent, Parse) => Refused,
         (CalendarEvent, Query) => Refused,
         (CalendarEvent, QueryChanges) => Refused,
@@ -242,10 +243,11 @@ mod tests {
         for (object, function, expected) in [
             (Calendar, Get, Served),
             (Calendar, Query, Served),
-            (Calendar, Changes, Refused),
+            // Release 6 spec 6.2: both /changes rows are served.
+            (Calendar, Changes, Served),
             (Calendar, Set, Refused),
             (CalendarEvent, Get, Served),
-            (CalendarEvent, Changes, Refused),
+            (CalendarEvent, Changes, Served),
             (CalendarEvent, Parse, Refused),
             (CalendarEvent, Query, Refused),
             (CalendarEvent, QueryChanges, Refused),

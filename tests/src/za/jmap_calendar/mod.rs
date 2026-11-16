@@ -31,6 +31,7 @@ use store::write::BatchBuilder;
 pub mod calendars;
 pub mod events;
 pub mod pipeline;
+pub mod sharing;
 
 /// A module's two key accounts and their CalDAV clients.
 pub(super) struct Pair {
@@ -78,7 +79,6 @@ pub(super) async fn pair(test: &mut TestServer, module: &str) -> Pair {
     }
 }
 
-#[allow(dead_code)]
 pub(super) async fn key_account(
     test: &mut TestServer,
     local: &str,
