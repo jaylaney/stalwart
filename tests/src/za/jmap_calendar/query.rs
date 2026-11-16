@@ -70,6 +70,11 @@ const PAGES: [&str; 4] = [
     "jmapcal-query-page-3",
     "jmapcal-query-page-4",
 ];
+const RENAME_PAGES: [&str; 3] = [
+    "jmapcal-query-page-5",
+    "jmapcal-query-page-6",
+    "jmapcal-query-page-7",
+];
 const UNAVAILABLE: &str =
     "This server is temporarily unavailable. Attempting this same operation later may succeed.";
 
@@ -416,7 +421,7 @@ async fn two_accounts_same_answers(test: &TestServer, q: &Query) {
         json!({ "participant": "\"arthur guest\"" }),
         json!({ "participant": "\"guest arthur\"" }),
     ];
-    for (index, condition) in conditions.into_iter().enumerate() {
+    for (index, condition) in conditions.iter().cloned().enumerate() {
         let negated = json!({ "operator": "NOT", "conditions": [condition.clone()] });
         for (filter, is_negated) in [(condition, false), (negated, true)] {
             let key = query(
@@ -432,6 +437,67 @@ async fn two_accounts_same_answers(test: &TestServer, q: &Query) {
             // not vacuous.
             if !is_negated && [0, 6, 7].contains(&index) {
                 assert!(!plain.is_empty(), "condition {}: {filter}", index + 1);
+            }
+        }
+    }
+
+    // Spec 9.2: text conditions combined with AND and OR (and the negation of each),
+    // unexpanded. The flat ANDs are asked in both JMAP forms: an AND operator over
+    // one-property conditions, and one condition with several properties.
+    let flat_ands = [
+        json!({ "title": "budget", "location": "alpha" }),
+        json!({ "title": "budget", "description": "marketing" }),
+        json!({ "title": "team", "description": "engineering" }),
+        json!({ "title": "offsite", "description": "engineering" }),
+        json!({
+            "participant": "jmapcal-query-arthur@remote.test",
+            "owner": "jmapcal-query-olive@remote.test"
+        }),
+    ];
+    let as_operator = |condition: &Value| {
+        json!({
+            "operator": "AND",
+            "conditions": condition
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| json!({ key.clone(): value.clone() }))
+                .collect::<Vec<_>>(),
+        })
+    };
+    let mut combined = Vec::new();
+    for condition in &flat_ands {
+        combined.push(condition.clone());
+        combined.push(as_operator(condition));
+    }
+    combined.extend([
+        json!({ "operator": "OR", "conditions": [{ "title": "budget" }, { "title": "dentist" }] }),
+        json!({ "operator": "OR", "conditions": [
+            { "uid": "jmapcal-query-meeting" }, { "description": "teeth" }
+        ] }),
+        json!({ "operator": "AND", "conditions": [
+            { "operator": "OR", "conditions": [{ "title": "budget" }, { "title": "dentist" }] },
+            { "operator": "NOT", "conditions": [{ "location": "alpha" }] }
+        ] }),
+        json!({ "operator": "OR", "conditions": [
+            { "text": "progress" },
+            { "operator": "AND", "conditions": [{ "location": "beta" }, { "title": "appointment" }] }
+        ] }),
+    ]);
+    for filter in combined {
+        let negated = json!({ "operator": "NOT", "conditions": [filter.clone()] });
+        for (filter, is_negated) in [(filter, false), (negated, true)] {
+            let key = query(
+                &q.pair.key,
+                &q.pair.key,
+                json!({ "filter": filter.clone() }),
+            )
+            .await;
+            let plain = query(&q.plain, &q.plain, json!({ "filter": filter.clone() })).await;
+            let (key, plain) = (uids_of(&key, &uid_maps[0]), uids_of(&plain, &uid_maps[1]));
+            assert_eq!(key, plain, "combined: {filter}");
+            if !is_negated {
+                assert!(!plain.is_empty(), "combined: {filter}");
             }
         }
     }
@@ -457,14 +523,28 @@ async fn two_accounts_same_answers(test: &TestServer, q: &Query) {
     )
     .await;
     assert_eq!(ids(&reply).len(), 4, "the master's occurrences: {reply:?}");
-    for title in ["offsite", "sync", "team offsite"] {
-        let filter = expanded(json!({ "title": title }));
+    // Spec 9.2: for the single conditions and the flat ANDs among them, the expanded
+    // form matches on each occurrence's own component, on both accounts alike.
+    let mut parity = vec![
+        json!({ "title": "offsite" }),
+        json!({ "title": "sync" }),
+        json!({ "title": "team offsite" }),
+    ];
+    parity.extend(conditions.iter().cloned());
+    parity.extend(flat_ands.iter().cloned());
+    for condition in parity {
+        let filter = expanded(condition.clone());
         let key = ids(&query(&q.pair.key, &q.pair.key, filter.clone()).await);
         let plain = ids(&query(&q.plain, &q.plain, filter).await);
+        let key_starts = starts(&q.pair.key, &key).await;
         assert_eq!(
-            starts(&q.pair.key, &key).await,
+            key_starts,
             starts(&q.plain, &plain).await,
-            "expanded {title}"
+            "expanded {condition}"
+        );
+        println!(
+            "two_accounts_same_answers: expanded {condition}: {} occurrences on both accounts",
+            key_starts.len()
         );
     }
     let negated = json!({
@@ -848,15 +928,47 @@ async fn query_changes_paged_origin(test: &TestServer, q: &Query, calendar: u32)
         "the initial-origin page while pending: {reply:?}"
     );
 
-    // A completed rename: the same distinction against its new boundary.
+    // A completed rename: the same distinction against the rename's own boundary. The
+    // completion of the pending boundary moves it to `b2`; an exact sync started after
+    // `b2` is served until the MOVE, and refused after it.
     owner_calendar_get(q).await;
-    assert!(!owner_boundary(test, owner_id, calendar).await.pending);
+    let completed = owner_boundary(test, owner_id, calendar).await;
+    assert!(!completed.pending, "{completed:?}");
+    let b2 = completed.rename_change_id;
+    put_event(
+        test,
+        owner,
+        &q.pair.dav,
+        SHARED,
+        RENAME_PAGES[0],
+        RENAME_PAGES[0],
+    )
+    .await;
+    let e2 = query_state(&query(reader, owner, json!({})).await);
+    assert!(e2.get_change_id() > b2, "{e2:?} {b2}");
+    for uid in &RENAME_PAGES[1..] {
+        put_event(test, owner, &q.pair.dav, SHARED, uid, uid).await;
+    }
+    let exact2 = ZaCalendarOrigin::Exact(e2.get_change_id());
+    let exact2_first = new_query_state(&query_changes_call(reader, owner, &e2, Some(1)).await);
+    assert_eq!(za_parts(&exact2_first).1, &exact2);
+    for (state, what) in [
+        (&exact2_first, "the exact-origin page before the rename"),
+        (&initial_first, "the initial-origin page before the rename"),
+    ] {
+        let reply = query_changes_call(reader, owner, state, Some(1)).await;
+        assert_eq!(method_error(&reply), None, "{what}: {reply:?}");
+    }
     rename(q, SHARED, RENAMED).await;
     let renamed = owner_boundary(test, owner_id, calendar).await;
     assert!(!renamed.pending, "{renamed:?}");
-    assert!(renamed.rename_change_id > e.get_change_id(), "{renamed:?}");
+    assert!(renamed.rename_change_id > b2, "{renamed:?} {b2}");
+    assert!(
+        renamed.rename_change_id > e2.get_change_id(),
+        "{renamed:?} {e2:?}"
+    );
     assert_refused(
-        &query_changes_call(reader, owner, &exact_first, Some(1)).await,
+        &query_changes_call(reader, owner, &exact2_first, Some(1)).await,
         "the exact-origin page after the rename",
     );
     let reply = query_changes_call(reader, owner, &initial_first, Some(1)).await;
@@ -1010,6 +1122,7 @@ async fn query_changes_paged_origin(test: &TestServer, q: &Query, calendar: u32)
     assert!(!owner_boundary(test, owner_id, calendar).await.pending);
     for uid in PAGES
         .iter()
+        .chain(&RENAME_PAGES)
         .chain(&["jmapcal-query-private", "jmapcal-query-public"])
     {
         delete_path(owner, &q.pair.dav, &format!("{SHARED}/{uid}.ics")).await;
