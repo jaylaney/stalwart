@@ -33,6 +33,7 @@ pub mod events;
 pub mod pipeline;
 pub mod query;
 pub mod refusals;
+pub mod scheduling;
 pub mod sharing;
 
 /// A module's two key accounts and their CalDAV clients.

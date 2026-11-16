@@ -1,0 +1,951 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
+//! Release 6 spec 5.4 (D4, D18), 3.3, 5.3 and 4.7 (review focus 1):
+//! `CalendarEvent/set` scheduling for key accounts.
+
+use super::{Pair, finish, key_account, pair};
+use crate::{
+    utils::{
+        account::Account,
+        http::HttpRequest,
+        jmap::JmapResponse,
+        server::TestServer,
+        smtp_sink::sink,
+        webdav::DummyWebDavClient,
+        za::{
+            CALENDAR_JMAP_USING, ZaClientKind, clear_received_scheduling, copy_href, event_records,
+            hold_task_consumer, inbox_ids, item_method, itip_tasks_for, new_inbox_items,
+            open_pending_item_as, token_record, wait_for_queue, za_bearer_jmap,
+            za_drop_oauth_client, za_oauth_client, za_refresh, za_revoke_token, za_sign_in,
+            za_uid_leases, za_unlock,
+        },
+    },
+    za::{
+        STRONG,
+        drain::{body, relative},
+        fanout::{NO_REPLY, Party, attendee_statuses, invite, stored_pairs, uid_copies},
+        gating::method_error,
+        mail::Traced,
+        uid_lease::put,
+        user_permissions,
+    },
+};
+use ::registry::{
+    schema::{
+        enums::Permission,
+        prelude::{ObjectType, Property},
+        structs::{Permissions, PermissionsList},
+    },
+    types::map::Map,
+};
+use calcard::icalendar::ICalendarMethod;
+use common::za::{
+    imip::ZA_IMIP_DROPPED,
+    test_hooks::{self, Pause},
+};
+use http::auth::oauth::TokenResponse;
+use hyper::{Method, StatusCode};
+use serde_json::{Value, json};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use trc::{CalendarEvent as TrcCalendarEvent, EventType, Key};
+use types::id::Id;
+use vault::record::za_session_binding;
+
+const OUT: &str = "jmapcal-scheduling-out@remote.test";
+const PLAIN: &str = "plain@example.com";
+const NOBODY: &str = "jmapcal-scheduling-nobody@example.com";
+/// A calendar address no scheduling method reaches: it is no email address
+/// (`itip_unreachable_recipient`, `crates/groupware/src/scheduling/itip.rs`).
+const UNREACHABLE: &str = "https://jmapcal-scheduling.remote.test/unreachable";
+const DENIED: &str = "This account is not allowed to send calendar scheduling messages.";
+const INCOMPLETE: &str = "The server could not complete this change, try again.";
+
+pub async fn test(test: &mut TestServer) {
+    println!("Running zero-access JMAP calendar scheduling tests...");
+    sink().clear();
+    let pair = pair(test, "scheduling").await;
+    let (noperm, noperm_id) = key_account(
+        test,
+        "scheduling-noperm",
+        user_permissions()
+            .into_iter()
+            .filter(|permission| *permission != Permission::CalendarSchedulingSend)
+            .collect(),
+    )
+    .await;
+    // `user_permissions()` lists no scheduling permission (the account's role
+    // grants it), so it is disabled through the registry, as `fanout::test`
+    // and `imip::outbound` disable theirs; the edit invalidates the token.
+    test.account("admin@example.com")
+        .registry_update_object(
+            ObjectType::Account,
+            noperm.id(),
+            json!({ Property::Permissions: Permissions::Merge(PermissionsList {
+                disabled_permissions: Map::new(vec![Permission::CalendarSchedulingSend]),
+                enabled_permissions: Map::new(user_permissions()),
+            }) }),
+        )
+        .await;
+    let test: &TestServer = test;
+    let plain = test.account(PLAIN).clone();
+    let s = Scheduling::new(test, &pair, &noperm, noperm_id, &plain).await;
+    let key2_start = inbox_ids(test, pair.key2_id).await;
+    let key_start = inbox_ids(test, pair.key_id).await;
+
+    // First: it needs an account that has pinned nobody.
+    first_invitation_and_the_session(&s).await;
+    invite_key_outside_and_plain(&s).await;
+    send_false_and_absent(&s).await;
+    send_true_denied(&s).await;
+    past_event_saved_unsent(&s).await;
+    withheld_and_unreachable_statuses(&s).await;
+    mail_guard_on_failed_commit(&s).await;
+    no_itip_task_ever(&s).await;
+
+    wait_for_queue(test).await;
+    Party::new(test, pair.key2.name())
+        .delete_items_since(test, &key2_start)
+        .await;
+    Party::new(test, pair.key.name())
+        .delete_items_since(test, &key_start)
+        .await;
+    clear_received_scheduling(test, &plain).await;
+    s.delete_left().await;
+    sink().clear();
+    finish(test, "scheduling").await;
+}
+
+/// The module's accounts, their default calendars and the events it leaves.
+struct Scheduling<'x> {
+    test: &'x TestServer,
+    pair: &'x Pair,
+    noperm: &'x Account,
+    noperm_id: u32,
+    noperm_dav: DummyWebDavClient,
+    plain: &'x Account,
+    cal: String,
+    noperm_cal: String,
+    left: Mutex<Vec<(u32, &'static str)>>,
+}
+
+async fn default_calendar(account: &Account) -> String {
+    let reply = account
+        .jmap_method_call(
+            "Calendar/get",
+            json!({ "accountId": account.id_string(), "ids": null }),
+        )
+        .await;
+    reply
+        .list()
+        .iter()
+        .find(|entry| entry["isDefault"] == true)
+        .or_else(|| reply.list().first())
+        .and_then(|entry| entry["id"].as_str())
+        .unwrap_or_else(|| panic!("no calendar for {}: {reply:?}", account.name()))
+        .to_string()
+}
+
+/// `sendSchedulingMessages: true`.
+fn send() -> Vec<(&'static str, Value)> {
+    vec![("sendSchedulingMessages", Value::Bool(true))]
+}
+
+fn none() -> Vec<(&'static str, Value)> {
+    Vec::new()
+}
+
+fn calendar_address(address: &str) -> String {
+    if address.contains('@') {
+        format!("mailto:{address}")
+    } else {
+        address.to_string()
+    }
+}
+
+/// Task 30's `event(uid)` with participants: the organizer, owner and
+/// chair, and each attendee expected to reply.
+fn invitation(organizer: &str, calendar_id: &str, uid: &str, attendees: &[&str]) -> Value {
+    let mut participants = serde_json::Map::new();
+    participants.insert(
+        "p0".to_string(),
+        json!({
+            "@type": "Participant",
+            "calendarAddress": format!("mailto:{organizer}"),
+            "roles": { "owner": true, "chair": true },
+            "participationStatus": "accepted",
+        }),
+    );
+    for (index, attendee) in attendees.iter().enumerate() {
+        participants.insert(
+            format!("p{}", index + 1),
+            json!({
+                "@type": "Participant",
+                "calendarAddress": calendar_address(attendee),
+                "kind": "individual",
+                "participationStatus": "needs-action",
+                "expectReply": true,
+            }),
+        );
+    }
+    json!({
+        "@type": "Event",
+        "uid": uid,
+        "title": uid,
+        "start": "2031-03-04T10:00:00",
+        "duration": "PT1H",
+        "timeZone": "Etc/UTC",
+        "calendarIds": { calendar_id: true },
+        "participants": participants,
+    })
+}
+
+/// The ICS twin of `invitation`, organized by `organizer`.
+fn invitation_ics(organizer: &str, uid: &str, attendees: &[&str]) -> String {
+    let mut ics = invite(uid, "20310304T100000Z", &[])
+        .replace("key1@example.com", organizer)
+        .replace("END:VEVENT\r\nEND:VCALENDAR\r\n", "");
+    for attendee in attendees {
+        ics.push_str(&format!(
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:{}\r\n",
+            calendar_address(attendee)
+        ));
+    }
+    ics.push_str("END:VEVENT\r\nEND:VCALENDAR\r\n");
+    ics
+}
+
+fn set_error(value: &Value) -> (&str, Option<&str>, Value) {
+    (
+        value["type"].as_str().unwrap_or_default(),
+        value["description"].as_str(),
+        value["properties"].clone(),
+    )
+}
+
+fn assert_updated(reply: &JmapResponse, id: &str) {
+    assert!(
+        reply
+            .pointer(&format!("/methodResponses/0/1/updated/{id}"))
+            .is_some(),
+        "{id} not updated: {reply:?}"
+    );
+}
+
+fn home(account: &Account) -> String {
+    format!("/dav/cal/{}/", account.name().replace('@', "%40"))
+}
+
+impl<'x> Scheduling<'x> {
+    async fn new(
+        test: &'x TestServer,
+        pair: &'x Pair,
+        noperm: &'x Account,
+        noperm_id: u32,
+        plain: &'x Account,
+    ) -> Self {
+        Scheduling {
+            test,
+            pair,
+            noperm,
+            noperm_id,
+            noperm_dav: DummyWebDavClient::new(noperm_id, noperm.name(), STRONG, noperm.name()),
+            plain,
+            cal: default_calendar(&pair.key).await,
+            noperm_cal: default_calendar(noperm).await,
+            left: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn leaves(&self, account_id: u32, uid: &'static str) {
+        self.left.lock().unwrap().push((account_id, uid));
+    }
+
+    fn forget(&self, uid: &str) {
+        self.left.lock().unwrap().retain(|(_, left)| *left != uid);
+    }
+
+    async fn create(
+        &self,
+        account: &Account,
+        object: Value,
+        args: Vec<(&str, Value)>,
+    ) -> JmapResponse {
+        account.jmap_create("CalendarEvent", [object], args).await
+    }
+
+    async fn update(
+        &self,
+        account: &Account,
+        id: &str,
+        patch: Value,
+        args: Vec<(&str, Value)>,
+    ) -> JmapResponse {
+        account
+            .jmap_update("CalendarEvent", [(id.to_string(), patch)], args)
+            .await
+    }
+
+    async fn href(&self, account_id: u32, uid: &str) -> String {
+        copy_href(self.test, account_id, uid).await
+    }
+
+    /// The CalDAV deletion, without scheduling, of every event the module left.
+    async fn delete_left(&self) {
+        let left = std::mem::take(&mut *self.left.lock().unwrap());
+        for (account_id, uid) in left {
+            let client = if account_id == self.noperm_id {
+                &self.noperm_dav
+            } else {
+                &self.pair.dav
+            };
+            let href = self.href(account_id, uid).await;
+            client
+                .request_with_headers("DELETE", &href, [NO_REPLY], "")
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+    }
+}
+
+/// Review focus 1 (spec 4.7, D19): a browser's first invitation to another
+/// key account pins its key; the pin's rewrap is a vault write that keeps
+/// the session.
+async fn first_invitation_and_the_session(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-first";
+    let (test, pair) = (s.test, s.pair);
+    let admin = test.account("admin@example.com");
+
+    // 1.
+    let app = za_oauth_client(test, admin, "za-jmapcal-app", ZaClientKind::Application).await;
+    let tokens = za_sign_in(test, &app, pair.key.name(), STRONG, None).await;
+    let vault = test
+        .server
+        .za_vault_record(pair.key_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let (revision, binding) = (vault.record.revision, za_session_binding(&vault.record));
+    let before = inbox_ids(test, pair.key2_id).await;
+    let account = pair.key.id_string();
+
+    // 2.
+    let (status, reply) = za_bearer_jmap(
+        &tokens.access,
+        CALENDAR_JMAP_USING,
+        json!([["CalendarEvent/set", {
+            "accountId": account,
+            "sendSchedulingMessages": true,
+            "create": { "i0": invitation(pair.key.name(), &s.cal, UID, &[pair.key2.name()]) },
+        }, "c0"]]),
+    )
+    .await;
+    assert_eq!(status, 200, "{reply:?}");
+    let id = reply.created_id(0).to_string();
+    s.leaves(pair.key_id, UID);
+    assert_eq!(
+        new_inbox_items(test, pair.key2_id, &before).await.len(),
+        1,
+        "first_invitation_and_the_session: key2's new items"
+    );
+
+    // 3. The rewrap raised the vault revision and evicted the resident keys;
+    // the token opens them again from the token record.
+    let get = |token: String| {
+        let id = id.clone();
+        async move {
+            za_bearer_jmap(
+                &token,
+                CALENDAR_JMAP_USING,
+                json!([["CalendarEvent/get", { "accountId": account, "ids": [id] }, "c0"]]),
+            )
+            .await
+        }
+    };
+    let (status, reply) = get(tokens.access.clone()).await;
+    assert_eq!(
+        status, 200,
+        "first_invitation_and_the_session: the same token after the pin"
+    );
+    assert_eq!(reply.list().len(), 1, "{reply:?}");
+
+    // 4.
+    let TokenResponse::Granted(refreshed) = za_refresh(&app, &tokens.refresh).await else {
+        panic!("first_invitation_and_the_session: the refresh was refused");
+    };
+    let (status, reply) = get(refreshed.access_token.clone()).await;
+    assert_eq!(
+        status, 200,
+        "first_invitation_and_the_session: the refreshed token"
+    );
+    let [event] = reply.list() else {
+        panic!("first_invitation_and_the_session: {reply:?}");
+    };
+    let key2_address = format!("mailto:{}", pair.key2.name());
+    let participant = event["participants"]
+        .as_object()
+        .and_then(|participants| {
+            participants
+                .values()
+                .find(|participant| participant["calendarAddress"] == key2_address.as_str())
+        })
+        .unwrap_or_else(|| panic!("key2 is no participant: {event}"));
+    assert_eq!(
+        participant["participationStatus"], "needs-action",
+        "{event}"
+    );
+    // Upstream's JSCalendar projection carries no SCHEDULE-STATUS (calcard
+    // drops the parameter, `jscalendar/import/params.rs:357`), so the status
+    // is read where the event records it: key2's item was delivered.
+    let statuses =
+        attendee_statuses(&pair.dav, &s.href(pair.key_id, UID).await, pair.key2.name()).await;
+    assert_eq!(
+        statuses,
+        ["1.2"],
+        "first_invitation_and_the_session: key2's status"
+    );
+
+    // 5.
+    let record = token_record(test, pair.key_id)
+        .await
+        .expect("first_invitation_and_the_session: the token record is gone");
+    assert!(
+        record.grant(tokens.grant_id).is_some(),
+        "first_invitation_and_the_session: the grant left the token record"
+    );
+    let vault = test
+        .server
+        .za_vault_record(pair.key_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(vault.record.revision, revision + 1);
+    assert_eq!(za_session_binding(&vault.record), binding);
+
+    // 6.
+    assert_eq!(
+        za_revoke_token(&app, refreshed.refresh_token.as_deref().unwrap()).await,
+        200
+    );
+    za_drop_oauth_client(test, admin, app).await;
+}
+
+/// D4, D18, spec 5.4: a key attendee gets a sealed item, an outside one and
+/// a plain one get mail, as the CalDAV twin gives them.
+async fn invite_key_outside_and_plain(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-invite";
+    const DAV_UID: &str = "jmapcal-sched-invite-dav";
+    let (test, pair) = (s.test, s.pair);
+    let attendees = [pair.key2.name(), OUT, PLAIN];
+
+    sink().clear();
+    let before = inbox_ids(test, pair.key2_id).await;
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(pair.key.name(), &s.cal, UID, &attendees),
+            send(),
+        )
+        .await;
+    let id = reply.created_id(0).to_string();
+    s.leaves(pair.key_id, UID);
+    wait_for_queue(test).await;
+    let items = new_inbox_items(test, pair.key2_id, &before).await;
+    assert_eq!(items.len(), 1, "invite_key_outside_and_plain: key2's items");
+    let (ical, _) = open_pending_item_as(test, pair.key2_id, STRONG, items[0].0).await;
+    assert_eq!(item_method(&ical), Some(ICalendarMethod::Request));
+    let mail = sink().take_to(OUT);
+    assert_eq!(mail.len(), 1, "invite_key_outside_and_plain: mail to OUT");
+    assert_eq!(mail[0].calendar_method().as_deref(), Some("REQUEST"));
+    let href = s.href(pair.key_id, UID).await;
+    for address in [OUT, PLAIN] {
+        assert_eq!(
+            attendee_statuses(&pair.dav, &href, address).await,
+            ["1.1"],
+            "{address}"
+        );
+    }
+
+    // The CalDAV twin.
+    assert_eq!(
+        put(
+            pair.key.name(),
+            STRONG,
+            format!("{}default/{DAV_UID}.ics", home(&pair.key)),
+            invitation_ics(pair.key.name(), DAV_UID, &attendees),
+        )
+        .await,
+        StatusCode::CREATED.as_u16()
+    );
+    s.leaves(pair.key_id, DAV_UID);
+    wait_for_queue(test).await;
+    let dav_href = s.href(pair.key_id, DAV_UID).await;
+    assert_eq!(
+        attendee_statuses(&pair.dav, &href, pair.key2.name()).await,
+        attendee_statuses(&pair.dav, &dav_href, pair.key2.name()).await,
+        "invite_key_outside_and_plain: key2's schedule status"
+    );
+    let keys = za_unlock(test, pair.key_id, STRONG).await;
+    let jmap_pairs = stored_pairs(test, &keys, pair.key_id, &relative(&href))
+        .await
+        .unwrap_or_default();
+    let dav_pairs = stored_pairs(test, &keys, pair.key_id, &relative(&dav_href))
+        .await
+        .unwrap_or_default();
+    assert!(!jmap_pairs.is_empty(), "the JMAP invitation stored no pair");
+    assert_eq!(jmap_pairs.len(), dav_pairs.len());
+    for address in attendees {
+        assert_eq!(
+            jmap_pairs.get(address).is_some(),
+            dav_pairs.get(address).is_some(),
+            "invite_key_outside_and_plain: the pair of {address}"
+        );
+    }
+
+    // An update with the flag schedules again.
+    wait_for_queue(test).await;
+    sink().clear();
+    let before = inbox_ids(test, pair.key2_id).await;
+    let reply = s
+        .update(
+            &pair.key,
+            &id,
+            json!({ "start": "2031-03-04T12:00:00" }),
+            send(),
+        )
+        .await;
+    assert_updated(&reply, &id);
+    wait_for_queue(test).await;
+    let items = new_inbox_items(test, pair.key2_id, &before).await;
+    assert_eq!(
+        items.len(),
+        1,
+        "invite_key_outside_and_plain: key2's update"
+    );
+    let (ical, _) = open_pending_item_as(test, pair.key2_id, STRONG, items[0].0).await;
+    assert_eq!(item_method(&ical), Some(ICalendarMethod::Request));
+    let mail = sink().take_to(OUT);
+    assert_eq!(mail.len(), 1, "invite_key_outside_and_plain: update mail");
+    assert_eq!(mail[0].calendar_method().as_deref(), Some("REQUEST"));
+}
+
+/// D4: `sendSchedulingMessages` false or absent turns scheduling off.
+async fn send_false_and_absent(s: &Scheduling<'_>) {
+    let (test, pair) = (s.test, s.pair);
+    for (label, uid, args) in [
+        (
+            "false",
+            "jmapcal-sched-false",
+            vec![("sendSchedulingMessages", Value::Bool(false))],
+        ),
+        ("absent", "jmapcal-sched-absent", none()),
+    ] {
+        sink().clear();
+        let before = inbox_ids(test, pair.key2_id).await;
+        let reply = s
+            .create(
+                &pair.key,
+                invitation(pair.key.name(), &s.cal, uid, &[pair.key2.name(), OUT]),
+                args,
+            )
+            .await;
+        let id = reply.created_id(0).to_string();
+        s.leaves(pair.key_id, uid);
+        assert_unscheduled(s, &format!("{label}, create"), uid, &before).await;
+
+        let reply = s
+            .update(
+                &pair.key,
+                &id,
+                json!({ "start": "2031-03-04T12:00:00" }),
+                none(),
+            )
+            .await;
+        assert_updated(&reply, &id);
+        assert_unscheduled(s, &format!("{label}, update"), uid, &before).await;
+    }
+}
+
+/// No item for key2, no mail and no schedule status since `before`.
+async fn assert_unscheduled(s: &Scheduling<'_>, step: &str, uid: &str, before: &[u32]) {
+    let (test, pair) = (s.test, s.pair);
+    wait_for_queue(test).await;
+    assert!(
+        new_inbox_items(test, pair.key2_id, before).await.is_empty(),
+        "send_false_and_absent, {step}: key2 got an item"
+    );
+    assert!(
+        sink().messages().is_empty(),
+        "send_false_and_absent, {step}: mail was sent"
+    );
+    let href = s.href(pair.key_id, uid).await;
+    for address in [pair.key2.name(), OUT] {
+        assert!(
+            attendee_statuses(&pair.dav, &href, address)
+                .await
+                .is_empty(),
+            "send_false_and_absent, {step}: {address} has a schedule status"
+        );
+    }
+}
+
+/// D18: with `sendSchedulingMessages: true`, a denied status refuses the
+/// object before any write; without the flag, and over CalDAV, it is saved.
+async fn send_true_denied(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-denied";
+    const DAV_UID: &str = "jmapcal-sched-denied-dav";
+    let test = s.test;
+
+    sink().clear();
+    let reply = s
+        .create(
+            s.noperm,
+            invitation(s.noperm.name(), &s.noperm_cal, UID, &[OUT]),
+            send(),
+        )
+        .await;
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        ("forbidden", Some(DENIED), Value::Null),
+        "{reply:?}"
+    );
+    assert_eq!(uid_copies(test, s.noperm_id, UID).await, 0);
+    assert_eq!(za_uid_leases(test).await, 0);
+    wait_for_queue(test).await;
+    assert!(sink().messages().is_empty(), "send_true_denied: mail");
+
+    let reply = s
+        .create(
+            s.noperm,
+            invitation(s.noperm.name(), &s.noperm_cal, UID, &[OUT]),
+            none(),
+        )
+        .await;
+    let document_id = reply.created_id(0).document_id();
+    s.leaves(s.noperm_id, UID);
+    let (meta, content) = event_records(test, s.noperm_id, document_id).await;
+    let id = Id::from(document_id).to_string();
+    let reply = s
+        .update(
+            s.noperm,
+            &id,
+            json!({ "start": "2031-03-04T12:00:00" }),
+            send(),
+        )
+        .await;
+    assert_eq!(
+        set_error(reply.not_updated(&id)),
+        ("forbidden", Some(DENIED), Value::Null),
+        "{reply:?}"
+    );
+    let (meta_after, content_after) = event_records(test, s.noperm_id, document_id).await;
+    assert!(
+        meta.as_bytes() == meta_after.as_bytes() && content.as_bytes() == content_after.as_bytes(),
+        "send_true_denied: the refused update changed the event"
+    );
+
+    assert_eq!(
+        put(
+            s.noperm.name(),
+            STRONG,
+            format!("{}default/{DAV_UID}.ics", home(s.noperm)),
+            invitation_ics(s.noperm.name(), DAV_UID, &[OUT]),
+        )
+        .await,
+        StatusCode::CREATED.as_u16()
+    );
+    s.leaves(s.noperm_id, DAV_UID);
+    wait_for_queue(test).await;
+    assert!(
+        sink().messages().is_empty(),
+        "send_true_denied: CalDAV mail"
+    );
+}
+
+/// D18: an event in the past is saved and nothing is sent.
+async fn past_event_saved_unsent(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-past";
+    let (test, pair) = (s.test, s.pair);
+    sink().clear();
+    let before = inbox_ids(test, pair.key2_id).await;
+    let mut object = invitation(pair.key.name(), &s.cal, UID, &[pair.key2.name(), OUT]);
+    object["start"] = json!("2001-03-04T10:00:00");
+    let reply = s.create(&pair.key, object, send()).await;
+    reply.created_id(0);
+    s.leaves(pair.key_id, UID);
+    wait_for_queue(test).await;
+    assert!(
+        new_inbox_items(test, pair.key2_id, &before)
+            .await
+            .is_empty(),
+        "past_event_saved_unsent: key2 got an item"
+    );
+    assert!(
+        sink().messages().is_empty(),
+        "past_event_saved_unsent: mail"
+    );
+}
+
+/// Spec 3.3: a withheld and an unreachable attendee record their statuses
+/// and the object is saved, as on CalDAV; upstream refuses the plain twin.
+async fn withheld_and_unreachable_statuses(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-withheld";
+    const DAV_UID: &str = "jmapcal-sched-withheld-dav";
+    const PLAIN_UID: &str = "jmapcal-sched-withheld-plain";
+    let (test, pair) = (s.test, s.pair);
+    let attendees = [NOBODY, UNREACHABLE];
+
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(pair.key.name(), &s.cal, UID, &attendees),
+            send(),
+        )
+        .await;
+    reply.created_id(0);
+    s.leaves(pair.key_id, UID);
+    assert_eq!(
+        put(
+            pair.key.name(),
+            STRONG,
+            format!("{}default/{DAV_UID}.ics", home(&pair.key)),
+            invitation_ics(pair.key.name(), DAV_UID, &attendees),
+        )
+        .await,
+        StatusCode::CREATED.as_u16()
+    );
+    s.leaves(pair.key_id, DAV_UID);
+    let href = s.href(pair.key_id, UID).await;
+    let dav_href = s.href(pair.key_id, DAV_UID).await;
+    for address in attendees {
+        let statuses = attendee_statuses(&pair.dav, &href, address).await;
+        assert!(!statuses.is_empty(), "{address}: no schedule status");
+        assert_eq!(
+            statuses,
+            attendee_statuses(&pair.dav, &dav_href, address).await,
+            "withheld_and_unreachable_statuses: {address}"
+        );
+    }
+
+    let plain_cal = default_calendar(s.plain).await;
+    let reply = s
+        .create(
+            s.plain,
+            invitation(PLAIN, &plain_cal, PLAIN_UID, &attendees),
+            send(),
+        )
+        .await;
+    assert_eq!(
+        reply.not_created(0)["type"],
+        "noSupportedScheduleMethods",
+        "{reply:?}"
+    );
+    assert_eq!(
+        uid_copies(test, s.plain.id().document_id(), PLAIN_UID).await,
+        0
+    );
+    wait_for_queue(test).await;
+}
+
+/// Spec 5.3 (D3, D28), release 5 invariant 46: an object whose commit fails
+/// drops its mail; the object before it keeps its commit and its mail, the
+/// one after it is not attempted.
+async fn mail_guard_on_failed_commit(s: &Scheduling<'_>) {
+    const UIDS: [&str; 3] = [
+        "jmapcal-sched-guard-1",
+        "jmapcal-sched-guard-2",
+        "jmapcal-sched-guard-3",
+    ];
+    let (test, pair) = (s.test, s.pair);
+    let key_id = pair.key_id;
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(pair.key.name(), &s.cal, UIDS[0], &[OUT]),
+            send(),
+        )
+        .await;
+    let mut created = vec![(reply.created_id(0), UIDS[0])];
+    for uid in &UIDS[1..] {
+        let reply = s
+            .create(
+                &pair.key,
+                invitation(pair.key.name(), &s.cal, uid, &[OUT]),
+                send(),
+            )
+            .await;
+        created.push((reply.created_id(0), *uid));
+    }
+    for uid in UIDS {
+        s.leaves(key_id, uid);
+    }
+    wait_for_queue(test).await;
+    sink().clear();
+    let account = pair.key.id_string().to_string();
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({ "accountId": account, "ids": [] }),
+        )
+        .await;
+    let state = reply.state().to_string();
+    created.sort_by_key(|(id, _)| id.to_string());
+    let [first, second, third] = [created[0], created[1], created[2]];
+    let third_before = event_records(test, key_id, third.0.document_id()).await;
+    let mut updates = serde_json::Map::new();
+    for (index, (id, _)) in created.iter().enumerate() {
+        updates.insert(
+            id.to_string(),
+            json!({ "title": format!("guard canary {}", index + 1), "start": "2031-03-04T12:00:00" }),
+        );
+    }
+
+    // The first object reaches its commit; the second pause is armed before
+    // the first is released, and the failure once the call is in the second.
+    let traced = Traced::start(&[EventType::Calendar(TrcCalendarEvent::ItipMessageError)]);
+    let first_pause = Arc::new(Pause::new(key_id));
+    test_hooks::set_update_commit_pause(Some(first_pause.clone()));
+    let caller = pair.key.clone();
+    let args = json!({
+        "accountId": account,
+        "sendSchedulingMessages": true,
+        "update": updates,
+    });
+    let call =
+        tokio::spawn(async move { caller.jmap_method_call("CalendarEvent/set", args).await });
+    tokio::time::timeout(Duration::from_secs(5), first_pause.arrived.notified())
+        .await
+        .expect("mail_guard_on_failed_commit: the first object did not reach its commit");
+    let second_pause = Arc::new(Pause::new(key_id));
+    test_hooks::set_update_commit_pause(Some(second_pause.clone()));
+    first_pause.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), second_pause.arrived.notified())
+        .await
+        .expect("mail_guard_on_failed_commit: the second object did not reach its commit");
+    test_hooks::set_update_commit_fail_once(Some(key_id));
+    second_pause.release.notify_one();
+    let reply = call.await.unwrap();
+    test_hooks::set_update_commit_pause(None);
+    test_hooks::set_update_commit_fail_once(None);
+    let dropped = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| {
+            event.details == ZA_IMIP_DROPPED && event.account_id == Some(u64::from(key_id))
+        })
+        .map(|event| {
+            event
+                .keys
+                .iter()
+                .find_map(|(key, value)| match (key, value) {
+                    (Key::DocumentId, trc::Value::UInt(id)) => Some(*id as u32),
+                    _ => None,
+                })
+                .expect("a document id")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_updated(&reply, &first.0.to_string());
+    for (id, _) in [second, third] {
+        assert_eq!(
+            set_error(reply.not_updated(&id.to_string())),
+            ("forbidden", Some(INCOMPLETE), Value::Null),
+            "{reply:?}"
+        );
+    }
+    let first_body = body(&pair.dav, &s.href(key_id, first.1).await).await;
+    assert!(first_body.contains("guard canary 1"), "{first_body}");
+    let second_body = body(&pair.dav, &s.href(key_id, second.1).await).await;
+    assert!(!second_body.contains("guard canary"), "{second_body}");
+    let third_after = event_records(test, key_id, third.0.document_id()).await;
+    assert!(
+        third_before.0.as_bytes() == third_after.0.as_bytes()
+            && third_before.1.as_bytes() == third_after.1.as_bytes(),
+        "mail_guard_on_failed_commit: the third object was written"
+    );
+
+    let changes = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/changes",
+            json!({ "accountId": account, "sinceState": state }),
+        )
+        .await;
+    let response = changes.response_at(0);
+    assert_eq!(
+        response["updated"],
+        json!([first.0.to_string()]),
+        "{changes:?}"
+    );
+    assert_eq!(response["created"], json!([]), "{changes:?}");
+    assert_eq!(response["destroyed"], json!([]), "{changes:?}");
+    assert_eq!(response["newState"], reply.response_at(0)["newState"]);
+
+    wait_for_queue(test).await;
+    let mail = sink().take_to(OUT);
+    assert_eq!(mail.len(), 1, "mail_guard_on_failed_commit: mail to OUT");
+    let uid_line = format!("UID:{}", first.1);
+    assert!(
+        mail[0]
+            .calendar_part()
+            .is_some_and(|part| part.lines().any(|line| line == uid_line)),
+        "mail_guard_on_failed_commit: the mail is not the first event's"
+    );
+    assert_eq!(
+        dropped,
+        [second.0.document_id()],
+        "mail_guard_on_failed_commit: ZA_IMIP_DROPPED"
+    );
+}
+
+/// Invariant 57: no key-account write queues an iTIP task.
+async fn no_itip_task_ever(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-no-task";
+    let (test, pair) = (s.test, s.pair);
+    let held = hold_task_consumer(test).await;
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(
+                pair.key.name(),
+                &s.cal,
+                UID,
+                &[pair.key2.name(), OUT, PLAIN],
+            ),
+            send(),
+        )
+        .await;
+    let id = reply.created_id(0).to_string();
+    let reply = s
+        .update(
+            &pair.key,
+            &id,
+            json!({ "start": "2031-03-04T12:00:00" }),
+            send(),
+        )
+        .await;
+    assert_updated(&reply, &id);
+    wait_for_queue(test).await;
+    let href = s.href(pair.key_id, UID).await;
+    let response = HttpRequest::with_credentials(8899, pair.key.name(), STRONG)
+        .send_full(Method::DELETE, &href, None, None)
+        .await;
+    assert_eq!(response.status, StatusCode::NO_CONTENT);
+    s.forget(UID);
+    wait_for_queue(test).await;
+    assert_eq!(
+        itip_tasks_for(test, pair.key_id).await,
+        0,
+        "no_itip_task_ever: an iTIP task was queued"
+    );
+    drop(held);
+}

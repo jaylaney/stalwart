@@ -12,18 +12,22 @@ use crate::{
     utils::{
         jmap::JmapResponse,
         server::TestServer,
+        smtp_sink::sink,
         za::{
             CALENDAR_JMAP_USING, HookParked, assert_no_event_preferences, delete_event_records,
-            inbox_ids, itip_tasks_for, plant_event, stored_event, wait_for_queue,
-            write_stored_event, za_bearer_jmap, za_grant_token, za_revoke_grant, za_uid_leases,
+            delete_inbox_item, inbox_ids, itip_tasks_for, plant_event, stored_event,
+            wait_for_queue, write_stored_event, za_bearer_jmap, za_grant_token, za_revoke_grant,
+            za_uid_leases, za_unlock,
         },
     },
     za::{
+        STRONG,
         dav_seal::resource_id,
         drain,
-        fanout::{CONTENT_TYPE, NO_REPLY, uid_copies},
+        fanout::{CONTENT_TYPE, NO_REPLY, invite, stored_pairs, stored_sequence, uid_copies},
         gating::method_error,
         imip::deliver,
+        uid_lease::put,
     },
 };
 use calcard::icalendar::ICalendarValue;
@@ -89,6 +93,17 @@ pub async fn test(test: &mut TestServer) {
     create_stores_no_preferences_and_no_index_document(&events).await;
     tasks(&events).await;
     create_holds_the_lease(&events).await;
+    // Release 6 spec 6.5, 5.4: CalendarEvent/set updates (Task 31).
+    update_keeps_pairs_and_display_name(&events).await;
+    update_applies_sequence_floor(&events).await;
+    let series = Series::create(&events).await;
+    update_recurrence_by_synthetic_id(&events, &series).await;
+    update_recurrence_by_override(&events, &series).await;
+    update_occurrence_flags_get_upstreams_refusal(&events, &series).await;
+    events.delete(series.document_id).await;
+    update_by_restricted_grantee_refused(&events).await;
+    update_uid_change_refused(&events).await;
+    update_legacy_event_seals_it(&events).await;
     events.finish().await;
     pair.dav
         .request_with_headers("DELETE", &event_path("jmapcal-shared/"), [NO_REPLY], "")
@@ -1333,4 +1348,349 @@ async fn create_holds_the_lease(events: &Events<'_>) {
     assert_eq!(uid_copies(events.test, events.pair.key_id, UID).await, 1);
     assert_eq!(za_uid_leases(events.test).await, 0);
     events.delete(document_id).await;
+}
+
+/// `update` of one event of the account, no scheduling flag.
+async fn update_event(events: &Events<'_>, document_id: u32, patch: Value) -> JmapResponse {
+    events
+        .pair
+        .key
+        .jmap_update(
+            "CalendarEvent",
+            [(Id::from(document_id).to_string(), patch)],
+            none(),
+        )
+        .await
+}
+
+/// The update's `updated` entry, or a panic naming the answer.
+fn assert_updated(reply: &JmapResponse, id: &str) {
+    assert!(
+        reply
+            .pointer(&format!("/methodResponses/0/1/updated/{id}"))
+            .is_some(),
+        "{id} not updated: {reply:?}"
+    );
+}
+
+/// Spec 5.4: with scheduling off, an update carries the stored token pairs
+/// and the stored display name into the resealed event.
+async fn update_keeps_pairs_and_display_name(events: &Events<'_>) {
+    const UID: &str = "jmapcal-events-pairs";
+    const PATH: &str = "default/jmapcal-events-pairs.ics";
+    let (test, pair) = (events.test, events.pair);
+    let start = inbox_ids(test, pair.key2_id).await;
+    assert_eq!(
+        put(
+            pair.key.name(),
+            STRONG,
+            event_path(PATH),
+            invite(UID, "20990301T100000Z", &[pair.key2.name()])
+                .replace("key1@example.com", pair.key.name()),
+        )
+        .await,
+        StatusCode::CREATED.as_u16()
+    );
+    pair.dav
+        .proppatch(
+            &event_path(PATH),
+            [("D:displayname", "Display canary")],
+            [],
+            [],
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let keys = za_unlock(test, pair.key_id, STRONG).await;
+    let address = pair.key2.name();
+    let before = stored_pairs(test, &keys, pair.key_id, PATH)
+        .await
+        .expect("the invitation stored a token pair");
+    let token = *before.get(address).expect("key2's pair");
+    let document_id = resource_id(test, pair.key_id, PATH).await;
+    let items = inbox_ids(test, pair.key2_id).await;
+
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "description": "Edited canary" }),
+    )
+    .await;
+    assert_updated(&reply, &Id::from(document_id).to_string());
+
+    let after = stored_pairs(test, &keys, pair.key_id, PATH)
+        .await
+        .expect("update_keeps_pairs_and_display_name: the update dropped the token pairs");
+    assert_eq!(after.len(), before.len());
+    assert!(
+        after.matches(address, &token),
+        "update_keeps_pairs_and_display_name: key2's pair changed"
+    );
+    pair.dav
+        .propfind(&event_path(PATH), ["D:displayname"])
+        .await
+        .properties(&event_path(PATH))
+        .get("D:displayname")
+        .with_values(["Display canary"]);
+    let body = drain::body(&pair.dav, &event_path(PATH)).await;
+    assert!(body.contains("DESCRIPTION:Edited canary"), "{body}");
+    assert_eq!(
+        inbox_ids(test, pair.key2_id).await,
+        items,
+        "key2 got an item without scheduling"
+    );
+
+    delete_event(pair, PATH).await;
+    for id in inbox_ids(test, pair.key2_id).await {
+        if !start.contains(&id) {
+            delete_inbox_item(test, &pair.dav2, pair.key2_id, id).await;
+        }
+    }
+}
+
+/// Spec 5.4: the SEQUENCE floor follows upstream's increment on every
+/// update, so a client's lower SEQUENCE never lowers the stored one.
+async fn update_applies_sequence_floor(events: &Events<'_>) {
+    const UID: &str = "jmapcal-events-floor";
+    const PATH: &str = "default/jmapcal-events-floor.ics";
+    const OUT: &str = "jmapcal-events-out@remote.test";
+    let (test, pair) = (events.test, events.pair);
+    assert_eq!(
+        put(
+            pair.key.name(),
+            STRONG,
+            event_path(PATH),
+            invite(UID, "20990301T100000Z", &[OUT])
+                .replace("key1@example.com", pair.key.name())
+                .replace("SEQUENCE:0", "SEQUENCE:5"),
+        )
+        .await,
+        StatusCode::CREATED.as_u16()
+    );
+    wait_for_queue(test).await;
+    sink().clear();
+    let floor = stored_sequence(&pair.dav, &event_path(PATH)).await;
+    assert!(floor >= 5, "{floor}");
+    let document_id = resource_id(test, pair.key_id, PATH).await;
+
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "sequence": 1, "description": "floor" }),
+    )
+    .await;
+    assert_updated(&reply, &Id::from(document_id).to_string());
+    let after = stored_sequence(&pair.dav, &event_path(PATH)).await;
+    println!("  update_applies_sequence_floor: stored {floor}, after the update {after}");
+    // Upstream's increment (`calendar_event/set.rs:916-926`) runs first and
+    // the floor after it; the stored SEQUENCE is never lowered to the
+    // client's value.
+    assert!(
+        after >= floor && after != 1,
+        "update_applies_sequence_floor: {after} below the floor {floor}"
+    );
+
+    delete_event(pair, PATH).await;
+    wait_for_queue(test).await;
+    sink().clear();
+}
+
+/// A daily event of five occurrences, created over JMAP, and the synthetic
+/// id of its second occurrence.
+struct Series {
+    document_id: u32,
+    second: String,
+}
+
+impl Series {
+    const UID: &'static str = "jmapcal-events-rec";
+
+    async fn create(events: &Events<'_>) -> Self {
+        let mut object = events.event(Self::UID);
+        object["recurrenceRule"] =
+            json!({ "@type": "RecurrenceRule", "frequency": "daily", "count": 5 });
+        let reply = events.create(vec![object]).await;
+        let document_id = Events::created_document(&reply, 0);
+
+        let account = events.pair.key.id_string();
+        let reply = events
+            .pair
+            .key
+            .jmap_method_call(
+                "CalendarEvent/query",
+                json!({
+                    "accountId": account,
+                    "filter": { "after": "2031-03-01T00:00:00", "before": "2031-03-31T00:00:00" },
+                    "expandRecurrences": true,
+                }),
+            )
+            .await;
+        assert_eq!(method_error(&reply), None, "{reply:?}");
+        let ids = reply.ids().map(str::to_string).collect::<Vec<_>>();
+        let reply = events
+            .pair
+            .key
+            .jmap_method_call(
+                "CalendarEvent/get",
+                json!({ "accountId": account, "ids": ids, "properties": ["id", "uid", "start"] }),
+            )
+            .await;
+        let second = reply
+            .list()
+            .iter()
+            .find(|event| event["uid"] == Self::UID && event["start"] == "2031-03-05T10:00:00")
+            .and_then(|event| event["id"].as_str())
+            .unwrap_or_else(|| panic!("no second occurrence: {reply:?}"))
+            .to_string();
+        Series {
+            document_id,
+            second,
+        }
+    }
+}
+
+/// Spec 6.5: an occurrence is updated through its synthetic id, upstream's
+/// conversion to an override of the base event.
+async fn update_recurrence_by_synthetic_id(events: &Events<'_>, series: &Series) {
+    let reply = events
+        .pair
+        .key
+        .jmap_update(
+            "CalendarEvent",
+            [(series.second.clone(), json!({ "title": "Override canary" }))],
+            none(),
+        )
+        .await;
+    assert_updated(&reply, &series.second);
+    let body = events.body(series.document_id).await;
+    assert_eq!(body.matches("BEGIN:VEVENT").count(), 2, "{body}");
+    assert!(
+        body.contains("RECURRENCE-ID") && body.contains("SUMMARY:Override canary"),
+        "{body}"
+    );
+}
+
+/// Spec 6.5: an occurrence is updated through the base event's
+/// `recurrenceOverrides`.
+async fn update_recurrence_by_override(events: &Events<'_>, series: &Series) {
+    let reply = update_event(
+        events,
+        series.document_id,
+        json!({ "recurrenceOverrides/2031-03-06T10:00:00": { "title": "Third canary" } }),
+    )
+    .await;
+    assert_updated(&reply, &Id::from(series.document_id).to_string());
+    let body = events.body(series.document_id).await;
+    assert_eq!(body.matches("BEGIN:VEVENT").count(), 3, "{body}");
+    assert!(body.contains("SUMMARY:Third canary"), "{body}");
+}
+
+/// Spec 6.5: the flag rulings apply to the event's own patch; on one
+/// occurrence upstream's instance validator answers.
+async fn update_occurrence_flags_get_upstreams_refusal(events: &Events<'_>, series: &Series) {
+    for property in ["isDraft", "mayInviteSelf", "useDefaultAlerts"] {
+        let reply = events
+            .pair
+            .key
+            .jmap_update(
+                "CalendarEvent",
+                [(series.second.clone(), json!({ property: true }))],
+                none(),
+            )
+            .await;
+        assert_eq!(
+            set_error(reply.not_updated(&series.second)),
+            (
+                "invalidProperties",
+                Some("This property cannot be modified on a single occurrence."),
+                json!([property])
+            ),
+            "{property}: {reply:?}"
+        );
+    }
+}
+
+/// Upstream's `EventChanges::assert_allowed` refuses a grantee that may only
+/// read the calendar; nothing is written.
+async fn update_by_restricted_grantee_refused(events: &Events<'_>) {
+    const UID: &str = "jmapcal-events-restricted";
+    let (test, pair) = (events.test, events.pair);
+    let path = event_path(&format!("jmapcal-shared/{UID}.ics"));
+    let document_id = put_event(test, &pair.key, &pair.dav, "jmapcal-shared", UID, UID).await;
+    let before = drain::body(&pair.dav, &path).await;
+    let id = Id::from(document_id).to_string();
+
+    let reply = pair
+        .key2
+        .jmap_update_account(
+            &pair.key,
+            "CalendarEvent",
+            [(id.clone(), json!({ "title": "Not allowed" }))],
+            none(),
+        )
+        .await;
+    assert_eq!(
+        set_error(reply.not_updated(&id)),
+        (
+            "forbidden",
+            Some("You are not allowed to modify this event."),
+            Value::Null
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(drain::body(&pair.dav, &path).await, before);
+    delete_event(pair, &format!("jmapcal-shared/{UID}.ics")).await;
+}
+
+/// Upstream's UID check on an update.
+async fn update_uid_change_refused(events: &Events<'_>) {
+    const UID: &str = "jmapcal-events-uid-change";
+    let reply = events.create(vec![events.event(UID)]).await;
+    let document_id = Events::created_document(&reply, 0);
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "uid": "jmapcal-events-other" }),
+    )
+    .await;
+    assert_eq!(
+        set_error(reply.not_updated(&Id::from(document_id).to_string())),
+        (
+            "invalidProperties",
+            Some("You cannot change the UID of a calendar event."),
+            json!(["uid"])
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(
+        uid_copies(events.test, events.pair.key_id, "jmapcal-events-other").await,
+        0
+    );
+    events.delete(document_id).await;
+}
+
+/// Release 1 spec 8.1: an update of a legacy plaintext event seals it.
+async fn update_legacy_event_seals_it(events: &Events<'_>) {
+    let (test, key_id) = (events.test, events.pair.key_id);
+    let document_id = plant_event(
+        test,
+        key_id,
+        "default",
+        "jmapcal-legacy.ics",
+        &event_ics("jmapcal-events-legacy-set", "jmapcal legacy set"),
+        None,
+    )
+    .await;
+    let reply = update_event(events, document_id, json!({ "title": "Sealed canary" })).await;
+    assert_updated(&reply, &Id::from(document_id).to_string());
+    let tree = stored_event(test, key_id, document_id)
+        .await
+        .tree()
+        .to_string();
+    assert!(
+        !tree.contains("Sealed canary"),
+        "update_legacy_event_seals_it: the stored tree holds the title in the clear"
+    );
+    let body = events.body(document_id).await;
+    assert!(body.contains("SUMMARY:Sealed canary"), "{body}");
+    delete_event(events.pair, "default/jmapcal-legacy.ics").await;
 }

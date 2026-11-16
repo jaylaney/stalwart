@@ -11,12 +11,17 @@
 //! applied by value (D11). A store error answers that object and every later
 //! one (D28).
 //!
-//! Until Tasks 31 to 33 land, updates and destroys are answered `forbidden`
-//! with `ZA_INTERIM` and never reach upstream's path (I §7.3).
+//! Updates are grouped as upstream groups them and written by the pipeline's
+//! update commit with the stored token pairs, display name and SEQUENCE floor
+//! (spec 5.4). Until Tasks 32 and 33 land, a change of an event's calendars
+//! and destroys are answered `forbidden` with `ZA_INTERIM` and never reach
+//! upstream's path (I §7.3).
 
 use super::{
-    DEFAULTED_FLAGS, EventWrite, PatchTarget, add_calendar_forbidden, assert_participants_limit,
-    clamp_created, generate_uid, stamp_created, stamp_updated, too_large_event, too_many_calendars,
+    ComponentSequences, DEFAULTED_FLAGS, EVENT_METADATA_FLAGS, EventOp, EventOps, EventUpdate,
+    EventUpdates, EventWrite, InstanceAction, InstanceOp, InstancePlan, PatchTarget,
+    add_calendar_forbidden, assert_participants_limit, clamp_created, generate_uid,
+    instance_imported_values, stamp_created, stamp_updated, too_large_event, too_many_calendars,
     too_many_events, update_calendar_event,
 };
 use crate::{
@@ -31,10 +36,18 @@ use crate::{
     },
     blob::embedded::EmbeddedExport,
     calendar_event::{
-        EventMainComponent, EventValue, JSCalendarEntries, duplicate_uid, is_origin,
-        privacy::{UidPrivacyConflicts, assert_privacy_allowed, uid_privacy_conflict},
-        server_set::{BlobProperties, ImportedValues, ServerSetValues, TrackedValues},
+        CalendarSyntheticId, EventMainComponent, EventValue, JSCalendarEntries,
+        detach_iana_timezones, duplicate_uid, is_origin,
+        privacy::{
+            UidPrivacyConflicts, assert_privacy_access, assert_privacy_allowed,
+            uid_privacy_conflict,
+        },
+        server_set::{
+            BlobProperties, EmbeddedBlobId, ImportedValues, ServerSetValues, TrackedValues,
+        },
         user::user_data_error,
+        validate::InstanceMetadata,
+        za_read::ZaEventReader,
     },
     changes::state::JmapCacheState,
 };
@@ -43,7 +56,7 @@ use calcard::{
     jscalendar::{JSCALENDAR_VERSION, JSCalendar, JSCalendarProperty},
 };
 use common::{
-    DavName, GroupwareResources, Server,
+    ArchivedDavName, DavName, GroupwareResources, Server,
     auth::{AccessToken, AccountCache, AccountInfo},
     storage::quota::{DiskQuotaBudget, ObjectQuotaUsage},
     za::calendar::za_calendar_keyless_refusal,
@@ -62,12 +75,16 @@ use groupware::{
             context::za_write_contexts,
             create::{ZaEventCreate, za_create_event},
             error::ZaPipelineError,
-            schedule::{ZaScheduled, za_schedule_create},
+            placement::ZaPlacementContexts,
+            schedule::{ZaScheduled, za_schedule_create, za_schedule_update},
             uid::za_take_uid_lease,
+            update::{ZaEventUpdate, za_commit_update},
         },
-        privacy::EventViewer,
-        rights::EventAcl,
+        privacy::{EventPrivacy, EventViewer},
+        rights::{EventAcl, EventChanges},
         schedule::{EventAlarmScheduler, EventAlarmUsers, EventAlarms},
+        sequence::{ICalendarSequence, SCHEDULING_EVENT_FLAGS},
+        sequence_floor::za_sequence_floor,
         sharing::resolve::ZaCalendarContext,
         user::ICalendarUserData,
         za_alerts::za_apply_default_alerts_by_value,
@@ -78,22 +95,29 @@ use jmap_proto::{
     error::set::SetError,
     method::set::{SetRequest, SetResponse},
     object::calendar_event,
-    request::capability::CapabilityIds,
+    request::{MaybeInvalid, capability::CapabilityIds},
     types::state::State,
 };
 use jmap_tools::{Key, Value};
 use registry::schema::enums::StorageQuota;
 use std::sync::Arc;
-use store::{roaring::RoaringBitmap, write::now};
+use store::{
+    ValueKey,
+    roaring::RoaringBitmap,
+    write::{Archive, ArchiveBytes, now},
+};
 use trc::{AddContext, EventType, LimitEvent, SecurityEvent};
 use types::{
     acl::Acl,
+    blob::BlobId,
     collection::{Collection, SyncCollection},
+    field::CalendarEventField,
     id::Id,
 };
 use vault::session::SessionKeys;
 
-/// I §7.3: the answer to an update or a destroy until Tasks 31 to 33.
+/// I §7.3: the answer to a change of an event's calendars and to a destroy
+/// until Tasks 32 and 33.
 pub(super) const ZA_INTERIM: &str = "This operation is not available for this account yet.";
 
 /// Upstream's text for a lost assertion (`calendar_event/set.rs:1611`).
@@ -122,6 +146,7 @@ struct ZaEventWriter<'x> {
     identities: CalendarAddresses,
     uid_privacy_conflicts: UidPrivacyConflicts,
     can_add_calendars: Option<RoaringBitmap>,
+    can_delete_calendars: Option<RoaringBitmap>,
     quota: ObjectQuotaUsage,
     schedule: ZaScheduling,
     default_alerts: DefaultAlertsResolver,
@@ -174,8 +199,7 @@ pub(super) async fn za_calendar_event_set(
 
     // Obtain calendarIds
     let is_shared = access_token.is_shared(account_id);
-    // The remove rights are read for destroys, which Task 33 serves.
-    let (can_add_calendars, _can_delete_calendars) = if is_shared {
+    let (can_add_calendars, can_delete_calendars) = if is_shared {
         (
             cache
                 .shared_containers(access_token, [Acl::AddItems], true)
@@ -235,6 +259,16 @@ pub(super) async fn za_calendar_event_set(
         .account(account_id)
         .await
         .caused_by(trc::location!())?;
+    // I §7.6: the reader sits in the head, so only a head error fails the
+    // method; the branch admitted a key account only.
+    let mut reader = ZaEventReader::new(server, access_token, account_id)
+        .await?
+        .ok_or_else(|| {
+            trc::StoreEvent::UnexpectedError
+                .into_err()
+                .account_id(account_id)
+                .details("zero-access: calendar event writer without a key account")
+        })?;
 
     let mut writer = ZaEventWriter {
         server,
@@ -245,6 +279,7 @@ pub(super) async fn za_calendar_event_set(
         identities,
         uid_privacy_conflicts,
         can_add_calendars,
+        can_delete_calendars,
         quota,
         schedule,
         default_alerts,
@@ -274,25 +309,133 @@ pub(super) async fn za_calendar_event_set(
             }
             Ok(Err(err)) => response.not_created.append(id, err),
             Err(err) => {
-                za_trace_set_failure(account_id, &err);
+                za_trace_set_failure(account_id, None, &err);
                 failed = true;
                 response.not_created.append(id, za_set_incomplete());
             }
         }
     }
 
-    // I §7.3: updates and destroys wait for Tasks 31 to 33.
-    for (id, _) in request.unwrap_update() {
-        response.not_updated.append(
-            id,
-            if failed {
-                za_set_incomplete()
-            } else {
-                SetError::forbidden().with_description(ZA_INTERIM)
-            },
+    // D28: after a store failure no update or destroy is attempted.
+    if failed {
+        for (id, _) in request.unwrap_update() {
+            response.not_updated.append(id, za_set_incomplete());
+        }
+        for id in will_destroy {
+            response.not_destroyed.append(id, za_set_incomplete());
+        }
+        return Ok(response);
+    }
+
+    // Group updates and instance removals by event (upstream's
+    // `calendar_event/set.rs:334-431`). The metadata preload (`:427`) and the
+    // moved UID index (`:432-448`) are not taken.
+    let has_synthetic_ids = will_destroy.iter().any(|id| id.is_synthetic())
+        || request.update.as_ref().is_some_and(|update| {
+            update
+                .iter()
+                .any(|(id, _)| matches!(id, MaybeInvalid::Value(id) if id.is_synthetic()))
+        });
+    let is_destroyed_event = |document_id: u32| {
+        will_destroy
+            .iter()
+            .any(|id| !id.is_synthetic() && id.document_id() == document_id)
+    };
+    let will_be_destroyed = |id: Id| {
+        will_destroy.iter().any(|destroy_id| {
+            *destroy_id == id
+                || (!destroy_id.is_synthetic() && destroy_id.document_id() == id.document_id())
+        })
+    };
+    let mut updates =
+        EventUpdates::with_capacity(request.update.as_ref().map_or(0, |update| update.len()));
+    for (id, mut object) in request.unwrap_update() {
+        let id = match id {
+            MaybeInvalid::Value(id) => id,
+            invalid => {
+                response.not_updated.append(invalid, SetError::not_found());
+                continue;
+            }
+        };
+        if will_be_destroyed(id) {
+            response.not_updated.append(id, SetError::will_destroy());
+            continue;
+        }
+        match writer
+            .metadata
+            .extract(MetadataPatches::for_update(), &mut object)
+        {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                // Upgrade ruling 66: object metadata is refused where it is extracted.
+                response.not_updated.append(
+                    id,
+                    SetError::forbidden().with_description(ZA_METADATA_REFUSED),
+                );
+                continue;
+            }
+            Err(err) => {
+                response.not_updated.append(id, err);
+                continue;
+            }
+        }
+        let op = match id.recurrence_key() {
+            Some(recurrence_key) => EventOp::Instance(InstanceOp {
+                id,
+                recurrence_key,
+                target: None,
+                action: InstanceAction::Update {
+                    patch: object,
+                    server_set: None,
+                },
+            }),
+            None => EventOp::Base { id, patch: object },
+        };
+        updates.push(has_synthetic_ids, op, &mut response);
+    }
+    for id in will_destroy.iter().copied() {
+        let Some(recurrence_key) = id.recurrence_key() else {
+            continue;
+        };
+        if is_destroyed_event(id.document_id()) {
+            response.not_destroyed.append(id, SetError::will_destroy());
+            continue;
+        }
+        updates.push(
+            has_synthetic_ids,
+            EventOp::Instance(InstanceOp {
+                id,
+                recurrence_key,
+                target: None,
+                action: InstanceAction::Destroy,
+            }),
+            &mut response,
         );
     }
-    for id in will_destroy {
+    let mut destroy_events = will_destroy;
+    if has_synthetic_ids {
+        destroy_events.retain(|id| !id.is_synthetic());
+    }
+
+    // Process updates: one commit per event (D3).
+    for mut update in updates.pending {
+        if failed {
+            update.fail(&mut response, za_set_incomplete());
+            continue;
+        }
+        let document_id = update.document_id;
+        if let Err(err) = writer
+            .update(&mut reader, &mut update, &mut response, &mut destroy_events)
+            .await
+        {
+            za_trace_set_failure(account_id, Some(document_id), &err);
+            failed = true;
+            update.fail(&mut response, za_set_incomplete());
+        }
+    }
+
+    // I §7.3: destroys wait for Task 33.
+    for id in destroy_events {
         response.not_destroyed.append(
             id,
             if failed {
@@ -644,6 +787,651 @@ impl ZaEventWriter<'_> {
             Err(err) => Ok(Err(err)),
         }
     }
+
+    /// One event of `updates.pending`, in upstream's order
+    /// (`calendar_event/set.rs:451-1414`), written by the pipeline. A set
+    /// error is answered here, as upstream's `continue 'update`; `Err` is a
+    /// store failure, which the caller answers under D28.
+    async fn update(
+        &mut self,
+        reader: &mut ZaEventReader,
+        update: &mut EventUpdate<'_>,
+        response: &mut SetResponse<calendar_event::CalendarEvent>,
+        destroy_events: &mut Vec<Id>,
+    ) -> trc::Result<()> {
+        let server = self.server;
+        let access_token = self.access_token;
+        let account_id = self.account_id;
+        let document_id = update.document_id;
+        let is_owner = access_token.is_member(account_id);
+        let is_shared = access_token.is_shared(account_id);
+
+        let Some(calendar_event_) = server
+            .store()
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+                account_id,
+                Collection::CalendarEvent,
+                document_id,
+            ))
+            .await?
+        else {
+            update.fail(response, SetError::not_found());
+            return Ok(());
+        };
+        let calendar_event = calendar_event_
+            .to_unarchived::<CalendarEvent>()
+            .caused_by(trc::location!())?;
+        if let Err(err) = assert_privacy_access(
+            EventPrivacy::from_flags(calendar_event.inner.flags.to_native()),
+            EventViewer::new(is_owner),
+        ) {
+            update.fail(response, err);
+            return Ok(());
+        }
+        if update.base_id().is_some() && self.uid_privacy_conflicts.updates.contains(document_id) {
+            update.fail(response, uid_privacy_conflict());
+            return Ok(());
+        }
+        // The metadata-only write (`:484-518`) is not taken: object metadata
+        // was refused when the update was grouped.
+        let Some(content_) = server
+            .store()
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+                account_id,
+                Collection::CalendarEvent,
+                document_id,
+                CalendarEventField::Content,
+            ))
+            .await?
+        else {
+            update.fail(response, SetError::not_found());
+            return Ok(());
+        };
+
+        // Spec 6.5, D1: the patch applies to the unsealed view; the stored
+        // archives stay the update's current values.
+        let previous_calendar_ids = calendar_event
+            .inner
+            .names
+            .iter()
+            .map(ArchivedDavName::parent_id)
+            .collect::<Vec<_>>();
+        let Some(za_view) = reader
+            .view(
+                server,
+                access_token,
+                document_id,
+                &previous_calendar_ids,
+                calendar_event.inner,
+                &content_,
+            )
+            .await?
+        else {
+            update.fail(response, SetError::not_found());
+            return Ok(());
+        };
+        let display_name = za_view.display_name.clone();
+        let content = za_view
+            .content
+            .to_unarchived::<CalendarEventContent>()
+            .caused_by(trc::location!())?;
+        let mut new_calendar_event = calendar_event
+            .deserialize::<CalendarEvent>()
+            .caused_by(trc::location!())?;
+        let mut new_content = content
+            .deserialize::<CalendarEventContent>()
+            .caused_by(trc::location!())?;
+
+        // Resolve synthetic ids into recurrence instances
+        let mut has_instances = false;
+        if update.has_instances() {
+            match update.plan_instances(&new_content.data, response) {
+                InstancePlan::Instances => {
+                    has_instances = true;
+                }
+                InstancePlan::BaseEvent => {}
+                InstancePlan::DestroyEvent(id) => {
+                    destroy_events.push(id);
+                    return Ok(());
+                }
+                InstancePlan::Nothing => {
+                    return Ok(());
+                }
+            }
+        }
+
+        let personal_id = access_token.personal_id(account_id, Collection::Calendar);
+        let ownership = self.identities.event_ownership(&new_content.data.event);
+        let was_origin = is_origin(&new_content.data.event, self.account_info.addresses());
+        // D10: the owner's form for every caller, as the content holds no
+        // preferences.
+        let mut view = new_content.data.event.clone();
+        let previous_event = std::mem::take(&mut new_content.data.event);
+        detach_iana_timezones(&mut view);
+        let mut js_calendar_group = view.into_jscalendar::<Id, BlobId>();
+
+        // Spec 6.5: the five flag rulings apply to the event's own patch; an
+        // occurrence's patch is checked for blob links only.
+        let rulings = match &mut update.ops {
+            EventOps::Base { patch, .. } => za_take_rulings(patch, true),
+            EventOps::Instances(instances) => instances.iter_mut().try_fold(
+                ZaRulings {
+                    use_default_alerts: false,
+                },
+                |rulings, instance| match &mut instance.action {
+                    InstanceAction::Update { patch, .. } => {
+                        za_take_rulings(patch, false).map(|_| rulings)
+                    }
+                    InstanceAction::Destroy => Ok(rulings),
+                },
+            ),
+        };
+        let rulings = match rulings {
+            Ok(rulings) => rulings,
+            Err(err) => {
+                update.fail(response, err);
+                return Ok(());
+            }
+        };
+
+        let tracked_before = update.base_patch().map(|patch| {
+            (
+                TrackedValues::from_patch(patch),
+                TrackedValues::from_event(&js_calendar_group, Some(was_origin)),
+            )
+        });
+        // Spec 6.11: a blob id was refused above, so no blob property is imported.
+        let blob_properties = BlobProperties::default();
+        update.track_instance_values(&previous_event, |blob_id| {
+            !blob_id.is_embedded_in(account_id, document_id)
+        });
+        let is_restricted = is_shared
+            && !EventAcl::for_calendars(
+                &self.cache,
+                access_token,
+                calendar_event
+                    .inner
+                    .names
+                    .iter()
+                    .map(ArchivedDavName::parent_id),
+            )
+            .may_write(ownership);
+        // Spec 6.5: a key account's event never holds `EVENT_HIDE_ATTENDEES`,
+        // so no participant is hidden (`:616-618`).
+        let per_user_changes = update.per_user_patch_changes();
+        let before_group = per_user_changes
+            .is_none()
+            .then(|| js_calendar_group.clone());
+
+        // Apply per-instance changes to the recurrence overrides of the base event
+        if has_instances {
+            let metadata = InstanceMetadata {
+                is_origin: was_origin,
+                flags: new_calendar_event.flags,
+                calendar_ids: &new_calendar_event.names,
+                use_default_alerts: false,
+            };
+            if !update.apply_instances(&mut js_calendar_group, &metadata, response) {
+                return Ok(());
+            }
+        }
+
+        // Process changes
+        if let Err(err) = update_calendar_event(
+            &self.cache,
+            personal_id,
+            PatchTarget {
+                write: EventWrite::Update,
+                id: update.base_id(),
+                is_origin: Some(was_origin),
+            },
+            update.take_base_patch(),
+            &mut new_calendar_event,
+            &mut new_content,
+            &mut js_calendar_group,
+        ) {
+            update.fail(response, err);
+            return Ok(());
+        }
+
+        // Validate calendarIds limit
+        let max_calendars = server.core.groupware.max_calendars_per_event;
+        if new_calendar_event.names.len() > max_calendars
+            && new_calendar_event.names.len() > calendar_event.inner.names.len()
+        {
+            update.fail(response, too_many_calendars(max_calendars));
+            return Ok(());
+        }
+
+        // Validate new calendarIds
+        for calendar_id in new_calendar_event.added_calendar_ids(calendar_event.inner) {
+            if !self.cache.has_container_id(&calendar_id) {
+                update.fail(
+                    response,
+                    SetError::invalid_properties()
+                        .with_property(JSCalendarProperty::CalendarIds)
+                        .with_description(format!(
+                            "calendarId {} does not exist.",
+                            Id::from(calendar_id)
+                        )),
+                );
+                return Ok(());
+            } else if self.can_add_calendars.as_ref().is_some_and(|ids| {
+                !ids.contains(calendar_id)
+                    && !(EventAcl::for_calendar(&self.cache, access_token, calendar_id)
+                        .may_manage_own_items()
+                        && ownership.may_write_own())
+            }) {
+                update.fail(response, add_calendar_forbidden(calendar_id));
+                return Ok(());
+            }
+        }
+
+        // Validate deleted calendarIds
+        if let Some(can_delete_calendars) = &self.can_delete_calendars {
+            for calendar_id in new_calendar_event.removed_calendar_ids(calendar_event.inner) {
+                if !can_delete_calendars.contains(calendar_id)
+                    && !(EventAcl::for_calendar(&self.cache, access_token, calendar_id)
+                        .may_manage_own_items()
+                        && ownership.may_write_own())
+                {
+                    update.fail(
+                        response,
+                        SetError::forbidden().with_description(format!(
+                            "You are not allowed to remove calendar events from calendar {}.",
+                            Id::from(calendar_id)
+                        )),
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        let is_calendar_ids_changed = new_calendar_event
+            .added_calendar_ids(calendar_event.inner)
+            .next()
+            .is_some()
+            || new_calendar_event
+                .removed_calendar_ids(calendar_event.inner)
+                .next()
+                .is_some();
+        if is_calendar_ids_changed {
+            // Spec 5.2: a change of the event's calendars is Task 32's.
+            update.fail(response, SetError::forbidden().with_description(ZA_INTERIM));
+            return Ok(());
+        }
+        let is_metadata_changed = is_calendar_ids_changed
+            || (calendar_event.inner.flags.to_native() ^ new_calendar_event.flags)
+                & EVENT_METADATA_FLAGS
+                != 0;
+
+        let mut changes = match &before_group {
+            Some(before_group) => EventChanges::between(
+                before_group,
+                &js_calendar_group,
+                calendar_event.inner.flags.to_native(),
+                new_calendar_event.flags,
+                &self.identities,
+            ),
+            None => per_user_changes.unwrap_or_default(),
+        };
+        // D11: the ruling took `useDefaultAlerts` (upstream's `:764-766`).
+        if rulings.use_default_alerts {
+            changes.insert_per_user();
+        }
+        let tracked = tracked_before.map(|(client, before)| {
+            (
+                client,
+                before,
+                TrackedValues::from_dates(&js_calendar_group),
+            )
+        });
+
+        // Convert JSCalendar to iCalendar
+        let ical = match server
+            .export_icalendar(access_token, js_calendar_group)
+            .await?
+        {
+            Ok(ical) => ical,
+            Err(err) => {
+                update.fail(response, err);
+                return Ok(());
+            }
+        };
+        new_content.data.event = ical;
+        changes.classify_recurrence_sets(&previous_event, &new_content.data.event);
+        if let Err(err) =
+            assert_privacy_allowed(&new_content.data.event, EventViewer::new(is_owner))
+        {
+            update.fail(response, err);
+            return Ok(());
+        }
+
+        // D11 (in place of `:803-816`): the writer's default alerts, by value,
+        // over the event's final calendars.
+        let mut new_calendar_ids: Vec<u32> = Vec::with_capacity(new_calendar_event.names.len());
+        for calendar_id in new_calendar_event.names.iter().map(DavName::parent_id) {
+            if !new_calendar_ids.contains(&calendar_id) {
+                new_calendar_ids.push(calendar_id);
+            }
+        }
+        if rulings.use_default_alerts {
+            za_apply_default_alerts_by_value(
+                server,
+                &mut self.default_alerts,
+                account_id,
+                personal_id,
+                &new_calendar_ids,
+                &mut new_content.data.event,
+            )
+            .await
+            .caused_by(trc::location!())?;
+        }
+        if let Err(err) = new_content
+            .data
+            .event
+            .validate_user_data_changes(&previous_event)
+        {
+            update.fail(response, user_data_error(err));
+            return Ok(());
+        }
+
+        // D10, invariant 59: the per-user split (`:826-893`) is not run for any
+        // caller.
+        let mut is_user_data_only = false;
+
+        // Assign an organizer when participants were added to an event that had none
+        let is_organizer_assigned = !is_user_data_only
+            && self
+                .account_info
+                .addresses()
+                .first()
+                .is_some_and(|organizer_address| {
+                    itip_assign_organizer(&mut new_content.data.event, organizer_address)
+                });
+        let has_scheduling_changes = !is_user_data_only
+            && new_content
+                .data
+                .event
+                .has_scheduling_changes(&previous_event);
+        if is_owner
+            && !is_metadata_changed
+            && !is_organizer_assigned
+            && !has_scheduling_changes
+            && new_content.data.event.has_same_sequences(&previous_event)
+        {
+            is_user_data_only = true;
+        }
+        let is_origin_event = is_origin(&new_content.data.event, self.account_info.addresses());
+        if !is_user_data_only && is_origin_event {
+            if has_scheduling_changes
+                || (calendar_event.inner.flags.to_native() ^ new_calendar_event.flags)
+                    & SCHEDULING_EVENT_FLAGS
+                    != 0
+            {
+                new_content.data.event.increment_sequence(&previous_event);
+            }
+            stamp_updated(&mut new_content.data.event, now() as i64);
+        }
+        // Spec 5.4: the SEQUENCE floor, right after upstream's increment, on
+        // every update.
+        za_sequence_floor(
+            &mut new_content.data.event,
+            &previous_event,
+            self.roles.sender.addresses(),
+        );
+
+        if let Err(err) = assert_participants_limit(
+            &new_content.data.event,
+            server.core.groupware.max_ical_attendees_per_instance,
+        ) {
+            update.fail(response, err);
+            return Ok(());
+        }
+
+        // Validate UID
+        if !is_user_data_only {
+            let description = match (
+                new_content.data.event.object_uid(),
+                previous_event.object_uid(),
+            ) {
+                (Some(new_uid), Some(old_uid)) if new_uid == old_uid => None,
+                (None, None) => None,
+                (None, Some(_)) => Some("The UID of a calendar event cannot be removed."),
+                _ => Some("You cannot change the UID of a calendar event."),
+            };
+            if let Some(description) = description {
+                update.fail(
+                    response,
+                    SetError::invalid_properties()
+                        .with_property(JSCalendarProperty::Uid)
+                        .with_description(description),
+                );
+                return Ok(());
+            }
+        }
+
+        if is_restricted {
+            let mut unchanged = new_calendar_event
+                .unchanged_calendar_ids(calendar_event.inner)
+                .peekable();
+            let acl = if unchanged.peek().is_none() {
+                EventAcl::for_calendars(
+                    &self.cache,
+                    access_token,
+                    new_calendar_event.added_calendar_ids(calendar_event.inner),
+                )
+            } else {
+                EventAcl::for_calendars(&self.cache, access_token, unchanged)
+            };
+            if let Err(err) =
+                changes.assert_allowed(&acl, ownership, calendar_event.inner.flags.to_native())
+            {
+                update.fail(
+                    response,
+                    SetError::forbidden().with_description(err.description()),
+                );
+                return Ok(());
+            }
+        }
+
+        // Check size and quota
+        new_calendar_event.size = SizeWriter::ical(&new_content.data.event) as u32;
+        if new_calendar_event.size as usize > server.core.groupware.max_ical_size {
+            update.fail(
+                response,
+                too_large_event(
+                    new_calendar_event.size as usize,
+                    server.core.groupware.max_ical_size,
+                ),
+            );
+            return Ok(());
+        }
+
+        // Obtain previous alarm, from the view and the stored flags
+        let now = now() as i64;
+        let prev_alarms = server
+            .next_event_alarms(
+                account_id,
+                &EventAlarmUsers::new(account_id, content.inner)?
+                    .with_event_flags(calendar_event.inner.flags.to_native()),
+                &content.inner.data,
+                &previous_calendar_ids,
+                now,
+                &mut self.default_alerts,
+            )
+            .await
+            .caused_by(trc::location!())?;
+        // Build event (in place of `:1019-1037`): no preferences, no default
+        // alerts, the key-account flag.
+        new_content.data = CalendarEventData::new_for(
+            new_content.data.event,
+            Tz::Floating,
+            server.core.groupware.max_ical_instances,
+            &DefaultAlerts::disabled(),
+            true,
+        );
+        let next_alarms = server
+            .next_event_alarms(
+                account_id,
+                &EventAlarmUsers::new(account_id, &new_content)?
+                    .with_event_flags(new_calendar_event.flags),
+                &new_content.data,
+                &new_calendar_event
+                    .names
+                    .iter()
+                    .map(DavName::parent_id)
+                    .collect::<Vec<_>>(),
+                now,
+                &mut self.default_alerts,
+            )
+            .await
+            .caused_by(trc::location!())?;
+
+        // Validate quota
+        let extra_bytes = (new_calendar_event.size as u64)
+            .saturating_sub(u32::from(calendar_event.inner.size) as u64);
+        if self.disk_quota.check(extra_bytes).is_err() {
+            update.fail(response, SetError::over_quota());
+            return Ok(());
+        }
+
+        // The pipeline: the contexts of every calendar the event stays in,
+        // the scheduling (D4, D18) and the commit with the stored pairs and
+        // the stored display name (spec 5.4).
+        let addressed = new_calendar_event.names[0].parent_id;
+        let contexts = match za_write_contexts(
+            server,
+            access_token,
+            account_id,
+            &calendar_event
+                .deserialize::<CalendarEvent>()
+                .caused_by(trc::location!())?,
+            addressed,
+            Acl::ModifyItems,
+        )
+        .await
+        {
+            Ok(contexts) => ZaPlacementContexts::unchanged(contexts),
+            Err(err) => return za_update_failed(update, response, err),
+        };
+        let schedule = if is_user_data_only {
+            ZaScheduling::Off
+        } else {
+            self.schedule
+        };
+        let scheduled = match za_schedule_update(
+            server,
+            access_token,
+            &self.roles,
+            schedule,
+            (!is_user_data_only).then_some(&previous_event),
+            &mut new_calendar_event,
+            &mut new_content,
+            account_id,
+            document_id,
+        )
+        .await
+        {
+            Ok(scheduled) => scheduled,
+            Err(err) => return za_update_failed(update, response, err),
+        };
+        let written = match za_commit_update(
+            server,
+            access_token,
+            &self.cache,
+            &self.account,
+            &self.keys,
+            &self.roles,
+            ZaEventUpdate {
+                document_id,
+                addressed,
+                stored_event: &calendar_event_,
+                stored_content: &content_,
+                new_event: new_calendar_event,
+                new_content,
+                display_name,
+                prev_alarms,
+                next_alarms,
+                scheduled,
+                contexts,
+                placement: None,
+            },
+        )
+        .await
+        {
+            Ok(written) => written,
+            Err(err) => return za_update_failed(update, response, err),
+        };
+        self.disk_quota.reserve(extra_bytes);
+
+        // Upstream's answer (`:1196-1260`, `:1380-1413`), from the committed tree.
+        update.succeed(response);
+        let server_set = tracked.map(|(client, before, dates)| {
+            let mut server_set = dates
+                .with_component(written.ical.main_component())
+                .with_origin(is_origin_event)
+                .server_set(&client, Some(&before));
+            let imported = ImportedValues {
+                participants: is_organizer_assigned,
+                blob_properties: &blob_properties,
+                every_blob_property: false,
+                visible_to: None,
+            };
+            if imported.is_requested() {
+                server_set.extend(imported.values(&written.ical, account_id, document_id));
+            }
+            server_set
+        });
+        if let (Some(base_id), Some(server_set)) = (update.base_id(), server_set) {
+            response.add_server_set_properties(base_id, server_set);
+        }
+        for instance in update.instances_mut() {
+            let (id, recurrence_key) = (instance.id, instance.recurrence_key);
+            let Some(tracked) = instance.take_server_set() else {
+                continue;
+            };
+            let mut values = TrackedValues::default()
+                .with_component(written.ical.instance_component(tracked.recurrence_id))
+                .server_set(&tracked.client, Some(&tracked.before));
+            let imported = ImportedValues {
+                participants: false,
+                blob_properties: &tracked.blob_properties,
+                every_blob_property: false,
+                visible_to: None,
+            };
+            if imported.is_requested() {
+                let data = CalendarEventData::new_for(
+                    written.ical.clone(),
+                    Tz::Floating,
+                    server.core.groupware.max_ical_instances,
+                    &DefaultAlerts::disabled(),
+                    true,
+                );
+                values.extend(instance_imported_values(
+                    &data,
+                    recurrence_key,
+                    &imported,
+                    account_id,
+                    document_id,
+                ));
+            }
+            response.add_server_set_properties(id, values);
+        }
+        // D3: the change id of the last commit.
+        response.new_state = State::Exact(written.change_id).into();
+        Ok(())
+    }
+}
+
+/// A pipeline error of an update, answered as spec 8 says; `Err` is a store
+/// failure (D28).
+fn za_update_failed(
+    update: &EventUpdate<'_>,
+    response: &mut SetResponse<calendar_event::CalendarEvent>,
+    error: ZaPipelineError,
+) -> trc::Result<()> {
+    update.fail(response, za_event_set_error(error, None)?);
+    Ok(())
 }
 
 /// Spec 6.5. With `base` (the event's own patch): refuses `isDraft: true` and
@@ -743,17 +1531,16 @@ pub(super) fn za_event_set_error(
 }
 
 /// Spec 8, D28 (I §7.5): a store failure is traced once as a fresh event of
-/// its kind, with the account id and a fixed reason (a create has no document
-/// id yet). The original error is not traced: its context may carry stored
-/// bytes.
-fn za_trace_set_failure(account_id: u32, error: &trc::Error) {
-    trc::error!(
-        error
-            .event_type()
-            .into_err()
-            .account_id(account_id)
-            .details("zero-access: calendar event write failed")
-    );
+/// its kind, with the account id, the document id when known (a create has
+/// none yet) and a fixed reason. The original error is not traced: its
+/// context may carry stored bytes.
+fn za_trace_set_failure(account_id: u32, document_id: Option<u32>, error: &trc::Error) {
+    let event = error.event_type().into_err().account_id(account_id);
+    let event = match document_id {
+        Some(document_id) => event.document_id(document_id),
+        None => event,
+    };
+    trc::error!(event.details("zero-access: calendar event write failed"));
 }
 
 #[cfg(test)]
