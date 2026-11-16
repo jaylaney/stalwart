@@ -362,10 +362,6 @@ pub async fn test(test: &mut TestServer) {
     let key1_account = key1.id_string();
     for (method, args) in [
         (
-            "CalendarEvent/set",
-            json!({ "accountId": key1_account, "create": {} }),
-        ),
-        (
             "CalendarEvent/copy",
             json!({ "accountId": key1_account, "fromAccountId": key1_account, "create": {} }),
         ),
@@ -402,6 +398,11 @@ pub async fn test(test: &mut TestServer) {
         // Release 6 spec 6.2: Calendar/set is served, less `shareWith`.
         (
             "Calendar/set",
+            json!({ "accountId": key1_account, "create": {} }),
+        ),
+        // Release 6 spec 6.2: CalendarEvent/set is served (6.5).
+        (
+            "CalendarEvent/set",
             json!({ "accountId": key1_account, "create": {} }),
         ),
         ("Calendar/get", json!({ "accountId": key1_account })),

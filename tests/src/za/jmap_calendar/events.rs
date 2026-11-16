@@ -13,25 +13,33 @@ use crate::{
         jmap::JmapResponse,
         server::TestServer,
         za::{
-            CALENDAR_JMAP_USING, delete_event_records, inbox_ids, plant_event, stored_event,
-            wait_for_queue, write_stored_event, za_bearer_jmap, za_grant_token, za_revoke_grant,
+            CALENDAR_JMAP_USING, HookParked, assert_no_event_preferences, delete_event_records,
+            inbox_ids, itip_tasks_for, plant_event, stored_event, wait_for_queue,
+            write_stored_event, za_bearer_jmap, za_grant_token, za_revoke_grant, za_uid_leases,
         },
     },
     za::{
         dav_seal::resource_id,
-        fanout::{CONTENT_TYPE, NO_REPLY},
+        drain,
+        fanout::{CONTENT_TYPE, NO_REPLY, uid_copies},
         gating::method_error,
         imip::deliver,
     },
 };
 use calcard::icalendar::ICalendarValue;
-use common::{auth::oauth::scope::OAuthScopes, za::ZA_CALENDAR_KEYLESS};
+use common::{
+    auth::oauth::scope::OAuthScopes,
+    za::{ZA_CALENDAR_KEYLESS, test_hooks},
+};
 use futures::FutureExt;
-use groupware::calendar::seal::tree::{KEY_PROP, is_carrier};
+use groupware::{
+    cache::GroupwareCache,
+    calendar::seal::tree::{KEY_PROP, is_carrier},
+};
 use hyper::StatusCode;
 use jmap_proto::types::state::{JMAPIntermediateState, State, ZaCalendarOrigin};
 use serde_json::{Value, json};
-use std::{panic::AssertUnwindSafe, time::Duration};
+use std::{panic::AssertUnwindSafe, str::FromStr, time::Duration};
 use store::{
     ValueKey,
     write::{BatchBuilder, ValueClass, serialize::RawValue},
@@ -41,7 +49,7 @@ use trc::{
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
 use types::{
-    collection::Collection,
+    collection::{Collection, SyncCollection},
     field::{CalendarEventField, Field},
     id::Id,
 };
@@ -70,6 +78,18 @@ pub async fn test(test: &mut TestServer) {
     identity_get_and_changes(&pair).await;
     parse_sealed_upload(&pair).await;
     parse_message_part(test, &pair).await;
+    // Release 6 spec 6.5: CalendarEvent/set creates (Task 30).
+    let events = Events::new(test, &pair).await;
+    create_reads_back_over_caldav(&events).await;
+    create_in_two_calendars(&events).await;
+    create_property_rulings(&events).await;
+    create_use_default_alerts(&events).await;
+    create_uid_rule(&events).await;
+    create_two_objects_one_fails(&events).await;
+    create_stores_no_preferences_and_no_index_document(&events).await;
+    tasks(&events).await;
+    create_holds_the_lease(&events).await;
+    events.finish().await;
     pair.dav
         .request_with_headers("DELETE", &event_path("jmapcal-shared/"), [NO_REPLY], "")
         .await
@@ -723,4 +743,594 @@ async fn parse_message_part(test: &TestServer, pair: &Pair) {
         json!([email["id"]]),
         "{reply:?}"
     );
+}
+
+/// Release 6 spec 6.5 (Task 30): the default calendar and a second one made
+/// with `Calendar/set`, shared by the create cases.
+struct Events<'x> {
+    test: &'x TestServer,
+    pair: &'x Pair,
+    cal: String,
+    second: String,
+}
+
+const MODIFIED: &str = "Another process modified this calendar event, please try again.";
+const DRAFTS: &str = "Drafts are not available for zero-access accounts.";
+const UNAVAILABLE: &str = "This property is not available for zero-access accounts.";
+const ATTACHMENTS: &str = "Event attachments are not available for zero-access accounts.";
+
+fn none() -> Vec<(&'static str, &'static str)> {
+    Vec::new()
+}
+
+/// One timed event in `calendar_id`.
+fn event_in(uid: &str, calendar_id: &str) -> Value {
+    json!({
+        "@type": "Event",
+        "uid": uid,
+        "title": uid,
+        "start": "2031-03-04T10:00:00",
+        "duration": "PT1H",
+        "timeZone": "Etc/UTC",
+        "calendarIds": { calendar_id: true },
+    })
+}
+
+/// A display alert, as JMAP writes one.
+fn display_alert(offset: &str) -> Value {
+    json!({
+        "@type": "Alert",
+        "action": "display",
+        "trigger": { "@type": "OffsetTrigger", "relativeTo": "start", "offset": offset },
+    })
+}
+
+impl<'x> Events<'x> {
+    async fn new(test: &'x TestServer, pair: &'x Pair) -> Self {
+        let reply = pair
+            .key
+            .jmap_method_call(
+                "Calendar/get",
+                json!({ "accountId": pair.key.id_string(), "ids": null }),
+            )
+            .await;
+        let cal = reply
+            .list()
+            .iter()
+            .find(|entry| entry["isDefault"] == true)
+            .and_then(|entry| entry["id"].as_str())
+            .unwrap_or_else(|| panic!("no default calendar: {reply:?}"))
+            .to_string();
+        let reply = pair
+            .key
+            .jmap_method_call(
+                "Calendar/set",
+                json!({
+                    "accountId": pair.key.id_string(),
+                    "create": { "c": { "name": "jmapcal-events-second" } },
+                }),
+            )
+            .await;
+        let second = reply
+            .pointer("/methodResponses/0/1/created/c/id")
+            .and_then(|id| id.as_str())
+            .unwrap_or_else(|| panic!("Calendar/set created nothing: {reply:?}"))
+            .to_string();
+        Events {
+            test,
+            pair,
+            cal,
+            second,
+        }
+    }
+
+    fn event(&self, uid: &str) -> Value {
+        event_in(uid, &self.cal)
+    }
+
+    async fn create(&self, objects: Vec<Value>) -> JmapResponse {
+        self.pair
+            .key
+            .jmap_create("CalendarEvent", objects, none())
+            .await
+    }
+
+    /// The created event `i<index>`'s document id.
+    fn created_document(reply: &JmapResponse, index: u32) -> u32 {
+        reply.created_id(index).document_id()
+    }
+
+    async fn get(&self, document_id: u32) -> Value {
+        let id = Id::from(document_id).to_string();
+        let reply = get_events(self.pair, false, json!([id])).await;
+        let [event] = reply.list() else {
+            panic!("Expected event {id}: {reply:?}");
+        };
+        event.clone()
+    }
+
+    /// Every href of the event, one per calendar it is named in.
+    async fn hrefs(&self, document_id: u32) -> Vec<String> {
+        self.test
+            .server
+            .fetch_groupware_resources(self.pair.key_id, self.pair.key_id, SyncCollection::Calendar)
+            .await
+            .unwrap()
+            .format_resource_paths_by_id(document_id)
+            .filter(|href| !href.ends_with('/'))
+            .collect()
+    }
+
+    /// The href of a calendar of the account.
+    async fn calendar_href(&self, calendar_id: &str) -> String {
+        let document_id = Id::from_str(calendar_id).unwrap().document_id();
+        self.test
+            .server
+            .fetch_groupware_resources(self.pair.key_id, self.pair.key_id, SyncCollection::Calendar)
+            .await
+            .unwrap()
+            .format_resource_paths_by_id(document_id)
+            .find(|href| href.ends_with('/'))
+            .unwrap_or_else(|| panic!("no href for calendar {calendar_id}"))
+    }
+
+    /// The CalDAV body of the event, from its first href.
+    async fn body(&self, document_id: u32) -> String {
+        let hrefs = self.hrefs(document_id).await;
+        drain::body(&self.pair.dav, &hrefs[0]).await
+    }
+
+    /// The JMAP destroy arrives in Task 33: events are deleted over CalDAV,
+    /// each of their names in turn.
+    async fn delete(&self, document_id: u32) {
+        for href in self.hrefs(document_id).await {
+            self.pair
+                .dav
+                .request_with_headers("DELETE", &href, [NO_REPLY], "")
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+    }
+
+    async fn finish(self) {
+        let href = self.calendar_href(&self.second).await;
+        self.pair
+            .dav
+            .request_with_headers("DELETE", &href, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+        assert_eq!(za_uid_leases(self.test).await, 0);
+    }
+}
+
+fn set_error(value: &Value) -> (&str, Option<&str>, Value) {
+    (
+        value["type"].as_str().unwrap_or_default(),
+        value["description"].as_str(),
+        value["properties"].clone(),
+    )
+}
+
+/// Spec 6.5 and D1: a JMAP create is sealed and read back over CalDAV.
+async fn create_reads_back_over_caldav(events: &Events<'_>) {
+    const UID: &str = "jmapcal-events-create";
+    let mut object = events.event(UID);
+    object["title"] = json!("Create canary");
+    object["description"] = json!("Body canary");
+    let reply = events.create(vec![object]).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    // The client omitted the flag: upstream's server-set reports it false.
+    assert_eq!(reply.created(0)["useDefaultAlerts"], false, "{reply:?}");
+    let document_id = Events::created_document(&reply, 0);
+
+    let body = events.body(document_id).await;
+    for line in [
+        "UID:jmapcal-events-create",
+        "SUMMARY:Create canary",
+        "DESCRIPTION:Body canary",
+        "DTSTART",
+    ] {
+        assert!(body.contains(line), "{line}: {body}");
+    }
+    let tree = stored_event(events.test, events.pair.key_id, document_id)
+        .await
+        .tree()
+        .to_string();
+    assert!(
+        !tree.contains("Create canary") && !tree.contains("Body canary"),
+        "the stored tree holds a sealed value in the clear"
+    );
+
+    let event = events.get(document_id).await;
+    assert_eq!(event["title"], "Create canary", "{event}");
+    assert_eq!(event["isDraft"], false, "{event}");
+    assert_eq!(event["useDefaultAlerts"], false, "{event}");
+    events.delete(document_id).await;
+}
+
+/// Spec 5.2: an event created in two calendars is named in both.
+async fn create_in_two_calendars(events: &Events<'_>) {
+    const UID: &str = "jmapcal-events-two";
+    let mut object = events.event(UID);
+    object["calendarIds"] = json!({ (events.cal.as_str()): true, (events.second.as_str()): true });
+    let reply = events.create(vec![object]).await;
+    let document_id = Events::created_document(&reply, 0);
+
+    let event = events.get(document_id).await;
+    assert_eq!(
+        event["calendarIds"],
+        json!({ (events.cal.as_str()): true, (events.second.as_str()): true }),
+        "{event}"
+    );
+    for calendar in [&events.cal, &events.second] {
+        let href = events.calendar_href(calendar).await;
+        let listing = events
+            .pair
+            .dav
+            .propfind_with_headers(&href, ["D:getetag"], [("depth", "1")])
+            .await;
+        let items = listing
+            .hrefs
+            .keys()
+            .filter(|item| !item.ends_with('/'))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 1, "{href}: {items:?}");
+        let body = drain::body(&events.pair.dav, &items[0]).await;
+        assert!(body.contains("UID:jmapcal-events-two"), "{body}");
+    }
+    events.delete(document_id).await;
+    assert_eq!(uid_copies(events.test, events.pair.key_id, UID).await, 0);
+}
+
+/// Spec 6.5: the property rulings on a create.
+async fn create_property_rulings(events: &Events<'_>) {
+    let (test, key_id) = (events.test, events.pair.key_id);
+
+    let mut object = events.event("jmapcal-events-draft");
+    object["isDraft"] = json!(true);
+    let reply = events.create(vec![object]).await;
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        ("invalidProperties", Some(DRAFTS), json!(["isDraft"])),
+        "{reply:?}"
+    );
+    assert_eq!(uid_copies(test, key_id, "jmapcal-events-draft").await, 0);
+
+    for property in ["mayInviteSelf", "mayInviteOthers", "hideAttendees"] {
+        let uid = format!("jmapcal-events-{property}");
+        let mut object = events.event(&uid);
+        object[property] = json!(true);
+        let reply = events.create(vec![object]).await;
+        assert_eq!(
+            set_error(reply.not_created(0)),
+            ("invalidProperties", Some(UNAVAILABLE), json!([property])),
+            "{reply:?}"
+        );
+        assert_eq!(uid_copies(test, key_id, &uid).await, 0, "{property}");
+    }
+
+    for property in [
+        "isDraft",
+        "mayInviteSelf",
+        "mayInviteOthers",
+        "hideAttendees",
+    ] {
+        let mut object = events.event(&format!("jmapcal-events-false-{property}"));
+        object[property] = json!(false);
+        let reply = events.create(vec![object]).await;
+        let document_id = Events::created_document(&reply, 0);
+        let event = events.get(document_id).await;
+        assert_eq!(event[property], false, "{property}: {event}");
+        events.delete(document_id).await;
+    }
+
+    let blob = events
+        .pair
+        .key
+        .jmap_client()
+        .await
+        .upload(None, b"x".to_vec(), None)
+        .await
+        .unwrap()
+        .take_blob_id();
+    let mut object = events.event("jmapcal-events-link");
+    object["links"] = json!({ "l1": { "@type": "Link", "blobId": blob, "rel": "enclosure" } });
+    let reply = events.create(vec![object]).await;
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        ("invalidProperties", Some(ATTACHMENTS), json!(["links"])),
+        "{reply:?}"
+    );
+    assert_eq!(uid_copies(test, key_id, "jmapcal-events-link").await, 0);
+
+    let mut object = events.event("jmapcal-events-metadata");
+    object["metadata"] = json!({ "example.com": { "note": "metadata-canary" } });
+    let reply = events
+        .pair
+        .key
+        .jmap_request(
+            &[
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:calendars",
+                "urn:ietf:params:jmap:metadata",
+            ],
+            json!([["CalendarEvent/set", {
+                "accountId": events.pair.key.id_string(),
+                "create": { "i0": object },
+            }, "0"]]),
+        )
+        .await;
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        (
+            "forbidden",
+            Some("Object metadata is not available for zero-access accounts."),
+            Value::Null
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(uid_copies(test, key_id, "jmapcal-events-metadata").await, 0);
+}
+
+async fn set_default_alerts(events: &Events<'_>, with_time: Value, without_time: Value) {
+    let reply = events
+        .pair
+        .key
+        .jmap_method_call(
+            "Calendar/set",
+            json!({
+                "accountId": events.pair.key.id_string(),
+                "update": { (events.cal.as_str()): {
+                    "defaultAlertsWithTime": with_time,
+                    "defaultAlertsWithoutTime": without_time,
+                } },
+            }),
+        )
+        .await;
+    assert!(
+        reply
+            .pointer(&format!("/methodResponses/0/1/updated/{}", events.cal))
+            .is_some(),
+        "{reply:?}"
+    );
+}
+
+fn alert_ids(event: &Value) -> Vec<String> {
+    event["alerts"]
+        .as_object()
+        .map(|alerts| alerts.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// D11: default alerts are written into the event by value.
+async fn create_use_default_alerts(events: &Events<'_>) {
+    set_default_alerts(
+        events,
+        json!({ "t1": display_alert("-PT15M") }),
+        json!({ "d1": display_alert("PT9H") }),
+    )
+    .await;
+
+    let mut object = events.event("jmapcal-events-alerts");
+    object["title"] = json!("Alert canary");
+    object["useDefaultAlerts"] = json!(true);
+    let reply = events.create(vec![object]).await;
+    let created = reply.created(0);
+    // Upstream's answer: the client sent the flag, and no alert is inserted.
+    assert!(
+        created.get("alerts").is_none() && created.get("useDefaultAlerts").is_none(),
+        "{reply:?}"
+    );
+    let timed = Events::created_document(&reply, 0);
+    let event = events.get(timed).await;
+    assert_eq!(event["useDefaultAlerts"], false, "{event}");
+    assert_eq!(alert_ids(&event), ["t1"], "{event}");
+    assert_eq!(
+        event["alerts"]["t1"]["trigger"]["offset"], "-PT15M",
+        "{event}"
+    );
+    let body = events.body(timed).await;
+    assert_eq!(body.matches("BEGIN:VALARM").count(), 1, "{body}");
+    assert!(
+        body.contains("TRIGGER:-PT15M") && body.contains("DESCRIPTION:Alert canary"),
+        "{body}"
+    );
+
+    let mut object = events.event("jmapcal-events-alerts-day");
+    object["start"] = json!("2031-03-04T00:00:00");
+    object["duration"] = json!("P1D");
+    object["showWithoutTime"] = json!(true);
+    object["useDefaultAlerts"] = json!(true);
+    let reply = events.create(vec![object]).await;
+    let all_day = Events::created_document(&reply, 0);
+    let event = events.get(all_day).await;
+    assert_eq!(alert_ids(&event), ["d1"], "{event}");
+    let body = events.body(all_day).await;
+    assert!(body.contains("TRIGGER:PT9H"), "{body}");
+
+    let mut object = events.event("jmapcal-events-alerts-own");
+    object["alerts"] = json!({ "own": display_alert("-PT1H") });
+    object["useDefaultAlerts"] = json!(true);
+    let reply = events.create(vec![object]).await;
+    let own = Events::created_document(&reply, 0);
+    let event = events.get(own).await;
+    assert_eq!(alert_ids(&event), ["t1"], "{event}");
+    let body = events.body(own).await;
+    assert_eq!(body.matches("BEGIN:VALARM").count(), 1, "{body}");
+    assert!(
+        body.contains("TRIGGER:-PT15M") && !body.contains("TRIGGER:-PT1H"),
+        "{body}"
+    );
+
+    // The calendar's defaults change; the event already written keeps its own.
+    set_default_alerts(
+        events,
+        json!({ "e1": {
+            "@type": "Alert",
+            "action": "email",
+            "trigger": { "@type": "OffsetTrigger", "relativeTo": "start", "offset": "-PT30M" },
+        } }),
+        json!({ "d1": display_alert("PT9H") }),
+    )
+    .await;
+    let event = events.get(timed).await;
+    assert_eq!(alert_ids(&event), ["t1"], "{event}");
+    assert_eq!(
+        event["alerts"]["t1"]["trigger"]["offset"], "-PT15M",
+        "{event}"
+    );
+
+    let mut object = events.event("jmapcal-events-alerts-mail");
+    object["useDefaultAlerts"] = json!(true);
+    let reply = events.create(vec![object]).await;
+    let mail = Events::created_document(&reply, 0);
+    let body = events.body(mail).await;
+    assert!(
+        body.contains("ATTENDEE:mailto:jmapcal-events@example.com"),
+        "{body}"
+    );
+
+    for document_id in [timed, all_day, own, mail] {
+        events.delete(document_id).await;
+    }
+    set_default_alerts(events, Value::Null, Value::Null).await;
+}
+
+/// Spec 3.3: a UID is unique within one calendar, checked under the lease.
+async fn create_uid_rule(events: &Events<'_>) {
+    const UID: &str = "jmapcal-events-uid";
+    let reply = events.create(vec![events.event(UID)]).await;
+    let first = Events::created_document(&reply, 0);
+
+    let reply = events.create(vec![event_in(UID, &events.second)]).await;
+    let second = Events::created_document(&reply, 0);
+
+    let reply = events.create(vec![events.event(UID)]).await;
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        (
+            "invalidProperties",
+            Some("An event with UID jmapcal-events-uid already exists."),
+            json!(["uid"])
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(za_uid_leases(events.test).await, 0);
+    assert_eq!(uid_copies(events.test, events.pair.key_id, UID).await, 2);
+    events.delete(first).await;
+    events.delete(second).await;
+}
+
+/// D3: each object is its own commit; a failed object does not undo another.
+async fn create_two_objects_one_fails(events: &Events<'_>) {
+    let mut bad = events.event("jmapcal-events-bad");
+    bad["isDraft"] = json!(true);
+    let reply = events
+        .create(vec![events.event("jmapcal-events-ok"), bad])
+        .await;
+    let ok = Events::created_document(&reply, 0);
+    assert_eq!(
+        reply.not_created(1)["type"],
+        "invalidProperties",
+        "{reply:?}"
+    );
+    let new_state = reply.new_state().to_string();
+    let read = get_events(events.pair, false, json!([Id::from(ok).to_string()])).await;
+    assert_eq!(read.list().len(), 1, "{read:?}");
+    assert_eq!(read.response_at(0)["state"], new_state, "{read:?}");
+
+    let mut bad = events.event("jmapcal-events-bad-2");
+    bad["isDraft"] = json!(true);
+    let reply = events
+        .create(vec![bad, events.event("jmapcal-events-ok-2")])
+        .await;
+    assert_eq!(
+        reply.not_created(0)["type"],
+        "invalidProperties",
+        "{reply:?}"
+    );
+    let ok_2 = Events::created_document(&reply, 1);
+
+    let mut bad = events.event("jmapcal-events-bad-3");
+    bad["isDraft"] = json!(true);
+    let reply = events.create(vec![bad]).await;
+    assert_eq!(
+        reply.not_created(0)["type"],
+        "invalidProperties",
+        "{reply:?}"
+    );
+    let response = reply.response_at(0);
+    assert_eq!(response["newState"], response["oldState"], "{reply:?}");
+
+    events.delete(ok).await;
+    events.delete(ok_2).await;
+}
+
+/// D10 and spec 6.4: no per-user data and no search document.
+async fn create_stores_no_preferences_and_no_index_document(events: &Events<'_>) {
+    let (test, key_id) = (events.test, events.pair.key_id);
+    let mut object = events.event("jmapcal-events-own-data");
+    object["alerts"] = json!({ "a1": display_alert("-PT5M") });
+    object["keywords"] = json!({ "kw": true });
+    object["color"] = json!("#aabbcc");
+    let reply = events.create(vec![object]).await;
+    let document_id = Events::created_document(&reply, 0);
+    assert_no_event_preferences(test, key_id, document_id).await;
+
+    // The event's own alarm task is due in 2031.
+    test.wait_for_tasks_skip_not_due().await;
+    assert!(
+        !test
+            .server
+            .za_has_calendar_search_documents(key_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(itip_tasks_for(test, key_id).await, 0);
+    events.delete(document_id).await;
+}
+
+/// Upstream's tasks are created as VTODOs.
+async fn tasks(events: &Events<'_>) {
+    let reply = events
+        .create(vec![json!({
+            "@type": "Task",
+            "uid": "jmapcal-events-task",
+            "title": "Task canary",
+            "due": "2031-03-06T10:00:00",
+            "calendarIds": { (events.cal.as_str()): true },
+        })])
+        .await;
+    let document_id = Events::created_document(&reply, 0);
+    let event = events.get(document_id).await;
+    assert_eq!(event["@type"], "Task", "{event}");
+    let body = events.body(document_id).await;
+    assert!(body.contains("BEGIN:VTODO"), "{body}");
+    events.delete(document_id).await;
+}
+
+/// Invitations spec 5.1: a create holds the UID lease until its commit.
+async fn create_holds_the_lease(events: &Events<'_>) {
+    const UID: &str = "jmapcal-events-lease";
+    let account = events.pair.key.clone();
+    let object = events.event(UID);
+    let parked = HookParked::start(
+        events.pair.key_id,
+        test_hooks::set_commit_pause,
+        async move { account.jmap_create("CalendarEvent", [object], none()).await },
+    )
+    .await;
+    let reply = events.create(vec![events.event(UID)]).await;
+    let first = parked.finish().await;
+
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        ("forbidden", Some(MODIFIED), Value::Null),
+        "{reply:?}"
+    );
+    let document_id = Events::created_document(&first, 0);
+    assert_eq!(uid_copies(events.test, events.pair.key_id, UID).await, 1);
+    assert_eq!(za_uid_leases(events.test).await, 0);
+    events.delete(document_id).await;
 }

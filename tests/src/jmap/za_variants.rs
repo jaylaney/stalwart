@@ -3602,22 +3602,37 @@ pub async fn calendars(test: &TestServer) {
         "{reply:?}"
     );
 
-    for (method, args) in [
-        (
+    // Release 6 spec 6.2: CalendarEvent/set is served. The row's `"a"` is a
+    // well-formed calendar id, so the served create names one no calendar has
+    // and upstream's check refuses it; nothing is stored.
+    let missing = Id::from(999_999u32).to_string();
+    let reply = account
+        .jmap_method_call(
             "CalendarEvent/set",
             json!({ "accountId": id, "create": { "e": {
                 "@type": "Event",
                 "title": "Test",
                 "start": "2025-01-01T09:00:00",
                 "duration": "PT1H",
-                "calendarIds": { "a": true }
+                "calendarIds": { (missing.as_str()): true }
             } } }),
-        ),
-        (
-            "CalendarEventNotification/get",
-            json!({ "accountId": id, "ids": null }),
-        ),
-    ] {
+        )
+        .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    let not_created = reply
+        .pointer("/methodResponses/0/1/notCreated/e")
+        .unwrap_or_else(|| panic!("CalendarEvent/set created the event: {reply:?}"));
+    assert_eq!(not_created["type"], "invalidProperties", "{reply:?}");
+    assert_eq!(
+        not_created["properties"],
+        json!(["calendarIds"]),
+        "{reply:?}"
+    );
+
+    for (method, args) in [(
+        "CalendarEventNotification/get",
+        json!({ "accountId": id, "ids": null }),
+    )] {
         let reply = account.jmap_method_call(method, args).await;
         assert_eq!(
             reply.error_type_at(0),

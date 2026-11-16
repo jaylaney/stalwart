@@ -23,6 +23,18 @@ pub(crate) const ZA_CALENDAR_SET_INCOMPLETE: &str =
 /// Release 6 spec 6.11: the description of a refused `shareWith`.
 pub(crate) const ZA_CALENDAR_SHARE_WITH: &str = "Calendar sharing is managed on the account page.";
 
+/// Release 6 spec 6.5: the description of a refused `isDraft: true`.
+pub(crate) const ZA_CALENDAR_DRAFTS: &str = "Drafts are not available for zero-access accounts.";
+
+/// Release 6 spec 6.5: the description of a participant-visibility flag set
+/// true (`mayInviteSelf`, `mayInviteOthers`, `hideAttendees`).
+pub(crate) const ZA_CALENDAR_PARTICIPANT_FLAG: &str =
+    "This property is not available for zero-access accounts.";
+
+/// Release 6 spec 6.11: the description of a link with a `blobId`, on `links`.
+pub(crate) const ZA_CALENDAR_ATTACHMENTS: &str =
+    "Event attachments are not available for zero-access accounts.";
+
 /// Set error `forbidden` with `ZA_CALENDAR_SET_INCOMPLETE`.
 pub(crate) fn za_set_incomplete<P: Property>() -> SetError<P> {
     SetError::forbidden().with_description(ZA_CALENDAR_SET_INCOMPLETE)
@@ -144,7 +156,8 @@ pub(crate) fn za_calendar_method(obj: MethodObject, function: MethodFunction) ->
         // Release 6 spec 6.2: CalendarEvent/query and /queryChanges are served.
         (CalendarEvent, Query) => Served,
         (CalendarEvent, QueryChanges) => Served,
-        (CalendarEvent, Set) => Refused,
+        // Release 6 spec 6.2: CalendarEvent/set is served (6.5).
+        (CalendarEvent, Set) => Served,
         (CalendarEvent, Copy) => Refused,
         // Release 6 spec 6.2: the identities are served; /set only switches the default.
         (ParticipantIdentity, Get) => Served,
@@ -274,7 +287,8 @@ mod tests {
             // Release 6 spec 6.2: CalendarEvent/query and /queryChanges are served.
             (CalendarEvent, Query, Served),
             (CalendarEvent, QueryChanges, Served),
-            (CalendarEvent, Set, Refused),
+            // Release 6 spec 6.2: CalendarEvent/set is served (6.5).
+            (CalendarEvent, Set, Served),
             (CalendarEvent, Copy, Refused),
             // Release 6 spec 6.2: the identities are served.
             (ParticipantIdentity, Get, Served),
