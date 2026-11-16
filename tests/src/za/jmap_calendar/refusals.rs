@@ -7,11 +7,19 @@
 //! Release 6 spec 6.9: a key account's participant identities, where only the
 //! default can be switched.
 
-use super::{finish, key_account};
+use super::{event_ics, finish, key_account, make_calendar, share};
 use crate::{
-    utils::{account::Account, jmap::JmapResponse, server::TestServer},
-    za::{STRONG, gating::method_error, user_permissions},
+    utils::{
+        account::Account,
+        jmap::JmapResponse,
+        server::TestServer,
+        webdav::DummyWebDavClient,
+        za::{CALENDAR_JMAP_USING, za_bearer_jmap, za_grant_token, za_revoke_grant},
+    },
+    za::{STRONG, fanout::NO_REPLY, gating::method_error, user_permissions},
 };
+use common::{auth::oauth::scope::OAuthScopes, za::ZA_CALENDAR_KEYLESS};
+use hyper::StatusCode;
 use serde_json::{Value, json};
 use store::{
     ValueKey,
@@ -34,8 +42,9 @@ pub async fn test(test: &mut TestServer) {
         )
         .await;
     test.insert_account(owner.clone());
-    key_account(test, "refusals-2", user_permissions()).await;
+    let (grantee, grantee_id) = key_account(test, "refusals-2", user_permissions()).await;
     identity_set_only_switches_default(test, &owner).await;
+    parse_by_grantee_and_keyless(test, &owner, &grantee, grantee_id).await;
     finish(test, "refusals").await;
 }
 
@@ -132,4 +141,89 @@ async fn identity_set_only_switches_default(test: &TestServer, owner: &Account) 
         "{reply:?}"
     );
     assert_eq!(identities(owner).await, expected("b"));
+}
+
+/// Release 6 spec 6.1 and 6.6: `CalendarEvent/parse` admits the owner with
+/// keys only. A grantee's own keys do not open a blob in the owner's account,
+/// and a keyless token cannot parse at all.
+async fn parse_by_grantee_and_keyless(
+    test: &TestServer,
+    owner: &Account,
+    grantee: &Account,
+    grantee_id: u32,
+) {
+    let owner_id = owner.id().document_id();
+    let dav = DummyWebDavClient::new(owner_id, owner.name(), STRONG, owner.name());
+    make_calendar(test, owner, &dav, "jmapcal-shared").await;
+    // A view grant passes upstream's access check for the grantee.
+    share(test, owner, grantee, grantee_id, "jmapcal-shared", "view").await;
+
+    let ics = event_ics("jmapcal-refusals-parse", "jmapcal parse canary").into_bytes();
+    let blob = owner
+        .jmap_client()
+        .await
+        .upload(None, ics.clone(), None)
+        .await
+        .unwrap()
+        .take_blob_id();
+    let parse = |blob: &str| json!({ "accountId": owner.id_string(), "blobIds": [blob] });
+    let refused =
+        json!(["error", { "type": "forbidden", "description": ZA_CALENDAR_KEYLESS }, "0"]);
+
+    // The grantee, with its own keys, is refused the owner's blob.
+    let reply = grantee
+        .jmap_method_call("CalendarEvent/parse", parse(&blob))
+        .await;
+    assert_eq!(reply.0["methodResponses"][0], refused, "{reply:?}");
+
+    // The owner's keyless token is refused the same way.
+    let (grant, token) = za_grant_token(&test.server, owner.name(), OAuthScopes::ALL).await;
+    let (status, reply) = za_bearer_jmap(
+        &token,
+        CALENDAR_JMAP_USING,
+        json!([["CalendarEvent/parse", parse(&blob), "0"]]),
+    )
+    .await;
+    za_revoke_grant(&test.server, grant).await;
+    assert_eq!(status, 200, "{reply:?}");
+    assert_eq!(reply.0["methodResponses"][0], refused, "{reply:?}");
+
+    // Control: the keyed owner parses its own blob.
+    let reply = owner
+        .jmap_method_call("CalendarEvent/parse", parse(&blob))
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        reply.response_at(0)["parsed"][&blob][0]["title"],
+        "jmapcal parse canary",
+        "{reply:?}"
+    );
+
+    // Control: the grantee parses a blob of its own, in its own account.
+    let own = grantee
+        .jmap_client()
+        .await
+        .upload(None, ics, None)
+        .await
+        .unwrap()
+        .take_blob_id();
+    let reply = grantee
+        .jmap_method_call(
+            "CalendarEvent/parse",
+            json!({ "accountId": grantee.id_string(), "blobIds": [own] }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+
+    dav.request_with_headers(
+        "DELETE",
+        &format!(
+            "/dav/cal/{}/jmapcal-shared/",
+            owner.name().replace('@', "%40")
+        ),
+        [NO_REPLY],
+        "",
+    )
+    .await
+    .with_status(StatusCode::NO_CONTENT);
 }

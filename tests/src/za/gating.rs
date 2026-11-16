@@ -375,10 +375,6 @@ pub async fn test(test: &mut TestServer) {
             json!({ "accountId": key1_account, "fromAccountId": key1_account, "create": {} }),
         ),
         (
-            "CalendarEvent/parse",
-            json!({ "accountId": key1_account, "blobIds": [] }),
-        ),
-        (
             "CalendarEvent/queryChanges",
             json!({ "accountId": key1_account, "sinceQueryState": "n" }),
         ),
@@ -422,6 +418,11 @@ pub async fn test(test: &mut TestServer) {
         (
             "CalendarEvent/changes",
             json!({ "accountId": key1_account, "sinceState": "n" }),
+        ),
+        // Release 6 spec 6.2: CalendarEvent/parse is served to the keyed owner.
+        (
+            "CalendarEvent/parse",
+            json!({ "accountId": key1_account, "blobIds": [] }),
         ),
         // Release 6 spec 6.9: the identities are served; /set refuses each edit
         // as a set error, not as a method error.

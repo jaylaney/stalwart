@@ -13,14 +13,15 @@ use crate::{
         jmap::JmapResponse,
         server::TestServer,
         za::{
-            CALENDAR_JMAP_USING, delete_event_records, plant_event, stored_event,
-            write_stored_event, za_bearer_jmap, za_grant_token, za_revoke_grant,
+            CALENDAR_JMAP_USING, delete_event_records, inbox_ids, plant_event, stored_event,
+            wait_for_queue, write_stored_event, za_bearer_jmap, za_grant_token, za_revoke_grant,
         },
     },
     za::{
         dav_seal::resource_id,
         fanout::{CONTENT_TYPE, NO_REPLY},
         gating::method_error,
+        imip::deliver,
     },
 };
 use calcard::icalendar::ICalendarValue;
@@ -67,6 +68,8 @@ pub async fn test(test: &mut TestServer) {
     read_store_errors_are_payload_free(test, &pair).await;
     changes_as_upstream(test, &pair).await;
     identity_get_and_changes(&pair).await;
+    parse_sealed_upload(&pair).await;
+    parse_message_part(test, &pair).await;
     pair.dav
         .request_with_headers("DELETE", &event_path("jmapcal-shared/"), [NO_REPLY], "")
         .await
@@ -607,6 +610,117 @@ async fn identity_get_and_changes(pair: &Pair) {
     assert_eq!(
         reply.list()[0]["calendarAddress"],
         "mailto:jmapcal-events-2@example.com",
+        "{reply:?}"
+    );
+}
+
+/// The one-event ICS of both parse cases, with no `METHOD`.
+fn parse_ics() -> String {
+    event_ics("jmapcal-events-parse", "jmapcal parse canary")
+}
+
+/// Release 6 spec 6.6: the keyed owner parses a sealed upload, which the
+/// handler reads through the unsealing reader.
+async fn parse_sealed_upload(pair: &Pair) {
+    let blob = pair
+        .key
+        .jmap_client()
+        .await
+        .upload(None, parse_ics().into_bytes(), None)
+        .await
+        .unwrap()
+        .take_blob_id();
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/parse",
+            json!({ "accountId": pair.key.id_string(), "blobIds": [blob] }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        reply.response_at(0)["parsed"][&blob][0]["title"],
+        "jmapcal parse canary",
+        "{reply:?}"
+    );
+}
+
+/// Release 6 spec 6.6: the keyed owner parses a part of a delivered message.
+/// The ICS has no `METHOD`, so delivery files no invitation.
+async fn parse_message_part(test: &TestServer, pair: &Pair) {
+    const SENDER: &str = "dmarc-jmapcal-events-org@remote.test";
+
+    let account = pair.key.id_string();
+    let message = format!(
+        concat!(
+            "From: <{sender}>\r\nTo: <{to}>\r\nSubject: jmapcal parse message\r\n",
+            "Message-ID: <jmapcal-events-parse@remote.test>\r\n",
+            "Date: Mon, 02 Nov 2026 10:00:00 +0000\r\nMIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"jmapcal-parse\"\r\n\r\n",
+            "--jmapcal-parse\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n",
+            "A calendar file.\r\n",
+            "--jmapcal-parse\r\nContent-Type: text/calendar; name=\"event.ics\"\r\n",
+            "Content-Disposition: attachment\r\n\r\n{ics}\r\n--jmapcal-parse--\r\n"
+        ),
+        sender = SENDER,
+        to = pair.key.name(),
+        ics = parse_ics(),
+    );
+    deliver(SENDER, pair.key.name(), &message).await;
+    wait_for_queue(test).await;
+
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "Email/get",
+            json!({
+                "accountId": account,
+                "ids": null,
+                "properties": ["id", "subject", "attachments"],
+            }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let email = reply
+        .list()
+        .iter()
+        .find(|email| email["subject"] == "jmapcal parse message")
+        .unwrap_or_else(|| panic!("the delivered message is missing: {reply:?}"))
+        .clone();
+    let blob = email["attachments"][0]["blobId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the message has no attachment: {email}"))
+        .to_string();
+
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/parse",
+            json!({ "accountId": account, "blobIds": [blob] }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        reply.response_at(0)["parsed"][&blob][0]["title"],
+        "jmapcal parse canary",
+        "{reply:?}"
+    );
+    assert!(
+        inbox_ids(test, pair.key_id).await.is_empty(),
+        "without a METHOD the message is no invitation"
+    );
+
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "Email/set",
+            json!({ "accountId": account, "destroy": [email["id"]] }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        reply.response_at(0)["destroyed"],
+        json!([email["id"]]),
         "{reply:?}"
     );
 }

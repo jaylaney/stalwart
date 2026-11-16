@@ -16,7 +16,6 @@ pub(crate) enum ZaCalendarMethod {
     /// An owner with keys or a grantee with their own keys and shared access.
     Served,
     /// CalendarEvent/parse requires the owner's keys.
-    #[allow(dead_code)] // Task 24 first serves CalendarEvent/parse.
     OwnerOnly,
     /// The method is unavailable for key accounts.
     Refused,
@@ -112,7 +111,7 @@ async fn za_admit_key_calendar_method(
 pub(crate) fn za_calendar_method(obj: MethodObject, function: MethodFunction) -> ZaCalendarMethod {
     use MethodFunction::*;
     use MethodObject::*;
-    use ZaCalendarMethod::{Refused, Served};
+    use ZaCalendarMethod::{OwnerOnly, Refused, Served};
 
     match (obj, function) {
         (Calendar, Get) => Served,
@@ -122,7 +121,8 @@ pub(crate) fn za_calendar_method(obj: MethodObject, function: MethodFunction) ->
         (Calendar, Set) => Refused,
         (CalendarEvent, Get) => Served,
         (CalendarEvent, Changes) => Served,
-        (CalendarEvent, Parse) => Refused,
+        // Release 6 spec 6.2: CalendarEvent/parse admits the owner with keys only.
+        (CalendarEvent, Parse) => OwnerOnly,
         (CalendarEvent, Query) => Refused,
         (CalendarEvent, QueryChanges) => Refused,
         (CalendarEvent, Set) => Refused,
@@ -249,7 +249,8 @@ mod tests {
             (Calendar, Set, Refused),
             (CalendarEvent, Get, Served),
             (CalendarEvent, Changes, Served),
-            (CalendarEvent, Parse, Refused),
+            // Release 6 spec 6.2: CalendarEvent/parse admits the owner with keys only.
+            (CalendarEvent, Parse, OwnerOnly),
             (CalendarEvent, Query, Refused),
             (CalendarEvent, QueryChanges, Refused),
             (CalendarEvent, Set, Refused),
