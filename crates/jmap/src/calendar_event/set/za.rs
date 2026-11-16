@@ -13,8 +13,9 @@
 //!
 //! Updates are grouped as upstream groups them and written by the pipeline's
 //! update commit with the stored token pairs, display name and SEQUENCE floor
-//! (spec 5.4). Until Tasks 32 and 33 land, a change of an event's calendars
-//! and destroys are answered `forbidden` with `ZA_INTERIM` and never reach
+//! (spec 5.4). A change of an event's calendars is a placement plan the
+//! pipeline resolves and commits with the update (spec 5.2). Until Task 33
+//! lands, destroys are answered `forbidden` with `ZA_INTERIM` and never reach
 //! upstream's path (I §7.3).
 
 use super::{
@@ -75,7 +76,7 @@ use groupware::{
             context::za_write_contexts,
             create::{ZaEventCreate, za_create_event},
             error::ZaPipelineError,
-            placement::ZaPlacementContexts,
+            placement::{ZaPlacementContexts, ZaPlacementPlan, za_placement_contexts},
             schedule::{ZaScheduled, za_schedule_create, za_schedule_update},
             uid::za_take_uid_lease,
             update::{ZaEventUpdate, za_commit_update},
@@ -116,8 +117,7 @@ use types::{
 };
 use vault::session::SessionKeys;
 
-/// I §7.3: the answer to a change of an event's calendars and to a destroy
-/// until Tasks 32 and 33.
+/// I §7.3: the answer to a destroy until Task 33.
 pub(super) const ZA_INTERIM: &str = "This operation is not available for this account yet.";
 
 /// Upstream's text for a lost assertion (`calendar_event/set.rs:1611`).
@@ -1054,11 +1054,9 @@ impl ZaEventWriter<'_> {
                 .removed_calendar_ids(calendar_event.inner)
                 .next()
                 .is_some();
-        if is_calendar_ids_changed {
-            // Spec 5.2: a change of the event's calendars is Task 32's.
-            update.fail(response, SetError::forbidden().with_description(ZA_INTERIM));
-            return Ok(());
-        }
+        // Release 6 spec 3.3: a UID held in an entered calendar is the
+        // pipeline's check against current archives; upstream's moved UID
+        // index (`:717-731`) is not used.
         let is_metadata_changed = is_calendar_ids_changed
             || (calendar_event.inner.flags.to_native() ^ new_calendar_event.flags)
                 & EVENT_METADATA_FLAGS
@@ -1261,6 +1259,9 @@ impl ZaEventWriter<'_> {
             )
             .await
             .caused_by(trc::location!())?;
+        // Spec 5.2: whether the shaped tree differs from the stored one, read
+        // before the build below takes the tree.
+        let content_changed = new_content.data.event != previous_event;
         // Build event (in place of `:1019-1037`): no preferences, no default
         // alerts, the key-account flag.
         new_content.data = CalendarEventData::new_for(
@@ -1295,24 +1296,48 @@ impl ZaEventWriter<'_> {
             return Ok(());
         }
 
-        // The pipeline: the contexts of every calendar the event stays in,
-        // the scheduling (D4, D18) and the commit with the stored pairs and
-        // the stored display name (spec 5.4).
+        // The pipeline: the contexts of every calendar the event stays in or,
+        // for a change of its calendars, of every calendar it is in and every
+        // one it enters (spec 5.2), the scheduling (D4, D18) and the commit
+        // with the stored pairs and the stored display name (spec 5.4).
+        let stored_event = calendar_event
+            .deserialize::<CalendarEvent>()
+            .caused_by(trc::location!())?;
+        // The first kept name, else the first entered one (`patch_parent_ids`).
         let addressed = new_calendar_event.names[0].parent_id;
-        let contexts = match za_write_contexts(
-            server,
-            access_token,
-            account_id,
-            &calendar_event
-                .deserialize::<CalendarEvent>()
-                .caused_by(trc::location!())?,
-            addressed,
-            Acl::ModifyItems,
-        )
-        .await
-        {
-            Ok(contexts) => ZaPlacementContexts::unchanged(contexts),
-            Err(err) => return za_update_failed(update, response, err),
+        // Spec 5.2: the writer builds the plan; `za_placement_contexts` asks
+        // every right and gives every refusal.
+        let placement = is_calendar_ids_changed
+            .then(|| {
+                ZaPlacementPlan::jmap(
+                    &stored_event.names,
+                    &new_calendar_event.names,
+                    content_changed,
+                )
+            })
+            .filter(ZaPlacementPlan::is_change);
+        // Spec 3.3: a UID held in an entered calendar is answered with the
+        // event's UID, which step 29 validated unchanged.
+        let uid = placement.as_ref().and_then(|_| previous_event.object_uid());
+        let contexts = match &placement {
+            Some(plan) => match za_placement_contexts(server, access_token, account_id, plan).await
+            {
+                Ok(contexts) => contexts,
+                Err(err) => return za_update_failed(update, response, err, uid),
+            },
+            None => match za_write_contexts(
+                server,
+                access_token,
+                account_id,
+                &stored_event,
+                addressed,
+                Acl::ModifyItems,
+            )
+            .await
+            {
+                Ok(contexts) => ZaPlacementContexts::unchanged(contexts),
+                Err(err) => return za_update_failed(update, response, err, None),
+            },
         };
         let schedule = if is_user_data_only {
             ZaScheduling::Off
@@ -1333,7 +1358,7 @@ impl ZaEventWriter<'_> {
         .await
         {
             Ok(scheduled) => scheduled,
-            Err(err) => return za_update_failed(update, response, err),
+            Err(err) => return za_update_failed(update, response, err, None),
         };
         let written = match za_commit_update(
             server,
@@ -1354,13 +1379,13 @@ impl ZaEventWriter<'_> {
                 next_alarms,
                 scheduled,
                 contexts,
-                placement: None,
+                placement,
             },
         )
         .await
         {
             Ok(written) => written,
-            Err(err) => return za_update_failed(update, response, err),
+            Err(err) => return za_update_failed(update, response, err, uid),
         };
         self.disk_quota.reserve(extra_bytes);
 
@@ -1424,13 +1449,14 @@ impl ZaEventWriter<'_> {
 }
 
 /// A pipeline error of an update, answered as spec 8 says; `Err` is a store
-/// failure (D28).
+/// failure (D28). `uid` is the event's UID on a change of its calendars.
 fn za_update_failed(
     update: &EventUpdate<'_>,
     response: &mut SetResponse<calendar_event::CalendarEvent>,
     error: ZaPipelineError,
+    uid: Option<&str>,
 ) -> trc::Result<()> {
-    update.fail(response, za_event_set_error(error, None)?);
+    update.fail(response, za_event_set_error(error, uid)?);
     Ok(())
 }
 

@@ -13,11 +13,12 @@ use crate::{
         jmap::JmapResponse,
         server::TestServer,
         smtp_sink::sink,
+        webdav::{DavResponse, DummyWebDavClient},
         za::{
             CALENDAR_JMAP_USING, HookParked, assert_no_event_preferences, delete_event_records,
             delete_inbox_item, inbox_ids, itip_tasks_for, plant_event, stored_event,
-            wait_for_queue, write_stored_event, za_bearer_jmap, za_grant_token, za_revoke_grant,
-            za_uid_leases, za_unlock,
+            wait_for_queue, write_stored_event, za_bearer_jmap, za_grant_token, za_post,
+            za_revoke_grant, za_uid_leases, za_unlock,
         },
     },
     za::{
@@ -35,6 +36,7 @@ use common::{
     auth::oauth::scope::OAuthScopes,
     za::{ZA_CALENDAR_KEYLESS, test_hooks},
 };
+use dav_proto::Depth;
 use futures::FutureExt;
 use groupware::{
     cache::GroupwareCache,
@@ -104,6 +106,13 @@ pub async fn test(test: &mut TestServer) {
     update_by_restricted_grantee_refused(&events).await;
     update_uid_change_refused(&events).await;
     update_legacy_event_seals_it(&events).await;
+    // Release 6 spec 5.2, 6.5: CalendarEvent/set placement (Task 32).
+    let places = Places::new(&events).await;
+    move_link_unlink_by_calendar_ids(&events, &places).await;
+    placement_and_content_together(&events, &places).await;
+    placement_refusals(&events, &places).await;
+    calendar_id_that_does_not_exist(&events).await;
+    places.finish(&events).await;
     events.finish().await;
     pair.dav
         .request_with_headers("DELETE", &event_path("jmapcal-shared/"), [NO_REPLY], "")
@@ -1722,4 +1731,503 @@ async fn update_legacy_event_seals_it(events: &Events<'_>) {
     let body = events.body(document_id).await;
     assert!(body.contains("SUMMARY:Sealed canary"), "{body}");
     delete_event(events.pair, "default/jmapcal-legacy.ics").await;
+}
+
+/// The calendars of the placement cases: `b` and `c` made with
+/// `Calendar/set`, and `s`, "jmapcal-events-shared", shared with key2 at
+/// `edit`. `a` is the default calendar (`Events.cal`).
+struct Places {
+    b: String,
+    c: String,
+    s: String,
+}
+
+const SHARED_SLUG: &str = "jmapcal-events-shared";
+
+impl Places {
+    async fn new(events: &Events<'_>) -> Self {
+        let (test, pair) = (events.test, events.pair);
+        let reply = pair
+            .key
+            .jmap_method_call(
+                "Calendar/set",
+                json!({
+                    "accountId": pair.key.id_string(),
+                    "create": {
+                        "b": { "name": "jmapcal-events-b" },
+                        "c": { "name": "jmapcal-events-c" },
+                    },
+                }),
+            )
+            .await;
+        let created = |key: &str| {
+            reply
+                .pointer(&format!("/methodResponses/0/1/created/{key}/id"))
+                .and_then(|id| id.as_str())
+                .unwrap_or_else(|| panic!("Calendar/set created no {key}: {reply:?}"))
+                .to_string()
+        };
+        let (b, c) = (created("b"), created("c"));
+        let s = make_calendar(test, &pair.key, &pair.dav, SHARED_SLUG).await;
+        share(
+            test,
+            &pair.key,
+            &pair.key2,
+            pair.key2_id,
+            SHARED_SLUG,
+            "edit",
+        )
+        .await;
+        Places {
+            b,
+            c,
+            s: Id::from(s).to_string(),
+        }
+    }
+
+    /// The module's cleanup deletes only its own shared calendar.
+    async fn finish(self, events: &Events<'_>) {
+        za_post(
+            "shares/revoke",
+            &json!({
+                "username": events.pair.key.name(),
+                "password": STRONG,
+                "calendar": SHARED_SLUG,
+                "grant": events.pair.key2_id,
+            }),
+        )
+        .await
+        .expect(200);
+        for calendar in [&self.b, &self.c, &self.s] {
+            let href = events.calendar_href(calendar).await;
+            events
+                .pair
+                .dav
+                .request_with_headers("DELETE", &href, [NO_REPLY], "")
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+    }
+}
+
+/// The sync token of a calendar now (upstream's `jmap/calendar/event.rs:919-1022`).
+async fn sync_token(dav: &DummyWebDavClient, calendar: &str) -> String {
+    dav.sync_collection(calendar, "", Depth::Infinity, None, ["D:getetag"])
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .sync_token()
+        .to_string()
+}
+
+/// The hrefs a `sync-collection` REPORT of `calendar` since `token` lists as
+/// removed (status 404).
+async fn tombstones_since(dav: &DummyWebDavClient, calendar: &str, token: &str) -> Vec<String> {
+    let response = dav
+        .sync_collection(calendar, token, Depth::Infinity, None, ["D:getetag"])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    tombstones(&response)
+}
+
+fn tombstones(response: &DavResponse) -> Vec<String> {
+    let mut href = None;
+    let mut removed = Vec::new();
+    for (key, value) in &response.xml {
+        match key.as_str() {
+            "D:multistatus.D:response.D:href" => href = Some(value.clone()),
+            "D:multistatus.D:response.D:status" if value.contains(" 404 ") => {
+                removed.extend(href.take());
+            }
+            _ => {}
+        }
+    }
+    removed.sort();
+    removed
+}
+
+/// The items a depth-1 PROPFIND of a calendar lists.
+async fn calendar_items(dav: &DummyWebDavClient, calendar: &str) -> Vec<String> {
+    let mut items = dav
+        .propfind_with_headers(calendar, ["D:getetag"], [("depth", "1")])
+        .await
+        .hrefs
+        .keys()
+        .filter(|item| !item.ends_with('/'))
+        .cloned()
+        .collect::<Vec<_>>();
+    items.sort();
+    items
+}
+
+fn calendar_ids(ids: &[&str]) -> Value {
+    Value::Object(ids.iter().map(|id| (id.to_string(), json!(true))).collect())
+}
+
+/// Spec 5.2, 6.5: a JMAP move, link and unlink by `calendarIds` keep one
+/// event, and CalDAV sees the left names as removed.
+async fn move_link_unlink_by_calendar_ids(events: &Events<'_>, places: &Places) {
+    const UID: &str = "jmapcal-events-move";
+    let (test, pair) = (events.test, events.pair);
+    let dav = &pair.dav;
+    let (b, c) = (places.b.as_str(), places.c.as_str());
+    let reply = events.create(vec![events.event(UID)]).await;
+    let document_id = Events::created_document(&reply, 0);
+    let id = Id::from(document_id).to_string();
+    assert_eq!(uid_copies(test, pair.key_id, UID).await, 1);
+    let a_href = events.calendar_href(&events.cal).await;
+    let b_href = events.calendar_href(&places.b).await;
+    let c_href = events.calendar_href(&places.c).await;
+    let old_href = events.hrefs(document_id).await;
+    assert_eq!(old_href.len(), 1, "{old_href:?}");
+    assert!(old_href[0].starts_with(&a_href), "{old_href:?}");
+
+    // Move.
+    let a_token = sync_token(dav, &a_href).await;
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "calendarIds": calendar_ids(&[b]) }),
+    )
+    .await;
+    assert_updated(&reply, &id);
+    let event = events.get(document_id).await;
+    assert_eq!(event["calendarIds"], calendar_ids(&[b]), "{event}");
+    assert_eq!(tombstones_since(dav, &a_href, &a_token).await, old_href);
+    dav.request("GET", &old_href[0], "")
+        .await
+        .with_status(StatusCode::NOT_FOUND);
+    let in_b = events.hrefs(document_id).await;
+    assert_eq!(in_b.len(), 1, "{in_b:?}");
+    assert!(in_b[0].starts_with(&b_href), "{in_b:?}");
+    let body = drain::body(dav, &in_b[0]).await;
+    assert!(body.contains("UID:jmapcal-events-move"), "{body}");
+    assert_eq!(uid_copies(test, pair.key_id, UID).await, 1);
+
+    // Link.
+    let b_token = sync_token(dav, &b_href).await;
+    let c_token = sync_token(dav, &c_href).await;
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ (format!("calendarIds/{c}")): true }),
+    )
+    .await;
+    assert_updated(&reply, &id);
+    let event = events.get(document_id).await;
+    assert_eq!(event["calendarIds"], calendar_ids(&[b, c]), "{event}");
+    let in_c = calendar_items(dav, &c_href).await;
+    for (calendar, items) in [
+        (&b_href, calendar_items(dav, &b_href).await),
+        (&c_href, in_c.clone()),
+    ] {
+        assert_eq!(items.len(), 1, "{calendar}: {items:?}");
+        let body = drain::body(dav, &items[0]).await;
+        assert!(body.contains("UID:jmapcal-events-move"), "{body}");
+    }
+    // The kept name stays where it was.
+    assert_eq!(calendar_items(dav, &b_href).await, in_b);
+    for (calendar, token) in [(&b_href, &b_token), (&c_href, &c_token)] {
+        assert_eq!(
+            tombstones_since(dav, calendar, token).await,
+            Vec::<String>::new(),
+            "{calendar}: a link left a tombstone"
+        );
+    }
+    assert_eq!(uid_copies(test, pair.key_id, UID).await, 1);
+
+    // Unlink.
+    let b_token = sync_token(dav, &b_href).await;
+    let c_token = sync_token(dav, &c_href).await;
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ (format!("calendarIds/{b}")): null }),
+    )
+    .await;
+    assert_updated(&reply, &id);
+    let event = events.get(document_id).await;
+    assert_eq!(event["calendarIds"], calendar_ids(&[c]), "{event}");
+    assert_eq!(tombstones_since(dav, &b_href, &b_token).await, in_b);
+    assert_eq!(
+        tombstones_since(dav, &c_href, &c_token).await,
+        Vec::<String>::new()
+    );
+    assert_eq!(events.hrefs(document_id).await, in_c);
+    let body = drain::body(dav, &in_c[0]).await;
+    assert!(body.contains("UID:jmapcal-events-move"), "{body}");
+    assert_eq!(uid_copies(test, pair.key_id, UID).await, 1);
+
+    events.delete(document_id).await;
+    assert_eq!(uid_copies(test, pair.key_id, UID).await, 0);
+}
+
+/// Spec 5.2: a change of placement and content is one update and one commit.
+async fn placement_and_content_together(events: &Events<'_>, places: &Places) {
+    const UID: &str = "jmapcal-events-move-content";
+    let pair = events.pair;
+    let reply = events.create(vec![event_in(UID, &places.b)]).await;
+    let document_id = Events::created_document(&reply, 0);
+    let id = Id::from(document_id).to_string();
+    let account = pair.key.id_string().to_string();
+    let state = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({ "accountId": account, "ids": [] }),
+        )
+        .await
+        .state()
+        .to_string();
+
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "calendarIds": calendar_ids(&[events.cal.as_str()]), "title": "Moved canary" }),
+    )
+    .await;
+    assert_updated(&reply, &id);
+    let changes = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/changes",
+            json!({ "accountId": account, "sinceState": state }),
+        )
+        .await;
+    let response = changes.response_at(0);
+    assert_eq!(response["updated"], json!([id]), "{changes:?}");
+    assert_eq!(response["created"], json!([]), "{changes:?}");
+    assert_eq!(response["destroyed"], json!([]), "{changes:?}");
+    assert_eq!(
+        response["newState"],
+        reply.response_at(0)["newState"],
+        "{changes:?} {reply:?}"
+    );
+
+    let hrefs = events.hrefs(document_id).await;
+    let a_href = events.calendar_href(&events.cal).await;
+    assert_eq!(hrefs.len(), 1, "{hrefs:?}");
+    assert!(hrefs[0].starts_with(&a_href), "{hrefs:?}");
+    let body = drain::body(&pair.dav, &hrefs[0]).await;
+    assert!(body.contains("SUMMARY:Moved canary"), "{body}");
+    events.delete(document_id).await;
+}
+
+/// A placement update that is refused: `forbidden`, the event's calendars as
+/// they were, and no tombstone in any of `calendars`.
+async fn placement_refused(
+    events: &Events<'_>,
+    document_id: u32,
+    patch: Value,
+    calendars: &[&str],
+) {
+    let dav = &events.pair.dav;
+    let id = Id::from(document_id).to_string();
+    let before = events.get(document_id).await["calendarIds"].clone();
+    let mut tokens = Vec::with_capacity(calendars.len());
+    for calendar in calendars {
+        let href = events.calendar_href(calendar).await;
+        let token = sync_token(dav, &href).await;
+        tokens.push((href, token));
+    }
+    let reply = update_event(events, document_id, patch.clone()).await;
+    assert_eq!(
+        set_error(reply.not_updated(&id)).0,
+        "forbidden",
+        "{patch}: {reply:?}"
+    );
+    assert_eq!(
+        events.get(document_id).await["calendarIds"],
+        before,
+        "{patch}"
+    );
+    for (href, token) in tokens {
+        assert_eq!(
+            tombstones_since(dav, &href, &token).await,
+            Vec::<String>::new(),
+            "{patch}: {href}"
+        );
+    }
+}
+
+/// Spec 5.2: a JMAP placement change follows the CalDAV rule for shared
+/// calendars, and the pipeline checks the UID in an entered calendar.
+async fn placement_refusals(events: &Events<'_>, places: &Places) {
+    let (test, pair) = (events.test, events.pair);
+    let (a, b, s) = (events.cal.as_str(), places.b.as_str(), places.s.as_str());
+    let mut created = Vec::new();
+
+    // 1. An event of `a` linked into `s` as well.
+    let reply = events
+        .create(vec![events.event("jmapcal-events-place-1")])
+        .await;
+    let document_id = Events::created_document(&reply, 0);
+    created.push(document_id);
+    placement_refused(
+        events,
+        document_id,
+        json!({ (format!("calendarIds/{s}")): true }),
+        &[a, s],
+    )
+    .await;
+
+    // 2. An event of `s` linked into `a` as well.
+    let document_id = put_event(
+        test,
+        &pair.key,
+        &pair.dav,
+        SHARED_SLUG,
+        "jmapcal-events-place-2",
+        "jmapcal-events-place-2",
+    )
+    .await;
+    created.push(document_id);
+    placement_refused(
+        events,
+        document_id,
+        json!({ (format!("calendarIds/{a}")): true }),
+        &[a, s],
+    )
+    .await;
+
+    // 3. An event of `a` and `b` moved into `s`.
+    let mut object = events.event("jmapcal-events-place-3");
+    object["calendarIds"] = calendar_ids(&[a, b]);
+    let reply = events.create(vec![object]).await;
+    let document_id = Events::created_document(&reply, 0);
+    created.push(document_id);
+    placement_refused(
+        events,
+        document_id,
+        json!({ "calendarIds": calendar_ids(&[s]) }),
+        &[a, b, s],
+    )
+    .await;
+
+    // 4. Allowed: a single-name event of `a` moved into `s`; key2 reads it.
+    const UID: &str = "jmapcal-events-place-4";
+    let reply = events.create(vec![events.event(UID)]).await;
+    let document_id = Events::created_document(&reply, 0);
+    created.push(document_id);
+    let id = Id::from(document_id).to_string();
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "calendarIds": calendar_ids(&[s]) }),
+    )
+    .await;
+    assert_updated(&reply, &id);
+    let reply = get_events(pair, true, json!([id])).await;
+    let [event] = reply.list() else {
+        panic!("key2 does not read the moved event: {reply:?}");
+    };
+    assert_eq!(event["uid"], UID, "{event}");
+    let in_s = events.hrefs(document_id).await;
+    assert_eq!(in_s.len(), 1, "{in_s:?}");
+    let body = drain::body(&pair.dav2, &in_s[0]).await;
+    assert!(body.contains("UID:jmapcal-events-place-4"), "{body}");
+
+    // 5. Allowed: moved back into `a`; key2 no longer finds it.
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "calendarIds": calendar_ids(&[a]) }),
+    )
+    .await;
+    assert_updated(&reply, &id);
+    let reply = get_events(pair, true, json!([id])).await;
+    assert!(reply.list().is_empty(), "{reply:?}");
+    assert_eq!(reply.not_found().collect::<Vec<_>>(), [id.as_str()]);
+    pair.dav2
+        .request("GET", &in_s[0], "")
+        .await
+        .with_status(StatusCode::NOT_FOUND);
+
+    // 6. A UID that `b` already holds, moved from `a` into `b`.
+    const SAME: &str = "jmapcal-events-place-6";
+    let reply = events.create(vec![event_in(SAME, b)]).await;
+    created.push(Events::created_document(&reply, 0));
+    let reply = events.create(vec![events.event(SAME)]).await;
+    let document_id = Events::created_document(&reply, 0);
+    created.push(document_id);
+    let id = Id::from(document_id).to_string();
+    let b_token = sync_token(&pair.dav, &events.calendar_href(b).await).await;
+    let a_token = sync_token(&pair.dav, &events.calendar_href(a).await).await;
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "calendarIds": calendar_ids(&[b]) }),
+    )
+    .await;
+    assert_eq!(
+        set_error(reply.not_updated(&id)),
+        (
+            "invalidProperties",
+            Some("An event with UID jmapcal-events-place-6 already exists."),
+            json!(["uid"])
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(
+        events.get(document_id).await["calendarIds"],
+        calendar_ids(&[a])
+    );
+    for (calendar, token) in [(b, b_token), (a, a_token)] {
+        let href = events.calendar_href(calendar).await;
+        assert_eq!(
+            tombstones_since(&pair.dav, &href, &token).await,
+            Vec::<String>::new(),
+            "{href}"
+        );
+    }
+    assert_eq!(uid_copies(test, pair.key_id, SAME).await, 2);
+
+    for document_id in created {
+        events.delete(document_id).await;
+    }
+}
+
+/// D17: upstream's existence check of `calendarIds`, on an update and a create.
+async fn calendar_id_that_does_not_exist(events: &Events<'_>) {
+    const UID: &str = "jmapcal-events-missing";
+    let missing = Id::from(999_999u32).to_string();
+    let reply = events
+        .create(vec![events.event("jmapcal-events-missing-update")])
+        .await;
+    let document_id = Events::created_document(&reply, 0);
+    let id = Id::from(document_id).to_string();
+
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "calendarIds": calendar_ids(&[missing.as_str()]) }),
+    )
+    .await;
+    let (kind, description, properties) = set_error(reply.not_updated(&id));
+    assert_eq!(
+        (kind, properties),
+        ("invalidProperties", json!(["calendarIds"])),
+        "{reply:?}"
+    );
+    assert!(
+        description.is_some_and(|text| text.ends_with("does not exist.")),
+        "{reply:?}"
+    );
+    assert_eq!(
+        events.get(document_id).await["calendarIds"],
+        calendar_ids(&[events.cal.as_str()])
+    );
+
+    let reply = events.create(vec![event_in(UID, &missing)]).await;
+    let (kind, description, properties) = set_error(reply.not_created(0));
+    assert_eq!(
+        (kind, properties),
+        ("invalidProperties", json!(["calendarIds"])),
+        "{reply:?}"
+    );
+    assert!(
+        description.is_some_and(|text| text.ends_with("does not exist.")),
+        "{reply:?}"
+    );
+    assert_eq!(uid_copies(events.test, events.pair.key_id, UID).await, 0);
+    events.delete(document_id).await;
 }
