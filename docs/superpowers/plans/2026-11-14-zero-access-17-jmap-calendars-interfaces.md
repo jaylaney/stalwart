@@ -1064,11 +1064,14 @@ pub(crate) enum ZaCalendarMethod {
 /// `za_calendar_keyless_refusal().account_id(account_id)`.
 pub(crate) async fn za_admit_calendar_method(server: &Server, access_token: &AccessToken, account_id: Id,
     method: ZaCalendarMethod) -> trc::Result<()>;
-/// Task 21, spec 8: classification/admission before polling a calendar read. The captured key-target
-/// decision also governs its Store-error context; no post-error reclassification of a keyed request.
+/// Spec 8: classification/admission before polling a served calendar method, read or write (the name
+/// stays). The captured key-target decision also governs its Store-error context; no post-error
+/// reclassification of a keyed request.
 pub(crate) async fn za_serve_calendar_read<T>(server: &Server, access_token: &AccessToken,
     account_id: Id, method: ZaCalendarMethod,
     read: impl std::future::Future<Output = trc::Result<T>> + Send) -> trc::Result<T>;
+/// The rebuild both forms below call. Private at Task 21; `pub(crate)` from Task 22, visibility only.
+pub(crate) fn calendar_read_error(za_key: bool, owner: u32, error: trc::Error) -> trc::Error;
 /// The class of each calendar method. Every method starts `Refused`; a task flips the ones it serves.
 pub(crate) fn za_calendar_method(obj: MethodObject, function: MethodFunction) -> ZaCalendarMethod;
 /// Calendar | CalendarEvent | ParticipantIdentity: the methods that trigger the drain.
@@ -1076,23 +1079,55 @@ pub(crate) fn is_calendar_method(obj: MethodObject) -> bool;
 ```
 
 Named `za_admit_calendar_method` so it does not collide with
-`groupware`'s `za_calendar_admission`. Call sites: `api/request.rs:536,
-543,552,561,652,659,668,776,785,794,803,891-892,943` and
-`changes/get.rs:203,209,215,228`.
+`groupware`'s `za_calendar_admission`. Call sites at `cf698b9a7`:
+`za_admit_calendar_method` at `api/request.rs:565,580`
+(`CalendarEventNotification/get`, `ParticipantIdentity/get`), `:690,705`
+(`CalendarEvent/query`, `CalendarEventNotification/query`),
+`:819,834,849,864` (`Calendar/set`, `CalendarEvent/set`,
+`CalendarEventNotification/set`, `ParticipantIdentity/set`), `:958,965`
+(`CalendarEvent/copy`, target and source) and `:1022`
+(`CalendarEvent/parse`); `changes/get.rs:206,218,230,249` (the `Calendar`,
+`CalendarEvent`, `CalendarEventNotification` and `ParticipantIdentity`
+arms); `changes/query.rs:325` (`CalendarEvent/queryChanges`).
+`za_serve_calendar_read` at `api/request.rs:539,552,677` (`Calendar/get`,
+`CalendarEvent/get`, `Calendar/query`).
 
-`za_serve_calendar_read` replaces the separate admission and handler call for
-Task 21's `Calendar/get`, `CalendarEvent/get` and `Calendar/query` dispatcher
-arms only, after their existing account resolution and access checks. It
-classifies once at the same admission point, shares the existing keyed
-admission implementation, and never polls the read after refused admission.
-For a target classified as keyed, any `Store` error returned by admission or the
-read is rebuilt with the same event type, the resolved account id, a numeric
-document id when present and representable as `u32`, and the fixed details
-`zero-access: calendar read failed`; all original context is dropped. It
-emits no trace: the dispatcher remains the one method-error trace producer.
-Ordinary results and errors, non-Store errors, and existing public admission
-callers remain unchanged. No extra classification occurs after the read.
-Store errors retain their existing fixed wire serialization.
+**The rule (spec 8; ruling R21-2).** Every key-calendar method a task serves
+routes the `Store` errors of a keyed target through one rebuild,
+`calendar_read_error`. The classification is captured once, at admission;
+nothing classifies again after an error. Two forms:
+
+- **Dispatcher form**, for a method admitted in `api/request.rs`:
+  `za_serve_calendar_read` (not limited to reads; the name stays) replaces
+  the arm's separate admission and handler calls, after its existing account
+  resolution and access checks. Task 21's three arms use it; Tasks 23, 24,
+  26, 28 and 30 move the arms they serve to it.
+- **Handler form**, for a method admitted inside a handler:
+  `Calendar/changes`, `CalendarEvent/changes` and
+  `ParticipantIdentity/changes` (`changes/get.rs`) and
+  `CalendarEvent/queryChanges` (`changes/query.rs`). The arm keeps the
+  classification it captured at its admission point (in `changes/get.rs` the
+  one `za_calendar_sync_boundary` reuses, §7.6) and passes every `Store`
+  error of its keyed path, from admission to the response, through
+  `calendar_read_error(za_key, owner, error)`: the sync boundary's context
+  resolution, upstream's cache and log reads and, for `/queryChanges`, the
+  query it runs. Task 22 places the form in all four arms; until Tasks 23
+  and 26 serve the last two, their refusal is a `Jmap` error and passes
+  unchanged. `calendar_read_error` becomes `pub(crate)` in Task 22,
+  visibility only; its signature and behaviour stay as Task 21 built them.
+
+In both forms `za_admit_calendar_method`'s public contract stays.
+`za_serve_calendar_read` classifies once at the admission point, shares the
+existing keyed admission implementation, and never polls the method after
+refused admission. For a target classified as keyed, any `Store` error
+returned by admission or the method is rebuilt with the same event type, the
+resolved account id, a numeric document id when present and representable as
+`u32`, and the fixed details `zero-access: calendar read failed` (the text
+stays for writes); all original context is dropped. Neither form emits a
+trace: the dispatcher remains the one method-error trace producer. Ordinary
+results and errors, non-Store errors, and existing public admission callers
+remain unchanged. No extra classification occurs after an error. Store
+errors retain their existing fixed wire serialization.
 
 ### 7.2 Reads
 

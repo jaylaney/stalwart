@@ -12,6 +12,7 @@ The JMAP writes, the drain hook, the session and principal objects, and two test
 - Create: `crates/jmap/src/calendar/set/za.rs`, with its `#[cfg(test)] mod tests`.
 - Modify: `crates/jmap/src/calendar/set.rs`: a `mod za;` line after the `use` block (`:60`), and one branch after `:80` (`let account_id = request.account_id.document_id();`).
 - Modify: `crates/jmap/src/api/za_calendar.rs`: the `Calendar/set` row (header, "Moving a refusal row"), and the items under Produces.
+- Modify: `crates/jmap/src/api/request.rs`: only the `Calendar/set` arm (I §7.1's dispatcher form).
 - Test: `tests/src/za/jmap_calendar/calendars.rs` (Task 21's file); `tests/src/za/gating.rs:366-369` and `tests/src/jmap/za_variants.rs:3521-3524` (the row).
 
 **Interfaces:**
@@ -32,6 +33,7 @@ The JMAP writes, the drain hook, the session and principal objects, and two test
 - D16: a destroy schedules with `ZaScheduling::On`: cancellations and declines go through the fan-out, and a denied status never fails the destroy.
 - Object metadata is refused where it is extracted (upgrade ruling 66), before the object's other checks.
 - `reschedule_calendar_alarms` and the owner's `inherit_owner_preferences` and `sync_owner_preferences` stay in the update path, as PROPPATCH's key arm has them; they change nothing for a key account today.
+- Spec 8, I §7.1 (ruling R21-2): the `Calendar/set` arm of `api/request.rs` moves to the dispatcher form, `za_serve_calendar_read`. It rebuilds the Store errors the method returns (a head error, D28); the per-object store failures stay as below.
 
 **Store failures (I §7.5, spec 5.3 D28).** Each object's body returns `trc::Result<Result<answer, SetError>>`. An `Err` of the body, and the `Err` of `za_calendar_set_error`, is a store failure: the handler traces it once (`trc::error!`, with the account id and, when known, the document id), answers the object with `za_set_incomplete()`, and answers every later object of the call (the remaining creates, then updates, then destroys) with the same set error without attempting it. Objects already answered keep their answers, `newState` is the last commit's change id, and the method returns `Ok`. An error in the head fails the method: nothing was committed. A store error of the default write after the objects is traced; the default stays as it was and the method still answers.
 
@@ -248,6 +250,7 @@ Every case asserts that `za_replace_alarms` returned `true`.
 - Create: `crates/jmap/src/calendar_event/set/za.rs`, with its `#[cfg(test)] mod tests`.
 - Modify: `crates/jmap/src/calendar_event/set.rs`: a `mod za;` line after the `use` block (`:106`); one branch after `:189` (`let account_id = request.account_id.document_id();`); the wording of the fork's three comments at `:1060-1061`, `:1527-1528` and `:1886-1887`.
 - Modify: `crates/jmap/src/api/za_calendar.rs`: the `CalendarEvent/set` row (header, "Moving a refusal row"); the three ruling texts of I §7.5.
+- Modify: `crates/jmap/src/api/request.rs`: only the `CalendarEvent/set` arm (I §7.1's dispatcher form).
 - Test: `tests/src/za/jmap_calendar/events.rs` (Task 21's file); `tests/src/za/gating.rs:376-379` and `tests/src/jmap/za_variants.rs:3527-3536` (the row).
 
 **Interfaces:**
@@ -267,6 +270,7 @@ Every case asserts that `za_replace_alarms` returned `true`.
 - The lease is taken after every check that can refuse the object and before the event data is built. On every path that does not hand it to `za_create_event`, a store failure included, the writer calls `lease.release().await` before it answers, so no lease outlives the object.
 - Object metadata is refused where it is extracted (upgrade ruling 66).
 - The UID in upstream's "An event with UID .. already exists." is the client's own value and is visible by structure.
+- Spec 8, I §7.1 (ruling R21-2): the `CalendarEvent/set` arm of `api/request.rs` moves to the dispatcher form, `za_serve_calendar_read`. It rebuilds the Store errors the method returns (a head error, D28); the per-object store failures stay as below.
 
 **Store failures (I §7.5, spec 5.3 D28).** As in Task 28: each object's body returns `trc::Result<Result<answer, SetError>>`; an `Err` of the body or of `za_event_set_error` is traced once, answers the object and every later object of the call (creates, then updates, then destroys) with `za_set_incomplete()` without attempting the later ones, keeps the earlier answers and `newState`, and returns `Ok`. An error in the head fails the method.
 

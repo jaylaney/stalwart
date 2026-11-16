@@ -222,7 +222,8 @@ question. Sol implements at `high`; independent Astra review is `xhigh`.
   `crates/jmap-proto/src/request/{parser,parser_restored_tests}.rs`;
   `crates/jmap/src/changes/{mod,get,query,za}.rs`;
   `crates/jmap/src/participant_identity/changes.rs`;
-  `crates/jmap/src/api/za_calendar.rs` (two served rows).
+  `crates/jmap/src/api/za_calendar.rs` (two served rows; `calendar_read_error`
+  becomes `pub(crate)`, I §7.1).
 - Tests: `tests/src/za/jmap_calendar/{events,mod}.rs`, `tests/src/za/{mod,gating}.rs`,
   `tests/src/jmap/za_variants.rs`. Keep every retained test function in place.
 - Read without changing the algorithm: `crates/jmap/src/changes/{page,state}.rs`,
@@ -278,6 +279,11 @@ predicate on every page. No first-retained lookup or `from_id - 1` guess.
 - Do not call or extend `za_log_first_retained` for this task.
 - Test setup may create/trim its isolated account's log through existing
   storage APIs. No production hook or alternate pagination algorithm.
+- Spec 8, I §7.1 (ruling R21-2), the handler form: the `Calendar`,
+  `CalendarEvent` and `ParticipantIdentity` arms of `changes/get.rs` and the
+  `CalendarEvent` arm of `changes/query.rs` pass every `Store` error of a
+  keyed target's path through `calendar_read_error`, with the classification
+  captured at the arm's admission. The last two arms serve in Tasks 23 and 26.
 
 - [ ] **Step 1: write the codec and consumer unit tests.** In
   `state_restored_tests.rs`, use the prefix `za_calendar_state_`:
@@ -330,6 +336,7 @@ predicate on every page. No first-retained lookup or `from_id - 1` guess.
   | `paged_sync_origin_survives_range_changes` | At least three pages preserve the exact same origin. Exercise insert/delete folding that moves the returned range's first ID and trimming between requests. The origin remains unchanged when upstream permits continuation; trimming that invalidates the underlying range retains upstream's refusal. Include paging for both calendar object types with suitable visible fixtures. |
   | `paged_sync_legacy_and_ordinary` | Key grantee legacy `r` requires Initial restart. A key owner's valid legacy chain emits only `r` until completion; its next new paged sync emits `z`. Ordinary initial/exact/legacy paging and bytes are unchanged; ordinary calendar `z` is `invalidArguments`. |
   | `calendar_state_slot_errors` | With otherwise authorized requests, feed both `z` origins to non-calendar state slots (including keyed Email queryChanges and ParticipantIdentity), and to ordinary calendar state slots: `invalidArguments`. Exercise the precondition matrix below. Retain unauthorized/keyless controls with their established admission errors. Task 37 adds the key-calendar writer slots after those methods are served. |
+| `changes_store_errors_are_payload_free` | Spec 8, ruling R21-2, modelled on Task 21's `read_store_errors_are_payload_free`. An exact-origin grantee's boundary resolves the shared calendar's context (`za_foreign_calendar_contexts`), whose archive read attaches the stored bytes to a Store error (`store/src/write/serialize.rs:85-93`). With a completed boundary, take the grantee's exact state after it from a successful call, which warms the cache; save the calendar's exact archive bytes and replace them with an invalid archive of inert synthetic canary bytes only. The grantee's `CalendarEvent/changes` and `Calendar/changes` from that state are each the method error `serverUnavailable` with its fixed description; the owner's keyless token (`za_grant_token`, `za_bearer_jmap`) gets `forbidden` with `ZA_CALENDAR_KEYLESS` for the same calls. Restore the exact bytes before the final assertions; the grantee's calls then succeed. A subscriber to every event type captures a Store error with the fixed details `zero-access: calendar read failed` and no event holding the canary (compared, never printed). The keyless token ends with `za_revoke_grant`. |
 
   Precondition matrix: valid and malformed `z` in `ifInState` of an
   already-served `/set`, Email/import and ordinary CalendarEvent/copy
@@ -355,7 +362,7 @@ predicate on every page. No first-retained lookup or `from_id - 1` guess.
   log reader to infer an origin. Flip `(Calendar, Changes)` and
   `(CalendarEvent, Changes)` in both admission and `calendar_method_classes`.
 - [ ] **Step 10: run U-ws `sync_boundary_origins`, then `calendar_method_classes`,
-  then ZA.** Expected GREEN, including all five sharing cases and
+  then ZA.** Expected GREEN, including all six sharing cases and
   `events::changes_as_upstream`. Public `CalendarEvent/queryChanges`
   remains refused until Task 26; its origin-preservation tests are there.
 - [ ] **Step 11: run JP, then JK.** Expected GREEN. Both modes matter
@@ -380,6 +387,7 @@ remain separately required.
 - Modify:
   - `crates/jmap/src/participant_identity/set.rs`: one branch after the state check (`:77`, before `let account_info` at `:79`), and a private function and constant at the end of the file, beside `identities_not_shared` (`:421-424`).
   - `crates/jmap/src/api/za_calendar.rs` (three rows).
+  - `crates/jmap/src/api/request.rs`: only the `ParticipantIdentity/get` and `/set` arms (I §7.1's dispatcher form).
   - `tests/src/za/jmap_calendar/events.rs` (one case); `tests/src/za/jmap_calendar/mod.rs` (`pub mod refusals;`); `tests/src/za/mod.rs` (the call `jmap_calendar::refusals::test`, after `jmap_calendar::sharing::test`).
   - `tests/src/za/gating.rs` (two rows); `tests/src/jmap/za_variants.rs` (two rows and a cleanup).
 - Must not touch: `participant_identity/get.rs`, `changes.rs`; preserve Task 22's explicit `z` rejection in `changes.rs`.
@@ -398,6 +406,7 @@ The branch: for a key account `za_refuse_identity_edits` moves every create, upd
 - Nothing of a refused request is stored.
 - For an ordinary account the handler costs one cached classification read.
 - Another account's request already gets upstream's `reject_identity_changes` (`set.rs:54-56`), before the fork's branch.
+- Spec 8, I §7.1 (ruling R21-2): the `ParticipantIdentity/get` and `/set` arms of `api/request.rs` move to the dispatcher form, `za_serve_calendar_read`; `/changes` already has the handler form Task 22 placed in `changes/get.rs`.
 
 - [ ] **Step 1: write the failing za cases.**
 
@@ -432,7 +441,7 @@ The branch: for a key account `za_refuse_identity_edits` moves every create, upd
 **Spec:** 6.6; 6.1 (`parse` admits the owner only); 6.2 (one row).
 
 **Files:**
-- Modify: `crates/jmap/src/api/za_calendar.rs` (one row; the allow on `OwnerOnly` goes); `tests/src/za/jmap_calendar/events.rs` (two cases); `tests/src/za/jmap_calendar/refusals.rs` (one case); `tests/src/za/gating.rs` (one row).
+- Modify: `crates/jmap/src/api/za_calendar.rs` (one row; the allow on `OwnerOnly` goes); `crates/jmap/src/api/request.rs` (only the `CalendarEvent/parse` arm, I §7.1's dispatcher form); `tests/src/za/jmap_calendar/events.rs` (two cases); `tests/src/za/jmap_calendar/refusals.rs` (one case); `tests/src/za/gating.rs` (one row).
 - Must not touch: `crates/jmap/src/calendar_event/parse.rs`, `crates/jmap/src/blob/download.rs`.
 
 **Interfaces:**
@@ -443,6 +452,7 @@ The branch: for a key account `za_refuse_identity_edits` moves every create, upd
 - Only admission changes. A sealed source is never read raw: the handler's one reader is `blob_download`.
 - The method writes nothing.
 - A grantee cannot parse a blob in the sharer's account, and a keyless token cannot parse at all. Both get the method error `forbidden` with `ZA_CALENDAR_KEYLESS`.
+- Spec 8, I §7.1 (ruling R21-2): the `CalendarEvent/parse` arm of `api/request.rs` moves to the dispatcher form, `za_serve_calendar_read` with `OwnerOnly`.
 
 - [ ] **Step 1: write the failing za cases.** The ICS of all three is one VEVENT with no `METHOD` property and the SUMMARY "jmapcal parse canary".
 
@@ -552,6 +562,7 @@ The branch: for a key account `za_refuse_identity_edits` moves every create, upd
 - Modify:
   - `crates/jmap/src/calendar_event/query.rs`: `mod za;`; point 1 between the end of the filter loop (`:373`) and the search-store call (`:417-425`), directly before `let results = self.search_store()`; point 2 at the stored content read of the expanded loop (`:483-497`).
   - `crates/jmap/src/api/za_calendar.rs` (two rows).
+  - `crates/jmap/src/api/request.rs`: only the `CalendarEvent/query` arm (I §7.1's dispatcher form).
   - `tests/src/za/jmap_calendar/mod.rs` (`pub mod query;`); `tests/src/za/mod.rs` (the call `jmap_calendar::query::test`, after `jmap_calendar::calendars::test` and before `jmap_calendar::sharing::test`).
   - `tests/src/za/gating.rs` (two rows); `tests/src/jmap/za_variants.rs` (one row).
 - Must not touch: upstream's filter building (`query.rs:241-373`), its sorting, its expansion; `changes/query.rs`.
@@ -585,6 +596,7 @@ The two points in `query.rs`:
 - `CalendarEvent/queryChanges` calls the query function directly, so the branch sits inside that function. D15/D29 reach `/queryChanges` through `self.changes(..)`: preserve the explicit origin in `sinceQueryState`, `oldQueryState` and `newQueryState`; no range-derived origin or extra boundary predicate.
 - For an ordinary account the function costs one cached classification read (`ZaEventReader::new`).
 - The insertions in `query.rs` stay at the two points; everything else is in `query/za.rs`. This path charges no memory budget for the views it opens.
+- Spec 8, I §7.1 (ruling R21-2): the `CalendarEvent/query` arm of `api/request.rs` moves to the dispatcher form, `za_serve_calendar_read`; `/queryChanges` already has the handler form Task 22 placed in `changes/query.rs`, which this task does not touch.
 
 - [ ] **Step 1: write the failing unit test**, `jmap`, in `query/za.rs`: `text_candidates_narrow_only_under_and`. The mask is `{1..=9}`; `T` is a text leaf on the title.
 
@@ -667,6 +679,12 @@ The two points in `query.rs`:
 
   `metadata_condition_refused`. `Account::jmap_request` with the `using` list `urn:ietf:params:jmap:core`, `urn:ietf:params:jmap:calendars`, `urn:ietf:params:jmap:metadata`, and `CalendarEvent/query` with `filter: { "metadataExists": "example.com/note" }`: the method error `unsupportedFilter`; its `description` is `ZA_METADATA_REFUSED`.
 
+  `query_store_errors_are_payload_free` (spec 8, ruling R21-2; modelled on Task 21's `read_store_errors_are_payload_free`). An event in `default` with SUMMARY "jmapcal corrupted word"; `{ "title": "corrupted" }` gives exactly its id, which warms the cache. Save the event's exact Content bytes (`CalendarEventField::Content`) and replace them with an invalid archive of inert synthetic canary bytes only.
+  - the same query is the method error `serverUnavailable` with its fixed description; the owner's keyless token (`za_grant_token`, `za_bearer_jmap`) gets `forbidden` with `ZA_CALENDAR_KEYLESS` for it;
+  - the exact bytes are restored before the final assertions; the query then gives the id again;
+  - a subscriber to every event type captures a Store error with the fixed details `zero-access: calendar read failed` and no event holding the canary (compared, never printed);
+  - cleanup: `za_revoke_grant`, then the event deleted over CalDAV.
+
   `text_query_cost` (review focus 5). 300 events in a calendar of their own, each with SUMMARY "jmapcal bulk <n>"; one also holds "needleword". Event `n` is one hour long and starts at 10:00 UTC on day `n % 30` of a 30-day span, ten a day. They are written with `uid_lease::put`, one after another.
   - `{ "title": "needleword" }` gives exactly the needle's id, within the JMAP test client's five seconds; print `text_query_cost: 300 events opened, one text query without a time range, <ms> ms`;
   - the same condition with `after` and `before` around the needle's day gives the same id; print `text_query_cost: 10 events opened, the same query within one day, <ms> ms`;
@@ -678,7 +696,7 @@ The two points in `query.rs`:
 - [ ] **Step 5: run ZA.** Expected: fails in `jmap_calendar::query`, at `two_accounts_same_answers`, on `accountNotSupportedByMethod` for the key account's first query.
 - [ ] **Step 6: implement** `query/za.rs` and the two points in `query.rs`.
 - [ ] **Step 7: flip the rows** `(CalendarEvent, Query)` and `(CalendarEvent, QueryChanges)` to `Served`, in the function and in `calendar_method_classes`. Run U-ws `text_candidates_narrow_only_under_and`, then `calendar_method_classes`. Expected: 1 passed each.
-- [ ] **Step 8: run ZA.** Expected: pass. Proved by the eight cases of `jmap_calendar::query`, including `query_changes_paged_origin`. Copy the two `text_query_cost` lines into the ledger; Task 43 puts them in the outcome note. D29's public queryChanges gate is complete only with this case's actual result.
+- [ ] **Step 8: run ZA.** Expected: pass. Proved by the nine cases of `jmap_calendar::query`, including `query_changes_paged_origin` and `query_store_errors_are_payload_free`. Copy the two `text_query_cost` lines into the ledger; Task 43 puts them in the outcome note. D29's public queryChanges gate is complete only with this case's actual result.
 - [ ] **Step 9: run JK.** Expected: pass.
 - [ ] **Step 10: the closing checks.**
 - [ ] **Step 11: commit.** `Release 6: CalendarEvent/query and queryChanges for key accounts`
