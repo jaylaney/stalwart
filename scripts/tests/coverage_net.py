@@ -18,7 +18,8 @@ every step's profile. It writes:
                           (the inventory gate's `strict_rule.py functions --exports`)
   DIR/merged.json         every step's profile merged (the coverage gate's `--merged`)
   DIR/steps.tsv           one row per attempt: command, environment, exit status, counts
-  DIR/logs/               each attempt's cargo output, and the profile and export logs
+  DIR/logs/               each attempt's cargo output, the unit listing's separate stdout and
+                          stderr, and the profile and export logs
   DIR/profdata/           each step's merged profile
 
 Build mode writes build.json for the prepared report objects. Shard mode records the
@@ -104,6 +105,8 @@ COVERAGE_STEPS = tuple(name for name in ORDER if name not in BUILD_STEPS)
 BY_NAME_RETRY = LLVM_TEST + shlex.split(ci_steps.BY_NAME_RETRY)[2:-1]
 REPORT = ["cargo", "llvm-cov", "report", "--no-default-ignore-filename-regex",
           "--ignore-filename-regex", EXTERNAL_RE]
+UNIT_LISTING_STDOUT = "unit-tests.listing.stdout.log"
+UNIT_LISTING_STDERR = "unit-tests.listing.stderr.log"
 SCHEMA = 1
 
 
@@ -326,7 +329,9 @@ class Net:
     def tests_crate_skips(self):
         """`--skip` arguments for every test of the tests crate, from its instrumented listing."""
         result = self.run(LLVM_TEST + ["-p", "tests", "--", "--list"], env=self.env({}), work=True)
-        (self.out / "logs" / "unit-tests.listing.log").write_text(result.stdout + result.stderr)
+        logs = self.out / "logs"
+        (logs / UNIT_LISTING_STDOUT).write_text(result.stdout, encoding="utf-8")
+        (logs / UNIT_LISTING_STDERR).write_text(result.stderr, encoding="utf-8")
         names = sorted(set(re.findall(r"^(\S+): test$", result.stdout, re.M)))
         if result.returncode != 0 or len(names) < 90:
             raise RuntimeError(f"tests crate listing failed (exit {result.returncode}, "

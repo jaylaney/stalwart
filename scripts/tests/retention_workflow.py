@@ -236,6 +236,7 @@ def shard_callee(base_env):
     shard_id = expression("inputs.shard-id")
     toolchain = expression("inputs.rust-toolchain")
     timeout = expression("inputs.timeout-minutes")
+    diagnostics_name = "retention-${{ inputs.shard-id }}-diagnostics-${{ github.run_attempt }}"
     return {
         "name": "Retention Coverage Shard",
         "on": {"workflow_call": {
@@ -287,16 +288,17 @@ def shard_callee(base_env):
                 upload("Upload coverage evidence", "retention-${{ inputs.shard-id }}-${{ github.run_attempt }}",
                        f"{ARTIFACT_PATH}/evidence/", "1", "5", step_id="receipt",
                        condition=f"{AFTER_FAILURE} && steps.stage.outcome == 'success'"),
+                upload("Retain sanitized shard receipt", diagnostics_name,
+                       f"{ARTIFACT_PATH}/evidence/receipt.json\n"
+                       f"{ARTIFACT_PATH}/evidence/logs/\n"
+                       f"{ARTIFACT_PATH}/evidence/steps.tsv", "7", "2",
+                       condition=f"{AFTER_FAILURE} && steps.stage.outcome == 'success'"),
                 shell("Stage sanitized shard diagnostics", "shard-diagnostics", f"""
                     {ARTIFACTS} stage-shard-diagnostics --producer "$SHARD_ID" \\
                       --source "$GATES/net" --out "$RUNNER_TEMP/shard-diagnostics"
-                    if [[ "$STAGE_OUTCOME" == success ]]; then
-                      cp -- "$GATES/evidence/receipt.json" "$RUNNER_TEMP/shard-diagnostics/receipt.json"
-                    fi
-                """, condition=AFTER_FAILURE, timeout="1",
-                      env={"SHARD_ID": shard_id, "STAGE_OUTCOME": expression("steps.stage.outcome")}),
-                upload("Retain sanitized shard diagnostics",
-                       "retention-${{ inputs.shard-id }}-diagnostics-${{ github.run_attempt }}",
+                """, condition=f"{AFTER_FAILURE} && steps.stage.outcome != 'success'",
+                      timeout="3", env={"SHARD_ID": shard_id}),
+                upload("Retain sanitized shard diagnostics", diagnostics_name,
                        "${{ runner.temp }}/shard-diagnostics/", "7", "2",
                        condition=f"{AFTER_FAILURE} && steps.shard-diagnostics.outcome == 'success'"),
             ],
@@ -383,11 +385,13 @@ def reporter_job(base_env):
                 time {COVERAGE} --merge-only \\
                   --out "{REPORTS}/net" --build-manifest "$GATES/build.json" \\
                   {DEADLINE_ARG} || status=$?
+                label='Validated profiles without a per-step coverage export'
                 if [[ -s "{REPORTS}/net/merged.json" ]]; then
                   printf 'available=true\\n' >> "$GITHUB_OUTPUT"
+                  label='Profiles included in merged coverage without a per-step export'
                 fi
-                jq -r '.missing_exports | select(length > 0) |
-                  "Missing per-step coverage exports: \\(join(", "))"' \\
+                jq -r --arg label "$label" '.missing_exports - .missing_profiles | select(length > 0) |
+                  "\\($label): \\(join(", "))"' \\
                   "{REPORTS}/collection.json" | tee -a "$GITHUB_STEP_SUMMARY"
                 exit "$status"
             """, condition=f"{AFTER_FAILURE} && {REPORT_INPUTS_OK} && steps.fetch.outcome == 'success'"),

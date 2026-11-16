@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import capture_listings
 import ci_steps
+import coverage_net
 import retention_evidence as evidence
 import retention_workflow
 
@@ -216,18 +217,63 @@ class ReceiptTests(unittest.TestCase):
                                        export="not-attempted")
 
         for shard in ("short", "za-rocks"):
-            write(self.root / "source" / shard / relative, b"Bearer bad-listing\n")
+            write(self.root / "source" / shard / relative, b"Bearer bad-listing\ntoken: test\n")
             write(self.root / "source" / shard / "logs/unit-tests.attempt1.listing.log",
                   b"Unexpected log\n")
         self.all({"short": ("failure", fail)})
         owned = self.inputs / "short"
         self.assertTrue((owned / relative).is_file())
-        self.assertEqual((owned / relative).read_text(), "Bearer [REDACTED]\n")
+        self.assertEqual((owned / relative).read_text(),
+                         "Bearer [REDACTED]\ntoken: [REDACTED]\n")
         self.assertIn(relative, read_json(owned / "receipt.json")["files"])
         for directory in (owned, self.inputs / "za-rocks"):
             self.assertFalse((directory / "logs/unit-tests.attempt1.listing.log").exists())
         self.assertFalse((self.inputs / "za-rocks" / relative).exists())
         self.assertFalse((owned / "logs/unit-tests.attempt1.log").exists())
+        self.assertEqual(self.collect(), 1)
+
+    def test_unit_listing_diagnostics_preserve_ids_only_from_libtest_stdout(self):
+        source = self.root / "source" / "short"
+        logs = source / "logs"
+        logs.mkdir(parents=True)
+        entries = ("tokens::r#type::password_lookup: benchmark", "password: test")
+        stdout = "\n".join((*entries, "secret=synthetic-stdout: test", "1 test, 1 benchmark", ""))
+        stderr = "token: test\nBearer synthetic-stderr\n"
+        fake_cargo = (
+            "import sys\n"
+            f"sys.stdout.write({stdout!r})\n"
+            f"sys.stderr.write({stderr!r})\n"
+            "sys.exit(101)\n"
+        )
+        net = object.__new__(coverage_net.Net)
+        net.out, net.work_deadline = source, None
+        with patch.object(coverage_net, "LLVM_TEST", [sys.executable, "-c", fake_cargo]):
+            with self.assertRaisesRegex(RuntimeError, r"listing failed \(exit 101,"):
+                net.tests_crate_skips()
+
+        def fail(steps):
+            steps["unit-tests"].update(status="failure", attempts=[], profile=False,
+                                       export="not-attempted")
+
+        for file in logs.glob("unit-tests.listing*.log"):
+            write(self.root / "source" / "za-rocks" / "logs" / file.name, file.read_bytes())
+        self.all({"short": ("failure", fail)})
+        fallback = self.root / "fallback"
+        evidence.stage_shard_diagnostics("short", source, fallback)
+        for directory in (self.inputs / "short", fallback):
+            with self.subTest(publisher=directory.name):
+                files = list((directory / "logs").glob("unit-tests.listing*.log"))
+                lines = "\n".join(file.read_text() for file in files).splitlines()
+                self.assertTrue(set(entries).issubset(lines), lines)
+                self.assertIn("token: [REDACTED]", lines)
+                self.assertIn("secret=[REDACTED] test", lines)
+                self.assertIn("Bearer [REDACTED]", lines)
+                self.assertNotIn("token: test", lines)
+                self.assertFalse(any("synthetic-" in line for line in lines))
+        unowned = self.root / "unowned"
+        evidence.stage_shard_diagnostics("za-rocks", self.root / "source" / "za-rocks", unowned)
+        for directory in (self.inputs / "za-rocks", unowned):
+            self.assertEqual(list((directory / "logs").glob("unit-tests.listing*.log")), [])
         self.assertEqual(self.collect(), 1)
 
     def test_smtp_failing_names_retry_passes_with_combined_evidence(self):

@@ -982,7 +982,27 @@ class WorkflowTests(unittest.TestCase):
         self.assertReports(self.edited(old, old.replace("!cancelled()", "success()")),
                            "gates-listings", "Retain sanitized listing receipt", "if")
 
-    def test_seven_day_shard_diagnostics_keep_receipt_and_sanitized_logs(self):
+    def test_seven_day_shard_receipt_upload_uses_staged_allowlist(self):
+        steps = {step["name"]: step
+                 for step in ci_steps.load_yaml(self.shard)["jobs"]["shard"]["steps"]}
+        name = "Retain sanitized shard receipt"
+        self.assertIn(name, list(steps))
+        self.assertEqual(steps[name]["if"], "${{ !cancelled() && steps.stage.outcome == 'success' }}")
+        self.assertEqual(steps[name]["timeout-minutes"], "2")
+        self.assertEqual(steps[name]["with"]["retention-days"], "7")
+        self.assertEqual(steps[name]["with"]["path"].splitlines(), [
+            "${{ env.GATES }}/evidence/receipt.json",
+            "${{ env.GATES }}/evidence/logs/",
+            "${{ env.GATES }}/evidence/steps.tsv",
+        ])
+        path = ("          path: |-\n"
+                "            ${{ env.GATES }}/evidence/receipt.json\n"
+                "            ${{ env.GATES }}/evidence/logs/\n"
+                "            ${{ env.GATES }}/evidence/steps.tsv\n")
+        self.assertReports(self.edited_shard(path, "          path: ${{ env.GATES }}/evidence/\n"),
+                           name, "with.path")
+
+    def test_seven_day_shard_fallback_retains_only_sanitized_diagnostics(self):
         original = "          path: ${{ runner.temp }}/shard-diagnostics/\n"
         for replacement in ("", "          path: ${{ env.GATES }}/evidence/profdata/\n",
                             "          path: ${{ env.GATES }}/net/logs/\n"):
@@ -995,17 +1015,58 @@ class WorkflowTests(unittest.TestCase):
                            "Retain sanitized shard diagnostics", "retention-days")
         stage = ("      - name: Stage sanitized shard diagnostics\n"
                  "        id: shard-diagnostics\n"
-                 "        if: ${{ !cancelled() }}\n")
-        self.assertReports(self.edited_shard(stage, stage.replace("!cancelled()", "success()")),
+                 "        if: ${{ !cancelled() && steps.stage.outcome != 'success' }}\n")
+        self.assertReports(self.edited_shard(stage, stage.replace(" && steps.stage.outcome != 'success'", "")),
                            "step shard-diagnostics", "if")
-        receipt_guard = '          if [[ "$STAGE_OUTCOME" == success ]]; then\n'
-        self.assertReports(self.edited_shard(receipt_guard, "          if true; then\n"),
-                           "step shard-diagnostics", "run")
+        timed_stage = stage + "        timeout-minutes: 3\n"
+        self.assertReports(self.edited_shard(timed_stage, timed_stage.replace("3\n", "1\n")),
+                           "step shard-diagnostics", "timeout-minutes")
         upload = ("      - name: Retain sanitized shard diagnostics\n"
                   "        if: ${{ !cancelled() && "
                   "steps.shard-diagnostics.outcome == 'success' }}\n")
         self.assertReports(self.edited_shard(upload, upload.replace("!cancelled()", "success()")),
                            "Retain sanitized shard diagnostics", "if")
+
+    @unittest.skipUnless(shutil.which("bash") and shutil.which("jq"), "requires bash and jq")
+    def test_merge_summary_distinguishes_profiles_without_exports(self):
+        steps = ci_steps.load_yaml(self.text)["jobs"]["gates"]["steps"]
+        command = next(step["run"] for step in steps if step.get("id") == "merge")
+        for merged, missing_exports, code, summary in (
+            ("{}", ["imap-plain", "jmap-plain"], 1,
+             "Profiles included in merged coverage without a per-step export: jmap-plain\n"),
+            ("", ["imap-plain", "jmap-plain"], 1,
+             "Validated profiles without a per-step coverage export: jmap-plain\n"),
+            ("{}", ["imap-plain"], 1, ""),
+            ("{}", ["jmap-plain"], 0,
+             "Profiles included in merged coverage without a per-step export: jmap-plain\n"),
+        ):
+            with self.subTest(merged=merged, missing_exports=missing_exports, code=code), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                reports = root / "reports"
+                (reports / "net").mkdir(parents=True)
+                (reports / "collection.json").write_text(json.dumps({
+                    "missing_profiles": ["imap-plain"] if "imap-plain" in missing_exports else [],
+                    "missing_exports": missing_exports,
+                }))
+                fake_merge = root / "scripts/tests/coverage_net.py"
+                fake_merge.parent.mkdir(parents=True)
+                fake_merge.write_text(
+                    "from pathlib import Path\n"
+                    f"Path('reports/net/merged.json').write_text({merged!r})\n"
+                    f"raise SystemExit({code})\n"
+                )
+                output = root / "outputs"
+                output.touch()
+                proc = subprocess.run(
+                    ["bash", "-eo", "pipefail", "-c", command], cwd=root,
+                    env={**os.environ, "GATES": str(root), "RETENTION_DEADLINE_EPOCH": "0",
+                         "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(root / "summary")},
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(proc.returncode, code, proc.stderr)
+                self.assertEqual(output.read_text(), "available=true\n" if merged else "")
+                self.assertEqual((root / "summary").read_text(), summary)
 
     def test_gate_pipelines_keep_failure_status(self):
         old = ("        if: ${{ !cancelled() && steps.functions.outcome == 'success' }}\n"

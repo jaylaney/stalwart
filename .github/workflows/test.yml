@@ -1158,11 +1158,13 @@ jobs:
           time python3 -I scripts/tests/coverage_net.py --merge-only \
             --out "$GATES/reports/net" --build-manifest "$GATES/build.json" \
             --deadline-epoch "$RETENTION_DEADLINE_EPOCH" || status=$?
+          label='Validated profiles without a per-step coverage export'
           if [[ -s "$GATES/reports/net/merged.json" ]]; then
             printf 'available=true\n' >> "$GITHUB_OUTPUT"
+            label='Profiles included in merged coverage without a per-step export'
           fi
-          jq -r '.missing_exports | select(length > 0) |
-            "Missing per-step coverage exports: \(join(", "))"' \
+          jq -r --arg label "$label" '.missing_exports - .missing_profiles | select(length > 0) |
+            "\($label): \(join(", "))"' \
             "$GATES/reports/collection.json" | tee -a "$GITHUB_STEP_SUMMARY"
           exit "$status"
 

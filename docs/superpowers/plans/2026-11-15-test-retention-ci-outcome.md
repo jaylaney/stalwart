@@ -88,6 +88,11 @@ build input that made `common` dirty. [Fingerprint replay](https://github.com/ja
 The isolated locked unit test confirmed all 94 tracked request fixtures retained their
 contents and timestamps. The first comparison was stopped after its diagnostics were saved.
 
+The subsequent PR review revision (`e3fbb7d07`) removed the temporary writes. The
+test parses and serializes 46 valid requests in memory and explicitly expects a
+namespace error for `propfind-009.xml`. The earlier test accepted any PROPFIND
+parse error. All 11 DAV library tests passed in the locked offline run.
+
 The first [production dispatch](https://github.com/jaylaney/stalwart/actions/runs/43754819285)
 and [intentional-failure trial](https://github.com/jaylaney/stalwart/actions/runs/43754934544)
 used the earlier unit test. Both were cancelled before the retention report so that

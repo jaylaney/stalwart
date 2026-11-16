@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture_listings
 from capture_listings import run_identity
 import ci_steps
-from coverage_net import STEPS, canonical_json, write_json
+from coverage_net import STEPS, UNIT_LISTING_STDERR, UNIT_LISTING_STDOUT, canonical_json, write_json
 from gate_common import ENTRY, RUNNING
 
 SCHEMA = 1
@@ -64,12 +64,15 @@ def file_digest(path):
     return digest.hexdigest()
 
 
-def redacted(path, destination, *, listing=False):
+def redacted(path, destination, *, listing=False, libtest_stdout=False):
     destination.parent.mkdir(parents=True, exist_ok=True)
     in_section = in_target = False
     with path.open("rb") as source, destination.open("wb") as output:
         for line in source:
-            if listing:
+            entry_text = None
+            if libtest_stdout:
+                entry_text = line.rstrip(b"\r\n").decode("utf-8", errors="replace")
+            elif listing:
                 if line.startswith(b"## command:"):
                     in_section, in_target = True, False
                 elif line.startswith(b"## exit:"):
@@ -80,13 +83,15 @@ def redacted(path, destination, *, listing=False):
                         in_target = True
                     elif LISTING_FOOTER.fullmatch(text):
                         in_target = False
-                    elif in_target and (entry := ENTRY.fullmatch(text)):
-                        # Assignment redaction can mistake a Rust module separator or
-                        # the test-kind suffix for a credential delimiter.
-                        if all(segment.removeprefix("r#").isidentifier()
-                               for segment in entry.group(1).split("::")):
-                            output.write(line)
-                            continue
+                    elif in_target:
+                        entry_text = text
+            if entry_text is not None and (entry := ENTRY.fullmatch(entry_text)):
+                # Assignment redaction can mistake a Rust module separator or
+                # the test-kind suffix for a credential delimiter.
+                if all(segment.removeprefix("r#").isidentifier()
+                       for segment in entry.group(1).split("::")):
+                    output.write(line)
+                    continue
             output.write(ASSIGNMENT.sub(rb"\1[REDACTED]", AUTH.sub(rb"\1[REDACTED]", line)))
 
 
@@ -97,7 +102,8 @@ def transfer(source, out, names, *, redact=False, listing=False):
         destination.parent.mkdir(parents=True, exist_ok=True)
         require(path.is_file() and not path.is_symlink(), f"missing regular file: {name}")
         if redact or listing:
-            redacted(path, destination, listing=listing)
+            redacted(path, destination, listing=listing,
+                     libtest_stdout=redact and name == f"logs/{UNIT_LISTING_STDOUT}")
         else:
             shutil.copyfile(path, destination)
         files[name] = file_digest(destination)
@@ -145,7 +151,9 @@ def diagnostic_names(producer, root):
         owned = ci_steps.COVERAGE_SHARDS[producer]
         steps = "|".join(map(re.escape, owned))
         pattern = re.compile(rf"(?:{steps})(?:\.attempt[12])?(?:\.(?:export|profdata-merge))?\.log")
-        listing = {"unit-tests.listing.log"} if "unit-tests" in owned else set()
+        # The old unframed listing log is still retained with generic redaction.
+        listing = ({"unit-tests.listing.log", UNIT_LISTING_STDOUT, UNIT_LISTING_STDERR}
+                   if "unit-tests" in owned else set())
         names.update(f"logs/{p.name}" for p in logs.iterdir()
                      if p.is_file() and not p.is_symlink()
                      and (p.name in listing or pattern.fullmatch(p.name)))
