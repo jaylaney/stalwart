@@ -1316,8 +1316,12 @@ async fn calendar_get(account: &Account) -> JmapResponse {
         .await
 }
 
-/// Empties both accounts' scheduling inboxes, so the drain cases below see
-/// only their own pending items (the cases before them leave some).
+/// Deletes every item of both accounts' scheduling inboxes, so the drain
+/// cases below see only their own pending items (the cases before them leave
+/// some). A non-pending item goes by a CalDAV `DELETE` as its account, which
+/// runs that account's drain first, so the helper runs before the case turns
+/// the drain on: with it on, the first `DELETE` would import every pending
+/// item behind it and leave the events in the calendar.
 async fn clear_inboxes(s: &Scheduling<'_>) {
     let (test, pair) = (s.test, s.pair);
     wait_for_queue(test).await;
@@ -1348,8 +1352,13 @@ async fn destroy_copy(s: &Scheduling<'_>, uid: &str) {
 async fn drain_runs_from_jmap(s: &Scheduling<'_>) {
     const UID: &str = "jmapcal-sched-drain";
     let (test, pair) = (s.test, s.pair);
-    let _drain = DrainOn::new();
     clear_inboxes(s).await;
+    assert_eq!(
+        uid_copies(test, pair.key2_id, "jmapcal-sched-unsent").await,
+        0,
+        "drain_runs_from_jmap: clearing the inboxes imported an earlier case's invitation"
+    );
+    let _drain = DrainOn::new();
 
     let reply = s
         .create(
@@ -1374,6 +1383,39 @@ async fn drain_runs_from_jmap(s: &Scheduling<'_>) {
     );
     assert_eq!(uid_copies(test, pair.key2_id, UID).await, 1);
     destroy_copy(s, UID).await;
+
+    // The hook drains the caller's own inbox, whatever account the methods
+    // name: key2's request names key's account.
+    const OTHER: &str = "jmapcal-sched-drain-other";
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(pair.key.name(), &s.cal, OTHER, &[pair.key2.name()]),
+            send(),
+        )
+        .await;
+    reply.created_id(0);
+    s.leaves(pair.key_id, OTHER);
+    wait_for_queue(test).await;
+    assert_eq!(
+        pending_ids(test, pair.key2_id).await.len(),
+        1,
+        "drain_runs_from_jmap: key2's pending item before the other-account request"
+    );
+    // What this call itself answers is not what the step proves.
+    let _ = pair
+        .key2
+        .jmap_method_call(
+            "Calendar/get",
+            json!({ "accountId": pair.key.id_string(), "ids": null }),
+        )
+        .await;
+    assert!(
+        pending_ids(test, pair.key2_id).await.is_empty(),
+        "drain_runs_from_jmap: a request naming another account did not drain the caller's inbox"
+    );
+    assert_eq!(uid_copies(test, pair.key2_id, OTHER).await, 1);
+    destroy_copy(s, OTHER).await;
 }
 
 /// Spec 5.5: a request of mail methods only, or of `CalendarEventNotification`
@@ -1381,8 +1423,8 @@ async fn drain_runs_from_jmap(s: &Scheduling<'_>) {
 async fn mail_only_request_does_not_drain(s: &Scheduling<'_>) {
     const UID: &str = "jmapcal-sched-nodrain";
     let (test, pair) = (s.test, s.pair);
-    let _drain = DrainOn::new();
     clear_inboxes(s).await;
+    let _drain = DrainOn::new();
     let account = pair.key2.id_string();
 
     let reply = s
@@ -1445,8 +1487,8 @@ async fn mail_only_request_does_not_drain(s: &Scheduling<'_>) {
 async fn invitation_by_email_found_by_uid(s: &Scheduling<'_>) {
     const UID: &str = "jmapcal-sched-mail";
     let (test, pair) = (s.test, s.pair);
-    let _drain = DrainOn::new();
     clear_inboxes(s).await;
+    let _drain = DrainOn::new();
     let account = pair.key.id_string();
     let address = pair.key.name();
 
@@ -1565,8 +1607,8 @@ async fn invitation_by_email_found_by_uid(s: &Scheduling<'_>) {
 async fn drain_failure_does_not_fail_the_request(s: &Scheduling<'_>) {
     const UID: &str = "jmapcal-sched-drainfail";
     let (test, pair) = (s.test, s.pair);
-    let _drain = DrainOn::new();
     clear_inboxes(s).await;
+    let _drain = DrainOn::new();
 
     let reply = s
         .create(
