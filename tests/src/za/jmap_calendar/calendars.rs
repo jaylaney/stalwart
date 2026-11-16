@@ -23,6 +23,7 @@ use crate::{
         dav_seal::{raw_calendar, resource_id},
         fanout::{NO_REPLY, invite, uid_copies},
         gating::method_error,
+        mail::Traced,
         uid_lease::put,
     },
 };
@@ -35,6 +36,7 @@ use store::{
     ValueKey,
     write::{Archive, ArchiveBytes, BatchBuilder, ValueClass},
 };
+use trc::{EventType, Key, StoreEvent};
 use types::{collection::Collection, field::PrincipalField, id::Id};
 
 const SLUG: &str = "jmapcal-work";
@@ -46,6 +48,11 @@ const OUTSIDE: &str = "jmapcal-calendars-out@remote.test";
 const SHARE_TEXT: &str = "Calendar sharing is managed on the account page.";
 const INCOMPLETE: &str = "The server could not complete this change, try again.";
 const NOT_ALLOWED: &str = "You are not allowed to modify this calendar.";
+/// The fixed reason of `Calendar/set`'s store-failure trace (`calendar/set/za.rs`).
+const FAILURE_REASON: &str = "zero-access: calendar write failed";
+/// The delete-commit hook's own details: an inert canary that the original
+/// error is never traced.
+const HOOK_DETAILS: &str = "zero-access test hook: delete commit failure";
 
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access JMAP calendar tests...");
@@ -880,6 +887,7 @@ async fn per_object_commits(pair: &Pair) {
 async fn store_failure_stops_the_call(test: &TestServer, pair: &Pair) {
     let x = Id::from(make_calendar(test, &pair.key, &pair.dav, "jmapcal-fail-x").await).to_string();
     let y = Id::from(make_calendar(test, &pair.key, &pair.dav, "jmapcal-fail-y").await).to_string();
+    let traced = Traced::start(trc::EventType::variants());
     set_delete_commit_fail_once(Some(pair.key_id));
     let reply = calendar_set(
         &pair.key,
@@ -891,6 +899,26 @@ async fn store_failure_stops_the_call(test: &TestServer, pair: &Pair) {
     )
     .await;
     set_delete_commit_fail_once(None);
+    let events = traced.finish().await;
+
+    // Spec 8, D28 (I §7.5): the store failure is traced as a fresh event of
+    // its kind with the ids and the fixed reason, never as the original error.
+    let x_id = u64::from(document_id(&x));
+    assert!(
+        events.iter().any(|event| {
+            event.typ == EventType::Store(StoreEvent::UnexpectedError)
+                && event.account_id == Some(u64::from(pair.key_id))
+                && event.details == FAILURE_REASON
+                && event.keys.iter().any(|(key, value)| {
+                    *key == Key::DocumentId && matches!(value, trc::Value::UInt(id) if *id == x_id)
+                })
+        }),
+        "store_failure_stops_the_call: no store-failure trace of the destroyed calendar"
+    );
+    assert!(
+        !events.iter().any(|event| event.text.contains(HOOK_DETAILS)),
+        "store_failure_stops_the_call: the original error was traced"
+    );
 
     assert_eq!(method_error(&reply), None, "{reply:?}");
     let created = reply.created_id(0).to_string();

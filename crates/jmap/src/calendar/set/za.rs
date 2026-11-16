@@ -138,6 +138,8 @@ pub(super) async fn za_calendar_set(
     // Spec 6.1: the writer's own keys, and the roles a destroy schedules with.
     let keys = match za_writer_keys(server, access_token, account_id).await {
         Ok(Some(keys)) => keys,
+        // Spec 8: a store error before the first object fails the method.
+        Err(ZaPipelineError::Store(error)) => return Err(error),
         Ok(None) | Err(_) => return Err(za_calendar_keyless_refusal().account_id(account_id)),
     };
     let roles = if will_destroy.is_empty() {
@@ -425,9 +427,10 @@ impl ZaCalendarWriter<'_> {
             return Ok(Err(err));
         }
 
-        // Both read the plaintext entry, before sealing.
+        // Both read the plaintext entry, before sealing; the alert ids are
+        // accepted only once the object's commit returns `Ok` (D3).
         let server_set = calendar.server_set_values(personal_id, &client_properties);
-        self.request_alerts.accept(None, &calendar, personal_id);
+        let accepted = calendar.clone();
 
         // Spec 6.7: the name, description, colour and a custom time zone are
         // sealed under the owner's keys (MKCOL's form).
@@ -444,6 +447,7 @@ impl ZaCalendarWriter<'_> {
             Ok(assigned_ids) => assigned_ids,
             Err(err) => return za_calendar_set_error(ZaPipelineError::Store(err)).map(Err),
         };
+        self.request_alerts.accept(None, &accepted, personal_id);
         Ok(Ok(ZaCreated {
             document_id: assigned_ids.slot(slot),
             change_id: assigned_ids.change_id(account_id, SyncCollection::Calendar),
@@ -592,8 +596,6 @@ impl ZaCalendarWriter<'_> {
             )
             .await
             .caused_by(trc::location!())?;
-        self.request_alerts
-            .accept(Some(document_id), &new_calendar, personal_id);
         sealed
             .update(
                 self.access_token.changed_by(),
@@ -603,10 +605,15 @@ impl ZaCalendarWriter<'_> {
                 &mut batch,
             )
             .caused_by(trc::location!())?;
+        // D3: the request's alert ids are accepted once the commit returns `Ok`.
         match self.server.commit_batch(batch).await {
-            Ok(assigned_ids) => Ok(Ok(
-                assigned_ids.change_id(account_id, SyncCollection::Calendar)
-            )),
+            Ok(assigned_ids) => {
+                self.request_alerts
+                    .accept(Some(document_id), &new_calendar, personal_id);
+                Ok(Ok(
+                    assigned_ids.change_id(account_id, SyncCollection::Calendar)
+                ))
+            }
             Err(err) => za_calendar_set_error(ZaPipelineError::Store(err)).map(Err),
         }
     }
@@ -840,10 +847,6 @@ fn za_calendar_set_error(error: ZaPipelineError) -> Result<SetError<CalendarProp
                 Ok(SetError::forbidden().with_description(ZA_MODIFIED))
             }
             EventType::Limit(LimitEvent::Quota) => Ok(SetError::over_quota()),
-            // The tenant quota event exists only in builds with the
-            // `enterprise` feature; the product build has no such variant.
-            #[cfg(feature = "enterprise")]
-            EventType::Limit(LimitEvent::TenantQuota) => Ok(SetError::over_quota()),
             EventType::Security(SecurityEvent::Unauthorized) => Ok(SetError::forbidden()),
             _ => Err(error),
         },
@@ -940,14 +943,6 @@ mod tests {
         ] {
             assert_eq!(&answer(error), expected, "{label}");
         }
-        // The unit-test features include `jmap/enterprise`, where the
-        // tenant quota event exists.
-        #[cfg(feature = "enterprise")]
-        assert_eq!(
-            answer(ZaPipelineError::Store(LimitEvent::TenantQuota.into_err())),
-            over_quota,
-            "Store(Limit(TenantQuota))"
-        );
 
         assert!(
             za_calendar_set_error(ZaPipelineError::Store(
