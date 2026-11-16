@@ -17,17 +17,26 @@ use crate::{
         account::Account,
         jmap::{JmapResponse, JmapUtils},
         server::TestServer,
+        smtp_sink::sink,
         webdav::DummyWebDavClient,
-        za::{CALENDAR_JMAP_USING, za_bearer_jmap, za_grant_token, za_post, za_revoke_grant},
+        za::{
+            CALENDAR_JMAP_USING, assert_no_event_preferences, copy_href, inbox_ids, item_method,
+            new_inbox_items, open_pending_item_as, pending_ids, trigger_drain, wait_for_queue,
+            za_bearer_jmap, za_grant_token, za_post, za_revoke_grant,
+        },
     },
     za::{
         STRONG,
-        fanout::NO_REPLY,
+        dav_seal::resource_id,
+        drain::{DrainOn, body, partstat_of, set_partstat},
+        fanout::{NO_REPLY, Party, uid_copies},
         gating::method_error,
+        imip,
         mail::{Traced, message_with},
         user_permissions,
     },
 };
+use calcard::icalendar::ICalendarMethod;
 use common::{auth::oauth::scope::OAuthScopes, za::ZA_CALENDAR_KEYLESS};
 use email::mailbox::INBOX_ID;
 use futures::FutureExt;
@@ -36,7 +45,7 @@ use groupware::calendar::{
 };
 use hyper::StatusCode;
 use jmap_proto::types::state::{JMAPIntermediateState, State, ZaCalendarOrigin};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::panic::AssertUnwindSafe;
 use store::{
     IterateParams, ValueKey,
@@ -99,6 +108,15 @@ pub async fn test(test: &mut TestServer) {
     admin.destroy_account(ordinary.plain).await;
     admin.destroy_account(ordinary.from).await;
     changes_store_errors_are_payload_free(test, &fixture).await;
+    // Release 6 spec 6.1, 6.5, 6.7, 6.10 (Task 36): a grantee over JMAP.
+    // Each case deletes what it creates and leaves the view grant.
+    grantee_reads_and_writes_at_both_levels(test, &fixture).await;
+    delegated_reply_carries_sent_by(test, &fixture).await;
+    revoke_ends_access(test, &fixture).await;
+    non_grantee_refused(test, &fixture).await;
+    grantee_default_alerts(test, &fixture).await;
+    grantee_session_lists_the_sharer(&fixture).await;
+    move_with_scheduling_into_shared(test, &fixture).await;
 
     // Each case leaves a completed boundary, the two setup events and the view grant.
     let owner = &fixture.pair.key;
@@ -1351,4 +1369,871 @@ async fn changes_store_errors_are_payload_free(test: &TestServer, f: &Sharing) {
         .filter(|event| event.keys.iter().any(|(_, value)| holds(value, CANARY)))
         .count();
     assert_eq!(leaked, 0, "events holding the synthetic canary");
+}
+
+// Release 6 spec 6.1, 6.5, 6.7, 6.10 and 9.2 (Task 36): a grantee using a
+// shared key-account calendar over JMAP, with its own keyed session.
+
+const ORG: &str = "jmapcal-sharing-org@remote.test";
+const READER: &str = "jmapcal-sharing-reader@example.com";
+const ALERTS_SLUG: &str = "jmapcal-alerts";
+const MODIFY: &str = "You are not allowed to modify this event.";
+const SHARE_TEXT: &str = "Calendar sharing is managed on the account page.";
+
+fn no_args() -> Vec<(&'static str, Value)> {
+    Vec::new()
+}
+
+/// `sendSchedulingMessages: true`.
+fn send() -> Vec<(&'static str, Value)> {
+    vec![("sendSchedulingMessages", Value::Bool(true))]
+}
+
+/// One timed event in `calendar_id`.
+fn event_in(uid: &str, calendar_id: &str) -> Value {
+    json!({
+        "@type": "Event",
+        "uid": uid,
+        "title": uid,
+        "start": "2031-03-04T10:00:00",
+        "duration": "PT1H",
+        "timeZone": "Etc/UTC",
+        "calendarIds": { calendar_id: true },
+    })
+}
+
+fn alert(action: &str, offset: &str) -> Value {
+    json!({
+        "@type": "Alert",
+        "action": action,
+        "trigger": { "@type": "OffsetTrigger", "relativeTo": "start", "offset": offset },
+    })
+}
+
+fn set_error(value: &Value) -> (&str, Option<&str>) {
+    (
+        value["type"].as_str().unwrap_or_default(),
+        value["description"].as_str(),
+    )
+}
+
+/// Whether an unfolded `TRIGGER` line of `body` has the value `offset`,
+/// whatever its parameters: a JMAP alert sent with `relativeTo: "start"`
+/// is written `TRIGGER;RELATED=START:<offset>`, a default alert
+/// `TRIGGER:<offset>`.
+fn has_trigger(body: &str, offset: &str) -> bool {
+    body.replace("\r\n ", "")
+        .lines()
+        .map(str::trim_end)
+        .any(|line| {
+            (line.starts_with("TRIGGER:") || line.starts_with("TRIGGER;"))
+                && line.rsplit(':').next() == Some(offset)
+        })
+}
+
+fn alert_ids(event: &Value) -> Vec<String> {
+    event["alerts"]
+        .as_object()
+        .map(|alerts| alerts.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn assert_set(reply: &JmapResponse, outcome: &str, id: &str, what: &str) {
+    assert_eq!(method_error(reply), None, "{what}: {reply:?}");
+    assert!(
+        reply
+            .pointer(&format!("/methodResponses/0/1/{outcome}/{id}"))
+            .is_some(),
+        "{what}: {id} not {outcome}: {reply:?}"
+    );
+}
+
+/// The one event `caller` reads with `CalendarEvent/get` in `owner`'s account.
+async fn event_get(caller: &Account, owner: &Account, id: &str) -> Value {
+    let reply = caller
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({ "accountId": owner.id_string(), "ids": [id] }),
+        )
+        .await;
+    let [event] = reply.list() else {
+        panic!("expected event {id}: {reply:?}");
+    };
+    event.clone()
+}
+
+/// The owner's CalDAV body of its one event with `uid`.
+async fn owner_body(test: &TestServer, f: &Sharing, uid: &str) -> String {
+    body(&f.pair.dav, &copy_href(test, f.pair.key_id, uid).await).await
+}
+
+/// The owner's CalDAV deletion of its one event with `uid`, without scheduling.
+async fn owner_delete(test: &TestServer, f: &Sharing, uid: &str) {
+    let href = copy_href(test, f.pair.key_id, uid).await;
+    f.pair
+        .dav
+        .request_with_headers("DELETE", &href, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+}
+
+async fn calendar_update(
+    caller: &Account,
+    owner: &Account,
+    id: &str,
+    patch: Value,
+) -> JmapResponse {
+    caller
+        .jmap_method_call(
+            "Calendar/set",
+            json!({ "accountId": owner.id_string(), "update": { id: patch } }),
+        )
+        .await
+}
+
+/// The methods a key account's calendars are served by, each naming `account`.
+fn served_calls(account: &str, calendar: &str, event: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        ("Calendar/get", json!({ "accountId": account, "ids": null })),
+        ("Calendar/query", json!({ "accountId": account })),
+        (
+            "Calendar/changes",
+            json!({ "accountId": account, "sinceState": "n" }),
+        ),
+        (
+            "Calendar/set",
+            json!({ "accountId": account, "update": { calendar: { "sortOrder": 1 } } }),
+        ),
+        (
+            "CalendarEvent/get",
+            json!({ "accountId": account, "ids": null }),
+        ),
+        ("CalendarEvent/query", json!({ "accountId": account })),
+        (
+            "CalendarEvent/changes",
+            json!({ "accountId": account, "sinceState": "n" }),
+        ),
+        (
+            "CalendarEvent/set",
+            json!({ "accountId": account, "update": { event: { "title": "jmapcal-sharing refused" } } }),
+        ),
+    ]
+}
+
+/// Spec 6.1: a caller the method's access check does not admit gets
+/// upstream's `accountNotFound` from every served method.
+async fn assert_account_not_found(
+    caller: &Account,
+    owner: &Account,
+    calendar: &str,
+    event: &str,
+    what: &str,
+) {
+    for (method, args) in served_calls(owner.id_string(), calendar, event) {
+        let reply = caller.jmap_method_call(method, args).await;
+        assert_eq!(
+            method_error(&reply),
+            Some("accountNotFound"),
+            "{what}: {method}: {reply:?}"
+        );
+    }
+}
+
+/// Spec 6.5 (D10), 6.7: at `view` the grantee reads and every write is
+/// refused; at `edit` it writes the event itself, alerts, keywords and
+/// colour included, and no per-user copy is stored.
+async fn grantee_reads_and_writes_at_both_levels(test: &TestServer, f: &Sharing) {
+    const EDIT: &str = "jmapcal-sharing-edit";
+    const RENAMED_TITLE: &str = "jmapcal-sharing-edit renamed";
+    let (owner, reader) = (&f.pair.key, &f.reader);
+    let owner_id = f.pair.key_id;
+    let cal = id(f.shared);
+    let seed_id = resource_id(test, owner_id, &format!("{SLUG}/{}.ics", EVENTS[0])).await;
+    let seed = id(seed_id);
+    let seed_href = format!("{}{}.ics", home(SLUG), EVENTS[0]);
+    let seed_before = body(&f.pair.dav, &seed_href).await;
+
+    // View.
+    let reply = reader
+        .jmap_method_call(
+            "Calendar/get",
+            json!({ "accountId": owner.id_string(), "ids": null }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let [entry] = reply.list() else {
+        panic!("grantee_reads_and_writes_at_both_levels: the view list: {reply:?}");
+    };
+    assert_eq!(entry["id"], cal.as_str(), "{entry}");
+    assert_eq!(entry["myRights"]["mayReadItems"], true, "{entry}");
+    assert_eq!(entry["myRights"]["mayWriteAll"], false, "{entry}");
+    assert_eq!(
+        event_get(reader, owner, &seed).await["title"],
+        EVENTS[0],
+        "grantee_reads_and_writes_at_both_levels: the seed's title"
+    );
+
+    let reply = reader
+        .jmap_create_account(
+            owner,
+            "CalendarEvent",
+            [event_in("jmapcal-sharing-view-create", &cal)],
+            no_args(),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(set_error(reply.not_created(0)).0, "forbidden", "{reply:?}");
+    assert_eq!(
+        uid_copies(test, owner_id, "jmapcal-sharing-view-create").await,
+        0
+    );
+    let reply = reader
+        .jmap_update_account(
+            owner,
+            "CalendarEvent",
+            [(
+                seed.clone(),
+                json!({ "title": "jmapcal-sharing not allowed" }),
+            )],
+            no_args(),
+        )
+        .await;
+    assert_eq!(
+        set_error(reply.not_updated(&seed)),
+        ("forbidden", Some(MODIFY)),
+        "{reply:?}"
+    );
+    let reply = reader
+        .jmap_update_account(
+            owner,
+            "CalendarEvent",
+            [(
+                seed.clone(),
+                json!({ "alerts": { "a1": alert("display", "-PT5M") } }),
+            )],
+            no_args(),
+        )
+        .await;
+    assert_eq!(
+        set_error(reply.not_updated(&seed)).0,
+        "forbidden",
+        "{reply:?}"
+    );
+    let reply = reader
+        .jmap_destroy_account(owner, "CalendarEvent", [seed.as_str()], no_args())
+        .await;
+    let remove = format!("You are not allowed to remove events from calendar {cal}.");
+    assert_eq!(
+        set_error(reply.not_destroyed(&seed)),
+        ("forbidden", Some(remove.as_str())),
+        "{reply:?}"
+    );
+    let key2 = f.pair.key2.id_string().to_string();
+    let reply = calendar_update(
+        reader,
+        owner,
+        &cal,
+        json!({ "shareWith": { &key2: { "mayReadItems": true } } }),
+    )
+    .await;
+    assert_eq!(
+        set_error(reply.not_updated(&cal)),
+        ("forbidden", Some(SHARE_TEXT)),
+        "{reply:?}"
+    );
+    assert_eq!(
+        body(&f.pair.dav, &seed_href).await,
+        seed_before,
+        "grantee_reads_and_writes_at_both_levels: a refused write changed the seed"
+    );
+
+    // Edit.
+    share(test, owner, reader, f.reader_id, SLUG, "edit").await;
+    let mut object = event_in(EDIT, &cal);
+    object["alerts"] = json!({ "a1": alert("display", "-PT5M") });
+    object["keywords"] = json!({ "kw": true });
+    object["color"] = json!("#aabbcc");
+    let reply = reader
+        .jmap_create_account(owner, "CalendarEvent", [object], no_args())
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let document_id = reply.created_id(0).document_id();
+    let event_id = id(document_id);
+    assert_no_event_preferences(test, owner_id, document_id).await;
+    let owned = owner_body(test, f, EDIT).await;
+    assert!(
+        owned.contains("BEGIN:VALARM") && has_trigger(&owned, "-PT5M"),
+        "{owned}"
+    );
+    let event = event_get(owner, owner, &event_id).await;
+    assert_eq!(alert_ids(&event), ["a1"], "{event}");
+    assert_eq!(event["alerts"]["a1"]["action"], "display", "{event}");
+    assert_eq!(
+        event["alerts"]["a1"]["trigger"]["offset"], "-PT5M",
+        "{event}"
+    );
+    assert_eq!(event["keywords"], json!({ "kw": true }), "{event}");
+    assert_eq!(event["color"], "#aabbcc", "{event}");
+
+    let reply = reader
+        .jmap_update_account(
+            owner,
+            "CalendarEvent",
+            [(event_id.clone(), json!({ "title": RENAMED_TITLE }))],
+            no_args(),
+        )
+        .await;
+    assert_set(&reply, "updated", &event_id, "the grantee's title update");
+    let owned = owner_body(test, f, EDIT).await;
+    assert!(
+        owned.contains(&format!("SUMMARY:{RENAMED_TITLE}")),
+        "{owned}"
+    );
+    let href = copy_href(test, owner_id, EDIT).await;
+    let reply = reader
+        .jmap_destroy_account(owner, "CalendarEvent", [event_id.as_str()], no_args())
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        reply.destroyed().collect::<Vec<_>>(),
+        [event_id.as_str()],
+        "{reply:?}"
+    );
+    f.pair
+        .dav
+        .request("GET", &href, "")
+        .await
+        .with_status(StatusCode::NOT_FOUND);
+    assert_eq!(uid_copies(test, owner_id, EDIT).await, 0);
+    share(test, owner, reader, f.reader_id, SLUG, "view").await;
+}
+
+/// Spec 6.5, release 4 D12: a grantee at `edit` answers for the owner; the
+/// REPLY to the outside organizer carries the grantee's SENT-BY.
+async fn delegated_reply_carries_sent_by(test: &TestServer, f: &Sharing) {
+    const UID: &str = "jmapcal-sharing-delegated";
+    let (owner, reader) = (&f.pair.key, &f.reader);
+    let owner_id = f.pair.key_id;
+    let address = owner.name();
+    share(test, owner, reader, f.reader_id, SLUG, "edit").await;
+
+    // The owner's attendee copy is a scheduled object (a schedule tag): an
+    // event the owner PUT itself would not be, and an attendee's change to
+    // it would send nothing (`za_schedule_update` treats it as a create).
+    // So the organizer's REQUEST is delivered by mail and imported by the
+    // owner's drain, as `scheduling::invitation_by_email_found_by_uid`
+    // does, and the owner then moves the copy into the shared calendar.
+    let owner_start = inbox_ids(test, owner_id).await;
+    assert!(pending_ids(test, owner_id).await.is_empty());
+    let card = imip::add_contact(&f.pair.dav, address, ORG).await;
+    sink().clear();
+    // The envelope sender passes the test-mode DMARC check by its prefix.
+    imip::deliver(
+        &format!("dmarc-{ORG}"),
+        address,
+        &imip::itip_mail(
+            ORG,
+            address,
+            "REQUEST",
+            &imip::event(UID, ORG, &[address], 0, ""),
+        ),
+    )
+    .await;
+    wait_for_queue(test).await;
+    {
+        let _drain = DrainOn::new();
+        assert_eq!(trigger_drain(address, STRONG).await, 207);
+    }
+    assert_eq!(uid_copies(test, owner_id, UID).await, 1);
+    let event_id = Id::from(
+        test.server
+            .document_ids_matching(
+                owner_id,
+                Collection::CalendarEvent,
+                types::field::CalendarEventField::Uid,
+                UID.as_bytes(),
+            )
+            .await
+            .unwrap()
+            .min()
+            .unwrap(),
+    )
+    .to_string();
+    let reply = owner
+        .jmap_update(
+            "CalendarEvent",
+            [(
+                event_id.clone(),
+                json!({ "calendarIds": { (id(f.shared)): true } }),
+            )],
+            no_args(),
+        )
+        .await;
+    assert_set(
+        &reply,
+        "updated",
+        &event_id,
+        "the owner's move into the shared calendar",
+    );
+    assert_eq!(
+        event_get(owner, owner, &event_id).await["calendarIds"],
+        json!({ (id(f.shared)): true })
+    );
+    wait_for_queue(test).await;
+    sink().clear();
+
+    let own = format!("mailto:{}", owner.name());
+    let event = event_get(reader, owner, &event_id).await;
+    let participant = event["participants"]
+        .as_object()
+        .and_then(|participants| {
+            participants
+                .iter()
+                .find(|(_, value)| {
+                    value["calendarAddress"]
+                        .as_str()
+                        .is_some_and(|address| address.eq_ignore_ascii_case(&own))
+                })
+                .map(|(key, _)| key.clone())
+        })
+        .unwrap_or_else(|| {
+            panic!("delegated_reply_carries_sent_by: no owner participant: {event}")
+        });
+    let path = format!("participants/{participant}/participationStatus");
+    let reply = reader
+        .jmap_update_account(
+            owner,
+            "CalendarEvent",
+            [(event_id.clone(), json!({ path: "accepted" }))],
+            send(),
+        )
+        .await;
+    assert_set(&reply, "updated", &event_id, "the grantee's answer");
+    wait_for_queue(test).await;
+    let mail = sink().take_to(ORG);
+    assert_eq!(
+        mail.len(),
+        1,
+        "delegated_reply_carries_sent_by: mail to the organizer"
+    );
+    assert_eq!(mail[0].calendar_method().as_deref(), Some("REPLY"));
+    let calendar = mail[0]
+        .calendar_part()
+        .unwrap_or_default()
+        .replace("\r\n ", "");
+    let sent_by = format!("sent-by=\"mailto:{READER}\"");
+    assert!(
+        calendar.lines().any(|line| {
+            let line = line.to_ascii_lowercase();
+            line.starts_with("attendee")
+                && line.contains("partstat=accepted")
+                && line.contains(&sent_by)
+                && line.contains(&own.to_ascii_lowercase())
+        }),
+        "delegated_reply_carries_sent_by: the reply's ATTENDEE line: {calendar}"
+    );
+
+    // What the case left: the event, the contact, the delivered message and
+    // the inbox item; the deletion sends nothing.
+    owner_delete(test, f, UID).await;
+    assert_eq!(uid_copies(test, owner_id, UID).await, 0);
+    imip::delete_contact(&f.pair.dav, &card).await;
+    let account = owner.id_string();
+    let reply = owner
+        .jmap_method_call(
+            "Email/get",
+            json!({ "accountId": account, "ids": null, "properties": ["id", "subject"] }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let mails: Vec<Value> = reply
+        .list()
+        .iter()
+        .filter(|email| email["subject"] == "iMIP REQUEST")
+        .map(|email| email["id"].clone())
+        .collect();
+    assert_eq!(mails.len(), 1, "the delivered message: {reply:?}");
+    let reply = owner
+        .jmap_method_call(
+            "Email/set",
+            json!({ "accountId": account, "destroy": mails.clone() }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(reply.response_at(0)["destroyed"], json!(mails), "{reply:?}");
+    Party::new(test, address)
+        .delete_items_since(test, &owner_start)
+        .await;
+    wait_for_queue(test).await;
+    sink().clear();
+    share(test, owner, reader, f.reader_id, SLUG, "view").await;
+}
+
+/// Spec 6.1: after the owner revokes its only grant, upstream's access check
+/// answers every served method first; the event the grantee wrote stays.
+async fn revoke_ends_access(test: &TestServer, f: &Sharing) {
+    const UID: &str = "jmapcal-sharing-revoke";
+    let (owner, reader) = (&f.pair.key, &f.reader);
+    let owner_id = f.pair.key_id;
+    let cal = id(f.shared);
+    share(test, owner, reader, f.reader_id, SLUG, "edit").await;
+    let reply = reader
+        .jmap_create_account(owner, "CalendarEvent", [event_in(UID, &cal)], no_args())
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let event_id = reply.created_id(0).to_string();
+
+    let revoked = za_post(
+        "shares/revoke",
+        &json!({
+            "username": owner.name(), "password": STRONG,
+            "calendar": SLUG, "grant": f.reader_id
+        }),
+    )
+    .await
+    .expect(200);
+    assert_eq!(revoked["changed"], true);
+    assert_account_not_found(reader, owner, &cal, &event_id, "revoke_ends_access").await;
+    let session = reader.jmap_session_object().await;
+    assert!(
+        session.0["accounts"].get(owner.id_string()).is_none(),
+        "revoke_ends_access: the grantee's session still lists the owner: {session:?}"
+    );
+    f.reader_dav
+        .request("PROPFIND", &home(SLUG), "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    let event = event_get(owner, owner, &event_id).await;
+    assert_eq!(event["title"], UID, "{event}");
+
+    owner_delete(test, f, UID).await;
+    assert_eq!(uid_copies(test, owner_id, UID).await, 0);
+    share(test, owner, reader, f.reader_id, SLUG, "view").await;
+}
+
+/// Spec 6.1: an account never granted gets `accountNotFound` from every
+/// served method; the fork's `forbidden` comes only after the access check.
+async fn non_grantee_refused(test: &TestServer, f: &Sharing) {
+    let seed = id(resource_id(test, f.pair.key_id, &format!("{SLUG}/{}.ics", EVENTS[0])).await);
+    assert_account_not_found(
+        &f.pair.key2,
+        &f.pair.key,
+        &id(f.shared),
+        &seed,
+        "non_grantee_refused",
+    )
+    .await;
+}
+
+/// Review focus 3 (D11): a grantee's `useDefaultAlerts: true` writes its own
+/// entry's defaults by value, starting as the copy of the owner's it took at
+/// the grant; an email alert names the grantee.
+async fn grantee_default_alerts(test: &TestServer, f: &Sharing) {
+    const FIRST: &str = "jmapcal-sharing-alerts-1";
+    const SECOND: &str = "jmapcal-sharing-alerts-2";
+    const OWN: &str = "jmapcal-sharing-alerts-own";
+    let (owner, reader) = (&f.pair.key, &f.reader);
+    let owner_id = f.pair.key_id;
+    let calendar = id(make_calendar(test, owner, &f.pair.dav, ALERTS_SLUG).await);
+    let reply = calendar_update(
+        owner,
+        owner,
+        &calendar,
+        json!({ "defaultAlertsWithTime": { "o1": alert("display", "-PT10M") } }),
+    )
+    .await;
+    assert_set(&reply, "updated", &calendar, "the owner's defaults");
+    share(test, owner, reader, f.reader_id, ALERTS_SLUG, "edit").await;
+
+    // The grantee set none: the owner's defaults, as granted.
+    let mut object = event_in(FIRST, &calendar);
+    object["useDefaultAlerts"] = json!(true);
+    let reply = reader
+        .jmap_create_account(owner, "CalendarEvent", [object], no_args())
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    reply.created_id(0);
+    let first_body = owner_body(test, f, FIRST).await;
+    assert_eq!(
+        first_body.matches("BEGIN:VALARM").count(),
+        1,
+        "{first_body}"
+    );
+    assert!(has_trigger(&first_body, "-PT10M"), "{first_body}");
+
+    // The grantee's own defaults.
+    let reply = calendar_update(
+        reader,
+        owner,
+        &calendar,
+        json!({ "defaultAlertsWithTime": { "g1": alert("email", "-PT45M") } }),
+    )
+    .await;
+    assert_set(&reply, "updated", &calendar, "the grantee's defaults");
+    let mut object = event_in(SECOND, &calendar);
+    object["useDefaultAlerts"] = json!(true);
+    let reply = reader
+        .jmap_create_account(owner, "CalendarEvent", [object], no_args())
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let second = reply.created_id(0).document_id();
+    let second_body = owner_body(test, f, SECOND).await;
+    assert!(
+        has_trigger(&second_body, "-PT45M") && !has_trigger(&second_body, "-PT10M"),
+        "grantee_default_alerts: the second event's alarms: {second_body}"
+    );
+    assert!(
+        second_body.contains(&format!("ATTENDEE:mailto:{READER}")),
+        "{second_body}"
+    );
+    let event = event_get(owner, owner, &id(second)).await;
+    assert_eq!(event["useDefaultAlerts"], false, "{event}");
+    assert_eq!(
+        event["alerts"]["g1"]["trigger"]["offset"], "-PT45M",
+        "{event}"
+    );
+    assert_no_event_preferences(test, owner_id, second).await;
+
+    // The owner's own create still takes the owner's defaults.
+    let mut object = event_in(OWN, &calendar);
+    object["useDefaultAlerts"] = json!(true);
+    let reply = owner
+        .jmap_create("CalendarEvent", [object], no_args())
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let own = reply.created_id(0).to_string();
+    assert_eq!(
+        alert_ids(&event_get(owner, owner, &own).await),
+        ["o1"],
+        "grantee_default_alerts: the owner's own create"
+    );
+    assert_eq!(
+        owner_body(test, f, FIRST).await,
+        first_body,
+        "grantee_default_alerts: the first event changed"
+    );
+
+    // Cleanup before any wait: no email alarm task stays queued.
+    for uid in [FIRST, SECOND, OWN] {
+        owner_delete(test, f, uid).await;
+    }
+    let revoked = za_post(
+        "shares/revoke",
+        &json!({
+            "username": owner.name(), "password": STRONG,
+            "calendar": ALERTS_SLUG, "grant": f.reader_id
+        }),
+    )
+    .await
+    .expect(200);
+    assert_eq!(revoked["changed"], true);
+    f.pair
+        .dav
+        .request_with_headers("DELETE", &home(ALERTS_SLUG), [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+}
+
+/// Spec 6.10 (D13): a grantee's session lists the sharer's account with the
+/// calendar capability and without the metadata capability.
+async fn grantee_session_lists_the_sharer(f: &Sharing) {
+    let owner = f.pair.key.id_string();
+    let session = f.reader.jmap_session_object().await;
+    let account = session.0["accounts"]
+        .get(owner)
+        .unwrap_or_else(|| panic!("the grantee's session lacks the owner: {session:?}"));
+    assert_eq!(account["isPersonal"], false, "{account}");
+    let capabilities = &account["accountCapabilities"];
+    assert!(
+        capabilities.get("urn:ietf:params:jmap:calendars").is_some(),
+        "{account}"
+    );
+    assert!(
+        capabilities.get("urn:ietf:params:jmap:metadata").is_none(),
+        "{account}"
+    );
+    let session = f.pair.key2.jmap_session_object().await;
+    assert!(
+        session.0["accounts"].get(owner).is_none(),
+        "a never-granted account's session lists the owner: {session:?}"
+    );
+}
+
+/// The owner's default calendar's JMAP id.
+async fn default_calendar(account: &Account) -> String {
+    let reply = account
+        .jmap_method_call(
+            "Calendar/get",
+            json!({ "accountId": account.id_string(), "ids": null }),
+        )
+        .await;
+    reply
+        .list()
+        .iter()
+        .find(|entry| entry["isDefault"] == true)
+        .and_then(|entry| entry["id"].as_str())
+        .unwrap_or_else(|| panic!("no default calendar for {}: {reply:?}", account.name()))
+        .to_string()
+}
+
+/// The new inbox items of `account_id` since `before` that name `uid`, each
+/// opened with the account's keys: (document id, pending, method).
+async fn new_items_for(
+    test: &TestServer,
+    account_id: u32,
+    before: &[u32],
+    uid: &str,
+) -> Vec<(u32, bool, Option<ICalendarMethod>)> {
+    let pending = pending_ids(test, account_id).await;
+    let uid_line = format!("UID:{uid}");
+    let mut items = Vec::new();
+    for (document_id, _) in new_inbox_items(test, account_id, before).await {
+        let is_pending = pending.contains(&document_id);
+        if !is_pending {
+            continue;
+        }
+        let (ical, _) = open_pending_item_as(test, account_id, STRONG, document_id).await;
+        if ical.to_string().contains(&uid_line) {
+            items.push((document_id, is_pending, item_method(&ical)));
+        }
+    }
+    items
+}
+
+/// Review addition: one update that moves an event into a shared calendar
+/// and sends scheduling messages opens the stored token pairs in the old
+/// calendar's domain and seals them in the new one's; the attendee's reply
+/// is applied only if its token matches the stored pair.
+async fn move_with_scheduling_into_shared(test: &TestServer, f: &Sharing) {
+    const UID: &str = "jmapcal-sharing-move-sched";
+    const TITLE: &str = "Moved with scheduling";
+    let (owner, key2, reader) = (&f.pair.key, &f.pair.key2, &f.reader);
+    let (owner_id, key2_id) = (f.pair.key_id, f.pair.key2_id);
+    let owner_start = inbox_ids(test, owner_id).await;
+    let key2_start = inbox_ids(test, key2_id).await;
+
+    let default = default_calendar(owner).await;
+    let mut object = event_in(UID, &default);
+    object["participants"] = json!({
+        "p0": {
+            "@type": "Participant",
+            "calendarAddress": format!("mailto:{}", owner.name()),
+            "roles": { "owner": true, "chair": true },
+            "participationStatus": "accepted",
+        },
+        "p1": {
+            "@type": "Participant",
+            "calendarAddress": format!("mailto:{}", key2.name()),
+            "kind": "individual",
+            "participationStatus": "needs-action",
+            "expectReply": true,
+        },
+    });
+    let reply = owner.jmap_create("CalendarEvent", [object], send()).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let event_id = reply.created_id(0).to_string();
+    let invited = new_items_for(test, key2_id, &key2_start, UID).await;
+    assert_eq!(
+        invited.len(),
+        1,
+        "move_with_scheduling_into_shared: key2's invitation: {invited:?}"
+    );
+
+    let before_move = inbox_ids(test, key2_id).await;
+    let reply = owner
+        .jmap_update(
+            "CalendarEvent",
+            [(
+                event_id.clone(),
+                json!({ "calendarIds": { (id(f.shared)): true }, "title": TITLE }),
+            )],
+            send(),
+        )
+        .await;
+    assert_set(&reply, "updated", &event_id, "the move with scheduling");
+    let moved = new_items_for(test, key2_id, &before_move, UID).await;
+    assert_eq!(
+        new_inbox_items(test, key2_id, &before_move).await.len(),
+        1,
+        "move_with_scheduling_into_shared: key2's new items after the move"
+    );
+    let [(request, true, Some(ICalendarMethod::Request))] = moved[..] else {
+        panic!("move_with_scheduling_into_shared: the move's item: {moved:?}");
+    };
+    assert_eq!(event_get(reader, owner, &event_id).await["title"], TITLE);
+    assert_eq!(event_get(owner, owner, &event_id).await["title"], TITLE);
+
+    // Only the move's REQUEST stays in key2's inbox, and nothing in the
+    // owner's, before the drain is on.
+    let key2_party = Party::new(test, key2.name());
+    let owner_party = Party::new(test, owner.name());
+    key2_party
+        .delete_items(
+            test,
+            inbox_ids(test, key2_id)
+                .await
+                .into_iter()
+                .filter(|item| *item != request),
+        )
+        .await;
+    owner_party
+        .delete_items(test, inbox_ids(test, owner_id).await)
+        .await;
+    assert_eq!(pending_ids(test, key2_id).await, [request]);
+    assert!(pending_ids(test, owner_id).await.is_empty());
+    let owner_href = copy_href(test, owner_id, UID).await;
+    {
+        let _drain = DrainOn::new();
+        assert_eq!(trigger_drain(key2.name(), STRONG).await, 207);
+        assert_eq!(uid_copies(test, key2_id, UID).await, 1);
+        let copy = copy_href(test, key2_id, UID).await;
+        set_partstat(&f.pair.dav2, &copy, key2.name(), "ACCEPTED").await;
+        assert_eq!(trigger_drain(owner.name(), STRONG).await, 207);
+        assert_eq!(
+            partstat_of(&f.pair.dav, &owner_href, key2.name())
+                .await
+                .as_deref(),
+            Some("ACCEPTED"),
+            "move_with_scheduling_into_shared: the reply was not applied after the move"
+        );
+    }
+
+    // Cleanup, without scheduling: neither destroy carries the flag.
+    let copy = Id::from(
+        test.server
+            .document_ids_matching(
+                key2_id,
+                Collection::CalendarEvent,
+                types::field::CalendarEventField::Uid,
+                UID.as_bytes(),
+            )
+            .await
+            .unwrap()
+            .min()
+            .unwrap(),
+    )
+    .to_string();
+    let reply = key2
+        .jmap_destroy("CalendarEvent", [copy.as_str()], no_args())
+        .await;
+    assert_set_destroyed(&reply, &copy);
+    let reply = owner
+        .jmap_destroy("CalendarEvent", [event_id.as_str()], no_args())
+        .await;
+    assert_set_destroyed(&reply, &event_id);
+    assert_eq!(uid_copies(test, owner_id, UID).await, 0);
+    assert_eq!(uid_copies(test, key2_id, UID).await, 0);
+    key2_party.delete_items_since(test, &key2_start).await;
+    owner_party.delete_items_since(test, &owner_start).await;
+    assert!(new_inbox_items(test, key2_id, &key2_start).await.is_empty());
+    assert!(
+        new_inbox_items(test, owner_id, &owner_start)
+            .await
+            .is_empty()
+    );
+}
+
+fn assert_set_destroyed(reply: &JmapResponse, id: &str) {
+    assert_eq!(method_error(reply), None, "{reply:?}");
+    assert_eq!(reply.destroyed().collect::<Vec<_>>(), [id], "{reply:?}");
 }
