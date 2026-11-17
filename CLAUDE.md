@@ -163,7 +163,12 @@ Where the code lives:
   issue, the keyed refresh), `auth/authenticate.rs` (the Bearer arm and its refusal at a stale
   generation), `auth/oauth/auth.rs` (the password step's keys, the hand-off at the code and the
   consent token), `auth/oauth/token.rs` (the code exchange, the refresh grant, the untraced granted
-  answer). Jmap-proto: `types/state.rs` (D29's transient `z` codec and expected-state handling)
+  answer), `api/vault.rs` (`za_totp` draws a fresh salt through `za_set_password` on every
+  second-factor change), `request.rs` (the three traced request URLs formatted through
+  `traced_url`). Http-proto: `crates/http-proto/src/request.rs` (`traced_url`, which masks a `code`
+  query parameter, applied by `traced_header` to `referer`). Common, again:
+  `crates/common/src/cache/invalidate.rs` (the `OAuthGrant` arm also evicts the account's resident
+  keys). Jmap-proto: `types/state.rs` (D29's transient `z` codec and expected-state handling)
   and `request/parser.rs` (refusal of a `z` outside the calendar changes methods), with their
   `*_restored_tests.rs`. Jmap: `api/za_calendar.rs` (the admission of calendar methods, the method
   table `za_calendar_method`, the fixed texts), `calendar_event/za_read.rs` (`ZaEventReader`, the

@@ -39,8 +39,9 @@ reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not 
 - On upgrade to release 6, every key account's existing OAuth token is refused once (its
   credential version changes), and the user signs in again.
 - The value of a `code` query parameter is masked in traced request URLs and traced `Referer`
-  headers, for every account, so an authorization code no longer appears in a trace.
-- A grantee no longer finds, by text search, an event of a shared key calendar whose details it
+  headers, for every account, so an authorization code no longer appears in a trace as a query
+  parameter named `code`.
+- A grantee does not find, by text search, an event of a shared key calendar whose details it
   cannot read.
 - `decode_access_token` strips a `~` suffix from every token that begins with the server's token
   header, for every account (D26). A shared calendar's colour is carried in each principal's
