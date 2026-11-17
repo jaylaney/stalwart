@@ -2133,13 +2133,17 @@ async fn stored_pair(
         .to_vec()
 }
 
-/// Review addition: one update that moves an event from the owner's default
-/// calendar into the shared one and sends scheduling messages keeps the
-/// stored token pair: the pair the owner's bundle holds for the attendee is
-/// the same token read in the default calendar's domain before the move and
-/// in the shared calendar's domain after it (a lost pair would be re-minted
-/// by the fan-out). The attendee's reply, applied only if its token matches
-/// the stored pair, then reaches the moved event.
+/// Review addition: moves between the owner's default calendar and the
+/// shared one keep the stored token pair, with and without scheduling. One
+/// update moves the event into the shared calendar and sends scheduling
+/// messages; two quiet updates (no flag) move it back to the default
+/// calendar and into the shared one again, sending nothing. The pair the
+/// owner's bundle holds for the attendee is the same token read in the
+/// default calendar's domain before the first move and in each target
+/// calendar's domain after every move (a lost pair would be re-minted by a
+/// scheduled move's fan-out, and lost for good by a quiet one). The
+/// attendee's reply, applied only if its token matches the stored pair, then
+/// reaches the moved event.
 async fn move_with_scheduling_into_shared(test: &TestServer, f: &Sharing) {
     const UID: &str = "jmapcal-sharing-move-sched";
     const TITLE: &str = "Moved with scheduling";
@@ -2221,6 +2225,46 @@ async fn move_with_scheduling_into_shared(test: &TestServer, f: &Sharing) {
     };
     assert_eq!(event_get(reader, owner, &event_id).await["title"], TITLE);
     assert_eq!(event_get(owner, owner, &event_id).await["title"], TITLE);
+
+    // Moves without scheduling: back to the default calendar, then into the
+    // shared one again. Nothing is sent, so no fan-out re-mints a token; the
+    // stored pair must be carried across each domain change as it is.
+    for (target, target_id, what) in [
+        (
+            default.as_str(),
+            default_id,
+            "the quiet move to the default calendar",
+        ),
+        (
+            shared.as_str(),
+            f.shared,
+            "the quiet move back into the shared calendar",
+        ),
+    ] {
+        let before = inbox_ids(test, key2_id).await;
+        let reply = owner
+            .jmap_update(
+                "CalendarEvent",
+                [(event_id.clone(), json!({ "calendarIds": { target: true } }))],
+                no_args(),
+            )
+            .await;
+        assert_set(&reply, "updated", &event_id, what);
+        assert_eq!(
+            event_get(owner, owner, &event_id).await["calendarIds"],
+            json!({ target: true }),
+            "move_with_scheduling_into_shared: the placement after {what}"
+        );
+        assert!(
+            new_inbox_items(test, key2_id, &before).await.is_empty(),
+            "move_with_scheduling_into_shared: {what} sent key2 an item"
+        );
+        let token = stored_pair(test, owner_id, document_id, target_id, key2.name()).await;
+        assert!(
+            token == before_token,
+            "move_with_scheduling_into_shared: the stored pair changed across {what}"
+        );
+    }
 
     // Only the move's REQUEST stays in key2's inbox, and nothing in the
     // owner's, before the drain is on.
