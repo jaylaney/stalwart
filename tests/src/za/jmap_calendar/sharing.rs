@@ -21,8 +21,8 @@ use crate::{
         webdav::DummyWebDavClient,
         za::{
             CALENDAR_JMAP_USING, assert_no_event_preferences, copy_href, inbox_ids, item_method,
-            new_inbox_items, open_pending_item_as, pending_ids, trigger_drain, wait_for_queue,
-            za_bearer_jmap, za_grant_token, za_post, za_revoke_grant,
+            new_inbox_items, open_pending_item_as, pending_ids, stored_event, trigger_drain,
+            wait_for_queue, za_bearer_jmap, za_grant_token, za_post, za_revoke_grant, za_unlock,
         },
     },
     za::{
@@ -41,12 +41,13 @@ use common::{auth::oauth::scope::OAuthScopes, za::ZA_CALENDAR_KEYLESS};
 use email::mailbox::INBOX_ID;
 use futures::FutureExt;
 use groupware::calendar::{
-    pipeline::context::za_foreign_calendar_contexts, sharing::resolve::ZaSyncBoundary,
+    pipeline::context::za_foreign_calendar_contexts,
+    sharing::resolve::{ZaSyncBoundary, za_owned_calendar_context},
 };
 use hyper::StatusCode;
 use jmap_proto::types::state::{JMAPIntermediateState, State, ZaCalendarOrigin};
 use serde_json::{Value, json};
-use std::panic::AssertUnwindSafe;
+use std::{panic::AssertUnwindSafe, str::FromStr};
 use store::{
     IterateParams, ValueKey,
     write::{BatchBuilder, LogCollection, ValueClass, serialize::RawValue},
@@ -117,6 +118,7 @@ pub async fn test(test: &mut TestServer) {
     grantee_default_alerts(test, &fixture).await;
     grantee_session_lists_the_sharer(&fixture).await;
     move_with_scheduling_into_shared(test, &fixture).await;
+    grantee_destroy_sends_delegated_cancel(test, &fixture).await;
 
     // Each case leaves a completed boundary, the two setup events and the view grant.
     let owner = &fixture.pair.key;
@@ -1759,6 +1761,13 @@ async fn delegated_reply_carries_sent_by(test: &TestServer, f: &Sharing) {
             .unwrap(),
     )
     .to_string();
+    let default = default_calendar(owner).await;
+    assert_ne!(default, id(f.shared));
+    assert_eq!(
+        event_get(owner, owner, &event_id).await["calendarIds"],
+        json!({ (default.as_str()): true }),
+        "delegated_reply_carries_sent_by: the imported copy's placement"
+    );
     let reply = owner
         .jmap_update(
             "CalendarEvent",
@@ -2100,10 +2109,37 @@ async fn new_items_for(
     items
 }
 
-/// Review addition: one update that moves an event into a shared calendar
-/// and sends scheduling messages opens the stored token pairs in the old
-/// calendar's domain and seals them in the new one's; the attendee's reply
-/// is applied only if its token matches the stored pair.
+/// The token the owner's stored bundle of `document_id` holds for
+/// `address`, read in the domain of `calendar_id`'s context.
+async fn stored_pair(
+    test: &TestServer,
+    owner_id: u32,
+    document_id: u32,
+    calendar_id: u32,
+    address: &str,
+) -> Vec<u8> {
+    let keys = za_unlock(test, owner_id, STRONG).await;
+    let context = za_owned_calendar_context(&test.server, &keys, calendar_id)
+        .await
+        .unwrap_or_else(|_| panic!("the owner's context of calendar {calendar_id}"));
+    let pairs = stored_event(test, owner_id, document_id)
+        .await
+        .pairs_in(&context.domain)
+        .unwrap_or_else(|err| panic!("the stored pairs do not open: {err:?}"))
+        .unwrap_or_else(|| panic!("event {document_id} holds no pairs"));
+    pairs
+        .get(address)
+        .unwrap_or_else(|| panic!("event {document_id} holds no pair for {address}"))
+        .to_vec()
+}
+
+/// Review addition: one update that moves an event from the owner's default
+/// calendar into the shared one and sends scheduling messages keeps the
+/// stored token pair: the pair the owner's bundle holds for the attendee is
+/// the same token read in the default calendar's domain before the move and
+/// in the shared calendar's domain after it (a lost pair would be re-minted
+/// by the fan-out). The attendee's reply, applied only if its token matches
+/// the stored pair, then reaches the moved event.
 async fn move_with_scheduling_into_shared(test: &TestServer, f: &Sharing) {
     const UID: &str = "jmapcal-sharing-move-sched";
     const TITLE: &str = "Moved with scheduling";
@@ -2113,6 +2149,11 @@ async fn move_with_scheduling_into_shared(test: &TestServer, f: &Sharing) {
     let key2_start = inbox_ids(test, key2_id).await;
 
     let default = default_calendar(owner).await;
+    let shared = id(f.shared);
+    assert_ne!(
+        default, shared,
+        "move_with_scheduling_into_shared: the default calendar is the shared one"
+    );
     let mut object = event_in(UID, &default);
     object["participants"] = json!({
         "p0": {
@@ -2131,13 +2172,21 @@ async fn move_with_scheduling_into_shared(test: &TestServer, f: &Sharing) {
     });
     let reply = owner.jmap_create("CalendarEvent", [object], send()).await;
     assert_eq!(method_error(&reply), None, "{reply:?}");
-    let event_id = reply.created_id(0).to_string();
+    let document_id = reply.created_id(0).document_id();
+    let event_id = id(document_id);
     let invited = new_items_for(test, key2_id, &key2_start, UID).await;
     assert_eq!(
         invited.len(),
         1,
         "move_with_scheduling_into_shared: key2's invitation: {invited:?}"
     );
+    assert_eq!(
+        event_get(owner, owner, &event_id).await["calendarIds"],
+        json!({ (default.as_str()): true }),
+        "move_with_scheduling_into_shared: the placement before the move"
+    );
+    let default_id = Id::from_str(&default).unwrap().document_id();
+    let before_token = stored_pair(test, owner_id, document_id, default_id, key2.name()).await;
 
     let before_move = inbox_ids(test, key2_id).await;
     let reply = owner
@@ -2145,12 +2194,22 @@ async fn move_with_scheduling_into_shared(test: &TestServer, f: &Sharing) {
             "CalendarEvent",
             [(
                 event_id.clone(),
-                json!({ "calendarIds": { (id(f.shared)): true }, "title": TITLE }),
+                json!({ "calendarIds": { (shared.as_str()): true }, "title": TITLE }),
             )],
             send(),
         )
         .await;
     assert_set(&reply, "updated", &event_id, "the move with scheduling");
+    assert_eq!(
+        event_get(owner, owner, &event_id).await["calendarIds"],
+        json!({ (shared.as_str()): true }),
+        "move_with_scheduling_into_shared: the placement after the move"
+    );
+    let after_token = stored_pair(test, owner_id, document_id, f.shared, key2.name()).await;
+    assert!(
+        before_token == after_token,
+        "move_with_scheduling_into_shared: the stored pair changed across the move"
+    );
     let moved = new_items_for(test, key2_id, &before_move, UID).await;
     assert_eq!(
         new_inbox_items(test, key2_id, &before_move).await.len(),
@@ -2236,4 +2295,107 @@ async fn move_with_scheduling_into_shared(test: &TestServer, f: &Sharing) {
 fn assert_set_destroyed(reply: &JmapResponse, id: &str) {
     assert_eq!(method_error(reply), None, "{reply:?}");
     assert_eq!(reply.destroyed().collect::<Vec<_>>(), [id], "{reply:?}");
+}
+
+/// The unfolded lines of a pending item that carry a `SENT-BY` parameter,
+/// opened with the recipient's keys.
+async fn sent_by_lines(test: &TestServer, account_id: u32, document_id: u32) -> Vec<String> {
+    let (ical, _) = open_pending_item_as(test, account_id, STRONG, document_id).await;
+    ical.to_string()
+        .replace("\r\n ", "")
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| line.to_ascii_lowercase().contains("sent-by="))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Release 4's delegated scheduling over JMAP: a grantee at `edit` that
+/// destroys a scheduled event of the shared calendar with
+/// `sendSchedulingMessages: true` sends the attendee a CANCEL naming the
+/// grantee as `SENT-BY`, as the grantee's CalDAV DELETE of its twin does.
+async fn grantee_destroy_sends_delegated_cancel(test: &TestServer, f: &Sharing) {
+    const JM: &str = "jmapcal-sharing-cancel-jm";
+    const DAV: &str = "jmapcal-sharing-cancel-dav";
+    let (owner, key2, reader) = (&f.pair.key, &f.pair.key2, &f.reader);
+    let (owner_id, key2_id) = (f.pair.key_id, f.pair.key2_id);
+    let shared = id(f.shared);
+    let key2_start = inbox_ids(test, key2_id).await;
+    share(test, owner, reader, f.reader_id, SLUG, "edit").await;
+
+    let mut ids = Vec::new();
+    for uid in [JM, DAV] {
+        let before = inbox_ids(test, key2_id).await;
+        let mut object = event_in(uid, &shared);
+        object["participants"] = json!({
+            "p0": {
+                "@type": "Participant",
+                "calendarAddress": format!("mailto:{}", owner.name()),
+                "roles": { "owner": true, "chair": true },
+                "participationStatus": "accepted",
+            },
+            "p1": {
+                "@type": "Participant",
+                "calendarAddress": format!("mailto:{}", key2.name()),
+                "kind": "individual",
+                "participationStatus": "needs-action",
+                "expectReply": true,
+            },
+        });
+        let reply = owner.jmap_create("CalendarEvent", [object], send()).await;
+        assert_eq!(method_error(&reply), None, "{reply:?}");
+        ids.push(reply.created_id(0).to_string());
+        let invited = new_items_for(test, key2_id, &before, uid).await;
+        assert!(
+            matches!(invited[..], [(_, true, Some(ICalendarMethod::Request))]),
+            "grantee_destroy_sends_delegated_cancel: {uid}'s invitation: {invited:?}"
+        );
+    }
+
+    // The JMAP destroy by the grantee, with the flag.
+    let before = inbox_ids(test, key2_id).await;
+    let reply = reader
+        .jmap_destroy_account(owner, "CalendarEvent", [ids[0].as_str()], send())
+        .await;
+    assert_set_destroyed(&reply, &ids[0]);
+    assert_eq!(uid_copies(test, owner_id, JM).await, 0);
+    let items = new_items_for(test, key2_id, &before, JM).await;
+    let [(jm_item, true, Some(ICalendarMethod::Cancel))] = items[..] else {
+        panic!("grantee_destroy_sends_delegated_cancel: the JMAP destroy's item: {items:?}");
+    };
+
+    // The CalDAV twin: the grantee's DELETE, without `Schedule-Reply: F`.
+    let href = copy_href(test, owner_id, DAV).await;
+    let before = inbox_ids(test, key2_id).await;
+    f.reader_dav
+        .request("DELETE", &href, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(uid_copies(test, owner_id, DAV).await, 0);
+    let items = new_items_for(test, key2_id, &before, DAV).await;
+    let [(dav_item, true, Some(ICalendarMethod::Cancel))] = items[..] else {
+        panic!("grantee_destroy_sends_delegated_cancel: the CalDAV DELETE's item: {items:?}");
+    };
+
+    // Both name the grantee as SENT-BY, on the same property.
+    let sent_by = format!("sent-by=\"mailto:{READER}\"");
+    let dav_lines = sent_by_lines(test, key2_id, dav_item).await;
+    let jm_lines = sent_by_lines(test, key2_id, jm_item).await;
+    assert!(
+        matches!(&dav_lines[..], [line] if line.to_ascii_lowercase().contains(&sent_by)),
+        "grantee_destroy_sends_delegated_cancel: the CalDAV CANCEL's SENT-BY: {dav_lines:?}"
+    );
+    assert_eq!(
+        jm_lines, dav_lines,
+        "grantee_destroy_sends_delegated_cancel: the JMAP CANCEL differs from its CalDAV twin"
+    );
+
+    Party::new(test, key2.name())
+        .delete_items_since(test, &key2_start)
+        .await;
+    assert!(new_inbox_items(test, key2_id, &key2_start).await.is_empty());
+    for uid in [JM, DAV] {
+        assert_eq!(uid_copies(test, key2_id, uid).await, 0);
+    }
+    share(test, owner, reader, f.reader_id, SLUG, "view").await;
 }
