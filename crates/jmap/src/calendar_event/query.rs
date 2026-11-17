@@ -427,6 +427,7 @@ impl CalendarEventQuery for Server {
                 reader,
                 &cache,
                 account_id,
+                is_member,
                 &mask,
                 &mut filters,
             )

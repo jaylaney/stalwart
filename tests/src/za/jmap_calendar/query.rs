@@ -110,6 +110,7 @@ pub async fn test(test: &mut TestServer) {
     filters_and_sorts(test, &q).await;
     let veiled = text_matches_the_view_not_the_tree(test, &q).await;
     let shared = grantee_privacy(test, &q).await;
+    grantee_text_skips_a_sealed_class(test, &q).await;
     query_changes(test, &q, veiled, shared).await;
     query_changes_paged_origin(test, &q, shared).await;
     metadata_condition_refused(&q).await;
@@ -835,6 +836,55 @@ async fn grantee_privacy(test: &TestServer, q: &Query) -> u32 {
     let reply = query(key, key, json!({ "filter": { "title": "private" } })).await;
     assert_eq!(ids(&reply), [id(private)], "the owner's private match");
     calendar
+}
+
+/// Final review FC2-1 (spec 6.3, 6.4, D12): an extension CLASS is sealed and
+/// leaves the row flags clear (field policy 2), and `CalendarEvent/get` shows
+/// the grantee the private view. The grantee's text query leaves the event
+/// out too, by word and by prefix, as an ordinary account's flagged private
+/// event matches no text leaf of a grantee; the owner's query finds it.
+async fn grantee_text_skips_a_sealed_class(test: &TestServer, q: &Query) {
+    const WORD: &str = "cloakedcanary";
+    let (key, key2, dav) = (&q.pair.key, &q.pair.key2, &q.pair.dav);
+    let path = format!("{SHARED}/jmapcal-query-classed.ics");
+    let classed = put_ics(
+        test,
+        key,
+        dav,
+        &path,
+        event_ics("jmapcal-query-classed", &format!("jmapcal {WORD}"))
+            .replace("END:VEVENT", "CLASS:X-JMAPCAL-VEILED\r\nEND:VEVENT"),
+    )
+    .await;
+    for filter in [json!({ "title": WORD }), json!({ "title": "cloaked*" })] {
+        let reply = query(key2, key, json!({ "filter": filter.clone() })).await;
+        assert_eq!(
+            ids(&reply),
+            Vec::<String>::new(),
+            "the grantee's match of {filter}"
+        );
+        let reply = query(key, key, json!({ "filter": filter.clone() })).await;
+        assert_eq!(ids(&reply), [id(classed)], "the owner's match of {filter}");
+    }
+    let reply = key2
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({
+                "accountId": key.id_string(),
+                "ids": [id(classed)],
+                "properties": ["title", "privacy"],
+            }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let [event] = reply.list() else {
+        panic!("the grantee does not read the event: {reply:?}");
+    };
+    assert!(
+        !event.to_string().contains(WORD),
+        "the grantee's get shows the title: {event}"
+    );
+    delete_path(key, dav, &path).await;
 }
 
 /// Spec 6.8: `/queryChanges` runs the query function, and D15's boundary applies to it.

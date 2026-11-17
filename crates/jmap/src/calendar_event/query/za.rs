@@ -11,25 +11,33 @@
 //! budget for the views it opens.
 
 use crate::calendar_event::za_read::ZaEventReader;
+use calcard::icalendar::ICalendar;
 use common::{GroupwareResources, Server, auth::AccessToken};
-use groupware::calendar::{CalendarEvent, CalendarEventContent, za_text::ZaEventTextIndex};
+use groupware::calendar::{
+    CalendarEvent, CalendarEventContent, privacy::ICalendarPrivacy, za_text::ZaEventTextIndex,
+};
 use store::{
     ValueKey,
     roaring::RoaringBitmap,
     search::SearchFilter,
-    write::{Archive, ArchiveBytes},
+    write::{Archive, ArchiveBytes, serialize::rkyv_deserialize},
 };
 use trc::AddContext;
 use types::{collection::Collection, field::CalendarEventField};
 
 /// Opens every candidate of `mask`, inserts it in a `ZaEventTextIndex`, and replaces the
-/// text leaves of `filters`. Without a text leaf nothing is opened.
+/// text leaves of `filters`. Without a text leaf nothing is opened. For a caller that is
+/// not a member of the account, an event whose unsealed tree is not public is left out of
+/// the index, so it matches no text leaf, as `CalendarEvent/get` shows it (spec 6.3) and as
+/// an ordinary account's flagged event matches none (D12; final review FC2-1).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn za_resolve_text_leaves(
     server: &Server,
     access_token: &AccessToken,
     reader: &mut ZaEventReader,
     cache: &GroupwareResources,
     account_id: u32,
+    is_member: bool,
     mask: &RoaringBitmap,
     filters: &mut Vec<SearchFilter>,
 ) -> trc::Result<()> {
@@ -87,13 +95,19 @@ pub(super) async fn za_resolve_text_leaves(
             )
             .await?
         {
-            index.insert(
-                account_id,
-                document_id,
-                view.content
-                    .unarchive::<CalendarEventContent>()
-                    .caused_by(trc::location!())?,
-            );
+            let content = view
+                .content
+                .unarchive::<CalendarEventContent>()
+                .caused_by(trc::location!())?;
+            if !is_member
+                && !rkyv_deserialize::<_, ICalendar>(&content.data.event)
+                    .caused_by(trc::location!())?
+                    .privacy()
+                    .is_public()
+            {
+                continue;
+            }
+            index.insert(account_id, document_id, content);
         }
     }
 
