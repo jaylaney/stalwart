@@ -126,8 +126,19 @@ can show, recorded so it is not mistaken for a client fault):
 - A grantee at the `view` level is refused every `Calendar/set` update of its own entry, its
   visibility and subscription flags included (Task 39, F3).
 - An attendee that creates, as its own copy, an event it does not organize and has already answered
-  sends no reply from that create (R36-10). Invitations that arrive through the drain carry a
-  schedule tag and are unaffected.
+  sends no reply from that create, and that copy does not schedule later edits either (R36-10, the
+  final review's FC1-1; the owner's decision is pending). Accepting an invitation whose event is
+  not yet in the calendar, if the client does it by creating the event, therefore creates the copy
+  and sends no reply: record whether the client accepts that way and whether the organizer sees
+  the answer. Invitations that arrive through the drain carry a schedule tag and are unaffected.
+- An empty `shareWith` (`null` or `{}`) on a `Calendar/set` create or rename is refused like any
+  other `shareWith` (FC2-15): record whether the client sends one.
+- An event created without a `uid`, whose create fails after its invitations went out, is retried
+  by the client under a new UID the server generates, so the attendees can hold an event the
+  organizer never stored (FB-2): record whether the client sends a `uid` on create.
+- A reminder's push (`CalendarAlert`) names a positional alert id (`k1`, ...) where
+  `CalendarEvent/get` shows the stored id, since the alarm's id is sealed (FD-3): record whether
+  the client matches the alert by id.
 - An event or invitation written through JMAP holds upstream's converter output (`DURATION` for
   `DTEND`, the export's property order), a `CREATED` stamp, and a SEQUENCE the server raises when
   the client omits `sequence` (Task 38). A CalDAV client of the same account sees that text.

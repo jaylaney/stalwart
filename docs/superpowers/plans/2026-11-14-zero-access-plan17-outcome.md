@@ -52,28 +52,28 @@ What this note can claim. Every result quoted here is local: RocksDB on one node
   - Task 40 `3d2abb4e6` (leak rules), fix `f3507acdc`;
   - Task 41 `91ff125fb` (the coverage cohort's additions and the key-mode JMAP step's description);
   - Task 42: no commit (the mutation sample applied temporary edits and reverted them);
-  - Task 43: the commit of this note, the reference client's checklist, `CLAUDE.md` and the release 6 documentation.
-- The final matrix is Task 44's. Each suite's result and time is added there.
+  - Task 43 `f6f9f0dde` (this note, the reference client's checklist, `CLAUDE.md` and the release 6 documentation), corrections after its review `5cadcd739` and after its second review `7000924b4`;
+  - Task 44's fix wave (`## The final review`): `3f1ce7dc5` (a fresh salt on every second-factor change), `f1c69900d` (the `code` parameter masked in traced request URLs), `f0150ec57` (a grantee's non-public events left out of a text query), `a5e45dc2f` (the smaller fixes and the missing cases); then this record of the review.
+- Head of the code: `a5e45dc2f`. The commits after it change documentation only.
+- **The final matrix, first pass** (Task 44, Step 2; logs in the git-ignored run directory). Rows 1 to 8 ran on `f6f9f0dde`, row 9 on `5cadcd739` and row 10 on `7000924b4`; the three differ in documentation files only, and row 10's test binary was built from the clean tree before the fix wave's first edit. Every row passed on its first attempt.
 
-  | Check | Command | Result | Time |
+  | Row | Command | Result | Wall time |
   |---|---|---|---|
-  | formatting | `cargo fmt --all --check` | Task 44 | Task 44 |
-  | compile check, shipping and tests | SHIP, TM (plan header) | Task 44 | Task 44 |
-  | vault and groupware units | `cargo test -p vault -p groupware --features vault/test_mode` | Task 44 | Task 44 |
-  | common units | `cargo test -p common --lib` | Task 44 | Task 44 |
-  | http units | `cargo test -p http@1.0.3 --lib --bins --features test_mode,enterprise` | Task 44 | Task 44 |
-  | workspace units | U-ws with `UNIT_TEST_FEATURES` | Task 44 | Task 44 |
-  | za suite | ZA | Task 44 | Task 44 |
-  | za suite, filesystem blobs | ZA-FS | Task 44 | Task 44 |
-  | cache swap suite | SWAP | Task 44 | Task 44 |
-  | CalDAV suite, plain and key | WP, WK | Task 44 | Task 44 |
-  | JMAP suite, plain and key | JP, JK | Task 44 | Task 44 |
-  | IMAP suite, plain and key | IP, IK | Task 44 | Task 44 |
-  | system suite | SYS | Task 44 | Task 44 |
-  | product build | full profile, `--locked` | Task 44 | Task 44 |
-  | fresh-store restart | FRESH | Task 44 | Task 44 |
-  | independent CalDAV client, key and plain | CALDAV | Task 44 (CI) | Task 44 |
-  | CI workflow and the retention gates | `test.yml` | Task 44 | Task 44 |
+  | 1 | `cargo fmt --all --check` | no output | 7 s |
+  | 2a | `python3 -I scripts/tests/ci_steps.py` | 0 differences | 0 s |
+  | 2b | `python3 -I scripts/tests/test_gates.py` | 45 tests OK, 2 skipped | 5 s |
+  | 3a | SHIP (`cargo check -p stalwart --no-default-features --features rocks`, with the plan header's warning filter) | clean | 151 s |
+  | 3b | TM (`cargo check -p tests --tests`, with the plan header's warning filter) | clean | 61 s |
+  | 4 | `cargo test -p vault -p groupware --features vault/test_mode` | vault 208 passed, groupware 59 passed | 95 s |
+  | 5 | U-ws (`cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --features "$UNIT_TEST_FEATURES"`) | 889 passed, 2 ignored, 0 failed | 222 s |
+  | 6 | `cargo test -p smtp --lib --bins --features test_mode` | 16 passed | 91 s |
+  | 7 | `cargo test -p http@1.0.3 --lib --bins --features test_mode,enterprise` | 7 passed | 93 s |
+  | 8 | `cargo test -p tests za::leak::tests::try_archive_short_values_are_not_archives -- --exact` | 1 passed | 97 s |
+  | 9 | ZA (`STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests`) | 1 passed (1695.50 s in the test) | 1790 s |
+  | 10 | ZA-FS (the same with `BLOB_STORE=FileSystem`) | 1 passed (1607.24 s in the test) | 1753 s |
+
+  Row 5 rewrites 26 tracked fixtures under `crates/dav-proto/resources/requests/` (the restored `parse_requests` test writes its JSON output unconditionally, with its equality assertion commented out). The same 26 files changed at Task 9; they were restored from the head while row 9 waited, and rows 6 to 8, which ran before that, do not run the dav-proto tests. The load gate for the za suites was a one-minute load below 20; on the project owner's word of 2026-11-17 it was raised to 40 for this matrix (the five-minute limit stays below 200). Row 9 had waited under 20 without starting (lowest sample 21.59) and was relaunched under 40; its highest one-minute load during the run was 37.24, row 10's 65.61, with no helper timeout. `query::text_query_cost` printed 300 events in 446 ms and 10 events in 17 ms in row 9, 405 ms and 16 ms in row 10. The pass stopped after row 10 by ruling (below): every fix of the review changes files under `crates/` or `tests/`, so rows 11 to 18 and a rerun of rows 1 to 10 run on the fixed head `a5e45dc2f` and are recorded here when finished.
+- **Not run by this matrix**: the Docker suites (`directory`, `automation_tests`), the independent CalDAV client in either mode, the inventory and coverage gates, and CI on the branch (the gates' dispatch and the push need the owner's word). Evidence limits as for every result here: local RocksDB, one node, debug test builds, macOS.
 
 ## What changed and why
 
@@ -91,7 +91,7 @@ What this note can claim. Every result quoted here is local: RocksDB on one node
 
 ## The session rule
 
-Decided by the project owner on 2026-11-14 (spec D19; section 12, decision 4): a key account's browser sessions end only when a credential changes, that is on a password change, a recovery or a second-factor change. They survive every other vault write: the first pin's rewrap, the self-check's repair, a new recovery key, and an app password's creation, publication, withdrawal or revocation. Each such write still raises the vault revision, so resident keys are evicted and the next request opens them again from the token record; a request whose keys were opened at a generation that is no longer current answers 401 (D23), and the client's refresh then succeeds.
+Decided by the project owner on 2026-11-14 (spec D19; section 12, decision 4): a key account's browser sessions end only when a credential changes, that is on a password change, a recovery or a second-factor change. They survive every other vault write: the first pin's rewrap, the self-check's repair, a new recovery key, and an app password's creation, publication, withdrawal or revocation. Each such write still raises the vault revision, so resident keys are evicted and the next request opens them again from the token record; a request whose keys were opened at a generation that is no longer current answers 401 (D23), and the client's refresh then succeeds. Since the final review's fix wave, a second-factor change also draws a fresh salt (`za_totp` calls `za_set_password`), so the binding cannot return to an earlier value and the sessions it ended stay ended (`tokens::second_factor_change_ends_sessions`).
 
 | Where | What it does | Tested by |
 |---|---|---|
@@ -103,6 +103,7 @@ Decided by the project owner on 2026-11-14 (spec D19; section 12, decision 4): a
 | the code exchange (Task 17) | a crossing credential change refuses; any other crossing vault write is retried | `tokens::exchange_crossed_by_password_change`, `tokens::exchange_crossed_by_recovery`, `tokens::exchange_crossed_by_other_vault_write` |
 | the refresh (Task 18) | the same | `tokens::refresh_crossed_by_credential_change`, `tokens::refresh_crossed_by_other_vault_write` |
 | a browser's first invitation (Task 31, review focus 1) | the session survives the pin's rewrap | `scheduling::first_invitation_and_the_session` |
+| `za_totp` (`crates/http/src/api/vault.rs`, Task 44's fix wave, FA-1) | every enrolment, replacement and removal of the second factor draws a fresh salt through `za_set_password`, so the binding cannot return to an earlier value and the tokens a second-factor change ended stay ended | `tokens::second_factor_change_ends_sessions` (kill check K1) |
 | the mutation sample (Task 42) | rows J16 and J16b, both killed | |
 | this documentation and the checklist row (Task 43) | state the rule | |
 
@@ -237,6 +238,23 @@ Each controller ruling that changed the plan's text has its own documentation co
 - **R43-3.** The project rule governs: the outcome note names an inherited behaviour without describing how it arises, and the paged-`/changes` item is not an accepted residual, since nobody accepted it; it moves to the open items as pending the owner's decision. Why: the note is public. Cost if wrong: the public note says less than it could.
 - **R43-4.** Release 4's sharing spec and plan 14's outcome note are not edited by Task 43: they are approved records of their own release, and a pointer in them is the owner's call. Their four statements of the colour exclusion D14 replaces are recorded under known staleness and put to the owner, with the observation that spec section 10's amendments do not list the sharing spec's colour statement. This supersedes the earlier ledger line that asked for a note in those documents. Cost if wrong: one more small edit when the owner asks for the pointers.
 - **R43-6 and the twelve minors** (R43-7 to R43-18) are corrected in the same fix round, though the brief's tables did not list those rows: each is a statement of fact in a public document or in the file every later session reads first, and leaving them would have the whole-branch review spend its one pass re-finding them. Cost if wrong: a larger fix diff for the scoped re-review.
+- **Five lenses for the whole-branch review.** Task 44's whole-branch review runs as five independent reviewers in one pass, each with a lens (A sign-in, the token record and the session rule; B the pipeline, the move out of `dav` and parity with CalDAV; C1 `CalendarEvent/set`, scheduling and default alerts; C2 admission, reads, `Calendar/set`, queries, paged sync and sharing over JMAP; D leaks across the change, the tests that changed, the gates and the documents), not one reviewer. Why: the branch is 118 files and about 42,800 added lines, more than one reader can read closely in one context, and the project's earlier whole-branch reviews ran as lenses. This is the one whole-branch pass the owner authorized. Cost if wrong: an issue between two lenses' slices is seen by neither; each lens was told to follow calls out of its slice.
+- **Independent briefs.** The initial briefs carry no earlier finding, implementer report, task-review conclusion or ruling of this note, and the reviewers do not open this note or the run directory; the ledger's 222 deferred lines and 40 coverage notes are put to each lens only after its report, for triage. Cost if wrong: a second, shorter turn per lens.
+- **The review before the matrix finished.** The review was dispatched on `5cadcd739` while the matrix's suite rows still waited on the load gate, with an extract of the rows already run. Why: the gate's wait was outside anyone's control, the review reads only, and a matrix failure is adjudicated whatever the reviewers knew. Cost if wrong: a reviewer spends attention on something a failing row would have pointed at.
+- **N1 (Task 43, second round).** The note's R43-3 entry now says that it names an inherited behaviour without describing how it arises, and that the item is pending the owner's decision. The wording fault was the controller's: the earlier text was copied from a private record into this public note. Cost: none beyond the edit.
+- **N2 to N8 (Task 43, second round)** are corrected in the same round, each one phrase; this note's "Rulings" was not extended then to the rulings after `5cadcd739`, which this record adds. Cost: a second small fix diff to re-review.
+- **The matrix pauses after row 10.** Rows 11 to 18, with a rerun of rows 1 to 10, run once on the head the fix wave leaves. Why: every fix changes files under `crates/` or `tests/`, so most rows would be rerun anyway, and one complete matrix on the final source is stronger evidence than rows split across two heads; the full-profile product build is not spent on a head about to change. Cost if wrong: a fault in rows 11 to 18 that predates the fixes is found one step later and cannot be separated from them by the record.
+- **FA-1 = FD-2** is fixed by drawing a fresh salt on every second-factor change, in the TOTP endpoint, through the existing `za_set_password`: the binding then never recurs, the change is atomic with the vault write, and no stored layout, registry object, D19 input or D19 text changes. Deleting the grants on a binding change was weighed and not taken (not atomic; a failed deletion leaves the revival in place); a guard in the commit funnel that refuses a binding change under an unchanged salt was left out of the wave and offered to the owner. Cost if wrong: one more Argon2 derivation per second-factor change, and a future second-factor endpoint that does not hold the password could not use this fix.
+- **FA-3 = FD-1** is fixed by masking the value of every `code` query parameter where a request URL is formatted for the trace, and in a traced `Referer`, for every request: no account is known when the URL is traced. A third every-account trace exception beside D24 and D26, it needs the owner's confirmation as an amendment of spec section 10; until then it is the controller's ruling. Cost if wrong: an operator no longer sees an authorization code in a debug URL trace.
+- **FC2-1** is fixed in the query's text resolution: for a caller that is not a member of the account, an event whose unsealed tree is not public enters no text index, as on an ordinary account (D12) and as `/get` shows it (6.3). CalDAV still serves such an event whole to a grantee (FC2-2), field policy 2's recorded limit, which goes to the owner as a line for spec 3.3. Cost if wrong: JMAP is stricter than CalDAV in one more place for such an event.
+- **FC1-1 = R36-10** changes no product code: the code is what D1 asks for, and a fallback could only sit in the pipeline's create arm, which CalDAV shares and releases 2 and 5 qualified. The wave adds one case that pins the behaviour; the owner is asked to add the line to spec 3.3 or to amend 3.2. Cost if wrong: an invitation accepted by creating the copy goes unanswered until the owner rules.
+- **FA-2 and FC1-2** are fixed as tests, FA-2 with a kill check that shows the case can now fail. Cost: the runs.
+- **The Minor findings** are disposed by id as the adjudication lists (the table under "The final review"): the wave takes a broken property, a missing test of a spec requirement or a one-line correction, and leaves what changes a client-visible answer under a fault, what the plan prescribed, and what only the owner can decide. Cost if wrong: a deferred or residual item is fixed in a follow-up, with its record here.
+- **The gate of 40 for the remaining runs.** The fix wave's runs and the second matrix pass use the gate the owner set for this matrix: the same task's runs on the same host in the same hours. Cost if wrong: a load-induced helper timeout, which the rerun rule answers.
+- **P4 gains `za_refresh_event`'s empty-list refusal** (`Forbidden(Context)`), the same class of fault as FB-1 in a function the wave otherwise leaves as moved; covered by reading only, since its trigger needs a lost assertion and a reclassified account in between. Cost if wrong: a refusal where a panic was.
+- **W-1 to W-5 are parked, with no second fix wave**: W-1 deferred with its fix named, W-2 a residual (an equivalent mutant at suite level), W-3 and W-4 deferred test gaps, W-5 a residual stated with the masking's rule. The second matrix pass continues on `a5e45dc2f`, since no code changes after the re-review. Cost if wrong: each is a small follow-up; none stores, serves or traces more than before the wave.
+
+The load gate's change from 20 to 40 for this matrix was the project owner's own instruction of 2026-11-17 ("let's raise it to 40"); it is recorded here as his decision, not as a ruling.
 
 ## Review focus
 
@@ -333,6 +351,78 @@ Task 40's two negative controls caught their faults (junk in field 153: "field 1
 - **D28** has no fault in spec 9.7's list. Its tests are `calendar_set_error_table` and `calendars::store_failure_stops_the_call` (Task 28), `event_set_error_table` (Task 30) and the two mail-guard cases (Tasks 31 and 33).
 - Known equivalent at suite level, not run: the attachment download's denial at `jmap/src/blob/download.rs` (R37-12); the 404 stays with the denial removed, because the embedded reader finds no attachment in the sealed tree.
 
+### Kill checks of the final review's fix wave
+
+The six kill checks K1 to K6 (and K6b) of Task 44's fix wave are tabled under "The final review" below.
+
+## The final review
+
+### How it ran
+
+Five independent reviewers read the whole branch at `5cadcd739` against the base `ade47a9ae`, each with a lens: A sign-in, the token record and the session rule; B the pipeline, the move out of `dav` and parity with CalDAV; C1 `CalendarEvent/set`, scheduling and default alerts; C2 admission, reads, `Calendar/set`, queries, paged sync and sharing over JMAP; D leaks across the change, the tests that changed, the gates and the documents. Five rather than one because the branch (118 files, about 42,800 added lines) is more than one reader can read closely in one context (ruling above). Their briefs held no earlier finding, report or ruling; the deferred lines and coverage notes of the task reviews were put to each lens only after its report, for a triage section. The review started before the matrix finished, with an extract of the rows already run (ruling above). Each reviewer read only and ran nothing.
+
+### Totals
+
+No Critical. Eight findings rated Important, six distinct (FA-1 = FD-2, FA-3 = FD-1). 78 Minor, with duplicates across lenses. One finding withdrawn by its own reviewer (FC2-4: a master login returns a token with no keys, as the ledger's R37-14 says).
+
+### The six Important findings
+
+- **FA-1 = FD-2: a second-factor change did not end sessions for good.** The binding is a function of the salt, the Argon2 parameters, the verifier and the second-factor secret, so removing a second factor restored the earlier binding and the old tokens authenticated again, keyless. Ruling: fixed; every change of the second factor draws a fresh salt. The wave: `za_totp` calls `za_set_password` with the password it has just verified and the master key it holds, in the record it commits (P1); the case `tokens::second_factor_change_ends_sessions` holds real tokens across second-factor changes (the factor removed, the same URL enrolled again) and a recovery (T1).
+- **FA-3 = FD-1: the hand-off secret and the code reached the request-URL trace** when the client's redirect is served by this server. Ruling: fixed for every request, pending the owner's confirmation as an amendment of spec section 10. The wave: `traced_url` (`crates/http-proto/src/request.rs`) masks the value of every `code` query parameter, `traced_header` passes a `referer` through it, and the three URL sites of `crates/http/src/request.rs` format through it (P2); six unit tests and the case `tokens::traced_urls_mask_the_code` (T2).
+- **FA-2: the D27 case could not fail** (fifteen refusals against a ban rate of 100 a day). Ruling: fixed as a test. The wave: the case lowers the ban rate to 5 for one forwarded address, makes six refusals and shows the address is not banned and a valid request from it is served (T3; kill checks K6 and K6b).
+- **FC1-1 (the ledger's R36-10): a key account that creates an event as an attendee with the scheduling flag sends no reply**, and that copy never schedules afterwards; upstream's JMAP create falls back to the attendee's reply, CalDAV's does not. Ruling: no product change (it is what D1 asks for); a pinning case, and the owner decides between a line in spec 3.3 and an amendment of 3.2. The wave: `scheduling::attendee_create_sends_no_reply` (T5).
+- **FC1-2: no test made a `CalendarEvent/set` create fail with a store error, and none crossed object kinds** (D28, invariant 75). Ruling: fixed as a test, with R32-1. The wave: `scheduling::mail_guard_on_failed_create` (a create's commit fails: the create before it keeps its commit and its mail, the failed create's mail is dropped, and every later object of the call, of any kind, gets the same answer unattempted), and `events::placement_refused` asserts the whole refusal (T4).
+- **FC2-1: a grantee's text query matched the fields `CalendarEvent/get` hides**, for an event whose CLASS is sealed (a non-standard value). Ruling: fixed; for a caller that is not a member of the account an event whose unsealed tree is not public enters no text index (P3, `crates/jmap/src/calendar_event/query/za.rs`). The case `query::grantee_text_skips_a_sealed_class` (T6). The remaining difference from CalDAV (FC2-2) goes to the owner.
+
+### The fix wave
+
+One implementer, four commits on `7000924b4`:
+
+- `3f1ce7dc5`: P1 and T1.
+- `f1c69900d`: P2 and T2.
+- `f0150ec57`: P3 and T6.
+- `a5e45dc2f`: P4 (an empty context list refused with `Forbidden(Context)` at the head of `za_commit_update`, and by the controller's addition in `za_refresh_event`), P5 (the `OAuthGrant` arm of `crates/common/src/cache/invalidate.rs` also evicts the account's resident keys), P6 (a compile-time equality of `CODE_LEN` and upstream's `DEVICE_CODE_LEN` beside `is_server_code`); comments for FA-15, FC2-11, FD-12 and R37-14; the two evidence strings of `tests/qualification/dispositions.json` (FD-10 = R41-2, R41-3); and the cases T3 to T5 and T7 to T11 (T7 `sharing::revoked_and_unshared_calendars_hidden`; T8 the ordinary local attendee's delivery; T9 a leak scan while a hand-off entry is live; T10 `pipeline::update_without_contexts_is_refused`; T11 resident keys gone after a grant's revocation).
+
+Its runs: TM and SHIP clean, six format checks clean, the six `traced_url` unit tests, vault 208 and groupware 59, `ci_steps.py` 0 differences, `test_gates.py` OK, and one whole ZA passed (1804 s), on the working tree before a two-line reorder in T1 (below); the matrix's second pass runs every row on the committed `a5e45dc2f`. Differences from its brief that its report records: T6 sits in `query.rs` beside `grantee_privacy`, not in `sharing.rs`, and has no ordinary twin (W-3); T1's removal step checks the tokens before the binding (the first K1 run failed at the binding comparison, and the commits were rebuilt once with that reorder); K6 as prescribed is caught by an older assertion, so K6b was added; `placement_refused` asserts no description, since the placement refusals are a bare `forbidden`; `traced_url` leaves a bare `code` without `=` unmasked and turns `code=` into `code=[redacted]`.
+
+Cost the re-review recorded for the documents: after any grant deletion of a key account (P5), each Basic CalDAV client of the account pays one Argon2 verification on its next request and another browser session one record read; the grant arm evicts the key cache, not the search index cache.
+
+### Kill checks K1 to K6
+
+Each on the committed tree, with a short form of the suite (a block of module calls in `tests/src/za/mod.rs` removed, never committed), and the edited files restored after each (`git status` of `crates/` and `tests/` empty).
+
+| Id | Change made | Case that failed | First panic |
+|---|---|---|---|
+| K1 | P1 undone (`za_totp` without the fresh salt) | `tokens::second_factor_change_ends_sessions` | "an access token was served after the removal", left 200, right 401 (the first run, before the reorder, failed at "removing the factor restored the earlier binding") |
+| K2 | the third URL site formats the URL as before | `tokens::traced_urls_mask_the_code` | "a code value appeared in a trace" |
+| K3 | P3 undone | `query::grantee_text_skips_a_sealed_class` | "the grantee's match of {"title":"cloakedcanary"}", left `["l"]`, right `[]` |
+| K4 | P4's guard in `za_commit_update` undone | `pipeline::update_without_contexts_is_refused` | "index out of bounds: the len is 0 but the index is 0", in `placement.rs` |
+| K5 | P5 undone | `tokens::sign_in_gives_keyed_tokens` | "resident keys outlived the grant's deletion" |
+| K6 | the Bearer arm's refusal counted as an authentication failure | `tokens::tampered_or_foreign_secret_is_401` | its older trace-count assertion ("zero-access: token keys unavailable", left 0, right 9), before the new ban assertions |
+| K6b | the refusal counted for banning without changing its error | `tokens::tampered_or_foreign_secret_is_401` | "fork refusal 5 from one address", left 429, right 401 |
+
+### The re-review
+
+A fresh reviewer read the wave's diff: every item addressed (P1 to P6, the four comments, the data file, T1 to T11), no new Critical or Important breakage, the kill checks shown from their logs, the tree restored. Its five Minor findings, ruled by the controller with no second fix wave:
+
+- **W-1** (deferred, with the fix named): a request that passed authentication before a grant's revocation can make that grant's keys resident after the eviction; they are unreachable and stay until the idle or age limit. Fix for a follow-up: insert the keys only when the authentication entry went in.
+- **W-2** (residual): T7 cannot fail on the fork's fresh-context filter, which sits behind upstream's ACL masks in every state a test can build without a hook; the case stands as coverage of the answer a grantee gets, and its comment overstates.
+- **W-3** (deferred): T6 has no ordinary twin.
+- **W-4** (deferred): T2 exercises one of the three URL sites; the helper has six unit tests.
+- **W-5** (residual): `traced_url` masks a `code` query parameter as a standard parser reads one; a callback URL percent-encoded inside another parameter's value and a `;`-separated query pass unmasked. The server generates neither.
+
+### The disposition of every finding
+
+- **Fixed in the wave**: FA-1 = FD-2; FA-3 = FD-1 (pending the owner's confirmation); FA-2; FC1-2, with R32-1; FC2-1; FB-1; FA-4; FA-10 (with ledger 478); FA-15; FC2-11 (its comments; its list of copied checks goes to the documents); FD-12; R37-14's comment; FD-10 (= R41-2, R41-3); FC1-11; FC2-20; FD-8; FA-7 = FD-6 (by FA-1's case).
+- **Corrected in the documents**: ledger 477 (the device-code poll's changed answer, also for the owner); FA-12 (the sweep's per-account read, also for the owner); FA-21 (tokens refused once after the upgrade); FD-14 (spec 2's delta for an operator); R35-5's wording (also for the owner); FC1-10, FA-9 and FC2-12 (the repeated upstream checks and the larger insertions, named as silent dependencies; the code stays, a residual).
+- **For the owner** (the code stays until he rules): FC1-1 (with its pinning case); FC2-2 (a line in spec 3.3); FC2-3 = R34-4; FC2-5 (D15); FC2-6 (a default alert's id in the clear); FC2-15 (an empty `shareWith` refused; in the checklist); FD-3 (a reminder's push names a positional alert id; a line in spec 3.3); FC1-5 (a grantee's email default alert is mailed to the owner); FC1-4 (no change recommended); FA-6 = R18-8 (D8's sentence); FA-17 = R18-2 (4.5 step 5's wording); FB-3 (the placement UID check outside the lease; spec 3.3's wording); FB-5 = R33-5, with FC1-9 (an event that does not unseal answers three ways); FC1-16 (spec 8's row for missing access); FB-6 (a move out of two unshared calendars into one shared one); R18-6 with FA-13 (token refusals without a trace; a store error on the Bearer path answered 401); R28-4 (a committed calendar destroy answered "try again" on a cluster with a broken broadcast).
+- **Residual**: FA-11 (an ordinary account's consent token with a 43-character suffix accepted); FA-14 (the sweep runs only after the purge steps before it succeed); FA-20 (D23 on a node that missed an invalidation broadcast); FB-2 (a create without a `uid` retried under a new UID after its fan-out); FB-7 (the assertion order of the placement and destroy batches, CalDAV's at the base); FC1-6, FC1-7, FC1-8, FC1-12, FC1-13, FC1-14, FC1-15 (the event writer's answers or order beside upstream's, as the plan prescribes, nothing stored in the clear); FC2-7, FC2-8 (an unranged text query's views held for the request; the leaf limit checked after the candidates open); FC2-9 (one shared calendar that does not open fails a grantee's `Calendar/get` and exact-origin `/changes`); FC2-10, FC2-13, FC2-14, FC2-17 (`Calendar/set`'s context before validation; non-canonical `z`; an owner's get that completes a boundary; an owner's sync completes none); FD-13 (store errors on the issue and refresh paths keep their context); FD-16 (`za_handoff_take` deletes before it checks the secret).
+- **Deferred**: FA-5 (the D22 precheck and an unreadable record); FA-8, FA-18, FA-19 (test gaps on the token paths); FA-16 (one exit of `delete_oauth_grant` skips the entry removal; bounded by the sweep); FB-4 (the placement arm's exits trace "abandoned" where the outcome is known); FB-8 = R38-6, FB-9, FB-10 (test weaknesses); FC1-3 (a repeated update of one event in one call); FC1-17 (thin coverage of the occurrence-patch rulings); FC2-18 = FD-4 = R21-12, FC2-19, FC2-21 = R28-7, FD-5, FD-7 = R40-7, FD-9 (test weaknesses); FD-11 (new fork tests in `parser_restored_tests.rs`; to the gates' run); FD-15 (`ZaPipelineError` derives `Debug`; no use site formats it).
+- **Inherited** (upstream's behaviour for every account, one line each): FA-22 (the device-authorization answer is traced with its device code; a retry while a rotation is pending returns the next generation); FC2-16 (JMAP destroys the default calendar that CalDAV's DELETE refuses in a product build; also a line in spec 3.3 for the owner); and from the lenses: an owner's JMAP update of alarms, keywords or colour only runs unscheduled while CalDAV's bumps the schedule tag; a CalDAV DELETE by a non-owner tests ownership on the stored tree; a large collection delete can commit in part after its cancellations went out; an unanswered attendee's JMAP create never schedules its copy; the first of two updates of one id in a call is lost; a grantee's destroy in an unshared calendar answers with the calendar's id; `/queryChanges` with `expandRecurrences` answers `cannotCalculateChanges` before the access check; a grantee's `/changes` reports updates of events it cannot see as destroyed ids; a `z`, like upstream's `r`, is bound to no account, collection or method; a windowed or property-subset read and a full read show default alerts differently.
+- **Withdrawn**: FC2-4.
+
+The deferred lines of the task reviews: no lens found one that requires a change of product behaviour before the merge. What they asked to be closed is ruled above (R36-10, R30-1 with R32-3, R33-1 and R32-1, R41-2 and R41-3, ledger 477, R35-5, R34-4, the D15 ruling, R37-14, R28-4). The run they asked for, ZA with the filesystem blob store, passed as the matrix's row 10; the inventory and coverage gates wait for the owner's word.
+
 ## Other harnesses
 
 Task 41's records, all first runs, on `0237a0b50` (Task 41's base, which holds Task 39's fix `8cf35e32c`) plus Task 41's two edits:
@@ -385,15 +475,31 @@ Every existing assertion a task changed, each with a comment in the code citing 
 - **Coverage that stays partial.** The refresh steps of 4.5 have a unit test for the classification only (`classify_refresh_cases`) and run otherwise in the za suite, where no case reaches the `Lost` or `Superseded` arm of the classifier (R18-4, N2). The pass-through of a foreign Bearer value (D26) has a unit test only.
 - **R27-1, rollback.** Every binary built before release 6 refuses a coloured personal bundle (the opener at the base `ade47a9ae`, release 7 included), so a binary rollback below release 6, or a cluster of mixed versions, leaves a coloured shared calendar unreadable to the older binary.
 - **X2.** The override branch of upstream's `increment_sequence` is covered by no test in this fork's net, for any account.
+- **The final review's residuals** (by id; the review files hold each in full):
+  - FA-11: an ordinary account's consent token followed by a 43-character suffix of the secret alphabet is accepted, the suffix stripped (also an every-account difference in `CLAUDE.md`).
+  - FA-14: the token sweep runs only when the purge steps before it in the maintenance task succeed.
+  - FA-20: a node that missed an invalidation broadcast answers D23's 401 to a request whose keys it opened at an older generation, until its cache entry ends.
+  - FB-2: a create without a `uid` whose commit fails after its invitations went out is retried by the client under a new UID, so the attendees hold an event of a UID the organizer never stored (a line in the checklist).
+  - FB-7: the placement and destroy batches assert in CalDAV's order at the base.
+  - FC1-6, FC1-7 (= R31-2), FC1-8 (= R30-2, R31-4), FC1-12, FC1-13, FC1-14 (= R31-3), FC1-15: the event writer's answers and check order beside upstream's, as the plan prescribes; nothing is stored in the clear by any.
+  - FC2-7 (= R21-8, R26-5) and FC2-8 (= R26-7): an unranged text query holds its opened views for the request, and the store's leaf limit is checked after the candidates are opened.
+  - FC2-9 (= R21-5): one shared calendar that does not open fails a grantee's whole `Calendar/get` and its exact-origin `/changes`, where the owner gets `notFound`. **Weighs more than its rating** (lens C2): a browser client then loses the whole sharer account, not one calendar.
+  - FC2-10, FC2-13 (= R22-3), FC2-14, FC2-17: `Calendar/set` reads its context before upstream's validation; a non-canonical `z` is accepted and echoed re-encoded; an owner's get can complete a sharing boundary; an owner's own sync completes none.
+  - FD-13: store errors on the issue and refresh paths keep their context in the trace.
+  - FD-16: `za_handoff_take` deletes the hand-off before it checks the secret, so a wrong secret consumes it.
+  - W-2: `sharing::revoked_and_unshared_calendars_hidden` cannot fail on the fork's fresh-context filter, which sits behind upstream's ACL masks in every state a test builds without a hook (an equivalent mutant at suite level); its comment overstates.
+  - W-5: `traced_url` masks a `code` query parameter as a standard parser reads one; a callback URL percent-encoded inside another parameter's value, and a `;`-separated query, pass unmasked. The server generates neither.
+  - FC1-10, FC2-11 (its list), FA-9, FC2-12: the key writers repeat upstream's inline checks, and several fork insertions are larger than one call or a short branch; the code stays, and `CLAUDE.md` names them as silent dependencies and hotspots.
 
 ## Deferred findings
 
 What stays open after this plan, by task: every `minor (deferred ...)` line of the ledger, with its id where the ledger gives one. The arrow names where the ledger routed it. The review files (`task-<n>-review.md`, `task-<n>-fix-review.md`) hold each in full.
 
+The final review's triage found 23 of these lines no longer true at the head (fixed by a later task or the fix wave, or the owed record delivered), and they are removed: Task 17's length-constant line, Task 18's N1 and O1, R21-10, R22-4, R22-8, R23-4, R23-5, R26-8, R27-1, R29-7, R30-1, R30-9, R30-11, R32-1, R32-2, R34-5, R35-3, R37-14, R37-16, R38-12, R40-8, and the line of R41-2 and R41-3; R28-4 and R30-10 are rewritten to what still holds. A line marked **weighs more than its rating** is one a lens found heavier against the whole branch than at its task.
+
 ### Task 17
 
-- (no id) A device-code poll whose `device_code` is the pending user code now answers `expired_token` for every account instead of `authorization_pending` (`token.rs:368-370`); no token was obtainable that way; not among the spec's every-account exceptions.
-- (no id) The device-code guard uses `vault::tokens::CODE_LEN` where upstream generates with `DEVICE_CODE_LEN`; both are 40 and nothing ties them; fails closed if they diverge.
+- (no id) A device-code poll whose `device_code` is the pending user code now answers `expired_token` for every account instead of `authorization_pending` (`token.rs:368-370`); no token was obtainable that way. Recorded since the final review among `CLAUDE.md`'s every-account differences, and proposed to the owner for spec section 10.
 - (no id) A failed hand-off cleanup on the classification error is discarded without a trace (`za_token.rs:36`), as briefed.
 - (no id) `PKCE_VERIFIER` duplicated in `tests/src/za/tokens.rs` from `tests/src/utils/oauth.rs`.
 - (no id, evidence) The RED run's `tokens.rs` hash differs from the first GREEN and the committed one; the RED file is not preserved.
@@ -406,15 +512,13 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 - R18-3: run 2 of `refresh_crossed_by_credential_change` cannot catch an omitted vault assertion (the binding change clears field 153 in the vault write's batch).
 - R18-4: no suite case reaches `classify_refresh`'s `Lost` arm, presents a well-formed wrong secret or reads the `Lost` trace; three-attempt exhaustion unexercised.
 - R18-5: `delete_keyed_grant`'s failure text says "unissued OAuth grant not deleted" on the refresh path, and the `Lost` trace says "deleted" before the deletion is attempted.
-- R18-6 (plan-mandated): `Superseded` and `VaultChanged` refusals emit no fork trace; spec 8 says a refused token open is traced (→ a question for the spec).
+- R18-6 (plan-mandated): `Superseded` and `VaultChanged` refusals emit no fork trace; spec 8 says a refused token open is traced (→ a question for the spec). **Weighs more than its rating** (lenses A and D): with FA-13, an operator has little to diagnose a failing browser session with.
 - R18-7: a well-formed secret appended to a keyless grant's refresh token makes the precheck answer `Keyed`, and the `Lost` arm deletes that grant; the spec is silent.
 - R18-8 (plan-mandated): an unusable token record makes each refresh delete its grant while D8's sweep leaves such a record alone (→ a mixed-version question for the spec).
 - R18-9: parked refreshes hold a five-second client across Argon2 vault writes; passed under a one-minute load of 20 to 54.
 - R18-10: the inherited linker warning and "tests (lib test) generated 1 warning" in the ZA and SYS logs.
 - R18-11: `change_race_password` repeats `change_password`; `za_token.rs:123-126` repeats `:86-89`.
-- N1: the comment at `crates/common/src/za/tokens.rs:410-411` should say "this request's rotation left the stored generation at `presented`, and it never falls".
 - N2: no ZA case reaches `classify_refresh`'s `Superseded` arm after the fix; the vault unit test covers the classifier.
-- O1: spec 4.5 step 2 and Task 18's plan steps did not state the R18-1 rule (reconciled later in `67917c44e`).
 
 ### Task 21
 
@@ -425,7 +529,6 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 - R21-7: the handlers classify the account again apart from the boundary's decision.
 - R21-8: the view memo never hits in `CalendarEvent/get` and keeps every opened view alive to the method's end.
 - R21-9: the event row read follows the content read; a concurrent update can give a spurious trace and a transient `notFound`.
-- R21-10: `za_variants.rs`' module doc edited outside the brief's range; accurate.
 - R21-12 (plan-mandated): the served-methods loop in `gating.rs` passes on `serverUnavailable`.
 
 ### Task 22
@@ -433,18 +536,14 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 - R22-1: three account classifications per calendar `/changes` request.
 - R22-2: the grantee sees one calendar, so its `Calendar/changes` paging asserts nothing about continuation pages.
 - R22-3: non-canonical `z` strings are accepted, so `oldState` echoes a re-encoding.
-- R22-4 (→ Task 43): upstream's `changes/get.rs` body moved unchanged into the `ChangesPage` trait; recorded as a merge hotspot.
 - R22-5: the `invalidArguments` text is defined twice (jmap-proto `parser.rs`, jmap `za_calendar.rs`).
 - R22-6: no test reaches the in-process `z` arms at `changes/get.rs`, `changes/za.rs`, `participant_identity/changes.rs`.
 - R22-7 (→ Task 43 or a documentation commit): I §7.1's call-site list and the header's `za_variants` row no longer match the code (recorded under "Decisions and remaining qualification").
-- R22-8: helpers not on the sheet; the fixture `jmapcal-sharing-plain-from` is outside the naming rule.
 
 ### Task 23
 
 - R23-1: `let mut` edits an upstream line in `participant_identity/set.rs:52`.
 - R23-2: the moved gating rows' comment cites spec 6.9 only; the header asks for 6.2.
-- R23-4 (plan-mandated form): the `za_variants` served block passes on `serverFail` or `invalidArguments`.
-- R23-5: the doc comment of `za_variants::calendars` was not updated for the served identities (superseded by Task 39's rewrite).
 - R23-6: no case covers a grantee's `/set` on the owner's account reaching upstream's `reject_identity_changes`.
 
 ### Task 24
@@ -467,7 +566,6 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 - R26-5 (→ the final review): an unexpanded text query keeps every opened event's full plaintext view for the request.
 - R26-6: two sequential store reads per candidate; a networked store could pass the client's five seconds on a large calendar.
 - R26-7: a query over the store's text-leaf limit is refused only after every candidate is opened.
-- R26-8 (carried to Tasks 30 and 31, closed there by the refusal of `hideAttendees: true`): nothing guards the reliance on no key event carrying `EVENT_HIDE_ATTENDEES`.
 - N1: expanded parity compares starts only, and two fixtures share a start.
 - N2: the expanded loop never asserts a non-empty answer.
 - N3: the expanded form asks the flat ANDs only as one multi-property condition.
@@ -476,7 +574,6 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 
 ### Task 27
 
-- R27-1 (→ Task 43): the opener of a binary built before release 6 refuses a coloured personal bundle; recorded under accepted residuals and in README-dev.
 - R27-2: no golden vector pins the bundle layout spec 11 depends on.
 - R27-3: no unit test pins `open_shared` refusing a colour.
 - R27-4: that rollback keeps the colour is shown by reading only.
@@ -485,7 +582,7 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 ### Task 28
 
 - R28-3: `za_write_default` reads the previous default after `za_delete_calendar` may have cleared it; one edge differs from upstream, the effective default is the same.
-- R28-4 (→ the whole-branch review): `za_commit_delete` returns the grantees' invalidation error after the deletion committed, so a committed destroy answers "incomplete"; inherited pipeline contract; reachability unverified.
+- R28-4 (→ the owner, after the whole-branch review): `za_commit_delete` submits the mail and then returns the grantees' invalidation error after the deletion committed, so a committed calendar destroy is answered D28's "try again", later destroys are skipped and `newState` does not carry the commit. The review found it unreachable on one node; it needs a failing `invalidate_caches`, that is a cluster whose broadcast fails. **Weighs more than its rating** (lens C2): against invariant 75's "objects already committed keep their answers".
 - R28-5: after a failed post-commit read of the stored default the fallback can report `isDefault: true` wrongly; two traces mislabel.
 - R28-6 (brief-internal): create checks `shareWith` before metadata, update the reverse; both answer `forbidden`.
 - R28-7: coverage gaps: no create/update commit or default-write store-failure case, no D16 decline or denied-status case, invariant 58's clear fields unchecked, no `Calendar/set` metadata refusal case, `grantee_destroy_refused` reaches upstream's refusal.
@@ -501,14 +598,12 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 - R29-4: that the root still references both VEVENTs is unchecked.
 - R29-5 (brief-mandated): the tests exercise upstream's merge; the fork's choices are untested.
 - R29-6: the overflow `false` return comes after the edit has started (unreachable).
-- R29-7 (→ Task 43): the copied "Reminder"/SUMMARY description rule is a silent dependency; recorded in the merge hotspots.
 - R29-8 (→ the owner): replacing alarms by value drops acknowledged or snoozed state that upstream keeps.
 - R29-9: the brief adds a member fallback the spec lacks.
 - R29-10: the SHIP, TM, FMT and mutation logs lack commands, source hashes and the mutation diffs.
 
 ### Task 30
 
-- R30-1: no test of a store failure on a create; the existing `COMMIT_FAIL_ONCE` hook would drive one.
 - R30-2 (plan-mandated): the disk-quota and UID checks run in another order than upstream's.
 - R30-3 (plan-mandated): two classification reads per call for every account.
 - R30-4: `create_two_objects_one_fails` cannot tell per-object commits from one batch.
@@ -516,9 +611,7 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 - R30-6: the unreachable missing-UID arm is a check of the fork's own.
 - R30-7 (plan-mandated wording): the reworded comment at `set.rs:1890` is inaccurate for `CalendarEvent/copy`.
 - R30-8: the store-failure trace says "write failed" for read failures too.
-- R30-9: the interim arm answered an invalid update id `forbidden` (gone with Task 31).
-- R30-10: `_can_delete_calendars` unused until Task 33; the head reads the account twice.
-- R30-11: `ZA_INTERIM` sat in `set/za.rs` (removed by Task 33).
+- R30-10: the head of `CalendarEvent/set`'s key writer reads the account twice when the call has creates.
 - R30-12: with duplicate `useDefaultAlerts` keys any true wins.
 
 ### Task 31
@@ -526,7 +619,7 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 - R31-2: one occurrence's ruling refusal fails every sibling occurrence, including a destroy.
 - R31-3 (plan-mandated): metadata on a synthetic id gets the fork refusal.
 - R31-4 (plan-mandated): the quota check runs before scheduling, so a denied update answers `overQuota`.
-- R31-5: the update path's D28 trace content is shown by reading only.
+- R31-5: the update path's D28 trace content is shown by reading only. **Weighs more than its rating**, with R33-1 (lens D): a regression that traced the original store error would pass.
 - R31-6 (rest): the other base-patch rulings untested on update.
 - R31-7 (→ Task 43 or a sheet commit): I §7.2 says a view error fails the method; in `/set`, D28 makes it per-object (recorded under "Decisions and remaining qualification").
 - R31-8: review focus 1 shows a vault write happened, not that it was the pin's rewrap.
@@ -540,8 +633,6 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 
 ### Task 32
 
-- R32-1: `placement_refused` asserts the error type only.
-- R32-2 (→ Task 36): no test ran a placement change together with a fan-out (closed by Task 36's added case).
 - R32-3: D28 on the plan path has no case.
 - R32-4: after the move back nothing reads the event as the owner.
 - R32-5: `placement_and_content_together` cannot tell one commit from two (Task 11's case proves the single commit).
@@ -556,11 +647,11 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 
 ### Task 33
 
-- R33-1: the D28 trace of a destroy's store failure is not asserted; the event writer's create and update traces are equally unasserted.
+- R33-1: the D28 trace of a destroy's store failure is not asserted; the event writer's create and update traces are equally unasserted. **Weighs more than its rating** (lens D; see R31-5).
 - R33-2 (plan-mandated): the own-items leg and `may_write_own` cannot be reached through the product and have no test.
 - R33-3: `InstancePlan::DestroyEvent` is newly live and untested.
 - R33-4: `no_itip_task_ever` still deletes over CalDAV.
-- R33-5 (→ the whole-branch review): a destroy with scheduling of a future scheduled event whose sealed tree does not open is answered as the retryable D28 case and stops every later id; without the flag it succeeds.
+- R33-5 (→ the whole-branch review, then the owner as FB-5 with FC1-9): a destroy with scheduling of a future scheduled event whose sealed tree does not open is answered as the retryable D28 case and stops every later id; without the flag it succeeds.
 - R33-6 (plan-mandated): a byte comparison cannot tell "not attempted" from "attempted and failed".
 - R33-7: test hygiene (a helper defined twice, a repeated lookup, a keep-list use, a bare `created_id(0)` as an assertion).
 - R33-8: the macOS linker note in every ZA and JK build.
@@ -569,8 +660,7 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 ### Task 34
 
 - R34-3: no case sends the triggering request with a Bearer token that carries a secret.
-- R34-4 (→ the owner and Task 43): the hook runs before the `using` check, `allowed_capabilities` and every permission check, so a keyed token whose OAuth scope excludes calendars still drains when it names a calendar method (recorded under "Decisions and remaining qualification").
-- R34-5 (→ Task 43's client notes): a `/set` with `ifInState` in a request whose own drain imported or merged an event answers `stateMismatch` once per arrival (recorded in `client-jmap.md`).
+- R34-4 (→ the owner and Task 43; the final review's FC2-3): the hook runs before the `using` check, `allowed_capabilities` and every permission check, so a keyed token whose OAuth scope excludes calendars still drains when it names a calendar method (recorded under "Decisions and remaining qualification"). **Weighs more than its rating** (lenses A, C1 and C2): release 6 first gives a key account scoped tokens that carry keys, and CalDAV's drain has the same property from this release on.
 - R34-6: the `CalendarEventNotification/get` reply is discarded.
 - R34-7: the mail case does not assert one pending item before the query.
 - R34-8: two RED receipts recorded different file hashes.
@@ -584,9 +674,8 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 
 - R35-1: the filter `za_shown_capability(is_key, false, key)` is now a no-op, and its doc comment describes something it does not do.
 - R35-2: the `&& !is_key` in upstream's expression has no comment.
-- R35-3 (→ Task 37, closed there): D13's "for every token, keyed or not" was asserted nowhere.
 - R35-4: no failing run for `mayGetAvailability` left true.
-- R35-5 (inherited, medium confidence; → the owner and Task 43): `Principal/getAvailability` for a key principal in an ordinary group with calendars returns the group's busy periods while `mayGetAvailability` is false (recorded under "Decisions and remaining qualification").
+- R35-5 (inherited, medium confidence; → the owner and Task 43): `Principal/getAvailability` for a key principal in an ordinary group with calendars returns the group's busy periods while `mayGetAvailability` is false (recorded under "Decisions and remaining qualification"; README-dev's wording corrected after the final review). **Weighs more than its rating** (lens D): the documents said "an empty list".
 - R35-6: a comment in `za_variants.rs` omits and narrates.
 - R35-7: the macOS linker note; `lsof`'s warning.
 
@@ -618,9 +707,7 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 - R37-11: one more temporary upload is left in the owner's account.
 - R37-12: the attachment download's 404 stays with the rule it cites removed; an equivalent mutant at suite level.
 - R37-13: the third impersonation form does not show in the test that the holder holds keys or shared access.
-- R37-14: the doc comment's reason for the unreachable `za_is_impersonated()` clause is not the code's: a master-user login returns a fresh token with no session keys at all (`crates/common/src/auth/authentication.rs:415-431`), also when master and target are the same account.
 - R37-15: the metadata read-back uses a get without the metadata capability.
-- R37-16 (→ Task 43): the 404 detail pins upstream's text at `crates/jmap-proto/src/error/request.rs:238`; recorded as a silent dependency.
 - (no id, re-review notes) the D29 case never sends a stale exact state as `ifInState`; the fixture `jmapcal-refusals-impersonate` needed a line in the fixture inventory (added to `CLAUDE.md`).
 
 ### Task 38
@@ -634,7 +721,6 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 - R38-9: Part B compares the pairs' recipients, not token values, and does not assert the list non-empty.
 - R38-10: an unset items or sink in `Expect` is not asserted empty.
 - R38-11 (spec half; → Task 43): spec 3.5's last sentence and 3.3/3.4 owe the record of Q1 and M2 (recorded under "Decisions and remaining qualification").
-- R38-12 (→ Task 42): the kill run failed on `Expect`; no mutant showed a cross-side comparison failing (X3 later did).
 - R38-13: M9's reply takes its SEQUENCE from each side's stored event.
 - R38-14: the METHOD line is not set against the message's MIME parameter.
 - R38-15: M7b asserts only that the top-level `sequence` left the patch.
@@ -654,8 +740,7 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 
 ### Task 40
 
-- R40-7: the trace capture's only control is that it is not empty, and it ends before the revocation and the password change.
-- R40-8: `handoff_exists` is asserted false after the exchange but never true before it.
+- R40-7: the trace capture's only control is that it is not empty, and it ends before the revocation and the password change. **Weighs more than its rating**, with R40-9 and R40-13 (lens D): the leak module is the release's only whole-flow trace and store net.
 - R40-9: `secret_forms` has no unit control.
 - R40-11: the report says 26 labelled secrets; the code builds 24.
 - R40-12: the conditional deletion of the owner's upstream OAuth grant does not record which branch it took.
@@ -670,10 +755,9 @@ What stays open after this plan, by task: every `minor (deferred ...)` line of t
 ### Task 41
 
 - R41-1: the report omits the product binary's version line.
-- R41-2, R41-3 (→ Task 43 as two one-line corrections; not made, since this task edits documentation only, and left for the whole-branch fix wave): `tests/qualification/dispositions.json:1120` says `za_read.rs` serves "CalendarEvent/get, Calendar/get and Calendar/query" (its callers are `CalendarEvent/get`, `/query` and `/set`); `:1095` credits `common/src/za/tokens.rs` with the record's deletion by a vault write (that code is in `auth/vault.rs`).
 - R41-4: the PRODUCT, fresh-store unit and FRESH receipts record no command, environment or HEAD.
 - R41-5: the plan's step 1 script ignores dispositions and does not test equivalents or rename targets.
-- R41-6, R41-7: the rerun decision rests on local evidence only; the report does not table the five runs.
+- R41-6, R41-7: the rerun decision rests on local evidence only; the report does not table the five runs. **Weighs more than its rating** (lens D): the key-mode JMAP step has no rerun and now runs upstream's timing-sensitive `calendar::alarm`; the first hosted-runner evidence comes with the pull request.
 - R41-9: the new evidence strings drop the backticks the existing entries use.
 
 ### Task 42
@@ -704,7 +788,25 @@ The ledger's coverage notes (⚠️) that stay open, for Task 44's reviewer:
 - Task 40: no earlier scan meets a live token record, so the field-153 rule's only live exercise is `leak::test_jmap_calendars`; spec 9.5 words the iTIP-task rule as a scan rule "for every scanned account" while the code checks it in the module.
 - Task 41: the CalDAV client was not run in either mode, so that leg of spec 5.1's proof of the move stays open until CI; the inventory and coverage gates run in Task 44's CI; no receipt records `git status` during the runs.
 - Task 42: the unreached named catchers are not shown to fail under their mutants; a clean tree after each row rests on the hash check and the batch-end status; X2 ran under ZA only; the unscheduled JMAP update that omits `sequence` on an event with an override is compared by no test (X2's residual).
-- R32-8 and R33-5 (above).
+- R32-8 and R33-5 (above): the review found R32-8 still true and latent (upstream folds names the same way) and sent R33-5 to the owner.
+
+### The final review
+
+Deferred by the final review and its re-review (by id; the review files hold each in full):
+
+- FA-5: the D22 precheck's answer when the token record cannot be read.
+- FA-8, FA-18 (= R18-3), FA-19: test gaps on the token paths.
+- FA-16: one exit of `delete_oauth_grant` skips the record entry's removal; the sweep bounds it.
+- FB-4 (with Task 31's and Task 32's coverage notes): the placement arm's exits end the mail guard as `ZA_IMIP_ABANDONED` where `ZA_IMIP_DROPPED` is true; nothing is mailed either way.
+- FB-8 (= R38-6), FB-9, FB-10: test weaknesses in the oracle and the placement cases.
+- FC1-3: a repeated update of one event id in one call.
+- FC1-17: thin coverage of the occurrence-patch rulings.
+- FC2-18 (= FD-4 = R21-12), FC2-19, FC2-21 (= R28-7), FD-5, FD-7 (= R40-7), FD-9: test weaknesses.
+- FD-11: new fork tests sit in `parser_restored_tests.rs`, which the gates' tooling groups as restored upstream tests; for the gates' run.
+- FD-15: `ZaPipelineError` derives `Debug`; no use site formats it.
+- W-1: a request that passed authentication before a grant's revocation can make that grant's keys resident after the eviction; they are unreachable and stay until the key cache's idle or age limit. The fix for a follow-up: insert the keys only when the authentication entry went in.
+- W-3: `query::grantee_text_skips_a_sealed_class` has no ordinary twin.
+- W-4: `tokens::traced_urls_mask_the_code` exercises one of the three URL sites; `traced_url` has six unit tests.
 
 ## Merge hotspots
 
@@ -723,37 +825,66 @@ The ledger's coverage notes (⚠️) that stay open, for Task 44's reviewer:
 
 **Observed status of the costs the brief names.** The memory of an unranged text query was not measured: the query holds every candidate's terms, and by R26-5 every opened event's full plaintext view, for the request (spec 6.4 accepted holding the terms). Its time is review focus 5's. The `/set` answer after D11 is upstream's, as spec 6.5 says: `events::create_use_default_alerts` asserts that a create sent with `useDefaultAlerts: true` answers with neither `alerts` nor `useDefaultAlerts` (`events.rs:1158-1161`), and `events::create_reads_back_over_caldav` that a create without the flag answers `useDefaultAlerts: false` (`events.rs:960`); the alerts appear on the next `CalendarEvent/get`.
 
-**Open items for the project owner.** None blocked a task.
+**Open items for the project owner.** None blocked a task. This list joins the task reviews' open items with the final review's; where the two overlapped, the final review's id is named beside the ledger's. Each carries the adjudication's recommendation.
 
-1. D15 as a sync-correctness rule, not an access control (ruling at Task 22): confirm.
-2. R29-8: acknowledged or snoozed alarm state is lost with by-value default alerts.
-3. Four questions from Tasks 17 and 18: the device-code poll with a pending user code now answers `expired_token` for every account (not among the spec's every-account exceptions); `Superseded` and `VaultChanged` refusals emit no trace against spec 8's wording (R18-6); a well-formed secret appended to a keyless grant's refresh token deletes that grant (R18-7); an unusable token record makes each refresh delete its grant while D8's sweep leaves such a record alone (R18-8).
-4. Upstream's paging of `/changes` after a log trim is inherited unchanged and applies to ordinary accounts' continuations as well (Task 22's concern 1); pending the owner's decision, not accepted.
-5. R34-4: the drain runs before the `using`, scope and permission checks, so a keyed token whose OAuth scope excludes calendars still drains (spec section 2 says a scope limits what the server will do for the token).
-6. R35-5: `Principal/getAvailability` for a key principal in an ordinary group returns the group's busy periods while `mayGetAvailability` is false.
-7. The placement UID check holds no lease or batch fence while spec 3.3 says "checked under the UID lease" (true of creates only).
-8. R36-10: an attendee that creates an event it does not organize, already answered, sends no reply from that create.
+To confirm:
+
+1. **The `code` masking (FA-3 = FD-1)**, as an amendment of spec section 10: the value of every `code` query parameter is masked in a traced request URL and a traced `Referer`, for every request, a third every-account trace exception beside D24 and D26. Recommended: confirm; it is in the code at `f1c69900d`.
+2. **D15 as a sync-correctness rule, not an access control** (ruling at Task 22; the final review's FC2-5, which shows the token that skips the boundary check, since a `z` state's origin is not authenticated). Recommended: confirm.
+
+To decide:
+
+3. **FC1-1 (= R36-10)**: a key account that creates an event as an attendee with the scheduling flag sends no reply, and that copy never schedules afterwards; upstream's JMAP create falls back to the attendee's reply, CalDAV's does not. The code is what D1 asks for; the case `scheduling::attendee_create_sends_no_reply` pins it. Two consistent ways out: add the line to spec 3.3 (recommended), or amend 3.2 so the scheduling input carries "a create by a non-organizer may reply", set by JMAP only, with one fallback in the pipeline's create arm (which CalDAV shares). Lens B's answer on what such a reply would reach: for a key organizer the fan-out would not attempt it (the copy holds no token pair, the organizer's status would record 5.3, and the drain drops a reply without a token); a mail-class organizer would be mailed.
+4. **FC2-3 (= R34-4)**: the drain runs before the `using`, scope and permission checks, so a keyed token whose OAuth scope excludes calendars still drains (spec section 2 says a scope limits what the server will do for the token). The drain does only what the account's next keyed calendar request does, and the token chooses nothing. If the scope is to be honoured, the JMAP change is one condition; CalDAV's drain has no scope-filtered value at that point. Otherwise a line in section 2.
+5. **FC2-6**: a default alert's id, a string the client chooses, is stored in the clear. Recommended: accept under 6.7 ("default alerts stay visible") with a line in the spec now; the key writer refusing or rewriting ids that are not short tokens as a follow-up.
+6. R29-8: acknowledged or snoozed alarm state is lost with by-value default alerts.
+7. R18-7: a well-formed secret appended to a keyless grant's refresh token deletes that grant.
+8. Upstream's paging of `/changes` after a log trim is inherited unchanged and applies to ordinary accounts' continuations as well (Task 22's concern 1); pending the owner's decision, not accepted.
 9. The two oracle rulings of Task 38: items and mail compared as the JSCalendar projection, and the script's explicit SEQUENCE with M7b leaving it to the server.
 10. Task 39's F1 with R39-5: three consequences of D11 not in spec section 12. A constant description on every component would remove the first two and needs a change to D11's wording.
 11. Task 39's F3 note: section 12 words the view-level consequence as "cannot rename or recolour"; the check also refuses `isVisible` and `isSubscribed`.
 12. R41-8: the fresh-store restart script exercises nothing release 6 adds (no OAuth grant, no token record across the restart, no JMAP calendar call).
-13. The independent CalDAV client was not run locally; that leg of spec 5.1's proof of the move stays open until CI.
-14. R31-15: a grantee-organized event's JMAP update takes a different path from its CalDAV twin (origin tested against the owner's addresses, the floor and sender with the sender's roles).
-15. R43-4: whether release 4's sharing spec and plan 14's outcome note get a pointer to D14 at their four statements of the colour exclusion (listed under known staleness below); spec section 10's amendments do not list the sharing spec's colour statement.
+13. R31-15: a grantee-organized event's JMAP update takes a different path from its CalDAV twin (origin tested against the owner's addresses, the floor and sender with the sender's roles); with scheduling on, the update still goes out with a raised SEQUENCE (lens C1), so the gap is confined to scheduling off.
+14. R43-4: whether release 4's sharing spec and plan 14's outcome note get a pointer to D14 at their four statements of the colour exclusion (listed under known staleness below).
+15. FC1-4 (an owner's per-user-only update stores the converter's whole output): no loss was established; recommended no change.
+16. FB-6 (a move out of two unshared calendars into one shared calendar is refused, though two updates reach the same end state): recommended accept, or a follow-up.
 
 **Proposed spec amendments, for the owner** (the spec file is not edited by this plan):
 
-- **3.3**: add R36-10 (an attendee's JMAP create of an answered event sends no reply); qualify "checked under the UID lease" as true of creates, with the placement check against current archives without a lease.
+- **3.3**:
+  - FC1-1 (if the first way out of item 3 is taken): an attendee's JMAP create sends no reply, and that copy does not schedule afterwards.
+  - FC2-2: a grantee's JMAP read of an event whose CLASS is sealed is private (as `/get` and, since the fix wave, the text query treat it), while CalDAV serves it whole; field policy 2's recorded limit, not this release's.
+  - FD-3: a key account's reminder push names a positional alert id (`k1`), since the alarm's id is sealed.
+  - FC1-5: a grantee's email default alert is mailed to the calendar's owner (release 1's alarm task); or a line in 3.4.
+  - FC2-16: JMAP destroys the default calendar that CalDAV's DELETE refuses in a product build (inherited).
+  - The UID lease: "checked under the UID lease" holds for creates only (FB-3); a placement change checks against current archives without a lease, as CalDAV's MOVE does.
 - **3.3 and 3.4, 3.5's last sentence** (R38-11): record that a JMAP write stores upstream's converter form (`DURATION` for `DTEND`, the export's property order), stamps `CREATED` and the update stamps, and raises SEQUENCE for a client that omits it, so its iCalendar text differs from a CalDAV client's for the same edit; the oracle compares at the JSCalendar projection for that reason.
+- **Section 10**:
+  - the `code` masking (item 1), a third every-account trace exception;
+  - the device-code poll whose `device_code` is the pending user code now answers `expired_token` where upstream answers `authorization_pending` (ledger 477), and an ordinary account's consent token with a 43-character suffix is accepted with the suffix stripped (FA-11);
+  - the costs: the token sweep's one read of field 153 per account in every purge run (FA-12); a pass over the key cache on any account's grant deletion (FA-4's fix); two cached classification reads for `Calendar/set` and `CalendarEvent/set` and three for a calendar `/changes`, where the section says one.
+- **D8's sentence** (FA-6 = R18-8): a refresh over an unreadable token record deletes the grant, since it cannot rewrap a master key it cannot open; "a sign-in or a refresh writes over it" holds for a sign-in only.
+- **4.5 step 5** (FA-17 = R18-2): a refresh crossed by a credential change before its first read is classified `Lost` and deletes the grant; spec 9.2 tolerates either answer.
+- **Spec 8's row for missing access** (FC1-16): a grantee's update in an unshared calendar answers `notFound`, which reveals less than the row's `forbidden`. **8** also: whether `Superseded` and `VaultChanged` refusals are traced (R18-6).
+- **6.2, 6.10, 6.11** (R35-5): "an empty list" holds only when the key principal is in no ordinary group with calendars; a key member of an ordinary group returns that group's busy periods.
 - **Section 12 (D11)** (R39-5): add the `iCalendar` member and override patches in subset reads, the stale description after a rename, and alarms that stay after a later `useDefaultAlerts: false`.
 - **Section 12 (6.7)**: "cannot rename or recolour its own entry" becomes "cannot change its own entry, its visibility and subscription flags included".
-- **6.2, 6.10, 6.11** (R35-5): "an empty list" holds only when the key principal is in no ordinary group with calendars.
-- **Section 2** (R34-4): the drain runs for a keyed token whatever its scope.
-- **10, every-account exceptions**: the device-code poll's `expired_token` answer for a pending user code.
-- **8** (R18-6): whether `Superseded` and `VaultChanged` refusals are traced.
-- **4.5** (R18-7, R18-8): a keyless grant presented with a well-formed secret, and an unusable record at a refresh.
+- **Spec 10's amendment list and the sharing spec's colour statement** (R43-4): the amendments do not list the sharing spec's statement that no entry's bundle carries a colour, which D14 replaces.
+- **4.5** (R18-7): a keyless grant presented with a well-formed secret.
 - **9.5** (Task 40's note): the iTIP-task rule is checked in the module, not as a scan rule for every scanned account.
 
-**Known staleness in the plan's own documents and in older records** (not corrected here; none of these files is in this task's list): R22-7 (the interface sheet's §7.1 call-site list and the header's `za_variants` row); R31-7 (the sheet's §7.2 says a view error fails the method; in `/set`, D28 makes it per-object); the plan header's routing lines; R41-2 and R41-3 in `dispositions.json`. Release 4's documents still state the colour exclusion that D14 replaces (Task 27's note; ruling R43-4): the sharing spec `docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:148-150` ("no supported client sets a per-principal colour") and `:566-570` ("No entry's bundle carries a colour a client could set"), and plan 14's outcome note `docs/superpowers/plans/2026-10-23-zero-access-plan14-outcome.md:439` and `:1445` (row T6-P: the shared format excludes the JMAP-only personal colour). Since release 6, each principal's colour of a shared calendar is sealed in its own personal bundle and the grant's conversion carries the owner's. Those approved records are not edited by Task 43.
+**Follow-ups not taken by the fix wave**, each with the adjudication's recommendation:
 
-**Remaining qualification.** Task 44: the final matrix, CI on the branch (including the independent CalDAV client in both modes, the fresh-store job and the retention gates with the cohort's new figure) and the whole-branch review. Then, outside this plan: the reference client's checklist (`docs/zero-access/client-jmap.md`), the native-client rows of the manual checklist, other store backends, a second node, and the account page's text about how long keys stay in memory, which describes password clients only (spec 12, a follow-up outside this repository).
+- R18-6 with FA-13: three token refusals emit no trace, and a store error on the Bearer key path is answered 401 with its cause dropped. Recommended: a store error answers a server error and is traced. Not in the wave, because it changes what a client sees under a store fault.
+- FB-5 (= R33-5) with FC1-9: an event that does not unseal is `notFound` on update, a store failure on a flagged destroy (stopping later ids on every retry) and destroyed without the flag. Recommended: treat it per object on destroy too.
+- R28-4: a committed calendar destroy answered "try again" when the grantees' invalidation fails after the commit; reachable only on a cluster whose broadcast fails.
+- FA-5: the D22 precheck's answer when the token record cannot be read.
+- FA-16: one exit of `delete_oauth_grant` skips the record entry's removal (bounded by the sweep).
+- FB-4: the placement arm's exits trace `ZA_IMIP_ABANDONED` where the outcome is known.
+- FC1-3: a repeated update of one event id in one call.
+- A guard in the vault commit funnel that refuses a binding change under an unchanged salt, which would make FA-1's fix a checked property of every vault write (the unit test `credential_change_clears_the_token_record` would need four rows changed).
+- W-1 (resident keys after a revocation crossed by an authenticated request), with its fix named under "Deferred findings".
+
+**Known staleness in the plan's own documents and in older records** (not corrected here; none of these files is in this task's list): R22-7 (the interface sheet's §7.1 call-site list and the header's `za_variants` row); R31-7 (the sheet's §7.2 says a view error fails the method; in `/set`, D28 makes it per-object); the plan header's routing lines (R41-2 and R41-3 in `dispositions.json` were corrected by the final review's fix wave). Release 4's documents still state the colour exclusion that D14 replaces (Task 27's note; ruling R43-4): the sharing spec `docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:148-150` ("no supported client sets a per-principal colour") and `:566-570` ("No entry's bundle carries a colour a client could set"), and plan 14's outcome note `docs/superpowers/plans/2026-10-23-zero-access-plan14-outcome.md:439` and `:1445` (row T6-P: the shared format excludes the JMAP-only personal colour). Since release 6, each principal's colour of a shared calendar is sealed in its own personal bundle and the grant's conversion carries the owner's. Those approved records are not edited by Task 43.
+
+**Remaining qualification.** The whole-branch review has run (above). Task 44's second matrix pass on `a5e45dc2f` is recorded under "Where things stand" when it finishes. Not qualified by this plan: the reference client's checklist (`docs/zero-access/client-jmap.md`, its D29 rows included), the independent CalDAV client in either mode (so that leg of spec 5.1's proof of the move stays open until CI), the Docker suites (`directory`, `automation_tests`), the inventory and coverage gates with the cohort's new figure (FD-11), CI on the branch, the native-client rows of the manual checklist, other store backends, a second node, and the account page's text about how long keys stay in memory, which describes password clients only (spec 12, a follow-up outside this repository). Pushing the branch, dispatching the gates and opening the pull request are the owner's to authorize. A passing suite here is not review approval.

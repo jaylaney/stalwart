@@ -34,7 +34,14 @@ reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not 
 - The token endpoint's successful answers leave the traces, for every account (D24).
 - Browser sessions end only on a password change, a recovery or a second-factor change (D19).
   Other vault writes (a new recovery key, an app password's revocation, the first pin's rewrap)
-  keep them.
+  keep them. A second-factor change ends them for good: it draws a fresh salt, so removing the
+  factor again does not revive the tokens it ended.
+- On upgrade to release 6, every key account's existing OAuth token is refused once (its
+  credential version changes), and the user signs in again.
+- The value of a `code` query parameter is masked in traced request URLs and traced `Referer`
+  headers, for every account, so an authorization code no longer appears in a trace.
+- A grantee no longer finds, by text search, an event of a shared key calendar whose details it
+  cannot read.
 - `decode_access_token` strips a `~` suffix from every token that begins with the server's token
   header, for every account (D26). A shared calendar's colour is carried in each principal's
   sealed personal bundle (D14); a binary built before release 6 cannot read a coloured one, so
