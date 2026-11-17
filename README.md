@@ -31,7 +31,7 @@ behavior and are outside this fork's zero-access encryption scope.
 For zero-access accounts, server-side mail search, sort and threading run in IMAP and JMAP
 requests that hold the account's keys, over a per-account index sealed under the account's
 search key (release 7); a content search with no current index is refused with a retry
-message, and a session without keys gets the keyless fallbacks of the search design. Text
+message, and a session without keys cannot search that mail: its searches are refused. Text
 search of a zero-access account's events runs over JMAP in a request that holds its keys and
 is matched in memory (release 6); a CalDAV `calendar-query` text match on such an account's
 calendar is also matched in memory, over every event in scope, since those events are not

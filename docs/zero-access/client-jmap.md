@@ -37,8 +37,9 @@ On one local machine:
      client with a matching `Application` is a first-party client and is granted the full scope
      set; without one it is a registered client granted the scopes it asks for. Either way the
      password step issues the code at once only when the request carries `consent: true` (the
-     reference client sends it, spec 1.3) or a grant for the client and scopes already exists;
-     otherwise it answers that consent is required, with a consent token. Record which kind of
+     reference client sends it, spec 4.4), or when a grant for the client and scopes already
+     exists and the request does not force the consent prompt
+     (`crates/http/src/auth/oauth/auth.rs:832`); otherwise it answers that consent is required, with a consent token. Record which kind of
      client was registered and which path the sign-in took.
 4. Make the server's HTTP CORS answers allow the client's origin. The only CORS switch in the
    registry schema is upstream's `usePermissiveCors` on the `Http` settings

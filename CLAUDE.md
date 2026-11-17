@@ -183,7 +183,8 @@ Where the code lives:
   `tests/src/za/jmap_calendar/{mod,pipeline,events,calendars,query,scheduling,sharing,refusals,oracle}.rs`,
   their calls in `tests/src/za/mod.rs`, `tests/src/za/leak.rs` (the token-record rule,
   `secret_hits`, `leak::test_jmap_calendars`), `tests/src/za/imip/oracle.rs` (the comparison
-  helpers the JMAP oracle reuses, `Tally`, `Kind`, `mail_key`, `mail_parts`, made `pub(crate)`),
+  helpers the JMAP oracle reuses, made `pub(crate)`: `Kind`, `Tally` with its fields and `same`,
+  `without_schedule_status`, `mail_key`, `mail_parts` and `raw_header`),
   `tests/src/za/dav_seal.rs` (three helpers' visibility), `tests/src/za/sweep.rs` (it calls the
   lifted `run_purge_maintenance`), the field-153 exemption in
   `tests/src/utils/{cleanup,storage}.rs`, the release's changed assertions in
@@ -400,7 +401,7 @@ Release 7 (search and threads) added merge hotspots at these upstream seams.
   and `crates/jmap/src/submission/{set,get,query}.rs` (singleton stored,
   mapped when returned). The pass trigger and 6.2 gates are in
   `crates/jmap/src/api/request.rs`: the `za_search_pass_hook` calls (in `handle_jmap_request`
-  and the pending-pass guard's `attempt`) and the `za_assert_mail_keys` calls in
+  and `PostWriteCall::attempt`) and the `za_assert_mail_keys` calls in
   `handle_method_call` (line numbers moved with release 6).
 - IMAP search, sort and thread resolution enter via
   `crates/imap/src/op/{search,thread}.rs`. Object ids use the validated view
