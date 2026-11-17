@@ -414,19 +414,21 @@ fn quiet_text(names: &Names) -> String {
     ]])
 }
 
-/// The main exchange's event after step `n`. Steps 8 and 9 are not written
-/// by the account: their texts are the event as the replies leave it, so
-/// step 10's text and difference start from it. Every VEVENT carries the
+/// The main exchange's event after stage `n` (`main_code` names the stages:
+/// 1 to 7 are M1 to M7, 8 is M7b, 9 to 12 are M8 to M11). M8 and M9 are not
+/// written by the account: their texts are the event as the replies leave
+/// it, so M10's text and difference start from it. Every VEVENT carries the
 /// organizer's SEQUENCE: `0` at the create, one higher at each organizer
-/// step that changes the text (M2, M4, M5, M6, M7, M10); the replies (M8,
-/// M9) keep it (Task 38's M2 ruling: the text an organizer's client writes).
+/// step that changes the text (M2, M4, M5, M6, M7, M7b, M10); the replies
+/// (M8, M9) keep it (Task 38's M2 ruling: the text an organizer's client
+/// writes).
 fn main_text(n: u32, names: &Names) -> String {
-    let sequence = [2, 4, 5, 6, 7, 10]
+    let sequence = [2, 4, 5, 6, 7, 8, 11]
         .into_iter()
         .filter(|step| *step <= n)
         .count();
-    let invitee = if n >= 8 { "ACCEPTED" } else { "NEEDS-ACTION" };
-    let outside = if n >= 9 { "ACCEPTED" } else { "NEEDS-ACTION" };
+    let invitee = if n >= 9 { "ACCEPTED" } else { "NEEDS-ACTION" };
+    let outside = if n >= 10 { "ACCEPTED" } else { "NEEDS-ACTION" };
     let scheduling = || {
         vec![
             format!("ORGANIZER:mailto:{}", names.account),
@@ -454,7 +456,12 @@ fn main_text(n: u32, names: &Names) -> String {
     } else {
         master.extend([
             "DTSTART:20990302T100000Z".to_string(),
-            "DTEND:20990302T110000Z".to_string(),
+            // M7b: the master ends one hour later.
+            if n >= 8 {
+                "DTEND:20990302T120000Z".to_string()
+            } else {
+                "DTEND:20990302T110000Z".to_string()
+            },
             "SUMMARY:oracle two".to_string(),
         ]);
     }
@@ -467,7 +474,7 @@ fn main_text(n: u32, names: &Names) -> String {
     if n >= 7 {
         master.push("LOCATION:room seven".to_string());
     }
-    if n >= 10 {
+    if n >= 11 {
         master.push("EXDATE:20990316T100000Z".to_string());
     }
     let mut components = vec![master];
@@ -487,6 +494,15 @@ fn main_text(n: u32, names: &Names) -> String {
         components.push(instance);
     }
     vcalendar(&components)
+}
+
+/// The script's name of main stage `n`: M7b is stage 8.
+fn main_code(n: u32) -> String {
+    match n {
+        1..=7 => n.to_string(),
+        8 => "7b".to_string(),
+        n => (n - 1).to_string(),
+    }
 }
 
 /// The outside address's REPLY to the main event at `sequence`, accepting
@@ -632,6 +648,18 @@ fn script() -> Vec<(Exchange, u32, Expect)> {
         (
             Main,
             8,
+            // M7b (fix round 1, R38-1): the server's SEQUENCE increment, the
+            // JMAP patch leaving `sequence` out.
+            Expect {
+                contains: &["SEQUENCE:6"],
+                items: Some(&[(Invitee, "REQUEST")]),
+                sink: Some(&[(Outside, "REQUEST")]),
+                ..Default::default()
+            },
+        ),
+        (
+            Main,
+            9,
             Expect {
                 items: Some(&[(Account, "REPLY")]),
                 drained: true,
@@ -641,7 +669,7 @@ fn script() -> Vec<(Exchange, u32, Expect)> {
         ),
         (
             Main,
-            9,
+            10,
             Expect {
                 partstat: Some((Outside, "ACCEPTED")),
                 ..Default::default()
@@ -649,7 +677,7 @@ fn script() -> Vec<(Exchange, u32, Expect)> {
         ),
         (
             Main,
-            10,
+            11,
             Expect {
                 items: Some(&[(Invitee, "CANCEL")]),
                 sink: Some(&[(Outside, "CANCEL")]),
@@ -658,7 +686,7 @@ fn script() -> Vec<(Exchange, u32, Expect)> {
         ),
         (
             Main,
-            11,
+            12,
             Expect {
                 present: Some(false),
                 items: Some(&[(Invitee, "CANCEL")]),
@@ -901,14 +929,22 @@ async fn dav_delete(name: &str, href: &str) {
     assert_eq!(response.status, StatusCode::NO_CONTENT, "DELETE {href}");
 }
 
-/// The update of the main event from step `n - 1`'s text to step `n`'s.
+/// The update of the main event from stage `n - 1`'s text to stage `n`'s.
+/// At M7b alone the JMAP patch leaves `sequence` out, so the server raises it
+/// (fix round 1, R38-1).
 async fn main_update(test: &TestServer, side: &Side, n: u32, send: bool) {
     let text = main_text(n, &side.names);
     if side.jmap {
-        let patch = top_level_diff(
+        let mut patch = top_level_diff(
             &jscalendar_of(&main_text(n - 1, &side.names)),
             &jscalendar_of(&text),
         );
+        if n == 8 {
+            assert!(
+                patch.as_object_mut().unwrap().remove("sequence").is_some(),
+                "M7b's difference raises sequence"
+            );
+        }
         jmap_update(test, side, MAIN_UID, patch, send).await;
     } else {
         let href = copy_href(test, side.account.id, MAIN_UID).await;
@@ -959,9 +995,9 @@ async fn perform(test: &TestServer, side: &Side, exchange: Exchange, n: u32) {
                 dav_put(account, href, text, 201).await;
             }
         }
-        // M2, M4, M5: updates; M6, M7, M10: updates, S.
+        // M2, M4, M5: updates; M6, M7, M7b, M10: updates, S.
         (Exchange::Main, 2 | 4 | 5) => main_update(test, side, n, false).await,
-        (Exchange::Main, 6 | 7 | 10) => main_update(test, side, n, true).await,
+        (Exchange::Main, 6 | 7 | 8 | 11) => main_update(test, side, n, true).await,
         // M3: the placement.
         (Exchange::Main, 3) => {
             if side.jmap {
@@ -984,14 +1020,14 @@ async fn perform(test: &TestServer, side: &Side, exchange: Exchange, n: u32) {
         }
         // M8: the invitee accepts in its own copy over CalDAV, on both sides
         // (its request drains its inbox first, which imports the invitation).
-        (Exchange::Main, 8) => {
+        (Exchange::Main, 9) => {
             let invitee = &side.invitee;
             assert_eq!(trigger_drain(invitee.name, STRONG).await, 207);
             let href = copy_href(test, invitee.id, MAIN_UID).await;
             set_partstat(&invitee.client, &href, invitee.name, "ACCEPTED").await;
         }
         // M9: the outside address's emailed REPLY, over LMTP.
-        (Exchange::Main, 9) => {
+        (Exchange::Main, 10) => {
             let href = copy_href(test, side.account.id, MAIN_UID).await;
             let stored = body(&side.account.client, &href).await;
             let sequence = ICalendar::parse(&stored)
@@ -1020,7 +1056,7 @@ async fn perform(test: &TestServer, side: &Side, exchange: Exchange, n: u32) {
             .await;
         }
         // M11: the delete, S.
-        (Exchange::Main, 11) => {
+        (Exchange::Main, 12) => {
             if side.jmap {
                 jmap_destroy(test, side, MAIN_UID, send_args(true)).await;
             } else {
@@ -1066,7 +1102,7 @@ async fn perform(test: &TestServer, side: &Side, exchange: Exchange, n: u32) {
 async fn drains(side: &Side, exchange: Exchange, n: u32) {
     if !matches!(
         (exchange, n),
-        (Exchange::Main, 8 | 9) | (Exchange::Inbound, 1)
+        (Exchange::Main, 9 | 10) | (Exchange::Inbound, 1)
     ) {
         return;
     }
@@ -1164,6 +1200,16 @@ fn sent_by<'x>(side: &Side, messages: &'x [SinkMessage]) -> Vec<&'x SinkMessage>
                 || message.mail_from.eq_ignore_ascii_case(side.invitee.name)
         })
         .collect()
+}
+
+/// The value of the `METHOD` line in a message's calendar part, unfolded.
+fn ics_method(message: &SinkMessage) -> Option<String> {
+    message
+        .calendar_part()?
+        .replace("\r\n ", "")
+        .replace("\r\n\t", "")
+        .lines()
+        .find_map(|line| line.trim_end().strip_prefix("METHOD:").map(str::to_string))
 }
 
 /// A sink message's `mail_key`, mapped, with the UID, SEQUENCE and
@@ -1371,8 +1417,12 @@ async fn run_step(
     n: u32,
     expect: &Expect,
 ) {
+    let code = match exchange {
+        Exchange::Main => main_code(n),
+        Exchange::Quiet | Exchange::Inbound => n.to_string(),
+    };
     let label = format!(
-        "{} step {}{n} (first CalDAV, second JMAP)",
+        "{} step {}{code} (first CalDAV, second JMAP)",
         exchange.name(),
         exchange.code()
     );
@@ -1449,12 +1499,17 @@ async fn compare(
     ];
     assert_eq!(present[0], present[1], "{label}: the event on both sides");
 
+    // Each side's SEQUENCE values, for the step's evidence line.
+    let mut stored_sequences = [None, None];
     if present[1] {
         // 2. The JSCalendar of the CalDAV GET.
         let mut gets = Vec::new();
         for side in [cd, jm] {
             let href = copy_href(test, side.account.id, uid).await;
             gets.push(body(&side.account.client, &href).await);
+        }
+        for (index, text) in gets.iter().enumerate() {
+            stored_sequences[index] = ics_fields(text).1;
         }
         same_jscal(
             &mut tally,
@@ -1576,6 +1631,32 @@ async fn compare(
                 ),
             }
         }
+        // The calendar part's own METHOD line (fix round 1, R38-2): the
+        // projection omits it and `calendar_method()` reads the MIME
+        // parameter, so it is compared here, between the sides and against
+        // the method the step's `Expect` names for this message.
+        let method_lines = [ics_method(c), ics_method(j)];
+        assert!(
+            method_lines[0].is_some(),
+            "{label}: the {method} to {rcpt} has no METHOD line"
+        );
+        assert_eq!(
+            method_lines[0], method_lines[1],
+            "{label}: the METHOD line of the {method} to {rcpt}"
+        );
+        if let Some(expected) = expect.sink {
+            let who = jm.who_is(rcpt.split(',').next().unwrap_or_default());
+            let wanted = expected
+                .iter()
+                .find(|(party, _)| *party == who)
+                .map(|(_, method)| *method);
+            assert_eq!(
+                method_lines[1].as_deref(),
+                wanted,
+                "{label}: the METHOD line of the message to {rcpt} against the step's Expect"
+            );
+        }
+        tally.compared += 1;
     }
 
     // 6. Each attendee's SCHEDULE-STATUS and the stored pairs' recipients.
@@ -1608,6 +1689,24 @@ async fn compare(
         "{label}: the sides are equal ({} values compared; differed before normalizing: {})",
         tally.compared,
         tally.absorbed.join(", ")
+    );
+    // The SEQUENCE each side showed (fix round 1, R38-1's evidence), already
+    // compared above: the stored event's first, each item's, each message's.
+    let side_sequences = |index: usize| {
+        format!(
+            "stored {}, items {:?}, mail {:?}",
+            stored_sequences[index].as_deref().unwrap_or("none"),
+            keys[index].iter().map(|key| key.3).collect::<Vec<_>>(),
+            mail[index]
+                .iter()
+                .map(|(entry, _)| entry.3.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    println!(
+        "{label}: SEQUENCE on the CalDAV side: {}; on the JMAP side: {}",
+        side_sequences(0),
+        side_sequences(1)
     );
 }
 
