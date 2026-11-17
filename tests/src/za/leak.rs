@@ -1341,10 +1341,12 @@ async fn check_token_record(
                 grant.access.len()
             ));
         }
+        // A refresh entry's sealed next secret is made by the same
+        // `wrap_key` primitive, so it is `WRAP_LEN` bytes too.
         for wrap in grant
             .refresh
             .iter()
-            .map(|entry| &entry.wrap)
+            .flat_map(|entry| std::iter::once(&entry.wrap).chain(entry.next.as_ref()))
             .chain(grant.access.iter().map(|entry| &entry.wrap))
         {
             if wrap.len() != WRAP_LEN {
@@ -1884,19 +1886,15 @@ pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(Subspace
     hits
 }
 
-/// The shortest stream-embedded base64 slice `secret_forms` keeps. A slice
-/// shorter than this (the 4 characters a 7-byte value leaves after one
-/// leading byte) would match unrelated base64 text by chance; secrets of 32
-/// bytes or more always yield slices of 40 characters or more.
-const MIN_EMBEDDED_FORM: usize = 8;
-
 /// Every form a secret of any length takes in storage (release 6 spec 9.5):
 /// its bytes; base64url without padding (the token-string form); standard
 /// base64 with and without padding; the standard base64 of a stream the
 /// secret sits in at each of the three alignments (preceded by 0, 1 and 2
-/// bytes), keeping only the characters of the groups of three bytes that lie
-/// wholly inside the secret, which do not depend on its neighbours; and lower
-/// and upper hex.
+/// bytes), keeping only the characters whose 6 bits lie wholly inside the
+/// secret, which do not depend on its neighbours (characters
+/// `ceil(8 * lead / 6)` to `floor(8 * (lead + len) / 6)`, exclusive: 9, 8 and
+/// 9 characters for a 7-byte value, 43, 42 and 43 for a 32-byte one); and
+/// lower and upper hex.
 fn secret_forms(secret: &[u8]) -> Vec<Vec<u8>> {
     let mut forms = vec![
         secret.to_vec(),
@@ -1909,9 +1907,9 @@ fn secret_forms(secret: &[u8]) -> Vec<Vec<u8>> {
         stream.extend_from_slice(secret);
         stream.resize(stream.len().div_ceil(3) * 3, 0);
         let text = STANDARD.encode(&stream);
-        let (first, last) = (lead.div_ceil(3), (lead + secret.len()) / 3);
-        if last > first && (last - first) * 4 >= MIN_EMBEDDED_FORM {
-            forms.push(text.as_bytes()[first * 4..last * 4].to_vec());
+        let (first, last) = ((8 * lead).div_ceil(6), 8 * (lead + secret.len()) / 6);
+        if last > first {
+            forms.push(text.as_bytes()[first..last].to_vec());
         }
     }
     let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
@@ -3790,6 +3788,37 @@ fn traced_strings(event: &TracedEvent) -> String {
     out.join(" ")
 }
 
+/// Reads `id` back with a keyed `method` call of `caller` in `owner`'s
+/// account and asserts that the object holds every value of `expected`. The
+/// answer holds no secret, so a failure prints it.
+async fn assert_read_back(
+    caller: &Account,
+    owner: &Account,
+    method: &str,
+    id: &str,
+    expected: &[&str],
+    what: &str,
+) {
+    let reply = caller
+        .jmap_method_call(
+            method,
+            json!({ "accountId": owner.id_string(), "ids": [id] }),
+        )
+        .await;
+    let [object] = reply.list() else {
+        panic!("{what}: not read back: {reply:?}");
+    };
+    let text = object.to_string();
+    let missing = expected
+        .iter()
+        .filter(|value| !text.contains(**value))
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "{what}: {missing:?} not read back from {object}"
+    );
+}
+
 /// Asserts that `hits` is empty, naming each hit by its secret's label and
 /// subspace, never by its key or bytes.
 fn assert_no_secret(hits: &[(Subspace, Vec<u8>, usize)], labels: &[String], when: &str) {
@@ -3819,13 +3848,17 @@ fn assert_no_secret(hits: &[(Subspace, Vec<u8>, usize)], labels: &[String], when
 /// and with the task consumer held; then each signs in through the
 /// authorization-code flow and refreshes. Then:
 ///
+/// - the task, before its destroy, read back and scanned at rest;
+/// - every canary and both colours read back through keyed gets, so no
+///   search below passes on a value the server dropped;
 /// - no iMIP task for either account, and the outside participant's mail at
 ///   the sink (the positive control);
 /// - no captured event holds a canary, a colour, a token secret or a hand-off
 ///   secret (the outside address is exempt in the SMTP, queue and delivery
 ///   layers, which carry the envelope recipient);
 /// - no token secret, code, hand-off secret or MK in any form anywhere in the
-///   store, while the sessions are live and after they end; no colour;
+///   store, while the sessions are live and after they end; no colour and no
+///   canary in any form;
 /// - the whole-store scan of each account finds no violation and reads one
 ///   token record while the sessions are live, none after they end;
 /// - the negative controls: junk in field 153 is a violation, and a record
@@ -4033,6 +4066,35 @@ pub async fn test_jmap_calendars(test: &mut TestServer) {
         .await;
     let grantee_event_id = created_id(&reply, "the grantee's event");
 
+    // The task at rest, before step 6 destroys it: read back with its
+    // canary, then one scan of the owner's account with the task present
+    // (the scan's event count includes it). The delivered queue blobs, which
+    // hold the canaries, are purged first, as before every scan.
+    assert_read_back(
+        key,
+        key,
+        "CalendarEvent/get",
+        &task_id,
+        &["jmapleak-task-canary"],
+        "the task",
+    )
+    .await;
+    sink_and_purge_held(test).await;
+    wait_for_index_queue(test, key_id, Duration::from_secs(30)).await;
+    let found = scan(test, key_id).await;
+    assert!(
+        found.violations.is_empty(),
+        "JMAP calendar leaks in {} with the task present:\n{}",
+        key.name(),
+        found.violations.join("\n")
+    );
+    assert!(
+        found.events >= 3,
+        "{}: {} events with the task present",
+        key.name(),
+        found.events
+    );
+
     // 6. The task's destroy, with scheduling.
     let reply = key
         .jmap_destroy(
@@ -4047,6 +4109,57 @@ pub async fn test_jmap_calendars(test: &mut TestServer) {
         "{reply:?}"
     );
 
+    // Every canary and both colours are stored: each read back through a
+    // keyed get of the object that holds it, by the account that wrote it.
+    assert_read_back(
+        key,
+        key,
+        "Calendar/get",
+        &shared,
+        &[
+            "jmapleak-calname-canary",
+            "jmapleak-caldesc-canary",
+            JMAPLEAK_COLOURS[0],
+        ],
+        "the owner's entry of the shared calendar",
+    )
+    .await;
+    assert_read_back(
+        key2,
+        key,
+        "Calendar/get",
+        &shared,
+        &["jmapleak-ownname-canary", JMAPLEAK_COLOURS[1]],
+        "the grantee's entry of the shared calendar",
+    )
+    .await;
+    assert_read_back(
+        key,
+        key,
+        "CalendarEvent/get",
+        &event_id,
+        &[
+            JMAPLEAK_TITLE,
+            "jmapleak-desc-canary",
+            "jmapleak-loc-canary",
+            "jmapleak-part-canary",
+            JMAPLEAK_ADDR_CANARY,
+            "jmapleak-kw-canary",
+            "jmapleak-ovr-canary",
+        ],
+        "the invitation",
+    )
+    .await;
+    assert_read_back(
+        key2,
+        key,
+        "CalendarEvent/get",
+        &grantee_event_id,
+        &["jmapleak-grantee-canary"],
+        "the grantee's event",
+    )
+    .await;
+
     // Invariant 57: no iMIP task for either account, with the consumer held
     // across every write.
     for (account_id, name) in [(key_id, key.name()), (key2_id, key2.name())] {
@@ -4059,6 +4172,15 @@ pub async fn test_jmap_calendars(test: &mut TestServer) {
     drop(held);
     drop(drain);
     sink_and_purge_held(test).await;
+    // The workers finish before any later scan, as in `test_imip`, but not
+    // through `test.wait_for_tasks()`: the grantee's event carries default
+    // alerts (D11) whose alarm task is due in 2031, and that wait does not
+    // skip a task that is not yet due. The due tasks, then each account's
+    // index queue (a partition in retry backoff included).
+    test.wait_for_tasks_skip_not_due().await;
+    for account_id in [key_id, key2_id] {
+        wait_for_index_queue(test, account_id, Duration::from_secs(30)).await;
+    }
 
     // Positive control: the outside participant's mail carries the title.
     assert!(
@@ -4074,9 +4196,12 @@ pub async fn test_jmap_calendars(test: &mut TestServer) {
     let mut sessions = Vec::new();
     for (account_id, account_key) in [(key_id, key), (key2_id, key2)] {
         let name = account_key.name();
+        // Not `unwrap_code`: its panic prints the response, and a consent
+        // token there would carry a hand-off secret.
         let code = za_authorize(&client, name, STRONG, None, Some(true), None)
             .await
-            .unwrap_code();
+            .location_param("code")
+            .unwrap_or_else(|| panic!("{name}: the sign-in did not authorize a code"));
         assert_eq!(
             code.len(),
             CODE_LEN + SECRET_TEXT_LEN,
@@ -4234,6 +4359,12 @@ pub async fn test_jmap_calendars(test: &mut TestServer) {
         &secret_hits(test, &secret_refs).await,
         &labels,
         "while the sessions are live",
+    );
+    let canaries = JMAPLEAK_CANARIES.map(str::as_bytes);
+    assert_no_secret(
+        &secret_hits(test, &canaries).await,
+        &JMAPLEAK_CANARIES.map(str::to_string),
+        "(the canaries, in any form)",
     );
     let colours = JMAPLEAK_COLOURS.map(str::as_bytes);
     assert_no_secret(
