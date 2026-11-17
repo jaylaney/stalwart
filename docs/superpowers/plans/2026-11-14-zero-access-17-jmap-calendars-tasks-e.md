@@ -194,6 +194,7 @@ Every line is upstream's except these:
 | `:154-160`, the full read of event 1 | the four flags and `isDraft` read `false` | 6.3 |
 | `:169` and `:175-187`, event 2 | `useDefaultAlerts` reads `false`; `alerts` is the value `events::create_use_default_alerts` pins for the same default alert | D11 |
 | `:237-240`, `:250` | event 1's three flags read `false`; event 2's `useDefaultAlerts` reads `false` | 6.3, D11 |
+| `:280-313`, `:475-506`, the windowed and property-subset reads of event 2 | upstream's objects, and each override whose title differed from the master's when the defaults were written also holds the patch `alerts/abc/iCalendar`, a `valarm` whose `description` is that override's title at that time | D11, D1: the alarms are stored per component with the component's title, and the read is upstream's projection of the stored tree |
 | `:350-370`, a second event with UID `00959BC664CA650E933C892C@example.com` created in calendar 1 while event 2 holds it in calendar 2 | it is created; the variant destroys it at once. Then the same create in calendar 2: `not_created(0).typ() == "invalidProperties"` and `description() == "An event with UID 00959BC664CA650E933C892C@example.com already exists."` | 3.3, UID rule |
 | `:467` | event 1's `useDefaultAlerts` reads `false` after the patch that set it | D11 |
 
@@ -231,7 +232,8 @@ It follows `calendar::acl::test` with the grant made through the account API. Th
 | `:146-161`, John's `shareWith` | `not_updated(&john_calendar_id).typ() == "forbidden"`; then the grant at level `view` through the endpoints | 6.11 |
 | `:162-190`, John's read of `shareWith` | unchanged: `mayReadItems` true, the other eight rights false | 6.7 |
 | Jane's reads of John's calendar | `id` and `myRights` asserted; the name is Jane's own entry and is not asserted here | 6.7 |
-| `:232-289`, `:399-455`, `:652-707`, the share notifications | `jane.jmap_changes(ShareNotification, state)` shows no change: the share endpoints write none | 6.11 |
+| `:232-289`, `:399-455`, `:652-707`, the share notifications | upstream's lines, with the rights of the level granted or revoked: one notification is created at each point, because the share endpoints write the calendar's ACL through upstream's builder, which logs one, holding ids and rights only | 6.2: `ShareNotification/*` is unchanged |
+| `:294-301`, Jane's empty patch at `view` | `not_updated(..).typ() == "forbidden"`: the key writer asks for the right to modify before it looks at what the patch changes | 6.7 |
 | `:302-313`, Jane's `shareWith: {}` | `not_updated(..).typ() == "forbidden"` | 6.11 |
 | added after `:313`, while the level is `view`: Jane's update of the calendar's name | `not_updated(..).typ() == "forbidden"` | 6.7 |
 | `:314-325`, Jane's destroy of the calendar | unchanged: `"You are not allowed to delete this calendar."` | 6.7 |
