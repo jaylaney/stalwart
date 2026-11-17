@@ -1023,6 +1023,121 @@
     "file": "crates/email/src/message/za/imip.rs",
     "runtime_excluded": false,
     "evidence": "Plan 15 (release 5, iMIP) Task 4 (commit fce064fea): a key account's inbound iMIP part at delivery (`za_imip_item`, `za_imip_uid_known`, `za_imip_sender`). A fork runtime file added by release 5 (`git log --diff-filter=A -- crates/email/src/message/za/imip.rs`)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/pipeline/mod.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 1 (commit 899671c8c): the pipeline module's `ZaScheduling`, `ZaWritten` and `ZaDeleted` types and its sub-module declarations. A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/pipeline/mod.rs)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/pipeline/error.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 1 (commit 899671c8c): the pipeline's neutral error (`ZaPipelineError`, `ZaRefusal`, `ZaBusy`) and the read-refusal mapping. A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/pipeline/error.rs)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/pipeline/admission.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 2 (commit 60a7ff75a): calendar admission, the writer's keys and the scheduling roles of a key account's write (`za_calendar_admission`, `za_writer_keys`, `za_roles`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/pipeline/admission.rs)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/pipeline/context.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 2 (commit 60a7ff75a): the read and mutation contexts of a key calendar and the read view of a stored event (`za_mutation_context`, `za_read_context`, `za_read_event_view`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/pipeline/context.rs)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/pipeline/uid.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 3 (commit cdb612dfe): the UID creation lease, the archive-based UID uniqueness check and the lost-create fence. A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/pipeline/uid.rs)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/pipeline/schedule.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 4 (commit fecf17ff4): a key account's scheduling assembly for create, update and delete (`za_schedule`, `za_schedule_create`, `za_schedule_update`, `za_delete_send_itip`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/pipeline/schedule.rs)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/pipeline/create.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 5 (commit 65a12d2d2): a key account's sealed create commit (`ZaEventCreate`, `za_create_event`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/pipeline/create.rs)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/pipeline/placement.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 6 (commit a704fe4a9): one placement resolver for COPY, MOVE and JMAP calendar changes of an event (`ZaPlacementPlan`, `za_placement_contexts`, `za_reseal_event_container`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/pipeline/placement.rs)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/pipeline/update.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 7 (commit 7954a4e87): a key account's sealed update commit (`ZaUpdateTarget`, `ZaEventUpdate`, `za_commit_update`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/pipeline/update.rs)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/pipeline/delete.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 8 (commit a985f16b8): a key account's event, name and calendar deletes (`za_delete_event`, `za_destroy_event`, `za_delete_calendar`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/pipeline/delete.rs)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/za_alerts.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 29 (commit 180f76685): a calendar's default alerts applied to an event by value (`za_apply_default_alerts_by_value`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/za_alerts.rs)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/za_text.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 25 (commit e5f8fc53d): the in-memory text index of a key account's events, built per request from unsealed views (`ZaEventTextIndex`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/groupware/src/calendar/za_text.rs)."
+   },
+   {
+    "file": "crates/vault/src/tokens.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 13 (commit d6211346e): the token record, token secrets and the hand-off value of keyed OAuth grants. A fork runtime file added by release 6 (git log --diff-filter=A -- crates/vault/src/tokens.rs)."
+   },
+   {
+    "file": "crates/common/src/za/tokens.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 14 (commit d75acf9b3): the token record's field and its deletion by a vault write, with the token issue and refresh helpers (`za_split_bearer`, `ZaIssued`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/common/src/za/tokens.rs)."
+   },
+   {
+    "file": "crates/common/src/za/calendar.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 20 (commit 4ceabe5ba): the JMAP error for calendar access without session keys (`za_calendar_keyless_refusal`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/common/src/za/calendar.rs)."
+   },
+   {
+    "file": "crates/http/src/auth/za_bearer.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 16 (commit 9f7d29690): the Bearer token's key lookup on HTTP and its refusal when token keys are unavailable (`za_bearer_keys`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/http/src/auth/za_bearer.rs)."
+   },
+   {
+    "file": "crates/http/src/auth/oauth/za_token.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 17 (commit 01b3cd762): the sign-in hand-off and keyed grants at the OAuth code exchange and refresh (`za_code_handoff`, `za_issue_keyed`, `za_refresh_keyed`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/http/src/auth/oauth/za_token.rs)."
+   },
+   {
+    "file": "crates/jmap/src/api/za_calendar.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 20 (commit 4ceabe5ba): the JMAP calendar admission table and the descriptions of its refusals (incomplete set, `shareWith`, drafts, participant flags, attachments). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/jmap/src/api/za_calendar.rs)."
+   },
+   {
+    "file": "crates/jmap/src/calendar_event/za_read.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 21 (commit cf698b9a7): the per-request reader of a key account's events for CalendarEvent/get, Calendar/get and Calendar/query (`ZaEventReader`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/jmap/src/calendar_event/za_read.rs)."
+   },
+   {
+    "file": "crates/jmap/src/calendar_event/query/za.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 26 (commit 37de290ef): the text leaves of a key account's CalendarEvent/query resolved in process memory (`za_resolve_text_leaves`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/jmap/src/calendar_event/query/za.rs)."
+   },
+   {
+    "file": "crates/jmap/src/calendar_event/set/za.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 30 (commit 81e40ef8b): CalendarEvent/set for a key account, one commit per object under a UID lease. A fork runtime file added by release 6 (git log --diff-filter=A -- crates/jmap/src/calendar_event/set/za.rs)."
+   },
+   {
+    "file": "crates/jmap/src/calendar/set/za.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 28 (commit beba6d2b1): Calendar/set for a key account, one commit per object. A fork runtime file added by release 6 (git log --diff-filter=A -- crates/jmap/src/calendar/set/za.rs)."
+   },
+   {
+    "file": "crates/jmap/src/changes/za_calendar.rs",
+    "runtime_excluded": false,
+    "evidence": "Plan 17 (release 6) Task 22 (commit 17f666208): the sync boundary of a key account's calendar changes and the explicit origin of a paged key-calendar sync. A fork runtime file added by release 6 (git log --diff-filter=A -- crates/jmap/src/changes/za_calendar.rs)."
    }
   ],
   "excluded_additions": [
