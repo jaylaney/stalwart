@@ -56,6 +56,7 @@ One step is performed on both sides, then compared. Each side's CalDAV input is 
 - a create sends the whole object with `calendarIds`;
 - an update sends the top-level difference between `jscalendar_of(previous text)` and `jscalendar_of(step text)`: each added or changed property with its new value, each removed one as `null`;
 - the flag is `sendSchedulingMessages: true` on every step marked S, and absent otherwise.
+- every VEVENT of a step's text carries the same SEQUENCE: 0 at a create and one higher at each organizer step that changes the event's text (M2, M4, M5, M6, M7, M7b, M10); an attendee's step keeps the organizer's value. A CalDAV client raises SEQUENCE in its own text, and upstream's JMAP update raises it for a client that leaves `sequence` out (3.1, D17's table), so the texts carry it and the difference sent to JMAP holds `sequence`. At M7b alone `sequence` is taken out of the difference, so that upstream's increment and the pipeline are set against the CalDAV client's own bump.
 
 Three exchanges, in this order. Times are UTC; a weekly series starts `20990302T100000Z`.
 
@@ -77,6 +78,7 @@ Main exchange, UID `jmapcal-oracle-main`.
 | M5 | override of the second instance: `RECURRENCE-ID:20990309T100000Z`, `SUMMARY:oracle two moved`, `DTSTART:20990309T120000Z` | `PUT` | update | contains `SUMMARY:oracle two moved` |
 | M6 | invite: `ORGANIZER` the account; `ATTENDEE` the invitee and the outside address, each `RSVP=TRUE;PARTSTAT=NEEDS-ACTION` | `PUT` | update, S | item `REQUEST` at the invitee; sink `(outside, REQUEST)`; the outside address's status is `1.1`; the invitee has a status; the stored pairs name the invitee and the outside address (release 5 spec 5.2: a mail-class attendee's pair stays in the sealed bundle) |
 | M7 | update: `LOCATION:room seven` on the master | `PUT` | update, S | item `REQUEST`; sink `(outside, REQUEST)` |
+| M7b | update: the master ends one hour later (`DTEND:20990302T120000Z`), which upstream counts as a scheduling change | `PUT` | update, S, with `sequence` taken out of the difference | item `REQUEST`; sink `(outside, REQUEST)`; contains the step's `SEQUENCE` line |
 | M8 | the invitee accepts in its own copy over CalDAV (`set_partstat`), on both sides; the account then drains | `trigger_drain` | a keyed `Calendar/get` | item `REPLY` at the account, drained; the invitee's `PARTSTAT` is `ACCEPTED` |
 | M9 | the outside address's emailed `REPLY`, `ACCEPTED`, delivered over LMTP to each account; the account then drains as in M8 | `trigger_drain` | a keyed `Calendar/get` | the outside address's `PARTSTAT` is `ACCEPTED` |
 | M10 | exclusion of the third instance: `EXDATE:20990316T100000Z` | `PUT` | update, S | item `CANCEL` at the invitee; sink `(outside, CANCEL)` |
@@ -100,7 +102,7 @@ After each step: `wait_for_queue`, the step's drains, then, under the label `"<e
 2. 3.5's first comparison: `normalize_jscal(jscalendar_of(the CalDAV GET of the event))` is equal on both sides, after the mapping.
 3. The same event read with `CalendarEvent/get` on both sides is equal after `normalize_jscal` and the mapping.
 4. 3.5's second comparison, items: the sorted lists of `(recipient, method, UID, SEQUENCE, recurrence ids)` of the new inbox items are equal. Then each pair of item trees is equal as `normalize_jscal(jscalendar_of(tree))`, after the mapping. The trees are not compared as text: by D1 the JMAP side's tree is the one upstream's converter exports (a `DURATION` where the CalDAV text had a `DTEND`, in the export's property order), and by D17 it carries JMAP's `CREATED` and update stamps, which have no CalDAV counterpart.
-5. The same for sink mail: the sorted lists of `mail_key`, extended with the UID, SEQUENCE and recurrence ids of `calendar_part()`, are equal. Then each pair goes part by part through `mail_parts`: a part of `Kind::Ics` as an item tree is compared, every other part through `Tally::same`.
+5. The same for sink mail: the sorted lists of `mail_key`, extended with the UID, SEQUENCE and recurrence ids of `calendar_part()`, are equal. Then each pair goes part by part through `mail_parts`: a part of `Kind::Ics` or `Kind::IcsCopy` as an item tree is compared, with the part's own `METHOD` line compared as text; every other part through `Tally::same`.
 6. 3.5's third comparison: each attendee's `SCHEDULE-STATUS` (`schedule_statuses`) is equal, and the recipients of the stored token pairs (`stored_pairs`) are equal after the mapping.
 
 `Tally::same` names its first value "plain" and its second "key" in a failure, so the CalDAV side is passed first. A failure prints both projections, which is what 9.3 asks of the first step that differs; a JSCalendar comparison that fails prints both projections the same way.
