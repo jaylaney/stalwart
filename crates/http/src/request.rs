@@ -46,7 +46,7 @@ use groupware::DavResourceName;
 use http_proto::{
     DownloadResponse, HttpContext, HttpRequest, HttpResponse, HttpResponseBody, HttpSessionData,
     JsonProblemResponse, ToHttpResponse, form_urlencoded,
-    request::{fetch_body, fetch_body_untraced},
+    request::{fetch_body, fetch_body_untraced, traced_url},
 };
 use hyper::{
     Method, StatusCode,
@@ -1035,7 +1035,7 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                                 trc::event!(
                                     Http(trc::HttpEvent::RequestUrl),
                                     SpanId = session.session_id,
-                                    Url = req.uri().to_compact_string(),
+                                    Url = traced_url(&req.uri().to_compact_string()),
                                 );
 
                                 session.remote_ip
@@ -1045,7 +1045,7 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                                     Http(trc::HttpEvent::RequestUrl),
                                     SpanId = session.session_id,
                                     RemoteIp = forwarded_for,
-                                    Url = req.uri().to_compact_string(),
+                                    Url = traced_url(&req.uri().to_compact_string()),
                                 );
 
                                 forwarded_for
@@ -1054,7 +1054,7 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                                 trc::event!(
                                     Http(trc::HttpEvent::RequestUrl),
                                     SpanId = session.session_id,
-                                    Url = req.uri().to_compact_string(),
+                                    Url = traced_url(&req.uri().to_compact_string()),
                                 );
 
                                 session.remote_ip

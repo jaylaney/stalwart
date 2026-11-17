@@ -176,6 +176,7 @@ pub async fn test(test: &mut TestServer) {
 
     thirty_third_sign_in_ends_the_oldest(test, &app).await;
     granted_answer_is_untraced(&app, test).await;
+    traced_urls_mask_the_code(test).await;
     sweep_removes_expired_entries(test, &admin, &app, owner).await;
     registry_destroyed_grant(test, &admin, &owner_account, &app).await;
     interrupted_refresh_cleared_by_sweep(test, &admin, &app, owner).await;
@@ -2064,6 +2065,66 @@ async fn granted_answer_is_untraced(app: &ZaOAuthClient, test: &TestServer) {
     for tokens in [keyed, plain] {
         assert_eq!(za_revoke_token(app, &tokens.refresh).await, 200);
     }
+}
+
+/// Final review FA-3: the value of a `code` query parameter is masked in the
+/// traced request URL and in a traced `Referer`, for every account. The
+/// canaries are inert strings; the request is an ordinary account's, whose
+/// request body (and so its headers) is traced.
+async fn traced_urls_mask_the_code(test: &TestServer) {
+    println!("  traced_urls_mask_the_code");
+    const URL_CANARY: &str = "tokenurlcanaryalpha";
+    const REFERER_CANARY: &str = "tokenrefcanarybravo";
+    assert!(
+        test.server
+            .account_id_from_email(PLAIN, false)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let traced = Traced::start(EventType::variants());
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .post(format!("{SERVER_URL}/jmap?code={URL_CANARY}&state=x"))
+        .basic_auth(PLAIN, Some(STRONG))
+        .header(
+            hyper::header::REFERER,
+            format!("https://example.org/za-token-app/?state=y&code={REFERER_CANARY}"),
+        )
+        .json(&json!({
+            "using": ["urn:ietf:params:jmap:core"],
+            "methodCalls": [["Core/echo", { "hello": "token" }, "e"]],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let events = traced.finish().await;
+    assert!(!events.is_empty(), "nothing was captured");
+    for canary in [URL_CANARY, REFERER_CANARY] {
+        assert!(
+            events.iter().all(|event| !event.text.contains(canary)),
+            "a code value appeared in a trace"
+        );
+    }
+    assert!(
+        events.iter().any(|event| {
+            event.typ == EventType::Http(HttpEvent::RequestUrl)
+                && event.text.contains("/jmap?code=[redacted]&state=x")
+        }),
+        "the request's URL was not traced"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.typ == EventType::Http(HttpEvent::RequestBody)
+                && event.text.contains("referer")
+                && event.text.contains("code=[redacted]")
+        }),
+        "the request's headers were not traced"
+    );
 }
 
 /// The refresh generations the token record holds for `grant`, in order.
