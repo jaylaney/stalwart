@@ -2733,6 +2733,47 @@ impl Keyless {
         };
         reply["methodResponses"][0].clone()
     }
+
+    /// A request of `calls` under the capabilities `using` (`call` keeps the
+    /// mail list); the whole response. The Bearer arm posts to
+    /// `{SERVER_URL}/jmap`.
+    pub async fn call_using(
+        &mut self,
+        using: &[&str],
+        calls: Value,
+    ) -> crate::utils::jmap::JmapResponse {
+        let reply: Value = match self {
+            Keyless::Bearer(token) => reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .post(format!("{SERVER_URL}/jmap"))
+                .bearer_auth(token)
+                .body(json!({ "using": using, "methodCalls": calls }).to_string())
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap(),
+            Keyless::WebSocket(socket) => serde_json::from_str(
+                &ws_call(
+                    socket,
+                    &json!({
+                        "@type": "Request",
+                        "id": "1",
+                        "using": using,
+                        "methodCalls": calls
+                    })
+                    .to_string(),
+                )
+                .await,
+            )
+            .unwrap(),
+        };
+        crate::utils::jmap::JmapResponse(reply)
+    }
 }
 
 /// A fresh TOTP enrolment URL (a random 20-byte secret).
