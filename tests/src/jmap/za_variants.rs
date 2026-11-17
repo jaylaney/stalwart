@@ -4983,6 +4983,8 @@ async fn calendar_notification(test: &TestServer) {
             "{method}: {reply:?}"
         );
     }
+    account.destroy_all_calendars().await;
+    test.assert_is_empty().await;
 }
 
 /// `calendar::acl::test` in key mode, with the grant made through the
@@ -4996,12 +4998,10 @@ async fn calendar_notification(test: &TestServer) {
 ///   calendar's ACL through upstream's builder, so each grant and the
 ///   revocation log upstream's notification, with the rights of the level
 ///   granted or revoked;
-/// - 6.7: Jane's reads of John's calendar assert `id` and `myRights` (the
-///   name is her own entry); the `edit` level holds no `Delete`, so her
-///   destroy of the calendar is refused and John destroys it; at the `view`
-///   level her update of the name, and even her empty patch, are refused;
-/// - spec section 8: her event update and destroy at `view` answer
-///   `forbidden`.
+/// - 6.7: the `edit` level holds no `Delete`, so Jane's `myRights` lack it,
+///   her destroy of the calendar is refused and John destroys it; at the
+///   `view` level her update of the name, and even her empty patch, are
+///   refused.
 async fn calendar_acl(test: &TestServer) {
     println!("Running key-account Calendar ACL tests...");
     let john = test.account("jdoe@example.com");
@@ -5220,26 +5220,22 @@ async fn calendar_acl(test: &TestServer) {
         }
         }));
 
-    // Verify Jane can access the event. Release 6 spec 6.7: Jane's name of
-    // the calendar is her own entry, so only `id` and `myRights` are
-    // asserted.
-    let mut jane_view = jane
-        .jmap_get_account(
-            john,
-            MethodObject::Calendar,
-            [
-                CalendarProperty::Id,
-                CalendarProperty::Name,
-                CalendarProperty::MyRights,
-            ],
-            [john_calendar_id.as_str()],
-        )
-        .await
-        .list()[0]
-        .clone();
-    jane_view.as_object_mut().unwrap().remove("name");
-    jane_view.assert_is_equal(json!({
+    // Verify Jane can access the event
+    jane.jmap_get_account(
+        john,
+        MethodObject::Calendar,
+        [
+            CalendarProperty::Id,
+            CalendarProperty::Name,
+            CalendarProperty::MyRights,
+        ],
+        [john_calendar_id.as_str()],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
         "id": john_calendar_id,
+        "name": "Test #1",
         "myRights": {
             "mayReadItems": true,
             "mayWriteAll": false,
@@ -5251,7 +5247,7 @@ async fn calendar_acl(test: &TestServer) {
             "mayRSVP": false,
             "maySetMetadata": false
         }
-    }));
+        }));
     jane.jmap_get_account(
         john,
         MethodObject::CalendarEvent,
@@ -5390,8 +5386,7 @@ async fn calendar_acl(test: &TestServer) {
     // 1.0 checks an event update by what it changes (`groupware/src/calendar/
     // rights.rs`), so the read-only sharee's refusal is tested with a change;
     // 0.16 refused the empty patch with "You are not allowed to modify
-    // calendar ...". Release 6 spec section 8: a key account's refusal is
-    // `forbidden`.
+    // calendar ...".
     assert_eq!(
         jane.jmap_update_account(
             john,
@@ -5401,10 +5396,10 @@ async fn calendar_acl(test: &TestServer) {
         )
         .await
         .not_updated(&john_event_id)
-        .typ(),
-        "forbidden"
+        .description(),
+        "You are not allowed to modify this event."
     );
-    assert_eq!(
+    assert!(
         jane.jmap_destroy_account(
             john,
             MethodObject::CalendarEvent,
@@ -5413,36 +5408,33 @@ async fn calendar_acl(test: &TestServer) {
         )
         .await
         .not_destroyed(&john_event_id)
-        .typ(),
-        "forbidden"
+        .description()
+        .contains("You are not allowed to remove events from calendar"),
     );
 
     // Grant Jane write access. Release 6 spec 6.11: through the account API,
     // at the `edit` level.
     sharing["level"] = json!("edit");
     za_post("shares/grant", &sharing).await.expect(200);
-    // Release 6 spec 6.7: the `edit` level holds no `Delete`; Jane's name is
-    // her own entry and is not asserted.
-    let mut jane_view = jane
-        .jmap_get_account(
-            john,
-            MethodObject::Calendar,
-            [
-                CalendarProperty::Id,
-                CalendarProperty::Name,
-                CalendarProperty::MyRights,
-            ],
-            [john_calendar_id.as_str()],
-        )
-        .await
-        .list()[0]
-        .clone();
-    jane_view.as_object_mut().unwrap().remove("name");
-    jane_view.assert_is_equal(json!({
+    jane.jmap_get_account(
+        john,
+        MethodObject::Calendar,
+        [
+            CalendarProperty::Id,
+            CalendarProperty::Name,
+            CalendarProperty::MyRights,
+        ],
+        [john_calendar_id.as_str()],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
         "id": john_calendar_id,
+        "name": "Test #1",
         "myRights": {
             "mayReadItems": true,
             "mayWriteAll": true,
+            // Release 6 spec 6.7: the `edit` level holds no `Delete`.
             "mayDelete": false,
             "mayShare": false,
             "mayWriteOwn": true,
@@ -5451,7 +5443,7 @@ async fn calendar_acl(test: &TestServer) {
             "mayRSVP": true,
             "maySetMetadata": false
         }
-    }));
+        }));
 
     // Verify Jane received a share notification with the updated rights.
     // Release 6 spec 6.2: upstream's notification, with the `edit` level's
