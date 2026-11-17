@@ -31,13 +31,20 @@ On one local machine:
    - an `OAuthClient` whose `clientId` is the one the client's configuration names, whose
      `redirectUris` hold the client's redirect address on the origin of step 2, with the
      `calendars` and `mail` scopes and the `authorizationCode` and `refreshToken` grant types;
-   - an `Application` for that client id, if the client's sign-in needs one (its configuration
-     says).
-4. Allow the client's origin in the server's HTTP CORS setting. This is upstream's setting; the
-   release adds none. `ZA_ACCOUNT_PAGE_ORIGIN` governs only `/api/vault/*`, which the client does
-   not call.
-5. Point the client at the server's base URL. The client discovers the session at
-   `/.well-known/jmap`.
+   - optionally, an `Application` whose `oauthClientId` is that client id. The server's rule
+     (`crates/common/src/manager/application.rs`, `is_application_client_id`;
+     `crates/common/src/auth/oauth/client.rs`, `registered_client` and `kind`): a registered
+     client with a matching `Application` is a first-party client and is granted the full scope
+     set; without one it is a registered client granted the scopes it asks for. Either way the
+     password step issues the code at once only when the request carries `consent: true` (the
+     reference client sends it, spec 1.3) or a grant for the client and scopes already exists;
+     otherwise it answers that consent is required, with a consent token. Record which kind of
+     client was registered and which path the sign-in took.
+4. Make the server's HTTP CORS answers allow the client's origin. The only CORS switch in the
+   registry schema is upstream's `usePermissiveCors` on the `Http` settings
+   (`crates/registry/src/schema/structs.rs`); the release adds none. `ZA_ACCOUNT_PAGE_ORIGIN`
+   governs only `/api/vault/*`, which the client does not call. Record the setting used.
+5. Point the client at the server's base URL, as the client's own documentation describes.
 6. Accounts, all on the fresh store:
    - **A**: a key account without a second factor, provisioned through
      `POST /api/vault/setup-token` and `POST /api/vault/setup` (README-dev, "Operating zero-access
@@ -47,7 +54,11 @@ On one local machine:
      account API (`docs/zero-access/calendar-sharing-api.md`) and as an invitee;
    - **O**: an outside address in a domain that is not local, relayed to an SMTP sink on the same
      machine (any local SMTP capture tool), through a relay route as the za suite's
-     `imip::route_outside_mail` sets one up.
+     `imip::route_outside_mail` sets one up. The sink receives the server's mail to O. Mail from
+     O into the server (O's replies, an invitation O sends) becomes a pending item only when
+     upstream's `is_authenticated()` accepts the message (release 5 invariant 43); a capture tool
+     that only receives cannot send such mail. If the setup has no sender the server accepts as
+     authenticated, record the inbound legs of rows 6 and 8 as not run, with that reason.
 
    Sign in to the client as A in one browser profile and as C in another. B is used for the
    second-factor sign-in rows.
@@ -78,9 +89,9 @@ says otherwise.
 | 3 | Create, edit, move and delete an event | Create an event, change its title and time, move it to another of A's calendars, delete it | Each step is shown and persists after a reload; a CalDAV client of A sees the same event. |
 | 4 | Recurring events: this one, this and future, all | Create a weekly event; edit one occurrence; edit this and future; edit all; delete one occurrence | Each edit applies to the occurrences the choice names. |
 | 5 | Tasks | Create, complete and delete a task | Each step is shown and persists. |
-| 6 | Invite a key account or an outside address; see replies | As A, invite C and O to an event with the invitation sent; C accepts in its calendar; answer from O at the sink's copy | C sees the invitation; O's mail reaches the sink; A sees both replies. |
+| 6 | Invite a key account or an outside address; see replies | As A, invite C and O to an event with the invitation sent; C accepts in its calendar; O answers by mail the server accepts as authenticated (setup, account O) | C sees the invitation; O's mail reaches the sink; A sees both replies. Without an authenticated sender for O, record O's reply as not run. |
 | 7 | After the first invitation to a key account | Row 6's invitation is A's first to C (A had not pinned C before). Keep using the same browser session; reload; wait past the access token's lifetime | The browser stays signed in (D19): the same session reads the event, and the client's refresh is granted. Only a password change, a recovery or a second-factor change ends a key account's browser sessions. |
-| 8 | Accept or decline, from the calendar and from an invitation email | As C, accept one invitation from the calendar and decline another; for an invitation mailed from O, answer from the email and from the calendar | Each answer reaches the organizer; the event shows the answer. |
+| 8 | Accept or decline, from the calendar and from an invitation email | As C, accept one invitation from the calendar and decline another; for an invitation mailed from O (by a sender the server accepts as authenticated), answer from the email and from the calendar | Each answer reaches the organizer; the event shows the answer. Without an authenticated sender for O, record the mailed-invitation leg as not run. |
 | 9 | Calendars shared with the user, read and edit | As C, open A's calendar shared at `view`, then at `edit`: read, create and edit an event | At `view` C reads and cannot write; at `edit` C reads and writes, and A sees C's changes. |
 | 10 | Answer for the owner of a shared calendar | As C with `edit`, answer an invitation in A's shared calendar | The organizer receives the answer sent by C on A's behalf (`SENT-BY`). |
 | 11 | Create, rename, colour, reorder and delete a calendar | As A, do each | Each step persists. A colour set on a shared calendar is A's own; C's starts as A's at the grant (D14). |
@@ -92,7 +103,7 @@ says otherwise.
 | 17 | Free/busy and suggested times | Open the client's free/busy or suggested-times view | Hidden or empty. |
 | 18 | Change-notification pop-ups | Change a shared event as C while A is signed in | No change-notification pop-up. |
 | 19 | Password, two-factor and app-password screens | Open each of the client's screens | Errors; the account page does these. |
-| 20 | File uploads | Attach a file to an event | Refused until release 8. |
+| 20 | File uploads | Upload a file in the client's files feature | Refused: a key account cannot store file content until release 8 (spec 1.2). |
 | 21 | Its own shared tags and templates | Open the client's tags or templates feature | Absent (object metadata is refused for key accounts). |
 | 22 | D29: an opaque state across several pages | As C, with A's shared calendar holding more changes than one page (add events in A's CalDAV client), let the client sync incrementally | The client sends back the `z` continuation strings unchanged across the pages and ends at an exact state; no page is refused. Record the states the browser's network log shows. |
 | 23 | D29: an initial sync across a sharing-boundary change | As C, start an initial sync of a large shared calendar, and while it pages rename the calendar through CalDAV as A (or grant again) | The initial sync continues to its end; it is never refused at the boundary. |

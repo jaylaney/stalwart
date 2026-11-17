@@ -37,8 +37,8 @@ reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not 
   keep them.
 - `decode_access_token` strips a `~` suffix from every token that begins with the server's token
   header, for every account (D26). A shared calendar's colour is carried in each principal's
-  sealed personal bundle (D14); a release 5 binary cannot read a coloured one, so a rollback
-  below release 6 leaves such a calendar unreadable.
+  sealed personal bundle (D14); a binary built before release 6 cannot read a coloured one, so
+  a rollback below release 6 leaves such a calendar unreadable.
 
 ## 0.4.0-beta.1 — 2026-11-05
 

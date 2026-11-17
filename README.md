@@ -11,11 +11,13 @@ extensions are required.
   messages and their private metadata are encrypted for zero-access accounts, including
   mail delivered while the user is logged out.
 - **Calendars:** CalDAV events, tasks and journals, with private content and calendar
-  names, descriptions, colours and custom time zones encrypted at rest.
+  names, descriptions, colours and custom time zones encrypted at rest. JMAP calendars are
+  served to a zero-access account signed in through a browser (an OAuth sign-in whose
+  token carries the account's keys); no web client is included.
 - **Invitations by email:** invite people on other servers and receive their invitations,
   replies, updates and cancellations through ordinary invitation email (iMIP). Incoming
-  invitations are processed at the next authenticated CalDAV sync, subject to the account's
-  scheduling settings.
+  invitations are processed at the next authenticated CalDAV sync, or the next keyed JMAP
+  calendar request, subject to the account's scheduling settings.
 - **Local scheduling and sharing:** invitations between zero-access accounts on this server
   use sealed internal delivery. View/edit calendar grants use pinned recipient keys and the
   [sharing API](docs/zero-access/calendar-sharing-api.md); an editor can also schedule on
@@ -26,8 +28,14 @@ extensions are required.
 Ordinary accounts retain upstream behavior. Contacts and files retain upstream storage
 behavior and are outside this fork's zero-access encryption scope.
 
-For zero-access accounts, server-side searches and sorts that need sealed mail content are
-refused, and calendar full-text search stays gated. Granting a share through JMAP, calendar
+For zero-access accounts, server-side mail search, sort and threading run in IMAP and JMAP
+requests that hold the account's keys, over a per-account index sealed under the account's
+search key (release 7); a content search with no current index is refused with a retry
+message, and a session without keys gets the keyless fallbacks of the search design. Text
+search of a zero-access account's events runs over JMAP in a request that holds its keys and
+is matched in memory (release 6); a CalDAV `calendar-query` text match on such an account's
+calendar is also matched in memory, over every event in scope, since those events are not
+indexed. Granting a share through JMAP, calendar
 re-sharing, free/busy-only grants, cross-server calendar sharing and mail sharing remain
 deferred or refused. Off-server invitations exchange event copies; they do not grant access to a calendar.
 
