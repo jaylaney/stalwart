@@ -4207,6 +4207,25 @@ pub async fn test_jmap_calendars(test: &mut TestServer) {
             CODE_LEN + SECRET_TEXT_LEN,
             "{name}: the code is not 40 characters and a hand-off secret"
         );
+        // Final review FD-8: while the hand-off entry is live (in this suite
+        // the in-memory store is the data store), the hand-off secret is in
+        // no record in any of its forms.
+        if account_id == key_id {
+            assert!(
+                handoff_exists(test, &code).await,
+                "{name}: no hand-off entry before the exchange"
+            );
+            let handoff_secret = URL_SAFE_NO_PAD
+                .decode(&code[CODE_LEN..])
+                .unwrap_or_else(|_| panic!("{name}: the hand-off secret does not decode"));
+            let hits = secret_hits(test, &[handoff_secret.as_slice()]).await;
+            assert!(
+                hits.is_empty(),
+                "{name}: the hand-off secret is stored ({} hits, first in {:?})",
+                hits.len(),
+                hits.first().map(|(subspace, _, _)| *subspace)
+            );
+        }
         let TokenResponse::Granted(first) = za_exchange(&client, &code).await else {
             panic!("{name}: the exchange was refused");
         };

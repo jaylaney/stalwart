@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::error::{ZaPipelineError, za_read_refusal};
+use super::error::{ZaPipelineError, ZaRefusal, za_read_refusal};
 use crate::calendar::{
     ArchivedCalendarEvent, CalendarEvent,
     seal::{
@@ -215,6 +215,11 @@ pub async fn za_refresh_event(
         za_write_contexts(server, token, owner_id, &sealed.meta, addressed, required).await?;
     if !calendars_changed(before, &after) {
         return Ok(None);
+    }
+    // No fresh context, no domain to rewrap in: refused, as the destroy's rebuild refuses it
+    // (final review FB-1).
+    if after.is_empty() {
+        return Err(ZaPipelineError::Forbidden(ZaRefusal::Context));
     }
     rewrap_event(sealed, &before[0].domain, &after[0].domain)
         .map_err(|error| seal_error(error, owner_id, addressed))?;

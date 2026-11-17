@@ -696,6 +696,10 @@ fn is_server_code(code: &str) -> bool {
     code.len() == CODE_LEN && code.bytes().all(|ch| ch.is_ascii_alphanumeric())
 }
 
+// Codes are generated with upstream's length and checked with the fork's: an upstream change
+// of the length stops the build here (final review FA-10).
+const _: () = assert!(CODE_LEN == common::auth::oauth::DEVICE_CODE_LEN);
+
 pub struct NewGrantRequest<'x> {
     account_id: u32,
     credential_version: u64,

@@ -665,7 +665,7 @@ async fn remove_calendar(test: &TestServer, account_id: u32, document_id: u32) {
     test.server.commit_batch(batch).await.unwrap();
 }
 
-async fn set_auth_ban_rate(admin: &Account, count: u64) {
+pub(crate) async fn set_auth_ban_rate(admin: &Account, count: u64) {
     admin
         .registry_update_object(
             ObjectType::Security,

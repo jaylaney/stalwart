@@ -2043,9 +2043,11 @@ async fn placement_refused(
         tokens.push((href, token));
     }
     let reply = update_event(events, document_id, patch.clone()).await;
+    // The placement refusal is a bare `forbidden`, with no description, so
+    // D28's incomplete answer (also `forbidden`) does not pass (review R32-1).
     assert_eq!(
-        set_error(reply.not_updated(&id)).0,
-        "forbidden",
+        set_error(reply.not_updated(&id)),
+        ("forbidden", None, Value::Null),
         "{patch}: {reply:?}"
     );
     assert_eq!(

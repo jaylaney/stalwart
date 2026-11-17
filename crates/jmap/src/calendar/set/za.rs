@@ -64,11 +64,14 @@ use types::{
 use utils::map::bitmap::Bitmap;
 use vault::session::SessionKeys;
 
-/// Upstream's text for a lost assertion (`calendar/set.rs:808`).
+/// Upstream's text for a lost assertion (`calendar_set`'s `Err(err) if err.is_assertion_failure()`
+/// arm, after "Write changes").
 const ZA_MODIFIED: &str = "Another process modified this calendar, please try again.";
-/// Upstream's text for a caller that may not modify the calendar (`calendar/set.rs:379`).
+/// Upstream's text for a caller that may not modify the calendar (`calendar_set`'s update
+/// loop, "Validate ACL").
 const ZA_NOT_ALLOWED: &str = "You are not allowed to modify this calendar.";
-/// Upstream's text for a caller that may not delete the calendar (`calendar/set.rs:540`).
+/// Upstream's text for a caller that may not delete the calendar (`calendar_set`'s destroy
+/// loop, "Validate ACLs").
 const ZA_NOT_ALLOWED_DELETE: &str = "You are not allowed to delete this calendar.";
 
 type Answer<T> = trc::Result<Result<T, SetError<CalendarProperty>>>;
@@ -103,7 +106,7 @@ pub(super) async fn za_calendar_set(
     access_token: &AccessToken,
     using: CapabilityIds,
 ) -> trc::Result<SetResponse<calendar::Calendar>> {
-    // Head, once per call (upstream's `calendar/set.rs:81-109`).
+    // Head, once per call (upstream's `calendar_set` from its start to "Process creates").
     let account_id = request.account_id.document_id();
     let metadata = ObjectMetadata::new(server, access_token, using, MetadataType::Calendar);
     let sampled = metadata.viewer_change_id(server, account_id).await?;
@@ -261,7 +264,7 @@ pub(super) async fn za_calendar_set(
         }
     }
 
-    // Set default calendar (upstream's rule, `calendar/set.rs:749-789`)
+    // Set default calendar (upstream's rule, `calendar_set`'s "Set default calendar" block)
     if let Some(MaybeIdReference::Id(id)) = &request.arguments.on_success_set_is_default {
         let document_id = id.document_id();
         let is_visible = if is_shared {
@@ -289,7 +292,8 @@ pub(super) async fn za_calendar_set(
         }
     }
 
-    // Server-set properties (upstream's `calendar/set.rs:816-867`)
+    // Server-set properties (upstream's `calendar_set`, after "Write changes": the
+    // `created_server_set` loop and the default calendar's `isDefault` properties)
     if !created_server_set.is_empty() {
         let stored_default = match za_stored_default(server, account_id).await {
             Ok(stored_default) => stored_default,

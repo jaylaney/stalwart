@@ -114,6 +114,7 @@ pub async fn test(test: &mut TestServer) {
     grantee_reads_and_writes_at_both_levels(test, &fixture).await;
     delegated_reply_carries_sent_by(test, &fixture).await;
     revoke_ends_access(test, &fixture).await;
+    revoked_and_unshared_calendars_hidden(test, &fixture).await;
     non_grantee_refused(test, &fixture).await;
     grantee_default_alerts(test, &fixture).await;
     grantee_session_lists_the_sharer(&fixture).await;
@@ -1918,6 +1919,139 @@ async fn revoke_ends_access(test: &TestServer, f: &Sharing) {
     owner_delete(test, f, UID).await;
     assert_eq!(uid_copies(test, owner_id, UID).await, 0);
     share(test, owner, reader, f.reader_id, SLUG, "view").await;
+}
+
+/// The calendar ids `caller` lists in `owner`'s account.
+async fn listed_calendars(caller: &Account, owner: &Account) -> Vec<String> {
+    let reply = caller
+        .jmap_method_call(
+            "Calendar/get",
+            json!({ "accountId": owner.id_string(), "ids": null }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    reply
+        .list()
+        .iter()
+        .map(|calendar| calendar["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Whether `caller`'s `CalendarEvent/query` of `owner`'s account with
+/// `filter` returns `event`. A method error returns nothing.
+async fn query_returns(caller: &Account, owner: &Account, filter: Value, event: &str) -> bool {
+    let mut args = json!({ "accountId": owner.id_string() });
+    if !filter.is_null() {
+        args["filter"] = filter;
+    }
+    let reply = caller.jmap_method_call("CalendarEvent/query", args).await;
+    method_error(&reply).is_none()
+        && reply.response_at(0)["ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(event)))
+}
+
+/// Spec 6.1, 6.3 (final review FC2-20): while the grantee keeps a grant on
+/// the owner's account, so that upstream's account check admits it, the
+/// fork's fresh context is the only check. A calendar whose grant was
+/// revoked, and one never shared, are not listed, and their events are
+/// neither read nor returned by a query, with or without a filter.
+async fn revoked_and_unshared_calendars_hidden(test: &TestServer, f: &Sharing) {
+    const KEPT: &str = "jmapcal-two-kept";
+    const REVOKED: &str = "jmapcal-two-revoked";
+    const UNSHARED: &str = "jmapcal-unshared";
+    let (owner, reader) = (&f.pair.key, &f.reader);
+    let mut calendars = Vec::new();
+    let mut events = Vec::new();
+    for slug in [KEPT, REVOKED, UNSHARED] {
+        let calendar = make_calendar(test, owner, &f.pair.dav, slug).await;
+        let uid = format!("{slug}-event");
+        let document_id = put_event(test, owner, &f.pair.dav, slug, &uid, &uid).await;
+        calendars.push(id(calendar));
+        events.push(id(document_id));
+    }
+    for slug in [KEPT, REVOKED] {
+        share(test, owner, reader, f.reader_id, slug, "view").await;
+    }
+    let revoked = za_post(
+        "shares/revoke",
+        &json!({
+            "username": owner.name(), "password": STRONG,
+            "calendar": REVOKED, "grant": f.reader_id
+        }),
+    )
+    .await
+    .expect(200);
+    assert_eq!(revoked["changed"], true);
+
+    let listed = listed_calendars(reader, owner).await;
+    assert!(
+        listed.contains(&calendars[0]),
+        "the kept calendar: {listed:?}"
+    );
+    assert!(
+        listed.contains(&id(f.shared)),
+        "the first grant: {listed:?}"
+    );
+    assert!(
+        !listed.contains(&calendars[1]),
+        "the revoked calendar is listed: {listed:?}"
+    );
+    assert!(
+        !listed.contains(&calendars[2]),
+        "the unshared calendar is listed: {listed:?}"
+    );
+    let event = event_get(reader, owner, &events[0]).await;
+    assert_eq!(event["uid"], format!("{KEPT}-event"), "{event}");
+    assert!(query_returns(reader, owner, Value::Null, &events[0]).await);
+
+    for (calendar, event, what) in [
+        (&calendars[1], &events[1], "revoked"),
+        (&calendars[2], &events[2], "unshared"),
+    ] {
+        let reply = reader
+            .jmap_method_call(
+                "CalendarEvent/get",
+                json!({ "accountId": owner.id_string(), "ids": [event] }),
+            )
+            .await;
+        assert_eq!(method_error(&reply), None, "{what}: {reply:?}");
+        assert!(
+            reply.list().is_empty(),
+            "{what}: the event was read: {reply:?}"
+        );
+        assert_eq!(
+            reply.not_found().collect::<Vec<_>>(),
+            [event.as_str()],
+            "{what}: {reply:?}"
+        );
+        assert!(
+            !query_returns(reader, owner, json!({ "inCalendar": calendar }), event).await,
+            "{what}: a query naming the calendar returned its event"
+        );
+        assert!(
+            !query_returns(reader, owner, Value::Null, event).await,
+            "{what}: a query without a filter returned the event"
+        );
+    }
+
+    let revoked = za_post(
+        "shares/revoke",
+        &json!({
+            "username": owner.name(), "password": STRONG,
+            "calendar": KEPT, "grant": f.reader_id
+        }),
+    )
+    .await
+    .expect(200);
+    assert_eq!(revoked["changed"], true);
+    for slug in [KEPT, REVOKED, UNSHARED] {
+        f.pair
+            .dav
+            .request_with_headers("DELETE", &home(slug), [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
 }
 
 /// Spec 6.1: an account never granted gets `accountNotFound` from every

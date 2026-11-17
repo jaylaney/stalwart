@@ -1092,7 +1092,7 @@
    {
     "file": "crates/common/src/za/tokens.rs",
     "runtime_excluded": false,
-    "evidence": "Plan 17 (release 6) Task 14 (commit d75acf9b3): the token record's field and its deletion by a vault write, with the token issue and refresh helpers (`za_split_bearer`, `ZaIssued`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/common/src/za/tokens.rs)."
+    "evidence": "Plan 17 (release 6) Task 14 (commit d75acf9b3): the token record's storage, the keyed issue and refresh, the opening of keys from a token, the removal of a grant's entries, the token sweep, the sign-in hand-off's store entry, the Bearer split (`za_split_bearer`) and the refresh precheck. A fork runtime file added by release 6 (git log --diff-filter=A -- crates/common/src/za/tokens.rs)."
    },
    {
     "file": "crates/common/src/za/calendar.rs",
@@ -1117,7 +1117,7 @@
    {
     "file": "crates/jmap/src/calendar_event/za_read.rs",
     "runtime_excluded": false,
-    "evidence": "Plan 17 (release 6) Task 21 (commit cf698b9a7): the per-request reader of a key account's events for CalendarEvent/get, Calendar/get and Calendar/query (`ZaEventReader`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/jmap/src/calendar_event/za_read.rs)."
+    "evidence": "Plan 17 (release 6) Task 21 (commit cf698b9a7): the per-request reader of a key account's unsealed event views for CalendarEvent/get, CalendarEvent/query and CalendarEvent/set (`ZaEventReader`). A fork runtime file added by release 6 (git log --diff-filter=A -- crates/jmap/src/calendar_event/za_read.rs)."
    },
    {
     "file": "crates/jmap/src/calendar_event/query/za.rs",

@@ -415,11 +415,12 @@ async fn keyless_token_on_each_served_method(test: &TestServer, owner: &Account)
 ///    an otherwise identical grantee without the permission (the module's
 ///    second account, given the same grant), which is served.
 ///
-/// The `!token.za_is_impersonated()` clause cannot be isolated by a login. A
-/// master-user login needs Impersonate on the authenticating account, and its
-/// token is the named account's, which can hold keys only when it is that
-/// same account (keys of another account are dropped). That token then holds
-/// Impersonate too, so the Impersonate clause refuses it as well.
+/// The `!token.za_is_impersonated()` clause cannot be reached by a login. A
+/// master-user login returns a fresh token of the named account with no
+/// session keys (`route_auth_request`'s master branch in
+/// `crates/common/src/auth/authentication.rs` builds it with
+/// `self.access_token(account_id)`), so the session-keys clause refuses it
+/// before the impersonation clause is read (review R37-14).
 ///
 /// `CalendarEvent/parse` admits the owner with keys only, so every form, and
 /// the control, is refused it at that rule rather than at the clauses above.

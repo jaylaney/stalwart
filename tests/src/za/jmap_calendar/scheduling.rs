@@ -107,7 +107,9 @@ pub async fn test(test: &mut TestServer) {
     send_true_denied(&s).await;
     past_event_saved_unsent(&s).await;
     withheld_and_unreachable_statuses(&s).await;
+    attendee_create_sends_no_reply(&s).await;
     mail_guard_on_failed_commit(&s).await;
+    mail_guard_on_failed_create(&s).await;
     cancel_and_decline_on_destroy(&s).await;
     mail_guard_on_failed_delete(&s).await;
     no_itip_task_ever(&s).await;
@@ -467,6 +469,13 @@ async fn invite_key_outside_and_plain(s: &Scheduling<'_>) {
     let id = reply.created_id(0).to_string();
     s.leaves(pair.key_id, UID);
     wait_for_queue(test).await;
+    // Final review FC1-11: the ordinary local attendee received the
+    // invitation; upstream's delivery imports it into its calendar.
+    assert_eq!(
+        uid_copies(test, s.plain.id().document_id(), UID).await,
+        1,
+        "invite_key_outside_and_plain: the plain attendee's copy"
+    );
     let items = new_inbox_items(test, pair.key2_id, &before).await;
     assert_eq!(items.len(), 1, "invite_key_outside_and_plain: key2's items");
     let (ical, _) = open_pending_item_as(test, pair.key2_id, STRONG, items[0].0).await;
@@ -915,6 +924,210 @@ async fn mail_guard_on_failed_commit(s: &Scheduling<'_>) {
         dropped,
         [second.0.document_id()],
         "mail_guard_on_failed_commit: ZA_IMIP_DROPPED"
+    );
+}
+
+/// Spec 5.3 (D28, invariant 75; final review FC1-2): a create whose commit
+/// fails is answered on that object, and every later object of the call, of
+/// any kind, gets the same answer unattempted; the create before it keeps
+/// its commit and its mail, the failed create's mail is dropped.
+async fn mail_guard_on_failed_create(s: &Scheduling<'_>) {
+    const UIDS: [&str; 2] = ["jmapcal-sched-create-1", "jmapcal-sched-create-2"];
+    const UPDATED: &str = "jmapcal-sched-create-updated";
+    const KEPT: &str = "jmapcal-sched-create-kept";
+    let (test, pair) = (s.test, s.pair);
+    let key_id = pair.key_id;
+    let account = pair.key.id_string().to_string();
+    let mut targets = Vec::new();
+    for uid in [UPDATED, KEPT] {
+        let reply = s
+            .create(
+                &pair.key,
+                invitation(pair.key.name(), &s.cal, uid, &[]),
+                none(),
+            )
+            .await;
+        targets.push(reply.created_id(0));
+        s.leaves(key_id, uid);
+    }
+    let [updated, kept] = [targets[0], targets[1]];
+    wait_for_queue(test).await;
+    sink().clear();
+    let state = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({ "accountId": account, "ids": [] }),
+        )
+        .await
+        .state()
+        .to_string();
+    let updated_before = event_records(test, key_id, updated.document_id()).await;
+    let kept_before = event_records(test, key_id, kept.document_id()).await;
+
+    let traced = Traced::start(&[EventType::Calendar(TrcCalendarEvent::ItipMessageError)]);
+    let first_pause = Arc::new(Pause::new(key_id));
+    test_hooks::set_commit_pause(Some(first_pause.clone()));
+    let caller = pair.key.clone();
+    let updated_key = updated.to_string();
+    let args = json!({
+        "accountId": account,
+        "sendSchedulingMessages": true,
+        "create": {
+            "i0": invitation(pair.key.name(), &s.cal, UIDS[0], &[OUT]),
+            "i1": invitation(pair.key.name(), &s.cal, UIDS[1], &[OUT]),
+        },
+        "update": { updated_key: { "title": "create guard canary" } },
+        "destroy": [kept.to_string()],
+    });
+    let call =
+        tokio::spawn(async move { caller.jmap_method_call("CalendarEvent/set", args).await });
+    tokio::time::timeout(Duration::from_secs(5), first_pause.arrived.notified())
+        .await
+        .expect("mail_guard_on_failed_create: the first create did not reach its commit");
+    let second_pause = Arc::new(Pause::new(key_id));
+    test_hooks::set_commit_pause(Some(second_pause.clone()));
+    first_pause.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), second_pause.arrived.notified())
+        .await
+        .expect("mail_guard_on_failed_create: the second create did not reach its commit");
+    test_hooks::set_commit_fail_once(Some(key_id));
+    second_pause.release.notify_one();
+    let reply = call.await.unwrap();
+    test_hooks::set_commit_pause(None);
+    test_hooks::set_commit_fail_once(None);
+    let dropped = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| {
+            event.details == ZA_IMIP_DROPPED && event.account_id == Some(u64::from(key_id))
+        })
+        .count();
+    s.leaves(key_id, UIDS[0]);
+
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let first = reply.created_id(0);
+    let response = reply.response_at(0);
+    assert_eq!(
+        response["created"].as_object().map(|created| created.len()),
+        Some(1),
+        "{reply:?}"
+    );
+    let incomplete = ("forbidden", Some(INCOMPLETE), Value::Null);
+    assert_eq!(set_error(reply.not_created(1)), incomplete, "{reply:?}");
+    assert_eq!(
+        set_error(reply.not_updated(&updated.to_string())),
+        incomplete,
+        "{reply:?}"
+    );
+    assert_eq!(
+        set_error(reply.not_destroyed(&kept.to_string())),
+        incomplete,
+        "{reply:?}"
+    );
+    assert_eq!(uid_copies(test, key_id, UIDS[0]).await, 1);
+    assert_eq!(uid_copies(test, key_id, UIDS[1]).await, 0);
+    for (target, before) in [(updated, &updated_before), (kept, &kept_before)] {
+        let after = event_records(test, key_id, target.document_id()).await;
+        assert!(
+            before.0.as_bytes() == after.0.as_bytes() && before.1.as_bytes() == after.1.as_bytes(),
+            "mail_guard_on_failed_create: {target} was written"
+        );
+    }
+
+    let changes = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/changes",
+            json!({ "accountId": account, "sinceState": state }),
+        )
+        .await;
+    let changed = changes.response_at(0);
+    assert_eq!(
+        changed["created"],
+        json!([first.to_string()]),
+        "{changes:?}"
+    );
+    assert_eq!(changed["updated"], json!([]), "{changes:?}");
+    assert_eq!(changed["destroyed"], json!([]), "{changes:?}");
+    assert_eq!(response["newState"], changed["newState"], "{changes:?}");
+
+    wait_for_queue(test).await;
+    let mail = sink().take_to(OUT);
+    assert_eq!(mail.len(), 1, "mail_guard_on_failed_create: mail to OUT");
+    let uid_line = format!("UID:{}", UIDS[0]);
+    assert!(
+        mail[0]
+            .calendar_part()
+            .is_some_and(|part| part.lines().any(|line| line == uid_line)),
+        "mail_guard_on_failed_create: the mail is not the first create's"
+    );
+    assert_eq!(dropped, 1, "mail_guard_on_failed_create: ZA_IMIP_DROPPED");
+    assert_eq!(za_uid_leases(test).await, 0);
+}
+
+/// Final review FC1-1. This case pins what the code does today; it is not a
+/// requirement. Ruling D1: a JMAP write is the CalDAV write of the converted
+/// tree, and CalDAV's create has no attendee fallback (put to the owner as a
+/// line for spec 3.3). A key account that creates, with the flag, an event an
+/// outside address organizes, in which it has already accepted, sends the
+/// organizer no REPLY, and a later change of its own participation status
+/// with the flag mails nothing either.
+async fn attendee_create_sends_no_reply(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-attendee";
+    let (test, pair) = (s.test, s.pair);
+    let address = pair.key.name();
+    let mut object = invitation(OUT, &s.cal, UID, &[]);
+    object["participants"]["p1"] = json!({
+        "@type": "Participant",
+        "calendarAddress": calendar_address(address),
+        "kind": "individual",
+        "participationStatus": "accepted",
+        "expectReply": true,
+    });
+    wait_for_queue(test).await;
+    sink().clear();
+    let reply = s.create(&pair.key, object, send()).await;
+    let id = reply.created_id(0).to_string();
+    s.leaves(pair.key_id, UID);
+    wait_for_queue(test).await;
+    assert!(
+        sink().take_to(OUT).is_empty(),
+        "attendee_create_sends_no_reply: the create mailed the organizer"
+    );
+
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({ "accountId": pair.key.id_string(), "ids": [id], "properties": ["participants"] }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let own = calendar_address(address);
+    let participant = reply.list()[0]["participants"]
+        .as_object()
+        .and_then(|participants| {
+            participants
+                .iter()
+                .find(|(_, value)| {
+                    value["calendarAddress"]
+                        .as_str()
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&own))
+                })
+                .map(|(key, _)| key.clone())
+        })
+        .unwrap_or_else(|| panic!("no participant for {address}: {reply:?}"));
+    let path = format!("participants/{participant}/participationStatus");
+    let reply = s
+        .update(&pair.key, &id, json!({ path: "declined" }), send())
+        .await;
+    assert_updated(&reply, &id);
+    wait_for_queue(test).await;
+    assert!(
+        sink().take_to(OUT).is_empty(),
+        "attendee_create_sends_no_reply: the declined update mailed the organizer"
     );
 }
 

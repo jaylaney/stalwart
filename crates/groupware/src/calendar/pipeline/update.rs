@@ -111,6 +111,12 @@ pub async fn za_commit_update(
         mut contexts,
         placement,
     } = update;
+    // No context, no domain to open the stored pairs in: refused before anything is read,
+    // as `za_update_target` and `za_create_event` refuse it (final review FB-1). The JMAP
+    // update can reach this when the owner stops reading as a key account mid-request.
+    if contexts.parents.is_empty() {
+        return Err(ZaPipelineError::Forbidden(ZaRefusal::Context));
+    }
     let account_id = account.id;
     let event = stored_event
         .to_unarchived::<CalendarEvent>()

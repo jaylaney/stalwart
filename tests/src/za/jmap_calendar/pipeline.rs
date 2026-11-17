@@ -517,6 +517,7 @@ pub async fn test(test: &mut TestServer) {
     delete_send_itip_matches_dav(test, &fx).await;
     destroy_required_denied(test, &fx).await;
     destroy_retry_after_source_rename(test, &fx).await;
+    update_without_contexts_is_refused(test, &fx).await;
     fx.cleanup(test).await;
     finish(test, "pipeline").await;
 }
@@ -1780,6 +1781,85 @@ async fn destroy_required_denied(test: &TestServer, fx: &Fx) {
     destroy(&test.server, &token, owner, id, ZaScheduling::On)
         .await
         .expect("destroy_required_denied: On saves despite denied scheduling");
+    assert_eq!(uid_copies(test, owner, uid).await, 0);
+}
+
+/// Final review FB-1: an update handed no context (the JMAP update can pass one
+/// when the owner stops reading as a key account between two objects) is
+/// refused with `Forbidden(Context)` before anything is read, not a panic.
+async fn update_without_contexts_is_refused(test: &TestServer, fx: &Fx) {
+    let owner = fx.pair.key_id;
+    let uid = "jmapcal-pipe-no-context";
+    let client = &fx.pair.dav;
+    let id = put_event(test, &fx.pair.key, client, "pipe-a", uid, "no context").await;
+    let version = stored_event(test, owner, id).await.version;
+    let token = session_token(test, owner).await;
+    let server = &test.server;
+    let resources = server
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    let event_archive: Archive<ArchiveBytes> = server
+        .store()
+        .get_value(ValueKey::archive(owner, Collection::CalendarEvent, id))
+        .await
+        .unwrap()
+        .unwrap();
+    let content_archive: Archive<ArchiveBytes> = server
+        .store()
+        .get_value(ValueKey::property(
+            owner,
+            Collection::CalendarEvent,
+            id,
+            CalendarEventField::Content,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let keys = za_writer_keys(server, &token, owner)
+        .await
+        .unwrap()
+        .expect("pipeline fixture is a key account");
+    let roles = za_roles(server, &token, owner).await.unwrap();
+    let account = server.account(owner).await.unwrap();
+    let result = za_commit_update(
+        server,
+        &token,
+        &resources,
+        &account,
+        &keys,
+        &roles,
+        ZaEventUpdate {
+            document_id: id,
+            addressed: fx.a,
+            stored_event: &event_archive,
+            stored_content: &content_archive,
+            new_event: event_archive.deserialize::<CalendarEvent>().unwrap(),
+            new_content: content_archive
+                .deserialize::<CalendarEventContent>()
+                .unwrap(),
+            display_name: None,
+            prev_alarms: Default::default(),
+            next_alarms: Default::default(),
+            scheduled: ZaScheduled {
+                messages: None,
+                resolution: None,
+            },
+            contexts: ZaPlacementContexts::unchanged(Vec::new()),
+            placement: None,
+        },
+    )
+    .await;
+    match result {
+        Err(ZaPipelineError::Forbidden(ZaRefusal::Context)) => {}
+        Err(err) => panic!("update_without_contexts_is_refused: unexpected refusal {err:?}"),
+        Ok(_) => panic!("update_without_contexts_is_refused: updated without a context"),
+    }
+    assert_eq!(stored_event(test, owner, id).await.version, version);
+    client
+        .request("DELETE", &format!("{HOME}pipe-a/{uid}.ics"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
     assert_eq!(uid_copies(test, owner, uid).await, 0);
 }
 

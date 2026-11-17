@@ -571,8 +571,9 @@ impl Server {
         }
     }
 
-    /// Upgrade ruling 185: a key account's credential version is its vault
-    /// revision, at least 1, so an OAuth grant's token (access or refresh) of
+    /// Upgrade ruling 185: a key account's credential version is the binding
+    /// of release 6's D19 (`za_session_binding`), which is never 0, so an
+    /// OAuth grant's token (access or refresh) of
     /// version 0 was minted while the account had no credential. Tokens
     /// bound to no grant (live tokens, RSVP links) carry 0 by design and are
     /// not checked here. Upstream exempts version 0 from the

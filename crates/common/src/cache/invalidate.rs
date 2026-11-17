@@ -696,8 +696,13 @@ impl Server {
                 CacheInvalidation::PrivateMetadata(id) => {
                     cache.metadata_viewers.invalidate(*id);
                 }
-                CacheInvalidation::OAuthGrant { grant_id, .. } => {
+                CacheInvalidation::OAuthGrant {
+                    account_id,
+                    grant_id,
+                } => {
                     revoked_grants.push(*grant_id);
+                    // Release 6 spec 4.6: a grant's deletion evicts its resident keys at once.
+                    cache.za_keys.remove_account(*account_id);
                 }
                 CacheInvalidation::ActiveSieveScript(id) => {
                     if let Some(account) = cache.accounts.peek(id) {

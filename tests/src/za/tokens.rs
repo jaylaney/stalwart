@@ -9,6 +9,7 @@ use super::{
     drain::DrainOn,
     mail::{self, Traced, TracedEvent, live_keys},
     pinning::{forget, lookup, pin},
+    setup::set_auth_ban_rate,
     uid_lease::put,
     user_permissions,
 };
@@ -47,10 +48,10 @@ use http::auth::{
 };
 use registry::{
     schema::{
-        prelude::{Object, ObjectInner, ObjectType},
+        prelude::{Object, ObjectInner, ObjectType, Property},
         structs,
     },
-    types::id::ObjectId,
+    types::{id::ObjectId, ipmask::IpAddrOrMask},
 };
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
@@ -382,11 +383,57 @@ async fn tampered_or_foreign_secret_is_401(test: &TestServer, owner: &Account) {
         }
     }
 
-    // Spec 4.6 (D27): these fifteen fork refusals use one address without
-    // X-Forwarded-For. The control checks continued service below the ban threshold.
+    // Spec 4.6 and 9.2 (D27): a fork refusal is not counted against its
+    // address. With the ban rate lowered to five, six refusals from one
+    // forwarded address would ban it if they were counted (final review FA-2,
+    // as `setup.rs` shows for setup), and a later request from it would be
+    // answered 429.
+    const D27_IP: &str = "10.0.60.20";
+    const BAN_RATE: u64 = 5;
+    let admin = test.account("admin@example.com").clone();
+    set_auth_ban_rate(&admin, BAN_RATE).await;
+    for attempt in 0..=BAN_RATE {
+        assert_eq!(
+            bearer_session_from(D27_IP, &cases[0]).await,
+            401,
+            "fork refusal {attempt} from one address"
+        );
+    }
+    assert!(
+        test.server
+            .registry()
+            .primary_key(
+                ObjectType::BlockedIp.into(),
+                Property::Address,
+                IpAddrOrMask::from_ip(D27_IP.parse().unwrap()).to_index_key(),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "fork refusals banned their address"
+    );
+    assert_eq!(bearer_session_from(D27_IP, &keyed).await, 200);
+    set_auth_ban_rate(&admin, 100).await;
     assert_eq!(za_bearer_session(&keyed).await.0, 200);
     za_revoke_grant(&test.server, grant).await;
     za_revoke_grant(&test.server, other_grant).await;
+}
+
+/// `GET /jmap/session` with `token`, sent from `ip` through `X-Forwarded-For`.
+async fn bearer_session_from(ip: &str, token: &str) -> u16 {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!("{SERVER_URL}/jmap/session"))
+        .bearer_auth(token)
+        .header("X-Forwarded-For", ip)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
 }
 
 fn bearer_failure(event: &TracedEvent, id: u32, grant: u64, reason: &str) -> bool {
@@ -1146,6 +1193,8 @@ async fn sign_in_gives_keyed_tokens(test: &TestServer, app: &ZaOAuthClient) {
     put_sign_in_canaries(test, owner).await;
     assert_sign_in_canaries(owner, &tokens.access).await;
     assert_first_entries(&token_record(test, id).await.unwrap(), tokens.grant_id);
+    let cache = &test.server.inner.cache;
+    assert!(cache.za_keys.contains_account(id));
     assert_eq!(za_revoke_token(app, &tokens.refresh).await, 200);
     assert!(
         test.server
@@ -1153,6 +1202,12 @@ async fn sign_in_gives_keyed_tokens(test: &TestServer, app: &ZaOAuthClient) {
             .await
             .unwrap()
             .is_none()
+    );
+    // Spec 4.6: a grant's deletion evicts the account's resident keys at once
+    // (final review FA-4).
+    assert!(
+        !cache.za_keys.contains_account(id),
+        "resident keys outlived the grant's deletion"
     );
     assert!(raw_token_record(test, id).await.is_none());
     assert_eq!(za_bearer_session(&tokens.access).await.0, 401);
