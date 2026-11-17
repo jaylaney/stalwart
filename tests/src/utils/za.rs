@@ -3520,3 +3520,41 @@ pub async fn delete_event_records(test: &TestServer, account_id: u32, document_i
     test.server
         .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
 }
+
+/// Upstream's JSCalendar converter (`ICalendar::into_jscalendar_with`), with
+/// the options `CalendarEvent/get` uses for an event read with every
+/// property: the first entry, without the iCalendar components. The release 6
+/// oracle's JMAP input (spec 3.5): its JSCalendar comes from its iCalendar
+/// text by upstream's own code.
+pub fn jscalendar_of(ics: &str) -> Value {
+    let ical = calcard::icalendar::ICalendar::parse(ics)
+        .unwrap_or_else(|err| panic!("jscalendar_of: the text does not parse: {err:?}"));
+    let converted = ical
+        .into_jscalendar_with::<Id, types::blob::BlobId, _>(
+            calcard::jscalendar::import::ImportOptions::new()
+                .include_ical_components(false)
+                .return_first(true),
+        )
+        .unwrap_or_else(|err| panic!("jscalendar_of: the conversion failed: {err:?}"));
+    serde_json::to_value(converted.into_inner()).expect("jscalendar_of: the object serializes")
+}
+
+/// The release 6 oracle's projection (spec 3.5): `value` without `id`,
+/// `baseEventId`, `created` and `updated`, and without the keys of
+/// `calendarIds`, at any depth. A `calendarIds` holds nothing but its keys
+/// (each maps to `true`), so it goes with them. Nothing else is removed.
+pub fn normalize_jscal(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter_map(|(key, value)| match (key.as_str(), value) {
+                    ("id" | "baseEventId" | "created" | "updated", _) => None,
+                    ("calendarIds", Value::Object(_)) => None,
+                    (_, value) => Some((key, normalize_jscal(value))),
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(normalize_jscal).collect()),
+        value => value,
+    }
+}

@@ -30,6 +30,7 @@ use store::write::BatchBuilder;
 
 pub mod calendars;
 pub mod events;
+pub mod oracle;
 pub mod pipeline;
 pub mod query;
 pub mod refusals;
