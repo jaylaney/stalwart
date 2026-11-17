@@ -27,9 +27,9 @@ Ordinary accounts retain upstream behavior. Contacts and files retain upstream s
 behavior and are outside this fork's zero-access encryption scope.
 
 For zero-access accounts, server-side searches and sorts that need sealed mail content are
-refused, and calendar full-text search stays gated. JMAP calendars, calendar re-sharing,
-free/busy-only grants, cross-server calendar sharing and mail sharing remain deferred or
-refused. Off-server invitations exchange event copies; they do not grant access to a calendar.
+refused, and calendar full-text search stays gated. Granting a share through JMAP, calendar
+re-sharing, free/busy-only grants, cross-server calendar sharing and mail sharing remain
+deferred or refused. Off-server invitations exchange event copies; they do not grant access to a calendar.
 
 Native-client and real-provider qualification for email invitations remain pending; see the
 [manual checklist](docs/zero-access/manual-checklist.md) for current client verification status.

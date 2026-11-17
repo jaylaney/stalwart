@@ -24,6 +24,7 @@ provenance, and the release checklist. Record fork release changes in the
 - Never open upstream issues or PRs from this fork (see AGENTS.md).
 - Zero-access account API tests: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests`
 - CalDAV suite against key accounts: `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav_tests`. In that mode the `acl`, `cal_alarm`, `cal_scheduling` and `copy_move` modules run the four key-mode variants in `tests/src/webdav/za_variants.rs` (`acl`, `alarm`, `scheduling`, `copy_move`) instead of skipping.
+- JMAP suite against key accounts: `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests jmap_tests`. Its calendar block is `za_variants::calendars` (release 6 spec 9.4): upstream's `calendar::{calendars, instance, alarm}` bodies run unchanged for key accounts, and `calendar_event`, `calendar_identity`, `calendar_notification`, `calendar_acl` and `calendar_availability` are variants in `tests/src/jmap/za_variants.rs`, each naming the upstream body it mirrors and the rulings that change its assertions.
 - Key cache tuning (environment): `ZA_KEY_IDLE_SECS` (900), `ZA_KEY_MAX_AGE_SECS` (3600), `ZA_KEY_MAX_ENTRIES` (10000).
 - Setup tokens expire after 7 days. The admin permission for `setup-token` is `sysAccountUpdate`.
 - Account page origin (environment): `ZA_ACCOUNT_PAGE_ORIGIN`, e.g. `https://account.example.com`. Read once at startup; it is the only origin CORS allows on `/api/vault/*`. Unset, empty or not a valid header value leaves the vault API without CORS headers. Other responses keep the operator's own `Access-Control-Allow-Origin` (or permissive CORS) unchanged.
@@ -33,7 +34,9 @@ provenance, and the release checklist. Record fork release changes in the
 - Provisioning: an administrator with `sysAccountUpdate` calls `POST /api/vault/setup-token` with `{ "account": "<address>" }` for a user account that has no password credential and holds no data (the 409 reasons are in `CLAUDE.md`'s "Where release 3 lives"; at 1.0 they include "account already holds object metadata"); the response carries a one-time token (7 days). The user then calls `POST /api/vault/setup` with `{ "username", "token", "password" }` and receives the recovery key, shown once. No administrator ever chooses or sees the password.
 - Marker: a key account's registry password credential holds the literal `$za$` instead of a hash. It classifies the account; the real verifier and key wraps live in the vault record. Credential edits through the registry API are refused for key accounts; password, recovery key, app passwords and TOTP are managed only through `/api/vault/*`.
 - Corrupt or missing vault record: a key account whose marker has no usable record cannot log in (the refusal names `zero-access vault record missing` in the log). This only arises from data loss; recovery is operator intervention (restore the record from backup). There is no in-band reset: the server cannot recreate the keys.
-- Key cache: unlocked keys are held per node in process memory only, never shared across a cluster or written to disk. Each node applies `ZA_KEY_IDLE_SECS` (sliding idle timeout, 900), `ZA_KEY_MAX_AGE_SECS` (hard cap from login, 3600) and `ZA_KEY_MAX_ENTRIES` (LRU bound, 10000), swept every 30 seconds; a node logs the effective values at startup. `SessionKeys` are attached by the HTTP layer for one request, and by the IMAP and POP3 login handlers for the life of the authenticated connection (mail spec 3.3; mail logins do not use the key cache: each derives afresh and the keys live in the connection's own state); WebSocket, EventSource, ManageSieve and SMTP sessions never hold them.
+- Key cache: unlocked keys are held per node in process memory only, never shared across a cluster or written to disk. Each node applies `ZA_KEY_IDLE_SECS` (sliding idle timeout, 900), `ZA_KEY_MAX_AGE_SECS` (hard cap from login, 3600) and `ZA_KEY_MAX_ENTRIES` (LRU bound, 10000), swept every 30 seconds; a node logs the effective values at startup. The cache also holds the keys of Bearer tokens that carry a secret, keyed by the fingerprint of the token as presented, suffix included, under the same idle and age limits. `SessionKeys` are attached by the HTTP layer for one request, from HTTP Basic or from a Bearer token that carries a secret, and by the IMAP and POP3 login handlers for the life of the authenticated connection (mail spec 3.3; mail logins do not use the key cache: each derives afresh and the keys live in the connection's own state); WebSocket, EventSource, ManageSieve and SMTP sessions never hold them.
+- Browser sign-in (release 6 spec section 4): an OAuth token of a key account issued through the authorization-code flow carries the account's keys. Each token string is upstream's token, a `~` and a 32-byte secret in URL-safe base64, so a keyed access token is about 45 characters longer than upstream's. The device-code flow and the Bearer logins of IMAP, POP3, SMTP and ManageSieve stay keyless (D9). A token that carries a secret whose entry is gone, expired or does not open answers 401, as an invalid token does, and the refusal is not counted for banning (D7, D27); a client that refreshes on 401 then gets a new entry. Only a credential change ends the account's browser sessions: a password change, a recovery or a second-factor change (D19). Revoking an app password, a new recovery key, the self-check's repair and the first pin's rewrap do not; each still evicts resident keys, which the next request opens again from the token record (a request that crossed the write gets one 401, D23). The token record is principal field 153 (`PrincipalField::ZeroAccessTokens`); the maintenance task's daily purge sweeps it and removes expired entries, superseded refresh entries and the entries of grants destroyed through the registry (D8), so such an entry opens nothing after the next run. At most 32 browser sign-ins of an account hold keys at once; the 33rd ends the one used least recently (D20). How long a browser stays signed in is upstream's refresh-token lifetime, thirty days without use by default; the release adds no setting.
+- Rollback below release 6: release 5's opener refuses a shared calendar's personal bundle that holds a colour (D14 fills that field from release 6 on), so a binary rollback, or a cluster that mixes the two, leaves a coloured shared calendar unreadable to the older binary.
 - Test builds (`test_mode` feature) use weakened Argon2 parameters for new passwords and log a warning at startup; never deploy them.
 
 ## Searching key accounts
@@ -173,6 +176,57 @@ STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests imap
 STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests jmap::jmap_tests
 ```
 
+## Browser sign-in and JMAP calendars
+
+Release 6 ([design](superpowers/specs/2026-11-13-zero-access-jmap-calendars-design.md),
+[plan 17](superpowers/plans/2026-11-14-zero-access-17-jmap-calendars.md) and its
+[outcome note](superpowers/plans/2026-11-14-zero-access-plan17-outcome.md)) serves a key
+account's calendars to a JMAP client in a browser. A JMAP write runs the same key-account
+pipeline as CalDAV (`groupware::calendar::pipeline`), so it stores what the CalDAV write of the
+same tree stores.
+
+Served for a key account (spec 6.2), to the owner and to a grantee under the rules CalDAV applies:
+
+- `Calendar/get`, `/changes`, `/query` and `/set` (less `shareWith`);
+- `CalendarEvent/get`, `/query`, `/queryChanges`, `/set`, `/changes`, and `/parse` for the keyed
+  owner;
+- `ParticipantIdentity/get` and `/changes`, and `/set`'s switch of the default identity;
+- the session and principal objects advertise the calendar capability for every token; a keyless
+  token meets the refusal per method (D13).
+
+Still refused (spec 6.11):
+
+- `Calendar/set` `shareWith` (set error `forbidden`, "Calendar sharing is managed on the account
+  page."); sharing stays on the account page;
+- `CalendarEventNotification/*` and `CalendarEvent/copy` (`accountNotSupportedByMethod`);
+- per-user event data, drafts and participant-visibility flags;
+- object metadata on calendars and events;
+- inline attachment blobs (the download is denied; a write with a `blobId` link is refused);
+- `ParticipantIdentity/set` create, update and destroy;
+- `Principal/getAvailability` of a key principal answers an empty list.
+
+The release ships no client. The reference client's manual checklist is
+[`zero-access/client-jmap.md`](zero-access/client-jmap.md); it has not been run.
+
+Text search of a key account's events (`text`, `title`, `description`, `location`, `owner`,
+`participant`) is matched in memory per request, over the unsealed view of each candidate, with
+the index's own code for terms and conditions (D12). A key account has no calendar search
+documents, so a text query without a time range opens every event of the account and holds their
+terms for the request. `query::text_query_cost` measured, in the latest passing za suite run (a
+debug build on local RocksDB), 300 events opened for one text query without a time range in
+440 ms, and 10 events for the same query within one day in 17 ms; memory was not measured.
+
+Each object of a `/set` for a key account is its own commit (D3). A store error on one object
+answers that object and every later one with the set error `forbidden` and "The server could not
+complete this change, try again."; the objects before it stay committed, and the method does not
+fail (D28).
+
+A keyed JMAP request that names a `Calendar`, `CalendarEvent` or `ParticipantIdentity` method runs
+the drain once before dispatch, so an account used only from a browser applies its invitations
+(spec 5.5). Default alerts are written into the event by value when it is saved (D11), and the
+`/set` answer does not carry them. Destroying a calendar through JMAP sends cancellations, as a
+CalDAV collection `DELETE` does (D16).
+
 ## Merging upstream
 
 The current integrated upstream base is Stalwart `v1.0.3`, commit
@@ -275,9 +329,9 @@ fresh revoked access. Use disposable accounts for the manual checklist.
 
 Release qualification runs the following commands sequentially; suites share listener ports.
 The benchmark and native checklist are separate gates. The key-mode JMAP gate must actually
-reach `za_variants::calendars`, including its seven calendar-method refusals and empty
-availability assertion. `RUST_TEST_NOCAPTURE=1` can expose its existing progress marker while
-retaining the exact Cargo arguments below.
+reach `za_variants::calendars`, which runs upstream's calendar bodies and the calendar variants
+(release 6 spec 9.4). `RUST_TEST_NOCAPTURE=1` can expose its progress marker
+(`Running key-account Calendar tests...`) while retaining the exact Cargo arguments below.
 
 ```sh
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"

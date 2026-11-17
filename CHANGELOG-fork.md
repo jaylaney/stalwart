@@ -6,6 +6,40 @@ The inherited [CHANGELOG.md](CHANGELOG.md) records upstream Stalwart history.
 
 ## Unreleased
 
+### Release 6: JMAP calendars and browser sign-in
+
+Design `docs/superpowers/specs/2026-11-13-zero-access-jmap-calendars-design.md`, revision 7;
+qualification in `docs/superpowers/plans/2026-11-14-zero-access-plan17-outcome.md`. The
+reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not been run.
+
+- Browser sign-in carries keys: an OAuth token of a key account issued through the
+  authorization-code flow carries a secret that opens the account's keys on every HTTP request
+  that presents it. A per-account token record (principal field 153) holds the wraps. The
+  device-code flow and the mail protocols' Bearer logins stay keyless.
+- JMAP calendars for key accounts: `Calendar/get`, `/changes`, `/query`, `/set`;
+  `CalendarEvent/get`, `/query`, `/queryChanges`, `/set`, `/changes`, `/parse`;
+  `ParticipantIdentity/get`, `/changes` and the default switch of `/set`. A grantee reads and
+  writes a shared key calendar under the rules CalDAV applies. Still refused: granting a share
+  through JMAP (`shareWith`), `CalendarEventNotification/*`, `CalendarEvent/copy`, per-user event
+  data, drafts, participant-visibility flags, object metadata, inline attachment blobs, and
+  identity creates, updates and destroys.
+- A keyed token whose entry is gone, expired or does not open is refused with 401, never served
+  keyless (D7); such refusals are not counted for banning.
+- Default alerts are applied by value: a create or update with `useDefaultAlerts: true` writes
+  the calendar's current default alerts into the event (D11).
+- Destroying a calendar through JMAP sends cancellations for its events, as a CalDAV collection
+  `DELETE` does (D16).
+- At most 32 browser sign-ins of an account hold keys at once; the 33rd ends the one used least
+  recently (D20).
+- The token endpoint's successful answers leave the traces, for every account (D24).
+- Browser sessions end only on a password change, a recovery or a second-factor change (D19).
+  Other vault writes (a new recovery key, an app password's revocation, the first pin's rewrap)
+  keep them.
+- `decode_access_token` strips a `~` suffix from every token that begins with the server's token
+  header, for every account (D26). A shared calendar's colour is carried in each principal's
+  sealed personal bundle (D14); a release 5 binary cannot read a coloured one, so a rollback
+  below release 6 leaves such a calendar unreadable.
+
 ## 0.4.0-beta.1 — 2026-11-05
 
 Limited prerelease candidate `55bb9ca67d91fe84e9b7122681f71c5746c86214`. Fully integrated upstream Stalwart `v1.0.3`, commit
