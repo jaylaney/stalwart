@@ -32,8 +32,9 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use common::{
     KV_OAUTH,
     auth::{
+        credential::AppPassword,
         oauth::{grant::GrantRotation, scope::OAuthScopes},
-        vault::{RawValue, ZaMark},
+        vault::{RawValue, ZaMark, ZaVerification},
     },
     za::{
         ZA_MAIL_KEYLESS, ZA_MAIL_LOGIN_REFUSED, test_hooks,
@@ -81,6 +82,7 @@ const CAP: &str = "token-cap@example.com";
 const PLAIN: &str = "token-plain@example.com";
 const REMOVED: &str = "token-removed@example.com";
 const GONE: &str = "token-gone@example.com";
+const FACTOR: &str = "token-factor@example.com";
 const CAL: &str = "/dav/cal/token-owner%40example.com/";
 const AUTH_FAILED: EventType = EventType::Auth(AuthEvent::Failed);
 const STRONG2: &str = "another long passphrase with 2 numbers";
@@ -97,6 +99,7 @@ pub async fn test(test: &mut TestServer) {
         (CAP, "Token Cap"),
         (CONSENT, "Token Consent"),
         (RACE, "Token Race"),
+        (FACTOR, "Token Factor"),
     ] {
         let account = admin
             .create_key_user_account(name, STRONG, description, &[], user_permissions())
@@ -138,6 +141,7 @@ pub async fn test(test: &mut TestServer) {
         Arc::new(za_oauth_client(test, &admin, "za-token-consent", ZaClientKind::Registered).await);
     sign_in_gives_keyed_tokens(test, &app).await;
     sign_in_with_second_factor(test, &app).await;
+    second_factor_change_ends_sessions(test, &app).await;
     consent_path(test, &registered).await;
     exchange_without_handoff_is_invalid_grant(test, &app).await;
     ordinary_code_with_suffix_is_invalid_grant(test, &app, plain_id).await;
@@ -184,6 +188,7 @@ pub async fn test(test: &mut TestServer) {
         cap,
         test.account(CONSENT).id().document_id(),
         race.id().document_id(),
+        test.account(FACTOR).id().document_id(),
         plain_id,
     ] {
         for grant in grants_of(test, id).await {
@@ -1151,6 +1156,159 @@ async fn sign_in_gives_keyed_tokens(test: &TestServer, app: &ZaOAuthClient) {
     assert!(raw_token_record(test, id).await.is_none());
     assert_eq!(za_bearer_session(&tokens.access).await.0, 401);
     remove_sign_in_canaries(test, owner).await;
+}
+
+/// The binding (D19) of the account's stored vault record.
+async fn stored_binding(test: &TestServer, id: u32) -> u64 {
+    za_session_binding(
+        &test
+            .server
+            .za_vault_record(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .record,
+    )
+}
+
+/// The account's password, and its second factor when one is enrolled, still
+/// verify and open its keys.
+async fn assert_password_opens(test: &TestServer, id: u32, totp: Option<&str>, step: &str) {
+    assert!(
+        matches!(
+            test.server
+                .za_verify_password(id, STRONG, totp)
+                .await
+                .unwrap(),
+            ZaVerification::Valid(_)
+        ),
+        "the password no longer opens the keys after {step}"
+    );
+}
+
+/// Every form of the pair is refused: each token with its secret and with the
+/// suffix cut off. The forms without a secret go first, so a token a reverted
+/// binding would accept again is caught before a refusal could end its grant.
+async fn assert_session_ended(app: &ZaOAuthClient, tokens: &ZaTokens, step: &str) {
+    for access in [za_split_token(&tokens.access).0, tokens.access.as_str()] {
+        assert_eq!(
+            za_bearer_session(access).await.0,
+            401,
+            "an access token was served after {step}"
+        );
+    }
+    for refresh in [za_split_token(&tokens.refresh).0, tokens.refresh.as_str()] {
+        assert!(
+            matches!(
+                za_refresh(app, refresh).await,
+                TokenResponse::Error {
+                    error: ErrorType::InvalidGrant
+                }
+            ),
+            "a refresh token was granted after {step}"
+        );
+    }
+}
+
+/// Spec 4.7 and D19 (final review FA-1, FA-7): a second-factor change ends
+/// the account's sessions for good. Removing the factor again, or enrolling
+/// the same URL again, draws a fresh salt, so the binding a token was minted
+/// under never returns. A recovery ends them too. The password and an app
+/// password made before the first change still open the keys.
+async fn second_factor_change_ends_sessions(test: &mut TestServer, app: &ZaOAuthClient) {
+    println!("  second_factor_change_ends_sessions");
+    let id = test.account(FACTOR).id().document_id();
+    let reply = za_post(
+        "app-password",
+        &json!({ "username": FACTOR, "password": STRONG, "description": "token-factor" }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    let app_password = AppPassword::parse(reply.body["app_password"].as_str().unwrap()).unwrap();
+    let credential_id = app_password.credential_id;
+
+    let tokens = za_sign_in(test, app, FACTOR, STRONG, None).await;
+    assert_keyed_pair(&tokens.access, &tokens.refresh);
+    assert_eq!(za_bearer_session(&tokens.access).await.0, 200);
+    let before = stored_binding(test, id).await;
+
+    let url = totp_url();
+    let reply = za_post(
+        "totp",
+        &json!({ "username": FACTOR, "password": STRONG, "otp_auth": &url, "confirm": code(&url) }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    let enrolled = stored_binding(test, id).await;
+    assert_ne!(enrolled, before);
+    assert_session_ended(app, &tokens, "the enrolment").await;
+    assert_password_opens(test, id, Some(&code(&url)), "the enrolment").await;
+
+    let reply = za_post(
+        "totp",
+        &json!({ "username": FACTOR, "password": STRONG, "otp_auth": null, "totp": code(&url) }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    // The tokens first: with a recurring binding, the access token without
+    // its secret would be served again here (final review FA-1).
+    assert_session_ended(app, &tokens, "the removal").await;
+    let removed = stored_binding(test, id).await;
+    assert_ne!(
+        removed, before,
+        "removing the factor restored the earlier binding"
+    );
+    assert_password_opens(test, id, None, "the removal").await;
+
+    let reply = za_post(
+        "totp",
+        &json!({ "username": FACTOR, "password": STRONG, "otp_auth": &url, "confirm": code(&url) }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    let again = stored_binding(test, id).await;
+    assert_ne!(again, enrolled, "the same enrolment restored its binding");
+    assert_ne!(again, before);
+    assert_session_ended(app, &tokens, "the second enrolment").await;
+    assert_password_opens(test, id, Some(&code(&url)), "the second enrolment").await;
+
+    let minted = za_sign_in(test, app, FACTOR, STRONG, Some(&code(&url))).await;
+    assert_eq!(za_bearer_session(&minted.access).await.0, 200);
+    let reply = za_post(
+        "recover",
+        &json!({
+            "username": FACTOR,
+            "recovery_key": test.account(FACTOR).recovery_key.as_deref().unwrap(),
+            "new_password": STRONG,
+        }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    test.accounts.get_mut(FACTOR).unwrap().recovery_key =
+        Some(reply.body["recovery_key"].as_str().unwrap().to_owned());
+    assert_ne!(stored_binding(test, id).await, again);
+    assert_session_ended(app, &minted, "the recovery").await;
+    assert_session_ended(app, &tokens, "the recovery").await;
+    assert_password_opens(test, id, None, "the recovery").await;
+    assert!(
+        test.server
+            .za_open_app_wrap(id, credential_id, &app_password.secret)
+            .await
+            .unwrap()
+            .is_some(),
+        "the app password no longer opens the keys"
+    );
+
+    for grant in grants_of(test, id).await {
+        za_revoke_grant(&test.server, grant.id()).await;
+    }
+    let reply = za_post(
+        "app-password/revoke",
+        &json!({ "username": FACTOR, "password": STRONG, "credential_id": credential_id }),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    assert!(raw_token_record(test, id).await.is_none());
 }
 
 async fn sign_in_with_second_factor(test: &TestServer, app: &ZaOAuthClient) {

@@ -1764,6 +1764,17 @@ async fn za_totp(
     }
     let mut record = read.record.clone();
     record.totp_url = otp_auth;
+    // A fresh salt on every second-factor change, so the session binding
+    // (D19) never returns to an earlier value: removing a factor would
+    // otherwise restore the binding the enrolment ended (final review
+    // FA-1). Same password, same MK: every other wrap still opens.
+    za_set_password(
+        &mut record,
+        account_id,
+        verified.keys.mk(),
+        &request.password,
+    )
+    .await?;
     // Only on top of the verified generation (invariant 8); the commit
     // invalidates cached authentication, so a password-only login cached
     // before an enrolment does not outlive it.
