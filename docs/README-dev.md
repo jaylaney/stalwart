@@ -218,9 +218,10 @@ Text search of a key account's events (`text`, `title`, `description`, `location
 `participant`) is matched in memory per request, over the unsealed view of each candidate, with
 the index's own code for terms and conditions (D12). A key account has no calendar search
 documents, so a text query without a time range opens every event of the account and holds their
-terms for the request. `query::text_query_cost` measured, in the latest passing za suite run (a
-debug build on local RocksDB), 300 events opened for one text query without a time range in
-440 ms, and 10 events for the same query within one day in 17 ms; memory was not measured.
+terms for the request. `query::text_query_cost` measured, in the za suite run of plan 17's final
+matrix on release 6's final source (`a5e45dc2f`; a debug build on local RocksDB, macOS), 300
+events opened for one text query without a time range in 402 ms, and 10 events for the same
+query within one day in 17 ms; memory was not measured.
 
 Each object of a `/set` for a key account is its own commit (D3). A store error on one object
 answers that object and every later one with the set error `forbidden` and "The server could not
