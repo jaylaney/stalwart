@@ -231,13 +231,13 @@ It follows `calendar::acl::test` with the grant made through the account API. Th
 |---|---|---|
 | `:146-161`, John's `shareWith` | `not_updated(&john_calendar_id).typ() == "forbidden"`; then the grant at level `view` through the endpoints | 6.11 |
 | `:162-190`, John's read of `shareWith` | unchanged: `mayReadItems` true, the other eight rights false | 6.7 |
-| Jane's reads of John's calendar | `id` and `myRights` asserted; the name is Jane's own entry and is not asserted here | 6.7 |
+| Jane's reads of John's calendar | unchanged: Jane's entry is a copy of John's made at the grant, so the name reads as upstream expects | 6.7 |
 | `:232-289`, `:399-455`, `:652-707`, the share notifications | upstream's lines, with the rights of the level granted or revoked: one notification is created at each point, because the share endpoints write the calendar's ACL through upstream's builder, which logs one, holding ids and rights only | 6.2: `ShareNotification/*` is unchanged |
 | `:294-301`, Jane's empty patch at `view` | `not_updated(..).typ() == "forbidden"`: the key writer asks for the right to modify before it looks at what the patch changes | 6.7 |
 | `:302-313`, Jane's `shareWith: {}` | `not_updated(..).typ() == "forbidden"` | 6.11 |
 | added after `:313`, while the level is `view`: Jane's update of the calendar's name | `not_updated(..).typ() == "forbidden"` | 6.7 |
 | `:314-325`, Jane's destroy of the calendar | unchanged: `"You are not allowed to delete this calendar."` | 6.7 |
-| `:330-353`, Jane's event update and destroy at `view` | `not_updated(..).typ() == "forbidden"`; `not_destroyed(..).typ() == "forbidden"` | section 8 |
+| `:330-353`, Jane's event update and destroy at `view` | unchanged: upstream's own checks answer first, in upstream's words | D17 |
 | `:357-369`, the write grant | the grant at level `edit` through the endpoints | 6.11 |
 | `:372-394`, Jane's `myRights` | `mayReadItems`, `mayWriteAll`, `mayWriteOwn`, `mayUpdatePrivate`, `mayRSVP` true; `mayDelete`, `mayShare`, `mayReadFreeBusy`, `maySetMetadata` false | 6.7: the `edit` level holds no `Delete` |
 | `:474-525`, `CalendarEvent/copy` in both directions | the method error `accountNotSupportedByMethod` | 6.11 |
