@@ -17,7 +17,7 @@ use crate::{
         webdav::DummyWebDavClient,
         za::{
             CALENDAR_JMAP_USING, Keyless, SERVER_URL, assert_no_event_preferences, pending_ids,
-            za_bearer_jmap, za_bearer_session, za_grant_token, za_revoke_grant,
+            za_bearer_jmap, za_bearer_session, za_grant_token, za_post, za_revoke_grant,
         },
     },
     za::{
@@ -28,6 +28,7 @@ use crate::{
         user_permissions,
     },
 };
+use ::registry::schema::enums::Permission;
 use common::{auth::oauth::scope::OAuthScopes, za::ZA_CALENDAR_KEYLESS};
 use hyper::StatusCode;
 use jmap_proto::types::state::{State, ZaCalendarOrigin};
@@ -69,7 +70,7 @@ pub async fn test(test: &mut TestServer) {
     identity_set_only_switches_default(test, &owner).await;
     parse_by_grantee_and_keyless(test, &owner, &grantee, grantee_id).await;
     keyless_token_on_each_served_method(test, &owner).await;
-    impersonation_refused(test, &owner).await;
+    impersonation_refused(test, &owner, &grantee, grantee_id).await;
     // Before 6.11's rows, whose `CalendarEventNotification/set` row would
     // otherwise stop the suite first when that method is let through.
     notification_destroy_leaves_the_item(test, &owner, &grantee, grantee_id).await;
@@ -398,9 +399,41 @@ async fn keyless_token_on_each_served_method(test: &TestServer, owner: &Account)
     }
 }
 
-/// Spec 6.1: impersonation holds no keys for the key account, in both of its
-/// forms: a master-user login, and an Impersonate holder naming the account.
-async fn impersonation_refused(test: &TestServer, owner: &Account) {
+/// Spec 6.1: impersonation is refused each served method, in three forms.
+///
+/// 1. A master-user login names the key account with the administrator's
+///    secret. Its token is marked impersonated and holds no keys: the HTTP
+///    layer never lets another account's keys travel with a token. Admission
+///    refuses it at the session-keys clause of `za_calendar_admission`.
+/// 2. The administrator, an ordinary account holding Impersonate, names the
+///    key account. It holds no keys at all, so it is refused at the same
+///    clause.
+/// 3. A key account holding Impersonate and a view grant on one of the
+///    owner's calendars, signed in with its own password, holds its own keys.
+///    It passes the session-keys clause and is refused by the
+///    `!token.has_permission(Permission::Impersonate)` clause. The control is
+///    an otherwise identical grantee without the permission (the module's
+///    second account, given the same grant), which is served.
+///
+/// The `!token.za_is_impersonated()` clause cannot be isolated by a login. A
+/// master-user login needs Impersonate on the authenticating account, and its
+/// token is the named account's, which can hold keys only when it is that
+/// same account (keys of another account are dropped). That token then holds
+/// Impersonate too, so the Impersonate clause refuses it as well.
+///
+/// `CalendarEvent/parse` admits the owner with keys only, so every form, and
+/// the control, is refused it at that rule rather than at the clauses above.
+async fn impersonation_refused(
+    test: &mut TestServer,
+    owner: &Account,
+    grantee: &Account,
+    grantee_id: u32,
+) {
+    const SLUG: &str = "jmapcal-refusals-impersonate";
+    let mut permissions = user_permissions();
+    permissions.push(Permission::Impersonate);
+    let (holder, holder_id) = key_account(test, "refusals-impersonate", permissions).await;
+
     let admin = test.account("admin@example.com");
     let master = format!("{}%{}", owner.name(), admin.name());
     for (method, args) in served(owner.id_string()) {
@@ -411,6 +444,49 @@ async fn impersonation_refused(test: &TestServer, owner: &Account) {
             .await;
         assert_calendar_keyless(&reply, &format!("{method} by an Impersonate holder"));
     }
+
+    // The third form, beside its control: the same view grant to both.
+    let owner_id = owner.id().document_id();
+    let dav = DummyWebDavClient::new(owner_id, owner.name(), STRONG, owner.name());
+    make_calendar(test, owner, &dav, SLUG).await;
+    share(test, owner, &holder, holder_id, SLUG, "view").await;
+    share(test, owner, grantee, grantee_id, SLUG, "view").await;
+    for (method, args) in served(owner.id_string()) {
+        let reply = holder
+            .jmap_request(CALENDAR_JMAP_USING, one(method, &args))
+            .await;
+        assert_calendar_keyless(
+            &reply,
+            &format!("{method} by a keyed grantee holding Impersonate"),
+        );
+        let reply = grantee
+            .jmap_request(CALENDAR_JMAP_USING, one(method, &args))
+            .await;
+        if method == "CalendarEvent/parse" {
+            assert_calendar_keyless(&reply, "control: CalendarEvent/parse by a grantee");
+        } else {
+            assert_eq!(
+                method_error(&reply),
+                None,
+                "control: {method} by a keyed grantee without Impersonate: {reply:?}"
+            );
+        }
+    }
+    for address in [holder.name(), grantee.name()] {
+        let revoked = za_post(
+            "shares/revoke",
+            &json!({
+                "username": owner.name(), "password": STRONG,
+                "calendar": SLUG, "address": address
+            }),
+        )
+        .await
+        .expect(200);
+        assert_eq!(revoked["changed"], true, "{address}");
+    }
+    dav.request_with_headers("DELETE", &home(owner, SLUG), [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
 }
 
 /// Spec 6.11: every row of what stays refused, on the keyed owner.
@@ -598,6 +674,129 @@ async fn every_row_of_6_11(test: &TestServer, owner: &Account, grantee: &Account
         )
         .await;
     assert_eq!(method_error(&reply), Some("unsupportedFilter"), "{reply:?}");
+
+    // An update naming metadata, of the event and of its calendar, is refused
+    // in each writer's update arm, and neither object changes.
+    let read_one = |method: &'static str, id: String| async move {
+        let reply = owner
+            .jmap_method_call(method, json!({ "accountId": account, "ids": [id] }))
+            .await;
+        assert_eq!(method_error(&reply), None, "{reply:?}");
+        (
+            reply.state().to_string(),
+            reply.list().first().cloned().expect("the object"),
+        )
+    };
+    let event_before = read_one("CalendarEvent/get", prefs.clone()).await;
+    let calendar_before = read_one("Calendar/get", calendar.clone()).await;
+    for (method, id) in [("CalendarEvent/set", &prefs), ("Calendar/set", &calendar)] {
+        let reply = owner
+            .jmap_request(
+                METADATA_USING,
+                one(
+                    method,
+                    &json!({
+                        "accountId": account,
+                        "update": { id: { "metadata": metadata } },
+                    }),
+                ),
+            )
+            .await;
+        assert_eq!(method_error(&reply), None, "{method}: {reply:?}");
+        assert_eq!(
+            set_error(reply.not_updated(id)),
+            ("forbidden", Some(METADATA)),
+            "{method}: {reply:?}"
+        );
+    }
+    assert_eq!(
+        read_one("CalendarEvent/get", prefs.clone()).await,
+        event_before,
+        "a refused metadata update changed the event"
+    );
+    assert_eq!(
+        read_one("Calendar/get", calendar.clone()).await,
+        calendar_before,
+        "a refused metadata update changed the calendar"
+    );
+
+    // Inline attachment blobs: the download of an event's inline ATTACH is
+    // denied, as for any key account's calendar data (spec 9; `has_access_blob`
+    // answers `Denied` for an embedded blob of a key account's event), and the
+    // route answers it not found.
+    const ATTACHED: &str = "jmapcal-refusals-attach";
+    let attach_path = format!("{}{ATTACHED}.ics", home(owner, SLUG));
+    dav.request_with_headers(
+        "PUT",
+        &attach_path,
+        [CONTENT_TYPE],
+        format!(
+            concat!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\n",
+                "UID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990301T100000Z\r\n",
+                "DURATION:PT1H\r\nSEQUENCE:0\r\nSUMMARY:jmapcal refusals attachment\r\n",
+                "ATTACH;FMTTYPE=text/plain;ENCODING=BASE64;VALUE=BINARY:{data}\r\n",
+                "END:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+            uid = ATTACHED,
+            // "jmapcal refusals inline attachment", base64.
+            data = "am1hcGNhbCByZWZ1c2FscyBpbmxpbmUgYXR0YWNobWVudA==",
+        ),
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    let attached = Id::from(
+        crate::za::dav_seal::resource_id(test, owner_id, &format!("{SLUG}/{ATTACHED}.ics")).await,
+    )
+    .to_string();
+    let reply = owner
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({
+                "accountId": account, "ids": [&attached],
+                "properties": ["id", "uid", "links"],
+            }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let [event_with_link] = reply.list() else {
+        panic!("the attached event: {reply:?}");
+    };
+    assert_eq!(event_with_link["uid"], ATTACHED, "{reply:?}");
+    let links = event_with_link["links"]
+        .as_object()
+        .unwrap_or_else(|| panic!("the attached event's links: {reply:?}"));
+    assert_eq!(links.len(), 1, "{reply:?}");
+    let attached_blob = links.values().next().unwrap()["blobId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the inline ATTACH's blobId: {reply:?}"))
+        .to_string();
+    let response = owner
+        .http_get_raw(
+            &format!(
+                "{}/jmap/download/{account}/{attached_blob}/attachment.txt",
+                owner.base_url()
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(response.status, 404, "{}", response.text());
+    let problem = response
+        .json()
+        .unwrap_or_else(|| panic!("{}", response.text()));
+    assert_eq!(problem["title"], "Not Found", "{problem}");
+    assert_eq!(
+        problem["detail"], "The requested resource does not exist on this server.",
+        "{problem}"
+    );
+    assert!(
+        !response.text().contains("inline attachment"),
+        "the denied download carried the attachment"
+    );
+    dav.request_with_headers("DELETE", &attach_path, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(uid_copies(test, owner_id, ATTACHED).await, 0);
 
     // Inline attachment blobs: a link to an upload of the account.
     let blob = owner
@@ -1038,6 +1237,27 @@ async fn calendar_continuation_is_not_a_write_precondition(
         event_before,
         "after the controls"
     );
+
+    // The same updates apply, and the same writers accept the current state as
+    // `ifInState`: the mismatches above are the `z` value's, not the update's.
+    let (current, _) = read("Calendar/get", k1.clone()).await;
+    let reply = owner
+        .jmap_method_call("Calendar/set", calendar_update(Some(&current)))
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    reply.updated(&k1);
+    let (current, _) = read("CalendarEvent/get", e1.clone()).await;
+    let reply = owner
+        .jmap_method_call("CalendarEvent/set", event_update(Some(&current)))
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    reply.updated(&e1);
+    let calendar_after = read("Calendar/get", k1.clone()).await;
+    assert_ne!(calendar_after, calendar_before, "the current-state update");
+    assert_eq!(calendar_after.1["name"], "jmapcal-refusals-changed");
+    let event_after = read("CalendarEvent/get", e1.clone()).await;
+    assert_ne!(event_after, event_before, "the current-state update");
+    assert_eq!(event_after.1["title"], "jmapcal-refusals-changed");
 
     for slug in slugs {
         dav.request_with_headers("DELETE", &home(owner, slug), [NO_REPLY], "")
