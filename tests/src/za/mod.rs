@@ -216,6 +216,7 @@ pub async fn za_tests() {
     leak::test_mail(&mut test).await;
     leak_search::test(&mut test).await;
     leak::test_imip(&mut test).await;
+    leak::test_jmap_calendars(&mut test).await;
     leak::test_codec(&mut test).await;
     leak::test(&mut test).await;
     leak::test_index_control(&mut test).await;

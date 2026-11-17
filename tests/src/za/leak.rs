@@ -66,32 +66,40 @@ use super::{
     dav_seal::{CANARIES, EVENT, mkcalendar_body, raw_event, raw_event_records},
     fanout::{NO_REPLY, Party, stored_pairs, uid_copies},
     imip::{deliver, event as imip_event, itip_mail},
-    mail::{Traced, key_mail_account, message_ids, stored_hash, stored_metadata_bytes},
+    jmap_calendar::{finish, pair, share},
+    mail::{
+        Traced, TracedEvent, key_mail_account, message_ids, stored_hash, stored_metadata_bytes,
+    },
     pinning::{ALICE, drop_entries, forget, parties, refuse_once_at},
     raw_input::{SUBMISSION_PORT, strings},
     uid_lease::put,
     user_permissions,
 };
 use crate::{
+    system::oidc::LoginResponseTest,
     utils::{
         account::Account,
         http::HttpRequest,
         imap::{ImapConnection, Type},
+        jmap::JmapResponse,
         pop3::{Pop3Connection, ResponseType as Pop3Reply},
         server::TestServer,
         smtp::SmtpConnection,
         smtp_sink::sink,
         webdav::DummyWebDavClient,
         za::{
-            Conn, IDS_ONLY_DOCUMENT, InboxItem, PlantedItem, assert_search_publication, copy_href,
-            current_mailbox_ids, destroy_inbox_item, email_log_tip, envelope_wrap,
-            expire_and_purge_blobs, hold_index_partition, hold_task_consumer, inbox_ids,
-            inbox_items, internal_search, itip_tasks_for, mail_borne_items, manifest_bytes,
-            new_inbox_items, open_pending_item_as, pending_ids, pin_record, plain_dav_container,
-            plant_container, plant_event, plant_inbox_item, plant_plain_message,
-            plant_sealed_event, queued_recipients, release_index_partition, substitute_public_key,
-            trigger_drain, wait_for_delivery, wait_for_index_queue, wait_for_queue,
-            write_manifest_bytes, za_unlock,
+            CALENDAR_JMAP_USING, Conn, IDS_ONLY_DOCUMENT, InboxItem, PlantedItem, ZaClientKind,
+            assert_search_publication, copy_href, current_mailbox_ids, destroy_inbox_item,
+            email_log_tip, envelope_wrap, expire_and_purge_blobs, handoff_exists,
+            hold_index_partition, hold_task_consumer, inbox_ids, inbox_items, internal_search,
+            itip_tasks_for, mail_borne_items, manifest_bytes, new_inbox_items,
+            open_pending_item_as, pending_ids, pin_record, plain_dav_container, plant_container,
+            plant_event, plant_inbox_item, plant_plain_message, plant_sealed_event,
+            queued_recipients, raw_token_record, release_index_partition, set_raw_token_record,
+            substitute_public_key, trigger_drain, wait_for_delivery, wait_for_index_queue,
+            wait_for_queue, write_manifest_bytes, za_authorize, za_bearer_jmap,
+            za_drop_oauth_client, za_exchange, za_oauth_client, za_post, za_refresh,
+            za_revoke_grant, za_revoke_token, za_split_token, za_unlock,
         },
     },
     za::drain::{DrainOn, body, set_partstat},
@@ -123,6 +131,7 @@ use groupware::calendar::{
         tree::{EXTRA_PROP, FORMAT_V1, KEY_PROP, PAD, SEALED_PROP, text_entry},
     },
 };
+use http::auth::oauth::TokenResponse;
 use hyper::{Method, StatusCode};
 use imap_proto::ResponseType;
 use mail_parser::{DateTime, MessageParser};
@@ -137,7 +146,7 @@ use registry::{
         },
     },
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use store::{
@@ -165,8 +174,12 @@ use types::{
 };
 use utils::{cheeky_hash::CheekyHash, hash128::Hash128};
 use vault::{
-    keys::{NONCE_LEN, Secret, TAG_LEN, generate_keypair},
+    keys::{NONCE_LEN, Secret, TAG_LEN, WRAP_LEN, generate_keypair},
     session::SessionKeys,
+    tokens::{
+        CODE_LEN, MAX_ACCESS_ENTRIES, MAX_KEYED_GRANTS, MAX_REFRESH_ENTRIES, SECRET_TEXT_LEN,
+        TOKEN_RECORD_VERSION,
+    },
 };
 
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
@@ -237,6 +250,23 @@ const EXTRA_CANARIES: &[&str] = &[
     "imipleak-sender-canary",
     "imipleak-out-sum-canary",
     "imipleak-out-att-canary",
+    // Release 6 (spec 9.5): `test_jmap_calendars`' JMAP writes: an event's
+    // title, description, location, a participant's name, the outside
+    // participant's address, a keyword, an override's title, a task's title,
+    // the grantee's event title, the calendar's name and description, and
+    // the grantee's own name of the shared calendar.
+    "jmapleak-title-canary",
+    "jmapleak-desc-canary",
+    "jmapleak-loc-canary",
+    "jmapleak-part-canary",
+    "jmapcal-leak-addr-canary",
+    "jmapleak-kw-canary",
+    "jmapleak-ovr-canary",
+    "jmapleak-task-canary",
+    "jmapleak-grantee-canary",
+    "jmapleak-calname-canary",
+    "jmapleak-caldesc-canary",
+    "jmapleak-ownname-canary",
 ];
 
 /// Mail spec 5.6: a key account's keyword and mailbox names are visible by
@@ -348,6 +378,8 @@ pub struct Scan {
     pub blobs: usize,
     pub index_blobs: usize,
     pub manifests: usize,
+    /// The account's token records (release 6, field 153).
+    pub token_records: usize,
     /// Records of the internal search store's `SearchTerm` and
     /// `SearchDocument` subspaces, and those of the account.
     pub search_records: usize,
@@ -1259,6 +1291,72 @@ async fn subspace_records(test: &TestServer, subspace: Subspace) -> Vec<(Vec<u8>
     records
 }
 
+/// Release 6 spec 4.3: field 153 of principal document 0 parses as a token
+/// record of the current version, within the caps, and every wrap it holds
+/// is `WRAP_LEN` bytes. The record is read through `Server::za_token_read`,
+/// whose raw bytes must be the scanned value.
+async fn check_token_record(
+    test: &TestServer,
+    account_id: u32,
+    key: &[u8],
+    value: &[u8],
+    what: &str,
+    scan: &mut Scan,
+) {
+    if key[U32_LEN + 2..] != 0u32.to_be_bytes() {
+        scan.violations
+            .push(format!("{what}: field 153 is outside principal document 0"));
+    }
+    let read = test.server.za_token_read(account_id).await.unwrap();
+    let record = match read.record {
+        Some(record) if read.raw.as_deref() == Some(value) => record,
+        _ => {
+            scan.violations.push(format!(
+                "{what}: field 153 does not parse as a token record"
+            ));
+            return;
+        }
+    };
+    if record.version != TOKEN_RECORD_VERSION {
+        scan.violations
+            .push(format!("{what}: field 153 has version {}", record.version));
+    }
+    if record.grants.len() > MAX_KEYED_GRANTS {
+        scan.violations.push(format!(
+            "{what}: field 153 holds {} grants",
+            record.grants.len()
+        ));
+    }
+    for grant in &record.grants {
+        let id = grant.grant_id;
+        if grant.refresh.len() > MAX_REFRESH_ENTRIES {
+            scan.violations.push(format!(
+                "{what}: field 153 grant {id} holds {} refresh entries",
+                grant.refresh.len()
+            ));
+        }
+        if grant.access.len() > MAX_ACCESS_ENTRIES {
+            scan.violations.push(format!(
+                "{what}: field 153 grant {id} holds {} access entries",
+                grant.access.len()
+            ));
+        }
+        for wrap in grant
+            .refresh
+            .iter()
+            .map(|entry| &entry.wrap)
+            .chain(grant.access.iter().map(|entry| &entry.wrap))
+        {
+            if wrap.len() != WRAP_LEN {
+                scan.violations.push(format!(
+                    "{what}: field 153 grant {id} holds a wrap of {} bytes",
+                    wrap.len()
+                ));
+            }
+        }
+    }
+}
+
 /// The two records of a split document (1.0: an event or an inbox item is
 /// a row, `Field::ARCHIVE`, and a content archive), as the walk finds them.
 #[derive(Default)]
@@ -1375,6 +1473,20 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                     ));
                 }
                 check_canaries(&value, &what, "manifest", true, &mut scan);
+                continue;
+            }
+            // Release 6 spec 4.3 and 9.5: the token record holds only what
+            // 4.3 lists, read through the product's own reader (no codec of
+            // the record is public).
+            if subspace == Subspace::Property
+                && of_account
+                && key.len() == U32_LEN + 2 + U32_LEN
+                && key[U32_LEN] == Collection::Principal as u8
+                && key[U32_LEN + 1] == PrincipalField::ZeroAccessTokens as u8
+            {
+                scan.token_records += 1;
+                check_token_record(test, account_id, &key, &value, &what, &mut scan).await;
+                check_canaries(&value, &what, "token record", true, &mut scan);
                 continue;
             }
             // The link subspace precedes raw blobs in Subspace::ALL.
@@ -1765,6 +1877,105 @@ pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(Subspace
                     .into_iter()
                     .map(|i| (Subspace::Blobs, hash.clone(), i)),
             ),
+            Ok(None) => {}
+            Err(err) => panic!("blob {hash:?} does not decode: {err:?}"),
+        }
+    }
+    hits
+}
+
+/// The shortest stream-embedded base64 slice `secret_forms` keeps. A slice
+/// shorter than this (the 4 characters a 7-byte value leaves after one
+/// leading byte) would match unrelated base64 text by chance; secrets of 32
+/// bytes or more always yield slices of 40 characters or more.
+const MIN_EMBEDDED_FORM: usize = 8;
+
+/// Every form a secret of any length takes in storage (release 6 spec 9.5):
+/// its bytes; base64url without padding (the token-string form); standard
+/// base64 with and without padding; the standard base64 of a stream the
+/// secret sits in at each of the three alignments (preceded by 0, 1 and 2
+/// bytes), keeping only the characters of the groups of three bytes that lie
+/// wholly inside the secret, which do not depend on its neighbours; and lower
+/// and upper hex.
+fn secret_forms(secret: &[u8]) -> Vec<Vec<u8>> {
+    let mut forms = vec![
+        secret.to_vec(),
+        URL_SAFE_NO_PAD.encode(secret).into_bytes(),
+        STANDARD.encode(secret).into_bytes(),
+        STANDARD_NO_PAD.encode(secret).into_bytes(),
+    ];
+    for lead in 0..3usize {
+        let mut stream = vec![0u8; lead];
+        stream.extend_from_slice(secret);
+        stream.resize(stream.len().div_ceil(3) * 3, 0);
+        let text = STANDARD.encode(&stream);
+        let (first, last) = (lead.div_ceil(3), (lead + secret.len()) / 3);
+        if last > first && (last - first) * 4 >= MIN_EMBEDDED_FORM {
+            forms.push(text.as_bytes()[first * 4..last * 4].to_vec());
+        }
+    }
+    let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+    forms.push(hex.to_uppercase().into_bytes());
+    forms.push(hex.into_bytes());
+    forms.retain(|form| !form.is_empty());
+    forms.sort_unstable();
+    forms.dedup();
+    forms
+}
+
+/// `token_hits`' search over secrets of any length (release 6 spec 9.5), in
+/// every form `secret_forms` lists: in a raw key, a raw value, a decoded
+/// archive or a decoded blob. Returns (subspace, key, secret index) per hit;
+/// a blob hit carries `Subspace::Blobs` and the blob hash. A caller that
+/// reports a hit names the subspace and the secret's label, never the key
+/// (it may hold the secret) nor the secret. A blob that fails to read panics.
+pub async fn secret_hits(test: &TestServer, secrets: &[&[u8]]) -> Vec<(Subspace, Vec<u8>, usize)> {
+    let forms: Vec<(usize, Vec<u8>)> = secrets
+        .iter()
+        .enumerate()
+        .flat_map(|(i, secret)| secret_forms(secret).into_iter().map(move |form| (i, form)))
+        .collect();
+    let find = |bytes: &[u8]| -> Vec<usize> {
+        forms
+            .iter()
+            .filter(|(_, form)| contains(bytes, form))
+            .map(|(i, _)| *i)
+            .collect()
+    };
+    let mut hits = Vec::new();
+    let mut blob_hashes: Vec<Vec<u8>> = Vec::new();
+    for &subspace in Subspace::ALL {
+        for (key, value) in subspace_records(test, subspace).await {
+            let mut found = find(&key);
+            found.extend(find(&value));
+            if let Some(archive) = try_archive(&value) {
+                found.extend(find(archive.as_bytes()));
+            }
+            if subspace == Subspace::Blobs {
+                blob_hashes.push(key.clone());
+            } else if subspace == Subspace::BlobLink && key.len() >= BLOB_HASH_LEN {
+                blob_hashes.push(key[..BLOB_HASH_LEN].to_vec());
+            }
+            found.sort_unstable();
+            found.dedup();
+            hits.extend(found.into_iter().map(|i| (subspace, key.clone(), i)));
+        }
+    }
+    blob_hashes.sort_unstable();
+    blob_hashes.dedup();
+    for hash in blob_hashes {
+        // A missing blob stays silent, as in `scan`.
+        match test.server.get_blob(&hash, 0..usize::MAX).await {
+            Ok(Some(blob)) => {
+                let mut found = find(&blob);
+                found.sort_unstable();
+                found.dedup();
+                hits.extend(
+                    found
+                        .into_iter()
+                        .map(|i| (Subspace::Blobs, hash.clone(), i)),
+                );
+            }
             Ok(None) => {}
             Err(err) => panic!("blob {hash:?} does not decode: {err:?}"),
         }
@@ -3484,6 +3695,660 @@ pub async fn test_imip(test: &mut TestServer) {
     set_auto_add(&admin, false).await;
     sink().clear();
     test.wait_for_tasks().await;
+}
+
+/// Release 6 spec 9.5: `test_jmap_calendars`' canaries, written through
+/// JMAP only. All are in `EXTRA_CANARIES`.
+const JMAPLEAK_TITLE: &str = "jmapleak-title-canary";
+const JMAPLEAK_ADDR_CANARY: &str = "jmapcal-leak-addr-canary";
+const JMAPLEAK_CANARIES: [&str; 12] = [
+    JMAPLEAK_TITLE,
+    "jmapleak-desc-canary",
+    "jmapleak-loc-canary",
+    "jmapleak-part-canary",
+    JMAPLEAK_ADDR_CANARY,
+    "jmapleak-kw-canary",
+    "jmapleak-ovr-canary",
+    "jmapleak-task-canary",
+    "jmapleak-grantee-canary",
+    "jmapleak-calname-canary",
+    "jmapleak-caldesc-canary",
+    "jmapleak-ownname-canary",
+];
+/// The outside participant, a sink address whose local part is a canary.
+const JMAPLEAK_OUT: &str = "jmapcal-leak-addr-canary@remote.test";
+/// The owner's and the grantee's colours of the shared calendar (D14).
+const JMAPLEAK_COLOURS: [&str; 2] = ["#a1b2c3", "#c3b2a1"];
+const JMAPLEAK_EVENT_UID: &str = "jmapleak-event";
+const JMAPLEAK_OVERRIDE: &str = "2031-05-13T10:00:00";
+/// The owner's password while its sessions end (a credential change, D19).
+const JMAPLEAK_PASSWORD2: &str = "another long passphrase with 2 numbers";
+
+/// One OAuth session of an account: the code it was authorized with and the
+/// sign-in's and the refresh's token pairs.
+struct LeakSession {
+    code: String,
+    access: [String; 2],
+    refresh: [String; 2],
+    grant_id: u64,
+}
+
+/// The 32 bytes of a token string's secret. Panics name `label` only.
+fn token_secret(token: &str, label: &str) -> Vec<u8> {
+    let secret = za_split_token(token)
+        .1
+        .unwrap_or_else(|| panic!("{label}: the token carries no secret"));
+    assert_eq!(secret.len(), SECRET_TEXT_LEN, "{label}: secret length");
+    URL_SAFE_NO_PAD
+        .decode(secret)
+        .unwrap_or_else(|_| panic!("{label}: the secret does not decode"))
+}
+
+/// A display alert relative to the start, as JMAP writes one.
+fn jmapleak_alert(offset: &str) -> Value {
+    json!({
+        "@type": "Alert",
+        "action": "display",
+        "trigger": { "@type": "OffsetTrigger", "relativeTo": "start", "offset": offset },
+    })
+}
+
+/// The calendar's DAV name (the last segment of its href), which the share
+/// endpoints take.
+async fn calendar_slug(test: &TestServer, account_id: u32, document_id: u32) -> String {
+    let href = test
+        .server
+        .fetch_groupware_resources(account_id, account_id, SyncCollection::Calendar)
+        .await
+        .unwrap()
+        .format_resource_paths_by_id(document_id)
+        .find(|href| href.ends_with('/'))
+        .unwrap_or_else(|| panic!("no href for calendar {account_id}/{document_id}"));
+    href.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// Asserts a JMAP `/set` created `i0` and returns its id.
+fn created_id(reply: &JmapResponse, step: &str) -> String {
+    reply
+        .pointer("/methodResponses/0/1/created/i0/id")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{step}: nothing created: {reply:?}"))
+        .to_string()
+}
+
+/// Every string a captured event carries, as captured (case kept), for the
+/// trace checks.
+fn traced_strings(event: &TracedEvent) -> String {
+    let mut out = vec![event.text.clone()];
+    for (_, value) in &event.keys {
+        strings(value, &mut out);
+    }
+    out.join(" ")
+}
+
+/// Asserts that `hits` is empty, naming each hit by its secret's label and
+/// subspace, never by its key or bytes.
+fn assert_no_secret(hits: &[(Subspace, Vec<u8>, usize)], labels: &[String], when: &str) {
+    let named = hits
+        .iter()
+        .map(|(subspace, key, i)| {
+            format!(
+                "{} in subspace {:?} (a key of {} bytes)",
+                labels[*i],
+                subspace_char(*subspace),
+                key.len()
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        named.is_empty(),
+        "secrets in the store {when}:\n{}",
+        named.join("\n")
+    );
+}
+
+/// Release 6 spec 9.5 (4.3, 4.4, 8; invariants 58, 59, 61, 62, 70; D11, D14,
+/// D19): a key account's JMAP calendar writes and its OAuth sessions leave
+/// nothing readable at rest. Two key accounts, `jmapcal-leak` (the owner)
+/// and `jmapcal-leak-2` (the grantee and invitee), write every canary of
+/// `JMAPLEAK_CANARIES` through JMAP over HTTP Basic, inside one trace capture
+/// and with the task consumer held; then each signs in through the
+/// authorization-code flow and refreshes. Then:
+///
+/// - no iMIP task for either account, and the outside participant's mail at
+///   the sink (the positive control);
+/// - no captured event holds a canary, a colour, a token secret or a hand-off
+///   secret (the outside address is exempt in the SMTP, queue and delivery
+///   layers, which carry the envelope recipient);
+/// - no token secret, code, hand-off secret or MK in any form anywhere in the
+///   store, while the sessions are live and after they end; no colour;
+/// - the whole-store scan of each account finds no violation and reads one
+///   token record while the sessions are live, none after they end;
+/// - the negative controls: junk in field 153 is a violation, and a record
+///   holding a secret in the clear is found.
+pub async fn test_jmap_calendars(test: &mut TestServer) {
+    println!("Running zero-access leak test of JMAP calendars and tokens...");
+    let pair = pair(test, "leak").await;
+    let test: &TestServer = test;
+    let admin = test.account("admin@example.com").clone();
+    let (key, key2) = (&pair.key, &pair.key2);
+    let (key_id, key2_id) = (pair.key_id, pair.key2_id);
+    let account = key.id_string().to_string();
+
+    // The objects the module writes; every canary must be in the scan's list
+    // and in what the module sends.
+    let calendars = json!({
+        "i0": {
+            "name": "jmapleak-calname-canary",
+            "description": "jmapleak-caldesc-canary",
+            "color": JMAPLEAK_COLOURS[0],
+            "defaultAlertsWithTime": { "a1": jmapleak_alert("-PT20M") },
+        },
+        "i1": { "name": "jmapleak-private" },
+    });
+    let own_entry = json!({ "name": "jmapleak-ownname-canary", "color": JMAPLEAK_COLOURS[1] });
+    let override_patch = json!({ "title": "jmapleak-ovr-canary" });
+    let event = |calendar_id: &str| {
+        json!({
+            "@type": "Event",
+            "uid": JMAPLEAK_EVENT_UID,
+            "title": JMAPLEAK_TITLE,
+            "description": "jmapleak-desc-canary",
+            "start": "2031-05-06T10:00:00",
+            "duration": "PT1H",
+            "timeZone": "Etc/UTC",
+            "calendarIds": { calendar_id: true },
+            "locations": { "l1": { "@type": "Location", "name": "jmapleak-loc-canary" } },
+            "keywords": { "jmapleak-kw-canary": true },
+            "color": JMAPLEAK_COLOURS[0],
+            "useDefaultAlerts": true,
+            "recurrenceRule": { "@type": "RecurrenceRule", "frequency": "weekly", "count": 4 },
+            "recurrenceOverrides": { JMAPLEAK_OVERRIDE: { "title": "jmapleak override" } },
+            "participants": {
+                "p0": {
+                    "@type": "Participant",
+                    "calendarAddress": format!("mailto:{}", key.name()),
+                    "roles": { "owner": true, "chair": true },
+                    "participationStatus": "accepted",
+                },
+                "p1": {
+                    "@type": "Participant",
+                    "name": "jmapleak-part-canary",
+                    "calendarAddress": format!("mailto:{}", key2.name()),
+                    "kind": "individual",
+                    "participationStatus": "needs-action",
+                    "expectReply": true,
+                },
+                "p2": {
+                    "@type": "Participant",
+                    "calendarAddress": format!("mailto:{JMAPLEAK_OUT}"),
+                    "kind": "individual",
+                    "participationStatus": "needs-action",
+                    "expectReply": true,
+                },
+            },
+        })
+    };
+    let task = |calendar_id: &str| {
+        json!({
+            "@type": "Task",
+            "uid": "jmapleak-task",
+            "title": "jmapleak-task-canary",
+            "due": "2031-05-08T10:00:00",
+            "calendarIds": { calendar_id: true },
+        })
+    };
+    let grantee_event = |calendar_id: &str| {
+        json!({
+            "@type": "Event",
+            "uid": "jmapleak-grantee",
+            "title": "jmapleak-grantee-canary",
+            "start": "2031-05-07T10:00:00",
+            "duration": "PT1H",
+            "timeZone": "Etc/UTC",
+            "calendarIds": { calendar_id: true },
+            "useDefaultAlerts": true,
+        })
+    };
+    let inputs = [
+        calendars.to_string(),
+        own_entry.to_string(),
+        event("c").to_string(),
+        override_patch.to_string(),
+        task("c").to_string(),
+        grantee_event("c").to_string(),
+    ]
+    .join("\n");
+    let listed = all_canaries();
+    for canary in JMAPLEAK_CANARIES {
+        assert!(
+            listed.contains(&canary),
+            "{canary} is not in the scan's list"
+        );
+        assert!(
+            inputs.contains(canary),
+            "{canary} is not in what the module sends"
+        );
+    }
+
+    // Negative control: junk in field 153 is a violation. The field was
+    // absent and is cleared again before any assertion.
+    assert!(raw_token_record(test, key_id).await.is_none());
+    set_raw_token_record(test, key_id, Some(b"jmapleak-junk")).await;
+    let found = scan(test, key_id).await;
+    set_raw_token_record(test, key_id, None).await;
+    assert_eq!(found.token_records, 1, "the junk record was not scanned");
+    assert!(
+        found
+            .violations
+            .iter()
+            .any(|violation| violation.ends_with("field 153 does not parse as a token record")),
+        "junk in field 153 is no violation: {:?}",
+        found.violations
+    );
+
+    sink().clear();
+    let starts = [
+        inbox_ids(test, key_id).await,
+        inbox_ids(test, key2_id).await,
+    ];
+    let traced = Traced::start(EventType::variants());
+    let drain = DrainOn::new();
+    let held = hold_task_consumer(test).await;
+
+    // 1. The owner's calendars: the shared one (name, description, colour,
+    // one default alert with time) and an unshared one.
+    let reply = key
+        .jmap_method_call(
+            "Calendar/set",
+            json!({ "accountId": account, "create": calendars }),
+        )
+        .await;
+    let [shared, private] = ["i0", "i1"].map(|create| {
+        reply
+            .pointer(&format!("/methodResponses/0/1/created/{create}/id"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("Calendar/set did not create {create}: {reply:?}"))
+            .to_string()
+    });
+    let shared_document = shared.parse::<Id>().unwrap().document_id();
+
+    // 2. The share at level edit, then the grantee's own entry (D14).
+    let slug = calendar_slug(test, key_id, shared_document).await;
+    share(test, key, key2, key2_id, &slug, "edit").await;
+    let reply = key2
+        .jmap_method_call(
+            "Calendar/set",
+            json!({ "accountId": account, "update": { (shared.as_str()): own_entry } }),
+        )
+        .await;
+    reply.updated(&shared);
+
+    // 3. The owner's invitation in the unshared calendar, with scheduling:
+    // jmapcal-leak-2 gets a sealed item, the outside participant mail.
+    let reply = key
+        .jmap_create(
+            "CalendarEvent",
+            [event(&private)],
+            [("sendSchedulingMessages", Value::Bool(true))],
+        )
+        .await;
+    let event_id = created_id(&reply, "the invitation");
+    wait_for_queue(test).await;
+
+    // 4. The override's title; a task.
+    let reply = key
+        .jmap_update(
+            "CalendarEvent",
+            [(
+                event_id.clone(),
+                json!({ (format!("recurrenceOverrides/{JMAPLEAK_OVERRIDE}")): override_patch }),
+            )],
+            Vec::<(&str, Value)>::new(),
+        )
+        .await;
+    reply.updated(&event_id);
+    let reply = key
+        .jmap_create(
+            "CalendarEvent",
+            [task(&private)],
+            Vec::<(&str, Value)>::new(),
+        )
+        .await;
+    let task_id = created_id(&reply, "the task");
+
+    // 5. The grantee's event in the shared calendar (D11). The request also
+    // drains the grantee's inbox: the invitation's copy is imported.
+    let reply = key2
+        .jmap_create_account(
+            key,
+            "CalendarEvent",
+            [grantee_event(&shared)],
+            Vec::<(&str, Value)>::new(),
+        )
+        .await;
+    let grantee_event_id = created_id(&reply, "the grantee's event");
+
+    // 6. The task's destroy, with scheduling.
+    let reply = key
+        .jmap_destroy(
+            "CalendarEvent",
+            [task_id.as_str()],
+            [("sendSchedulingMessages", Value::Bool(true))],
+        )
+        .await;
+    assert_eq!(
+        reply.destroyed().collect::<Vec<_>>(),
+        [task_id.as_str()],
+        "{reply:?}"
+    );
+
+    // Invariant 57: no iMIP task for either account, with the consumer held
+    // across every write.
+    for (account_id, name) in [(key_id, key.name()), (key2_id, key2.name())] {
+        assert_eq!(
+            itip_tasks_for(test, account_id).await,
+            0,
+            "an iMIP task for {name}"
+        );
+    }
+    drop(held);
+    drop(drain);
+    sink_and_purge_held(test).await;
+
+    // Positive control: the outside participant's mail carries the title.
+    assert!(
+        sink().messages().iter().any(|message| message
+            .calendar_part()
+            .is_some_and(|part| part.contains(JMAPLEAK_TITLE))),
+        "the positive control: the title at the sink"
+    );
+
+    // The sessions: a sign-in through the authorization-code flow, the
+    // exchange and a refresh, each access token read once.
+    let client = za_oauth_client(test, &admin, "za-jmapcal-leak", ZaClientKind::Registered).await;
+    let mut sessions = Vec::new();
+    for (account_id, account_key) in [(key_id, key), (key2_id, key2)] {
+        let name = account_key.name();
+        let code = za_authorize(&client, name, STRONG, None, Some(true), None)
+            .await
+            .unwrap_code();
+        assert_eq!(
+            code.len(),
+            CODE_LEN + SECRET_TEXT_LEN,
+            "{name}: the code is not 40 characters and a hand-off secret"
+        );
+        let TokenResponse::Granted(first) = za_exchange(&client, &code).await else {
+            panic!("{name}: the exchange was refused");
+        };
+        assert!(
+            !handoff_exists(test, &code).await,
+            "{name}: the hand-off entry outlived its code"
+        );
+        let first_refresh = first
+            .refresh_token
+            .unwrap_or_else(|| panic!("{name}: the exchange issued no refresh token"));
+        let grant_id = test
+            .server
+            .decode_access_token(None, &first.access_token)
+            .unwrap_or_else(|_| panic!("{name}: the access token does not decode"))
+            .grant
+            .unwrap_or_else(|| panic!("{name}: the access token has no grant"))
+            .id;
+
+        // Negative control, after the first sign-in: a record holding the
+        // access secret in the clear is found. The record's bytes are
+        // restored before any assertion.
+        if account_id == key_id {
+            let secret = token_secret(&first.access_token, "the first access token");
+            let original = raw_token_record(test, key_id)
+                .await
+                .expect("the first sign-in left no token record");
+            let mut planted = original.clone();
+            planted.extend_from_slice(&secret);
+            set_raw_token_record(test, key_id, Some(&planted)).await;
+            let hits = secret_hits(test, &[secret.as_slice()]).await;
+            set_raw_token_record(test, key_id, Some(&original)).await;
+            assert!(
+                hits.iter()
+                    .any(|(subspace, _, _)| *subspace == Subspace::Property),
+                "the planted secret was not found in the property subspace ({} hits elsewhere)",
+                hits.len()
+            );
+            assert!(
+                raw_token_record(test, key_id).await.as_deref() == Some(original.as_slice()),
+                "the token record was not restored"
+            );
+        }
+
+        let TokenResponse::Granted(refreshed) = za_refresh(&client, &first_refresh).await else {
+            panic!("{name}: the refresh was refused");
+        };
+        let refreshed_refresh = refreshed
+            .refresh_token
+            .unwrap_or_else(|| panic!("{name}: the refresh issued no refresh token"));
+        let own = account_key.id_string().to_string();
+        for (label, access) in [
+            ("first", &first.access_token),
+            ("refreshed", &refreshed.access_token),
+        ] {
+            let (status, reply) = za_bearer_jmap(
+                access,
+                CALENDAR_JMAP_USING,
+                json!([["Calendar/get", { "accountId": own, "ids": null }, "c0"]]),
+            )
+            .await;
+            assert_eq!(status, 200, "{name}: Calendar/get with the {label} token");
+            assert_eq!(
+                reply.name_at(0),
+                "Calendar/get",
+                "{name}: the {label} token's Calendar/get is not keyed: {reply:?}"
+            );
+        }
+        sessions.push(LeakSession {
+            code,
+            access: [first.access_token, refreshed.access_token],
+            refresh: [first_refresh, refreshed_refresh],
+            grant_id,
+        });
+    }
+
+    // Every secret of the sessions and both accounts' MK, each with a label
+    // that the failure messages name instead of its value.
+    let mut labels = Vec::new();
+    let mut secrets: Vec<Vec<u8>> = Vec::new();
+    let mut traced_secrets: Vec<(String, String)> = Vec::new();
+    for ((account_id, name), session) in [(key_id, key.name()), (key2_id, key2.name())]
+        .into_iter()
+        .zip(&sessions)
+    {
+        for (kind, tokens) in [("access", &session.access), ("refresh", &session.refresh)] {
+            for (which, token) in ["first", "refreshed"].into_iter().zip(tokens.iter()) {
+                let label = format!("{name}'s {which} {kind} secret");
+                let text = za_split_token(token).1.unwrap_or_default().to_string();
+                secrets.push(token_secret(token, &label));
+                labels.push(format!("{label} (bytes)"));
+                secrets.push(text.clone().into_bytes());
+                labels.push(format!("{label} (text)"));
+                traced_secrets.push((label, text));
+            }
+        }
+        let (upstream, handoff) = session.code.split_at(CODE_LEN);
+        secrets.push(upstream.as_bytes().to_vec());
+        labels.push(format!("{name}'s code"));
+        let handoff_bytes = URL_SAFE_NO_PAD
+            .decode(handoff)
+            .unwrap_or_else(|_| panic!("{name}: the hand-off secret does not decode"));
+        secrets.push(handoff_bytes);
+        labels.push(format!("{name}'s hand-off secret (bytes)"));
+        secrets.push(handoff.as_bytes().to_vec());
+        labels.push(format!("{name}'s hand-off secret (text)"));
+        traced_secrets.push((format!("{name}'s hand-off secret"), handoff.to_string()));
+        secrets.push(
+            za_unlock(test, account_id, STRONG)
+                .await
+                .mk()
+                .as_bytes()
+                .to_vec(),
+        );
+        labels.push(format!("{name}'s MK"));
+    }
+
+    // The trace capture ends here: no event names a canary, a colour or a
+    // secret. The outside address is exempt in the SMTP, queue and delivery
+    // layers (the envelope recipient), as in `imip::traces`.
+    let captured = traced.finish().await;
+    assert!(!captured.is_empty(), "the trace capture saw nothing");
+    let mut named = Vec::new();
+    for event in &captured {
+        let text = traced_strings(event);
+        let transit = matches!(
+            event.typ,
+            EventType::Smtp(_) | EventType::Queue(_) | EventType::Delivery(_)
+        );
+        for canary in JMAPLEAK_CANARIES {
+            if !(canary == JMAPLEAK_ADDR_CANARY && transit) && text.contains(canary) {
+                named.push(format!("{canary} in {:?}", event.typ));
+            }
+        }
+        for colour in JMAPLEAK_COLOURS {
+            if text.contains(colour) {
+                named.push(format!("{colour} in {:?}", event.typ));
+            }
+        }
+        for (label, secret) in &traced_secrets {
+            if text.contains(secret.as_str()) {
+                named.push(format!("{label} in {:?}", event.typ));
+            }
+        }
+    }
+    assert!(named.is_empty(), "traced:\n{}", named.join("\n"));
+
+    // No secret in the store while the sessions are live, and no colour.
+    let secret_refs = secrets.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    assert_no_secret(
+        &secret_hits(test, &secret_refs).await,
+        &labels,
+        "while the sessions are live",
+    );
+    let colours = JMAPLEAK_COLOURS.map(str::as_bytes);
+    assert_no_secret(
+        &secret_hits(test, &colours).await,
+        &JMAPLEAK_COLOURS.map(str::to_string),
+        "(the colours)",
+    );
+
+    // The whole-store scan of each account: no violation, one token record,
+    // the scanner not blind.
+    for (account_id, name) in [(key_id, key.name()), (key2_id, key2.name())] {
+        let found = scan(test, account_id).await;
+        assert!(
+            found.violations.is_empty(),
+            "JMAP calendar leaks in {name}:\n{}",
+            found.violations.join("\n")
+        );
+        assert_eq!(found.token_records, 1, "{name}: token records");
+        assert!(
+            found.events >= 1 && found.calendars >= 1,
+            "{name}: {} events, {} calendars",
+            found.events,
+            found.calendars
+        );
+    }
+
+    // The sessions end: jmapcal-leak-2 revokes its refresh token, and
+    // jmapcal-leak changes its password, a credential change (D19).
+    assert_eq!(
+        za_revoke_token(&client, &sessions[1].refresh[1]).await,
+        200,
+        "{}: the revocation",
+        key2.name()
+    );
+    za_post(
+        "password",
+        &json!({ "username": key.name(), "password": STRONG, "new_password": JMAPLEAK_PASSWORD2 }),
+    )
+    .await
+    .expect(200);
+    for (account_id, name) in [(key_id, key.name()), (key2_id, key2.name())] {
+        assert!(
+            raw_token_record(test, account_id).await.is_none(),
+            "{name}: the token record outlived the session"
+        );
+        assert_eq!(
+            scan(test, account_id).await.token_records,
+            0,
+            "{name}: token records after the session"
+        );
+    }
+    assert_no_secret(
+        &secret_hits(test, &secret_refs).await,
+        &labels,
+        "after the sessions end",
+    );
+
+    // Cleanup. The owner's password back (its Basic client and the share
+    // endpoints use it); its grant, if the password change left it.
+    za_post(
+        "password",
+        &json!({ "username": key.name(), "password": JMAPLEAK_PASSWORD2, "new_password": STRONG }),
+    )
+    .await
+    .expect(200);
+    if test
+        .server
+        .oauth_grant(sessions[0].grant_id)
+        .await
+        .unwrap()
+        .is_some()
+    {
+        za_revoke_grant(&test.server, sessions[0].grant_id).await;
+    }
+    let reply = key
+        .jmap_destroy(
+            "CalendarEvent",
+            [event_id.as_str(), grantee_event_id.as_str()],
+            [("sendSchedulingMessages", Value::Bool(false))],
+        )
+        .await;
+    assert_eq!(reply.destroyed().count(), 2, "{reply:?}");
+    let copy = copy_href(test, key2_id, JMAPLEAK_EVENT_UID).await;
+    pair.dav2
+        .request_with_headers("DELETE", &copy, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let revoked = za_post(
+        "shares/revoke",
+        &json!({
+            "username": key.name(), "password": STRONG,
+            "calendar": slug, "address": key2.name()
+        }),
+    )
+    .await
+    .expect(200);
+    assert_eq!(revoked["changed"], true);
+    let reply = key
+        .jmap_method_call(
+            "Calendar/set",
+            json!({ "accountId": account, "destroy": [shared, private] }),
+        )
+        .await;
+    assert_eq!(reply.destroyed().count(), 2, "{reply:?}");
+    Party::new(test, key.name())
+        .delete_items_since(test, &starts[0])
+        .await;
+    Party::new(test, key2.name())
+        .delete_items_since(test, &starts[1])
+        .await;
+    assert_eq!(uid_copies(test, key_id, JMAPLEAK_EVENT_UID).await, 0);
+    assert_eq!(uid_copies(test, key2_id, JMAPLEAK_EVENT_UID).await, 0);
+    za_drop_oauth_client(test, &admin, client).await;
+    sink().clear();
+    finish(test, "leak").await;
 }
 
 pub async fn test(test: &mut TestServer) {
