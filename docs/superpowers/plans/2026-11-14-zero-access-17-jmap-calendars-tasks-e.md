@@ -99,11 +99,11 @@ After each step: `wait_for_queue`, the step's drains, then, under the label `"<e
 1. `Expect`, on each side.
 2. 3.5's first comparison: `normalize_jscal(jscalendar_of(the CalDAV GET of the event))` is equal on both sides, after the mapping.
 3. The same event read with `CalendarEvent/get` on both sides is equal after `normalize_jscal` and the mapping.
-4. 3.5's second comparison, items: the sorted lists of `(recipient, method, UID, SEQUENCE, recurrence ids)` of the new inbox items are equal. Then each pair of item trees goes through `Tally::same` with `Kind::Ics`.
-5. The same for sink mail: the sorted lists of `mail_key`, extended with the UID, SEQUENCE and recurrence ids of `calendar_part()`, are equal. Then each pair goes part by part through `mail_parts` and `Tally::same`.
+4. 3.5's second comparison, items: the sorted lists of `(recipient, method, UID, SEQUENCE, recurrence ids)` of the new inbox items are equal. Then each pair of item trees is equal as `normalize_jscal(jscalendar_of(tree))`, after the mapping. The trees are not compared as text: by D1 the JMAP side's tree is the one upstream's converter exports (a `DURATION` where the CalDAV text had a `DTEND`, in the export's property order), and by D17 it carries JMAP's `CREATED` and update stamps, which have no CalDAV counterpart.
+5. The same for sink mail: the sorted lists of `mail_key`, extended with the UID, SEQUENCE and recurrence ids of `calendar_part()`, are equal. Then each pair goes part by part through `mail_parts`: a part of `Kind::Ics` as an item tree is compared, every other part through `Tally::same`.
 6. 3.5's third comparison: each attendee's `SCHEDULE-STATUS` (`schedule_statuses`) is equal, and the recipients of the stored token pairs (`stored_pairs`) are equal after the mapping.
 
-`Tally::same` names its first value "plain" and its second "key" in a failure, so the CalDAV side is passed first. A failure prints both projections, which is what 9.3 asks of the first step that differs.
+`Tally::same` names its first value "plain" and its second "key" in a failure, so the CalDAV side is passed first. A failure prints both projections, which is what 9.3 asks of the first step that differs; a JSCalendar comparison that fails prints both projections the same way.
 
 - [ ] **Step 5: Write `round_trip_keeps_what_an_ordinary_account_keeps`**
 
