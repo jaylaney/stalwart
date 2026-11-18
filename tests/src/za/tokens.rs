@@ -133,6 +133,8 @@ pub async fn test(test: &mut TestServer) {
     suffix_on_ordinary_token_is_401(test, plain_id).await;
     keyed_token_without_secret_is_keyless(test, &owner_account).await;
     bearer_crossed_by_vault_write_is_refused(test, owner).await;
+    keyed_entry_bounded_by_token_expiry(test, owner).await;
+    keyed_request_crossed_by_revocation(test, owner).await;
     mail_bearer_login_stays_refused(test, owner).await;
     revocation_and_introspection_accept_the_suffix(test, owner).await;
 
@@ -528,6 +530,73 @@ async fn bearer_crossed_by_vault_write_is_refused(test: &mut TestServer, id: u32
     );
     assert_eq!(za_bearer_session(&keyed).await.0, 200);
     za_revoke_grant(&test.server, grant).await;
+}
+
+/// `GET /jmap/session` with `token`, through a client whose timeout outlasts
+/// a parked request.
+async fn slow_session_status(token: String) -> u16 {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!("{SERVER_URL}/jmap/session"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap_or_else(|_| panic!("Bearer request failed"))
+        .status()
+        .as_u16()
+}
+
+/// PR #90 review C4617611615: a keyed entry does not outlive its token. A
+/// three-second token's request parked after its key lookup until the token
+/// expired is served, uncached: no cache entry and no resident keys under the
+/// token, and its next request is refused.
+async fn keyed_entry_bounded_by_token_expiry(test: &TestServer, id: u32) {
+    println!("  keyed_entry_bounded_by_token_expiry");
+    let (grant, keyed, _) = {
+        let _expiry = oauth_expiry(test, Some(3), None, None);
+        keyed_grant(test, id).await
+    };
+    let parked = Parked::start(id, za_test::set, slow_session_status(keyed.clone())).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        parked.finish().await,
+        200,
+        "a request whose key lookup outlasted its token is served uncached"
+    );
+    let cache = &test.server.inner.cache;
+    assert!(
+        cache.http_auth.get(&keyed).is_none(),
+        "an expired token's entry was published"
+    );
+    assert!(
+        cache
+            .za_keys
+            .get(&cache.za_fingerprint(&keyed), std::time::Instant::now())
+            .is_none(),
+        "an expired token's keys were made resident"
+    );
+    assert_eq!(
+        za_bearer_session(&keyed).await.0,
+        401,
+        "an expired token was served from the cache"
+    );
+    za_revoke_grant(&test.server, grant).await;
+}
+
+/// W-1 (fix-wave review): keys are not published across a revocation. A keyed
+/// request parked after its key lookup while its grant is revoked leaves
+/// nothing of the account cached.
+async fn keyed_request_crossed_by_revocation(test: &TestServer, id: u32) {
+    println!("  keyed_request_crossed_by_revocation");
+    let (grant, keyed, _) = keyed_grant(test, id).await;
+    let parked = Parked::start(id, za_test::set, slow_session_status(keyed.clone())).await;
+    za_revoke_grant(&test.server, grant).await;
+    assert_eq!(parked.finish().await, 200);
+    assert_nothing_cached(test, id);
+    assert_eq!(za_bearer_session(&keyed).await.0, 401);
 }
 
 async fn mail_bearer_login_stays_refused(test: &TestServer, id: u32) {

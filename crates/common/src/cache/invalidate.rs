@@ -593,6 +593,7 @@ impl Server {
         let mut negative_emails: AHashSet<(u32, u32)> = AHashSet::new();
         let mut http_auth_accounts = IdFilter::default();
         let mut revoked_grants: Vec<u64> = Vec::new();
+        let mut revoked_key_accounts: Vec<u32> = Vec::new();
         let mut domain_names = IdFilter::default();
         let mut email_accounts = IdFilter::default();
         let mut email_lists = IdFilter::default();
@@ -701,8 +702,9 @@ impl Server {
                     grant_id,
                 } => {
                     revoked_grants.push(*grant_id);
-                    // Release 6 spec 4.6: a grant's deletion evicts its resident keys at once.
-                    cache.za_keys.remove_account(*account_id);
+                    // Release 6 spec 4.6: a grant's deletion evicts its resident keys at once,
+                    // below, after the revocation epoch advances (W-1).
+                    revoked_key_accounts.push(*account_id);
                 }
                 CacheInvalidation::ActiveSieveScript(id) => {
                     if let Some(account) = cache.accounts.peek(id) {
@@ -750,6 +752,9 @@ impl Server {
             cache
                 .grant_revocations
                 .evict(&cache.http_auth, &revoked_grants);
+            for account_id in revoked_key_accounts {
+                cache.za_keys.remove_account(account_id);
+            }
         }
 
         if !domain_names.is_empty() {

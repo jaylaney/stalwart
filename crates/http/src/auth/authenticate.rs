@@ -208,16 +208,9 @@ async fn authenticate_uncached(
         ))
         .await?;
 
-    let (session_keys, keys_from_bearer) = if mechanism.eq_ignore_ascii_case("bearer") {
-        (za_bearer_keys(server, token, &access_token).await?, true)
-    } else {
-        (session_keys, false)
-    };
-
-    #[cfg(feature = "test_mode")]
-    za_test::pause_point(access_token.account_id()).await;
-
-    // Cache credentials
+    // Cache credentials. The entry's deadline is fixed here, at verification,
+    // so the key lookup below does not extend it past the token's signed
+    // expiry (PR #90 review C4617611615).
     let cache = &server.inner.cache;
     let revocations = &cache.grant_revocations;
     let account_id = access_token.account_id();
@@ -231,6 +224,16 @@ async fn authenticate_uncached(
         revision: access_token.revision(),
         token_scope: access_token.token_scope(),
     };
+
+    let (session_keys, keys_from_bearer) = if mechanism.eq_ignore_ascii_case("bearer") {
+        (za_bearer_keys(server, token, &access_token).await?, true)
+    } else {
+        (session_keys, false)
+    };
+
+    #[cfg(feature = "test_mode")]
+    za_test::pause_point(access_token.account_id()).await;
+
     match session_keys {
         None => {
             // A keyless result for a key account (a token without a secret, an
@@ -280,8 +283,14 @@ async fn authenticate_uncached(
                 }
             })?;
             if keys.generation != 0 && keys.generation == account.za_generation() {
-                revocations.insert(&cache.http_auth, token, entry, epoch);
-                cache.za_insert_keys(cache.za_fingerprint(token), keys.clone(), Instant::now());
+                // PR #90 review C4617611615: only a live entry is published; a
+                // key lookup that outlasted the token publishes nothing and
+                // the request is served uncached. W-1: the keys go in only
+                // under the revocation epoch read before verification.
+                if cache.http_auth.is_live(&entry) {
+                    revocations.insert(&cache.http_auth, token, entry, epoch);
+                    za_insert_keys_fenced(server, token, &keys, epoch);
+                }
             } else if keys_from_bearer {
                 return Err(za_bearer_refusal(
                     &access_token,
@@ -301,6 +310,28 @@ async fn authenticate_uncached(
             access_token,
             epoch,
         })
+}
+
+/// W-1 (fix-wave review): resident keys are inserted only while the
+/// revocation epoch is the one read before verification, and removed again if
+/// it moved during the insert, as `GrantRevocations::insert` fences its entry.
+/// A grant's invalidation advances the epoch before it removes the account's
+/// keys, so keys a revocation crossed never stay resident.
+fn za_insert_keys_fenced(
+    server: &Server,
+    token: &str,
+    keys: &std::sync::Arc<vault::session::SessionKeys>,
+    epoch: RevocationEpoch,
+) {
+    let cache = &server.inner.cache;
+    let revocations = &cache.grant_revocations;
+    if revocations.epoch() == epoch {
+        let fingerprint = cache.za_fingerprint(token);
+        cache.za_insert_keys(fingerprint, keys.clone(), Instant::now());
+        if revocations.epoch() != epoch {
+            cache.za_keys.remove(&fingerprint);
+        }
+    }
 }
 
 /// Test-only pause points, each keyed on an account id and one-shot: only
