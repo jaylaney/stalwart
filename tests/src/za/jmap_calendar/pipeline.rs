@@ -243,6 +243,19 @@ async fn update(
     let resources = server
         .fetch_groupware_resources(token.account_id(), owner, SyncCollection::Calendar)
         .await?;
+    update_in(server, token, owner, document_id, calendars, ics, resources).await
+}
+
+/// `update` with the request's snapshot given, which may be stale.
+async fn update_in(
+    server: &Server,
+    token: &AccessToken,
+    owner: u32,
+    document_id: u32,
+    calendars: &[u32],
+    ics: Option<&str>,
+    resources: std::sync::Arc<common::GroupwareResources>,
+) -> Result<ZaWritten, ZaPipelineError> {
     let stored_event: Archive<ArchiveBytes> = server
         .store()
         .get_value(ValueKey::archive(
@@ -520,6 +533,7 @@ pub async fn test(test: &mut TestServer) {
     destroy_retry_after_source_rename(test, &fx).await;
     update_without_contexts_is_refused(test, &fx).await;
     calendar_delete_with_a_stale_child_list(test, &fx).await;
+    removed_href_from_the_asserted_parent(test, &fx).await;
     fx.cleanup(test).await;
     finish(test, "pipeline").await;
 }
@@ -2042,3 +2056,115 @@ async fn calendar_delete_with_a_stale_child_list(test: &TestServer, fx: &Fx) {
     assert_eq!(uid_copies(test, owner, uid).await, 0);
 }
 
+/// PR #90 review C4617611584: the href a destroy and a placement log for a
+/// removed name comes from the parent the write asserted, even when the
+/// request's snapshot predates that calendar. Another client created
+/// `pipe-late` and moved the event into it after the snapshot.
+async fn removed_href_from_the_asserted_parent(test: &TestServer, fx: &Fx) {
+    let owner = fx.pair.key_id;
+    let client = &fx.pair.dav;
+    let server = &test.server;
+    let token = session_token(test, owner).await;
+
+    // The destroy.
+    let uid = "jmapcal-pipe-late-destroy";
+    put_event(test, &fx.pair.key, client, "pipe-a", uid, "late destroy").await;
+    let stale = server
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    make_calendar(test, &fx.pair.key, client, "pipe-late").await;
+    let late = format!("{HOME}pipe-late/{uid}.ics");
+    client
+        .request_with_headers(
+            "MOVE",
+            &format!("{HOME}pipe-a/{uid}.ics"),
+            [("destination", late.as_str())],
+            "",
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let id = resource_id(test, owner, &format!("pipe-late/{uid}.ics")).await;
+    let sync_token = client
+        .sync_collection(
+            &format!("{HOME}pipe-late/"),
+            "",
+            Depth::Infinity,
+            None,
+            ["D:getetag"],
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .sync_token()
+        .to_string();
+    let event: Archive<ArchiveBytes> = server
+        .store()
+        .get_value(ValueKey::archive(owner, Collection::CalendarEvent, id))
+        .await
+        .unwrap()
+        .unwrap();
+    let keys = za_writer_keys(server, &token, owner)
+        .await
+        .unwrap()
+        .expect("pipeline fixture is a key account");
+    let roles = za_roles(server, &token, owner).await.unwrap();
+    let deleted = za_destroy_event(
+        server, &token, &stale, &keys, &roles, owner, id, event, false,
+    )
+    .await
+    .expect("removed_href_from_the_asserted_parent: the destroy");
+    assert_eq!(
+        vanished_at(test, owner, deleted.change_id).await,
+        [late.clone()]
+    );
+    client
+        .sync_collection(
+            &format!("{HOME}pipe-late/"),
+            &sync_token,
+            Depth::Infinity,
+            None,
+            ["D:getetag"],
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .into_propfind_response(None)
+        .properties(&late)
+        .with_status(StatusCode::NOT_FOUND);
+
+    // The placement out of a calendar the snapshot does not know.
+    let uid = "jmapcal-pipe-late-place";
+    put_event(test, &fx.pair.key, client, "pipe-a", uid, "late placement").await;
+    let stale = server
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    make_calendar(test, &fx.pair.key, client, "pipe-late-2").await;
+    let late = format!("{HOME}pipe-late-2/{uid}.ics");
+    client
+        .request_with_headers(
+            "MOVE",
+            &format!("{HOME}pipe-a/{uid}.ics"),
+            [("destination", late.as_str())],
+            "",
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let id = resource_id(test, owner, &format!("pipe-late-2/{uid}.ics")).await;
+    let written = update_in(server, &token, owner, id, &[fx.b], None, stale)
+        .await
+        .expect("removed_href_from_the_asserted_parent: the placement");
+    assert_eq!(vanished_at(test, owner, written.change_id).await, [late]);
+    assert_eq!(parents_of(test, owner, id).await, [fx.b]);
+
+    client
+        .request("DELETE", &format!("{HOME}pipe-b/{uid}.ics"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    for slug in ["pipe-late", "pipe-late-2"] {
+        client
+            .request("DELETE", &format!("{HOME}{slug}/"), "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    assert_eq!(uid_copies(test, owner, uid).await, 0);
+}

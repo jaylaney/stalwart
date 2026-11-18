@@ -250,16 +250,17 @@ pub async fn za_commit_update(
                     .names
                     .iter()
                     .any(|new| new.parent_id == parent_id && new.name == name.name.as_str())
-                    || resources.container_resource_path_by_id(parent_id).is_none()
                 {
                     continue;
                 }
                 // Use the parent archive fenced by this attempt, including after a rename.
+                // PR #90 review C4617611584: the href is logged from the asserted
+                // parent, whether or not the request's snapshot knows the calendar.
                 let parent = contexts
                     .parents
                     .iter()
                     .find(|context| context.calendar_id == parent_id)
-                    .expect("placement must resolve every stored parent");
+                    .ok_or(ZaPipelineError::Forbidden(ZaRefusal::Context))?;
                 let calendar = parent
                     .stored
                     .unarchive::<Calendar>()

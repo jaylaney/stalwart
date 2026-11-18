@@ -339,14 +339,13 @@ async fn enqueue_destroy_event(
         .caused_by(trc::location!())?;
     for name in names.iter() {
         let parent_id = name.parent_id.to_native();
-        if resources.container_resource_path_by_id(parent_id).is_none() {
-            continue;
-        }
         // Use this attempt's asserted calendar name, including after a rename.
+        // PR #90 review C4617611584: the href is logged from the asserted
+        // parent, whether or not the request's snapshot knows the calendar.
         let parent = contexts
             .iter()
             .find(|context| context.calendar_id == parent_id)
-            .expect("destroy must resolve every stored parent");
+            .ok_or(ZaPipelineError::Forbidden(ZaRefusal::Context))?;
         let calendar = parent
             .stored
             .unarchive::<Calendar>()
