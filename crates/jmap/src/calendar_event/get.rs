@@ -11,9 +11,9 @@ use crate::{
     },
     blob::embedded::{EmbeddedBlobIds, import_error},
     calendar_event::{
-        CalendarSyntheticId, EventMap, EventValue, is_origin, za_read::ZaEventReader,
+        CalendarSyntheticId, EventMap, EventValue, is_origin,
+        za_read::{ZaEventReader, za_event_state},
     },
-    changes::state::JmapCacheState,
 };
 use calcard::{
     common::{PartialDateTime, timezone::Tz},
@@ -159,9 +159,17 @@ impl CalendarEventGet for Server {
             }
             None => None,
         };
+        let mut za_reader = ZaEventReader::new(self, access_token, account_id).await?;
         let mut response = GetResponse {
             account_id: request.account_id.into(),
-            state: sampled.state(cache.get_state(false)).into(),
+            state: sampled
+                .state(za_event_state(
+                    za_reader.is_some(),
+                    access_token,
+                    account_id,
+                    &cache,
+                ))
+                .into(),
             list: Vec::with_capacity(ids.len()),
             not_found: vec![],
         };
@@ -189,7 +197,6 @@ impl CalendarEventGet for Server {
         )?;
         let mut projector =
             EventProjector::new(self, access_token, account_id, &projection).await?;
-        let mut za_reader = ZaEventReader::new(self, access_token, account_id).await?;
         let mut results = ProjectionResults::with_capacity(ids.len());
 
         let mut budget = GetBudget::new(reservation);

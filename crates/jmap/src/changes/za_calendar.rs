@@ -73,8 +73,32 @@ where
     if let State::ZaCalendarIntermediate { range, .. } = &since {
         request.since_state = State::Intermediate(range.clone());
     }
+    // PR #90 review C4617611565: a grantee's final event state is raised to
+    // the tip of a snapshot read before the page, which therefore covered
+    // every item change up to it. Upstream ends at the last item change,
+    // which can lie below a sharing boundary (a container change).
+    let tip =
+        if za_key && object == MethodObject::CalendarEvent && owner != access_token.account_id() {
+            Some(
+                server
+                    .fetch_groupware_resources(
+                        access_token.account_id(),
+                        owner,
+                        SyncCollection::Calendar,
+                    )
+                    .await
+                    .caused_by(trc::location!())
+                    .map_err(keyed)?
+                    .highest_change_id,
+            )
+        } else {
+            None
+        };
     let mut changes = page(request).await.map_err(keyed)?;
     changes.response.old_state = since;
+    if let (Some(tip), State::Exact(change_id)) = (tip, &changes.response.new_state) {
+        changes.response.new_state = State::Exact((*change_id).max(tip));
+    }
     changes.response.new_state = za_calendar_reattach_origin(changes.response.new_state, origin);
     Ok(changes)
 }

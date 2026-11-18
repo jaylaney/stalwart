@@ -11,7 +11,7 @@ use crate::{
         },
         query::QueryResponseBuilder,
     },
-    calendar_event::za_read::ZaEventReader,
+    calendar_event::za_read::{ZaEventReader, za_event_state},
     changes::state::JmapCacheState,
 };
 use calcard::{common::timezone::Tz, icalendar::ArchivedICalendar, jscalendar::JSCalendarDateTime};
@@ -482,7 +482,12 @@ impl CalendarEventQuery for Server {
         } else {
             results.into_iter().collect()
         };
-        let query_state = sampled.state(cache.get_state(false));
+        let query_state = sampled.state(za_event_state(
+            za_reader.is_some(),
+            access_token,
+            account_id,
+            &cache,
+        ));
 
         // Extract comparators
         let comparators = request

@@ -100,6 +100,7 @@ pub async fn test(test: &mut TestServer) {
     complete_boundary(test, &fixture).await;
 
     sync_boundary_matches_caldav(test, &fixture).await;
+    grantee_state_above_the_boundary(test, &fixture).await;
     paged_sync_retention_collision(test, &fixture).await;
     paged_sync_origin_survives_range_changes(test, &fixture).await;
     let ordinary = ordinary_accounts(test).await;
@@ -503,6 +504,87 @@ async fn sync_boundary_matches_caldav(test: &TestServer, f: &Sharing) {
     .await;
 }
 
+/// PR #90 review C4617611565: with no event written after a rename and its
+/// completed boundary (both container changes), a grantee's event state from
+/// `/changes`, `/get` and `/query` lies at or above the boundary, so the next
+/// incremental call is served, and an `edit` grantee's `ifInState` matches it.
+/// The owner's states stay upstream's item state.
+async fn grantee_state_above_the_boundary(test: &TestServer, f: &Sharing) {
+    const UID: &str = "jmapcal-sharing-quiet";
+    let (owner, reader) = (&f.pair.key, &f.reader);
+    let owner_id = f.pair.key_id;
+    let method = "CalendarEvent/changes";
+    share(test, owner, reader, f.reader_id, SLUG, "edit").await;
+    complete_boundary(test, f).await;
+    put_event(test, owner, &f.pair.dav, SLUG, UID, UID).await;
+    let item = new_state(&changes(owner, owner, method, &State::Initial, None).await);
+    rename(f, SLUG, RENAMED).await;
+    rename(f, RENAMED, SLUG).await;
+    let b = complete_boundary(test, f).await;
+    assert!(b > item.get_change_id(), "{b} {item:?}");
+
+    let s = new_state(&changes(reader, owner, method, &State::Initial, None).await);
+    assert!(s.get_change_id() > b, "{s:?} {b}");
+    assert_eq!(
+        calendar_log(test, owner_id, s.get_change_id())
+            .await
+            .first(),
+        Some(&(s.get_change_id(), false)),
+        "the record of the grantee's state"
+    );
+    let reply = changes(reader, owner, method, &s, None).await;
+    assert_eq!(new_state(&reply), s, "{reply:?}");
+    for list in ["created", "updated", "destroyed"] {
+        assert_eq!(reply.response_at(0)[list], json!([]), "{list}: {reply:?}");
+    }
+
+    let reply = reader
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({ "accountId": owner.id_string(), "ids": [] }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let got = State::parse(reply.state()).unwrap();
+    assert_eq!(got, s, "the grantee's /get state");
+    let reply = reader
+        .jmap_method_call(
+            "CalendarEvent/query",
+            json!({ "accountId": owner.id_string() }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        reply.response_at(0)["queryState"]
+            .as_str()
+            .and_then(State::parse),
+        Some(s.clone()),
+        "the grantee's /query state"
+    );
+    let reply = changes(reader, owner, method, &got, None).await;
+    assert_eq!(method_error(&reply), None, "from the /get state: {reply:?}");
+    let reply = reader
+        .jmap_method_call(
+            "CalendarEvent/set",
+            json!({ "accountId": owner.id_string(), "ifInState": s.to_string() }),
+        )
+        .await;
+    assert_eq!(
+        method_error(&reply),
+        None,
+        "the grantee's ifInState: {reply:?}"
+    );
+
+    // The owner's `/changes` state is upstream's item state, below the boundary.
+    assert_eq!(
+        new_state(&changes(owner, owner, method, &State::Initial, None).await),
+        item
+    );
+    delete_events(f, SLUG, &[UID]).await;
+    share(test, owner, reader, f.reader_id, SLUG, "view").await;
+    complete_boundary(test, f).await;
+}
+
 /// The amendment's collision (b < m < f < g < c): after retention leaves an empty
 /// marker at m, an initial and an exact(m) first page cover the same range.
 async fn paged_sync_retention_collision(test: &TestServer, f: &Sharing) {
@@ -589,7 +671,17 @@ async fn paged_sync_retention_collision(test: &TestServer, f: &Sharing) {
     assert!(g_id < c, "{g_id} {c}");
     let served = changes(reader, owner, "CalendarEvent/changes", &initial, Some(1)).await;
     assert_eq!(created(&served), [id(second)], "{served:?}");
-    assert_eq!(new_state(&served), State::Exact(g_id));
+    // PR #90 review C4617611565: a grantee's final state is the log's tip, at
+    // or above the rename's boundary, no longer the last item change `g`.
+    let tip = test
+        .server
+        .store()
+        .get_last_change_id(owner_id, SyncCollection::Calendar.into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(tip >= c, "{tip} {c}");
+    assert_eq!(new_state(&served), State::Exact(tip));
     assert_eq!(served.response_at(0)["oldState"], initial.to_string());
     assert_refused(
         &changes(reader, owner, "CalendarEvent/changes", &exact, Some(1)).await,

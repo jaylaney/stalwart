@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::{Server, auth::AccessToken};
+use crate::changes::state::JmapCacheState;
+use common::{GroupwareResources, Server, auth::AccessToken};
 use groupware::calendar::{
     ArchivedCalendarEvent,
     pipeline::{
@@ -13,9 +14,31 @@ use groupware::calendar::{
     },
     seal::ZaEventView,
 };
+use jmap_proto::types::state::State;
 use std::collections::{HashMap, hash_map::Entry};
 use store::write::{Archive, ArchiveBytes};
 use trc::{EventType, StoreEvent};
+
+/// PR #90 review C4617611565: the event state a key account's events are
+/// answered with. For a caller that is not the owner it is the snapshot's
+/// highest change id: every sharing boundary the snapshot holds (a grant or a
+/// rename, both container changes) lies at or below it, and its log record
+/// exists, so a sync from it is not refused at the boundary. The owner's state,
+/// and an ordinary account's (`is_key` false), stay upstream's item state.
+pub(crate) fn za_event_state(
+    is_key: bool,
+    access_token: &AccessToken,
+    account_id: u32,
+    cache: &GroupwareResources,
+) -> State {
+    if is_key && access_token.account_id() != account_id {
+        (cache.highest_change_id != 0)
+            .then_some(cache.highest_change_id)
+            .into()
+    } else {
+        cache.get_state(false)
+    }
+}
 
 /// The opened events and calendar contexts live only for one request.
 pub(crate) struct ZaEventReader {

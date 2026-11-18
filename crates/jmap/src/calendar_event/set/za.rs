@@ -51,9 +51,8 @@ use crate::{
         },
         user::user_data_error,
         validate::InstanceMetadata,
-        za_read::ZaEventReader,
+        za_read::{ZaEventReader, za_event_state},
     },
-    changes::state::JmapCacheState,
 };
 use calcard::{
     common::timezone::Tz,
@@ -181,7 +180,12 @@ pub(super) async fn za_calendar_event_set(
         .await
         .caused_by(trc::location!())?;
     let mut response = SetResponse::from_request(&request, server.core.jmap.set_max_objects)?
-        .with_state(sampled.assert_state(cache.get_state(false), &request.if_in_state)?);
+        .with_state(sampled.assert_state(
+            // PR #90 review C4617611565: a grantee's state is the snapshot's
+            // highest change id, as `/get`, `/query` and `/changes` answer it.
+            za_event_state(true, access_token, account_id, &cache),
+            &request.if_in_state,
+        )?);
     let will_destroy = response.collect_will_destroy(request.unwrap_destroy());
     let is_owner = access_token.is_member(account_id);
     let identities = if is_owner {
