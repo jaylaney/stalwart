@@ -943,20 +943,33 @@ impl ZaEventWriter<'_> {
         let mut js_calendar_group = view.into_jscalendar::<Id, BlobId>();
 
         // Spec 6.5: the five flag rulings apply to the event's own patch; an
-        // occurrence's patch is checked for blob links only.
+        // occurrence's patch is checked for blob links only. PR #90 review
+        // C4617611635: a refused occurrence is answered alone, as
+        // `apply_instances` answers its other errors; the others go on and
+        // commit together.
         let rulings = match &mut update.ops {
             EventOps::Base { patch, .. } => za_take_rulings(patch, true),
-            EventOps::Instances(instances) => instances.iter_mut().try_fold(
-                ZaRulings {
-                    use_default_alerts: false,
-                },
-                |rulings, instance| match &mut instance.action {
-                    InstanceAction::Update { patch, .. } => {
-                        za_take_rulings(patch, false).map(|_| rulings)
+            EventOps::Instances(instances) => {
+                instances.retain_mut(|instance| {
+                    let refused = match &mut instance.action {
+                        InstanceAction::Update { patch, .. } => za_take_rulings(patch, false).err(),
+                        InstanceAction::Destroy => None,
+                    };
+                    match refused {
+                        Some(err) => {
+                            instance.fail(response, err);
+                            false
+                        }
+                        None => true,
                     }
-                    InstanceAction::Destroy => Ok(rulings),
-                },
-            ),
+                });
+                if instances.is_empty() {
+                    return Ok(());
+                }
+                Ok(ZaRulings {
+                    use_default_alerts: false,
+                })
+            }
         };
         let rulings = match rulings {
             Ok(rulings) => rulings,

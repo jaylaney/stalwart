@@ -103,6 +103,7 @@ pub async fn test(test: &mut TestServer) {
     update_recurrence_by_override(&events, &series).await;
     update_occurrence_flags_get_upstreams_refusal(&events, &series).await;
     events.delete(series.document_id).await;
+    occurrence_link_refused_alone(&events).await;
     update_by_restricted_grantee_refused(&events).await;
     update_uid_change_refused(&events).await;
     update_legacy_event_seals_it(&events).await;
@@ -1598,6 +1599,119 @@ async fn update_recurrence_by_synthetic_id(events: &Events<'_>, series: &Series)
         body.contains("RECURRENCE-ID") && body.contains("SUMMARY:Override canary"),
         "{body}"
     );
+}
+
+/// PR #90 review C4617611635: in one call that patches occurrence 2 with a
+/// `links` blob id, destroys occurrence 3 and retitles occurrence 4, only
+/// occurrence 2 is refused; the other two commit together, in one record.
+async fn occurrence_link_refused_alone(events: &Events<'_>) {
+    const UID: &str = "jmapcal-events-rec-links";
+    let (test, pair) = (events.test, events.pair);
+    let mut object = events.event(UID);
+    object["recurrenceRule"] =
+        json!({ "@type": "RecurrenceRule", "frequency": "daily", "count": 5 });
+    let reply = events.create(vec![object]).await;
+    let document_id = Events::created_document(&reply, 0);
+    let account = pair.key.id_string();
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/query",
+            json!({
+                "accountId": account,
+                "filter": { "after": "2031-03-01T00:00:00", "before": "2031-03-31T00:00:00" },
+                "expandRecurrences": true,
+            }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let ids = reply.ids().map(str::to_string).collect::<Vec<_>>();
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({ "accountId": account, "ids": ids, "properties": ["id", "uid", "start"] }),
+        )
+        .await;
+    let [second, third, fourth] = [
+        "2031-03-05T10:00:00",
+        "2031-03-06T10:00:00",
+        "2031-03-07T10:00:00",
+    ]
+    .map(|start| {
+        reply
+            .list()
+            .iter()
+            .find(|event| event["uid"] == UID && event["start"] == start)
+            .and_then(|event| event["id"].as_str())
+            .unwrap_or_else(|| panic!("no occurrence at {start}: {reply:?}"))
+            .to_string()
+    });
+    let blob = pair
+        .key
+        .jmap_client()
+        .await
+        .upload(None, b"x".to_vec(), None)
+        .await
+        .unwrap()
+        .take_blob_id();
+    let tip = test
+        .server
+        .store()
+        .get_last_change_id(pair.key_id, SyncCollection::Calendar.into())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let reply = pair
+        .key
+        .jmap_method_call(
+            "CalendarEvent/set",
+            json!({
+                "accountId": account,
+                "update": {
+                    &second: { "links": { "l1": { "@type": "Link", "blobId": blob, "rel": "enclosure" } } },
+                    &fourth: { "title": "Fourth canary" },
+                },
+                "destroy": [&third],
+            }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        set_error(reply.not_updated(&second)),
+        ("invalidProperties", Some(ATTACHMENTS), json!(["links"])),
+        "{reply:?}"
+    );
+    assert_eq!(destroyed(&reply), [third.clone()], "{reply:?}");
+    assert_updated(&reply, &fourth);
+
+    let body = events.body(document_id).await;
+    assert!(
+        body.lines()
+            .any(|line| line.starts_with("EXDATE") && line.contains("20310306")),
+        "occurrence_link_refused_alone: no EXDATE of occurrence 3: {body}"
+    );
+    assert!(
+        body.lines()
+            .any(|line| line.starts_with("RECURRENCE-ID") && line.contains("20310307"))
+            && body.contains("SUMMARY:Fourth canary"),
+        "occurrence_link_refused_alone: no override of occurrence 4: {body}"
+    );
+    assert!(
+        !body
+            .lines()
+            .any(|line| line.starts_with("RECURRENCE-ID") && line.contains("20310305")),
+        "occurrence_link_refused_alone: occurrence 2 was overridden: {body}"
+    );
+    let records = test
+        .server
+        .store()
+        .za_changes_records_range(pair.key_id, SyncCollection::Calendar, tip, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(records.records.len(), 1, "one log record: {records:?}");
+    events.delete(document_id).await;
 }
 
 /// Spec 6.5: an occurrence is updated through the base event's
