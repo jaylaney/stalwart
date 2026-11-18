@@ -5,6 +5,20 @@
  */
 
 use super::ZA_CALENDAR_KEYLESS;
+use crate::auth::{AccessToken, oauth::scope::OAuthScopes};
+use std::sync::Arc;
+use vault::session::SessionKeys;
+
+/// Invitations spec 6.1, release 6 spec 5.5 (PR #90 review C4617611594): the
+/// keys a request gives to the invitation drain. Only the caller's own, and
+/// only when the token's scope admits calendars; a Basic login and a token
+/// with full scope have no restricted scope, so they are unaffected. The one
+/// rule of the CalDAV and the JMAP trigger.
+pub fn za_drain_keys(access_token: &AccessToken) -> Option<&Arc<SessionKeys>> {
+    access_token
+        .za_keys_for(access_token.account_id())
+        .filter(|_| access_token.allows_oauth_scopes(OAuthScopes::CALENDARS))
+}
 
 /// Release 6 spec 6.1: the JMAP error for calendar access without session keys.
 pub fn za_calendar_keyless_refusal() -> trc::Error {

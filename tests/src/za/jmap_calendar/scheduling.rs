@@ -20,8 +20,9 @@ use crate::{
             CALENDAR_JMAP_USING, ZaClientKind, clear_received_scheduling, copy_href, event_records,
             hold_task_consumer, inbox_ids, item_method, item_partstat, itip_tasks_for,
             new_inbox_items, open_pending_item_as, pending_ids, token_record, trigger_drain,
-            wait_for_queue, za_bearer_jmap, za_drop_oauth_client, za_oauth_client, za_refresh,
-            za_revoke_token, za_sign_in, za_uid_leases, za_unlock,
+            wait_for_queue, za_bearer_dav, za_bearer_jmap, za_drop_oauth_client, za_keyed_grant,
+            za_oauth_client, za_refresh, za_revoke_grant, za_revoke_token, za_sign_in,
+            za_uid_leases, za_unlock,
         },
     },
     za::{
@@ -44,9 +45,12 @@ use ::registry::{
     types::map::Map,
 };
 use calcard::icalendar::ICalendarMethod;
-use common::za::{
-    imip::ZA_IMIP_DROPPED,
-    test_hooks::{self, Pause},
+use common::{
+    auth::oauth::scope::OAuthScopes,
+    za::{
+        imip::ZA_IMIP_DROPPED,
+        test_hooks::{self, Pause},
+    },
 };
 use http::auth::oauth::TokenResponse;
 use hyper::{Method, StatusCode};
@@ -115,6 +119,7 @@ pub async fn test(test: &mut TestServer) {
     no_itip_task_ever(&s).await;
     drain_runs_from_jmap(&s).await;
     mail_only_request_does_not_drain(&s).await;
+    drain_only_within_the_token_scope(&s).await;
     invitation_by_email_found_by_uid(&s).await;
     drain_failure_does_not_fail_the_request(&s).await;
 
@@ -1692,6 +1697,134 @@ async fn mail_only_request_does_not_drain(s: &Scheduling<'_>) {
     );
     assert_eq!(uid_copies(test, pair.key2_id, UID).await, 1);
     destroy_copy(s, UID).await;
+}
+
+/// PR #90 review C4617611594: a keyed token gives its keys to the drain only
+/// when its scope admits calendars, and on JMAP only for a calendar call that
+/// parsed and whose capability is in the scope-filtered `using`. A mail-only
+/// token's `Calendar/get` and `PROPFIND` and a contacts-only token's CardDAV
+/// request leave the invitation pending; a calendar-scoped token drains.
+async fn drain_only_within_the_token_scope(s: &Scheduling<'_>) {
+    const UID: &str = "jmapcal-sched-scope";
+    let (test, pair) = (s.test, s.pair);
+    clear_inboxes(s).await;
+    let _drain = DrainOn::new();
+    let account = pair.key2.id_string();
+    let calendar_get = json!([["Calendar/get", { "accountId": account, "ids": null }, "c0"]]);
+    let still_pending = |step: &'static str| async move {
+        assert_eq!(
+            pending_ids(test, pair.key2_id).await.len(),
+            1,
+            "drain_only_within_the_token_scope: {step} drained"
+        );
+        assert_eq!(uid_copies(test, pair.key2_id, UID).await, 0, "{step}");
+    };
+
+    let reply = s
+        .create(
+            &pair.key,
+            invitation(pair.key.name(), &s.cal, UID, &[pair.key2.name()]),
+            send(),
+        )
+        .await;
+    reply.created_id(0);
+    s.leaves(pair.key_id, UID);
+    wait_for_queue(test).await;
+    still_pending("nothing").await;
+
+    // A keyed mail-only token: it holds keys (Mailbox/get is served), its
+    // Calendar/get answers unknownMethod and its PROPFIND is refused.
+    let (mail_grant, mail_token, _) = za_keyed_grant(
+        test,
+        pair.key2.name(),
+        pair.key2_id,
+        STRONG,
+        OAuthScopes::MAIL,
+    )
+    .await;
+    let (status, reply) = za_bearer_jmap(
+        &mail_token,
+        CALENDAR_JMAP_USING,
+        json!([["Mailbox/get", { "accountId": account, "ids": null }, "m0"]]),
+    )
+    .await;
+    assert_eq!(status, 200, "{reply:?}");
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    still_pending("a mail-only Mailbox/get").await;
+    let (status, reply) =
+        za_bearer_jmap(&mail_token, CALENDAR_JMAP_USING, calendar_get.clone()).await;
+    assert_eq!(status, 200, "{reply:?}");
+    assert_eq!(method_error(&reply), Some("unknownMethod"), "{reply:?}");
+    still_pending("a mail-only Calendar/get").await;
+    let response = za_bearer_dav(&pair.key2, &mail_token)
+        .request_with_headers(
+            "PROPFIND",
+            &format!("/dav/cal/{}/", pair.key2.name()),
+            [("depth", "0")],
+            "",
+        )
+        .await;
+    assert_eq!(response.status.as_u16(), 403, "a mail-only PROPFIND");
+    still_pending("a mail-only PROPFIND").await;
+
+    // A keyed contacts-only token's CardDAV request is served and does not
+    // drain the calendar inbox.
+    let (contacts_grant, contacts_token, _) = za_keyed_grant(
+        test,
+        pair.key2.name(),
+        pair.key2_id,
+        STRONG,
+        OAuthScopes::CONTACTS,
+    )
+    .await;
+    let response = za_bearer_dav(&pair.key2, &contacts_token)
+        .request_with_headers(
+            "PROPFIND",
+            &format!("/dav/card/{}/", pair.key2.name()),
+            [("depth", "0")],
+            "",
+        )
+        .await;
+    assert_eq!(
+        response.status.as_u16(),
+        207,
+        "a contacts-only CardDAV PROPFIND"
+    );
+    still_pending("a contacts-only CardDAV PROPFIND").await;
+
+    // A calendar-scoped token: a Calendar/get whose `using` leaves the
+    // calendars capability out is refused and does not drain; with it, the
+    // request drains.
+    let (calendar_grant, calendar_token, _) = za_keyed_grant(
+        test,
+        pair.key2.name(),
+        pair.key2_id,
+        STRONG,
+        OAuthScopes::CALENDARS,
+    )
+    .await;
+    let (status, reply) = za_bearer_jmap(
+        &calendar_token,
+        &["urn:ietf:params:jmap:core"],
+        calendar_get.clone(),
+    )
+    .await;
+    assert_eq!(status, 200, "{reply:?}");
+    assert_eq!(method_error(&reply), Some("unknownMethod"), "{reply:?}");
+    still_pending("a Calendar/get without the calendars capability").await;
+    let (status, reply) = za_bearer_jmap(&calendar_token, CALENDAR_JMAP_USING, calendar_get).await;
+    assert_eq!(status, 200, "{reply:?}");
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert!(
+        pending_ids(test, pair.key2_id).await.is_empty(),
+        "drain_only_within_the_token_scope: a calendar-scoped Calendar/get did not drain"
+    );
+    assert_eq!(uid_copies(test, pair.key2_id, UID).await, 1);
+
+    destroy_copy(s, UID).await;
+    for grant in [mail_grant, contacts_grant, calendar_grant] {
+        za_revoke_grant(&test.server, grant).await;
+    }
 }
 
 /// Spec 5.5 and 9.2: an invitation that arrived by email is drained by the

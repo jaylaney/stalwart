@@ -8,7 +8,11 @@ use common::{Server, auth::AccessToken, za::calendar::za_calendar_keyless_refusa
 use groupware::calendar::pipeline::{admission::za_calendar_admission, error::ZaPipelineError};
 use jmap_proto::{
     error::set::SetError,
-    request::method::{MethodFunction, MethodObject},
+    request::{
+        Call, RequestMethod,
+        capability::{Capability, CapabilityIds},
+        method::{MethodFunction, MethodObject},
+    },
 };
 use jmap_tools::Property;
 use std::future::Future;
@@ -178,6 +182,18 @@ pub(crate) fn is_calendar_method(obj: MethodObject) -> bool {
         obj,
         MethodObject::Calendar | MethodObject::CalendarEvent | MethodObject::ParticipantIdentity
     )
+}
+
+/// PR #90 review C4617611594: a call counts toward the calendar drain or the
+/// search pass only when it parsed and its capability is in `using` as the
+/// HTTP layer filtered it by the token's scope, the dispatcher's own check
+/// before a method runs. The method's JMAP permission is not part of it.
+pub(crate) fn za_call_admitted(call: &Call<RequestMethod<'_>>, using: CapabilityIds) -> bool {
+    if matches!(call.method, RequestMethod::Error(_)) {
+        return false;
+    }
+    let capability = call.name.capability();
+    capability == Capability::Stalwart || using.contains(capability)
 }
 
 #[cfg(test)]

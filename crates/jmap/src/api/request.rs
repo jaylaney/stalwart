@@ -8,7 +8,9 @@ use crate::{
     addressbook::{get::AddressBookGet, set::AddressBookSet},
     api::{
         auth::JmapAuthorization,
-        za_calendar::{is_calendar_method, za_admit_calendar_method, za_calendar_method},
+        za_calendar::{
+            is_calendar_method, za_admit_calendar_method, za_calendar_method, za_call_admitted,
+        },
     },
     blob::{copy::BlobCopy, get::BlobOperations, upload::BlobUpload},
     calendar::{get::CalendarGet, set::CalendarSet},
@@ -52,7 +54,9 @@ use crate::{
 use common::za::test_hooks::{
     SearchStage, claim_search_observation, observe_search_wait, with_search_observation,
 };
-use common::{Server, auth::AccessToken, network::memory::MemoryReservation};
+use common::{
+    Server, auth::AccessToken, network::memory::MemoryReservation, za::calendar::za_drain_keys,
+};
 use compact_str::format_compact;
 use email::message::{
     ingest::IngestedEmail,
@@ -197,12 +201,14 @@ impl RequestHandler for Server {
         };
         // Release 6 spec 5.5: a calendar method of a key account's own request
         // drains its inbox first, as a CalDAV request does. The drain never
-        // fails the request.
-        if let Some(keys) = access_token.za_keys_for(owner)
+        // fails the request. Only within the token's scope: a calendar call
+        // that parsed and whose capability is in the scope-filtered `using`
+        // (PR #90 review C4617611594).
+        if let Some(keys) = za_drain_keys(access_token)
             && request
                 .method_calls
                 .iter()
-                .any(|call| is_calendar_method(call.name.obj))
+                .any(|call| is_calendar_method(call.name.obj) && za_call_admitted(call, using))
         {
             self.za_drain(keys).await;
         }
@@ -210,7 +216,7 @@ impl RequestHandler for Server {
             if request
                 .method_calls
                 .iter()
-                .any(|call| is_mail_method(call.name.obj))
+                .any(|call| is_mail_method(call.name.obj) && za_call_admitted(call, using))
             {
                 #[cfg(feature = "test_mode")]
                 with_search_observation(

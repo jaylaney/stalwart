@@ -25,8 +25,8 @@ use crate::utils::{
         substitute_public_key, token_record, totp_url, trigger_drain, vault_revision,
         wait_for_index_queue, wrap_mark, writer_key, za_authorize, za_bearer_dav, za_bearer_jmap,
         za_bearer_session, za_confirm_consent, za_drop_oauth_client, za_exchange, za_grant_token,
-        za_oauth_client, za_post, za_refresh, za_revoke_grant, za_revoke_token, za_sign_in,
-        za_split_token, za_tamper_secret, za_unlock,
+        za_keyed_grant, za_oauth_client, za_post, za_refresh, za_revoke_grant, za_revoke_token,
+        za_sign_in, za_split_token, za_tamper_secret, za_unlock,
     },
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -243,12 +243,7 @@ async fn issue(test: &TestServer, id: u32, grant: u64, mk: &Secret, binding: u64
 }
 
 async fn keyed_grant(test: &TestServer, id: u32) -> (u64, String, ZaIssued) {
-    let (grant, mut token, keys, binding) = minted(test, OWNER, id, STRONG).await;
-    let ZaTokenIssue::Issued(issued) = issue(test, id, grant, keys.mk(), binding).await else {
-        panic!("the grant was not issued");
-    };
-    append_secret(&mut token, &issued.access);
-    (grant, token, issued)
+    za_keyed_grant(test, OWNER, id, STRONG, OAuthScopes::ALL).await
 }
 
 async fn keyed_bearer_reads_sealed_data(test: &TestServer, owner: &Account) {

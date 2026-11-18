@@ -11,9 +11,13 @@ use super::{
 use common::{
     Core, Inner, KV_OAUTH,
     auth::{
-        oauth::registration::{ClientRegistrationRequest, ClientRegistrationResponse},
+        oauth::{
+            registration::{ClientRegistrationRequest, ClientRegistrationResponse},
+            scope::OAuthScopes,
+        },
         vault::RawValue,
     },
+    za::tokens::{ZaIssued, ZaTokenIssue},
 };
 use http::auth::oauth::{
     TokenResponse,
@@ -28,10 +32,16 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use store::{
-    ValueKey, dispatch::lookup::KeyValue, registry::bootstrap::Bootstrap, write::BatchBuilder,
+    ValueKey,
+    dispatch::lookup::KeyValue,
+    registry::bootstrap::Bootstrap,
+    write::{BatchBuilder, now},
 };
 use types::{collection::Collection, field::PrincipalField, id::Id};
-use vault::tokens::{CODE_LEN, SECRET_SEPARATOR, ZaTokenRecord};
+use vault::{
+    record::za_session_binding,
+    tokens::{CODE_LEN, SECRET_SEPARATOR, ZaTokenRecord, append_secret},
+};
 
 const PKCE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 const PKCE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -418,6 +428,45 @@ fn bearer_client() -> reqwest::Client {
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap()
+}
+
+/// A keyed access token of `name` (account `account_id`): a grant restricted
+/// to `scopes` (`za_grant_token`), the keys unlocked with `password`, and the
+/// grant's record entry issued as the keyed code exchange issues it (an hour
+/// for the access token, thirty days for the refresh token), its secret
+/// appended to the token. Returns the grant id, the token and the entry.
+pub async fn za_keyed_grant(
+    test: &TestServer,
+    name: &str,
+    account_id: u32,
+    password: &str,
+    scopes: OAuthScopes,
+) -> (u64, String, ZaIssued) {
+    let (grant, mut token) = super::za::za_grant_token(&test.server, name, scopes).await;
+    let keys = super::za::za_unlock(test, account_id, password).await;
+    let vault = test
+        .server
+        .za_vault_record(account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let ZaTokenIssue::Issued(issued) = test
+        .server
+        .za_token_issue(
+            account_id,
+            grant,
+            keys.mk(),
+            za_session_binding(&vault.record),
+            now() + 3_600,
+            now() + 2_592_000,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the grant was not issued");
+    };
+    append_secret(&mut token, &issued.access);
+    (grant, token, issued)
 }
 
 async fn bearer_json(request: reqwest::RequestBuilder) -> (u16, Value) {

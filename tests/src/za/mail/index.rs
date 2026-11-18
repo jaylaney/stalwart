@@ -21,8 +21,8 @@ use crate::{
             HookParked, expire_and_purge_blobs, force_loss, index_holds, log_records_since,
             lower_changes_history, manifest_bytes, pop3_delete, principal_blob_links,
             purge_account, read_manifest, run_search_pass, search_config_guard, simulate_restart,
-            temporary_blob_hashes, wait_for_delivery, write_manifest_bytes, za_search_thread_part,
-            za_setup_token, za_unlock,
+            temporary_blob_hashes, wait_for_delivery, write_manifest_bytes, za_bearer_jmap,
+            za_keyed_grant, za_revoke_grant, za_search_thread_part, za_setup_token, za_unlock,
         },
     },
     za::{
@@ -31,7 +31,7 @@ use crate::{
         user_permissions,
     },
 };
-use common::auth::vault::ZaVaultExtra;
+use common::auth::{oauth::scope::OAuthScopes, vault::ZaVaultExtra};
 use common::za::{
     search::{
         ZaSearchConfig,
@@ -136,6 +136,8 @@ pub async fn test(test: &mut TestServer) {
 
     case_blob_hook_does_not_create_mailboxes(test, &triggers, true).await;
     case_triggers(test, &triggers).await;
+    clean_messages(test, &triggers).await;
+    case_scope_excludes_mail(test, &triggers).await;
     clean_messages(test, &triggers).await;
     case_pipelined_imap_commands(test, &triggers, &plain_triggers).await;
     clean_messages(test, &triggers).await;
@@ -2006,6 +2008,52 @@ async fn case_blob_hook_does_not_create_mailboxes(test: &TestServer, key: &Accou
         // A real mailbox request still uses normal lazy provisioning.
         mailbox_get(key).await;
         assert!(!mailbox_ids().await.is_empty());
+    }
+}
+
+/// PR #90 review C4617611594: the search pass hook runs only for a mail call
+/// that parsed and whose capability is in `using` as the HTTP layer filtered
+/// it by the token's scope. A keyed calendars-only token's `Email/get` is
+/// refused (`unknownMethod`) and runs no pass; a keyed mail-scoped token's
+/// same request runs it.
+async fn case_scope_excludes_mail(test: &TestServer, key: &Account) {
+    println!("case_scope_excludes_mail");
+    let id = account_id(key);
+    let since = change_id(test, id).await;
+    let document = deliver_one(test, key, "Scope-limited trigger backlog").await;
+    let before = index(test, id).await.indexed_to;
+    assert!(before.change_id < change_id(test, id).await);
+    let using = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"];
+    let email_get = json!([["Email/get", {
+        "accountId": key.id_string(), "ids": null, "properties": ["id"],
+    }, "g"]]);
+
+    let (calendar_grant, calendar_token, _) =
+        za_keyed_grant(test, key.name(), id, key.secret(), OAuthScopes::CALENDARS).await;
+    let counter = common::za::test_hooks::SearchPassCounter::start(id);
+    let (status, reply) = za_bearer_jmap(&calendar_token, &using, email_get.clone()).await;
+    assert_eq!(status, 200, "{reply:?}");
+    assert_eq!(
+        reply.0["methodResponses"][0][1]["type"], "unknownMethod",
+        "{reply:?}"
+    );
+    assert_eq!(
+        counter.counts(),
+        [0; 5],
+        "a calendars-only token's refused Email/get ran a search pass"
+    );
+    assert_eq!(index(test, id).await.indexed_to, before);
+    drop(counter);
+
+    let (mail_grant, mail_token, _) =
+        za_keyed_grant(test, key.name(), id, key.secret(), OAuthScopes::MAIL).await;
+    let (status, reply) = za_bearer_jmap(&mail_token, &using, email_get).await;
+    assert_eq!(status, 200, "{reply:?}");
+    assert_eq!(reply.0["methodResponses"][0][0], "Email/get", "{reply:?}");
+    assert_indexed(test, id, document, since).await;
+
+    for grant in [calendar_grant, mail_grant] {
+        za_revoke_grant(&test.server, grant).await;
     }
 }
 
