@@ -9,8 +9,8 @@
 //! JMAP changes handlers and CalDAV's sync-collection REPORT.
 
 use super::{
-    Pair, finish, key_account, make_calendar, mark_boundary_pending, owner_boundary, pair,
-    put_event, session_token, share,
+    Pair, event_ics, finish, key_account, make_calendar, mark_boundary_pending, owner_boundary,
+    pair, put_event, session_token, share,
 };
 use crate::{
     utils::{
@@ -29,7 +29,7 @@ use crate::{
         STRONG,
         dav_seal::resource_id,
         drain::{DrainOn, body, partstat_of, set_partstat},
-        fanout::{NO_REPLY, Party, uid_copies},
+        fanout::{CONTENT_TYPE, NO_REPLY, Party, uid_copies},
         gating::method_error,
         imip,
         mail::{Traced, message_with},
@@ -120,6 +120,7 @@ pub async fn test(test: &mut TestServer) {
     grantee_session_lists_the_sharer(&fixture).await;
     move_with_scheduling_into_shared(test, &fixture).await;
     grantee_destroy_sends_delegated_cancel(test, &fixture).await;
+    grantee_held_to_effective_privacy(test, &fixture).await;
 
     // Each case leaves a completed boundary, the two setup events and the view grant.
     let owner = &fixture.pair.key;
@@ -2575,5 +2576,73 @@ async fn grantee_destroy_sends_delegated_cancel(test: &TestServer, f: &Sharing) 
     for uid in [JM, DAV] {
         assert_eq!(uid_copies(test, key2_id, uid).await, 0);
     }
+    share(test, owner, reader, f.reader_id, SLUG, "view").await;
+}
+
+/// PR #90 review C4617611549: an `edit` grantee's destroy and update are held to
+/// the event's effective privacy, the higher of the row flags' and the unsealed
+/// tree's, as `CalendarEvent/get` and the text query read it. An extension
+/// `CLASS` is sealed and leaves the flags public; the update that would set
+/// `privacy: "public"` (and drop the sealed value) is refused too. A public
+/// event of the same calendar is still destroyed by the grantee.
+async fn grantee_held_to_effective_privacy(test: &TestServer, f: &Sharing) {
+    const VEILED: &str = "jmapcal-sharing-veiled";
+    const OPEN: &str = "jmapcal-sharing-open";
+    const TITLE: &str = "jmapcal sharing veiled title";
+    const PRIVATE: &str = "Private events can only be modified by the calendar owner.";
+    let (owner, reader) = (&f.pair.key, &f.reader);
+    let owner_id = f.pair.key_id;
+    share(test, owner, reader, f.reader_id, SLUG, "edit").await;
+    f.pair
+        .dav
+        .request_with_headers(
+            "PUT",
+            &format!("{}{VEILED}.ics", home(SLUG)),
+            [CONTENT_TYPE],
+            event_ics(VEILED, TITLE).replace("END:VEVENT", "CLASS:X-JMAPCAL-VEILED\r\nEND:VEVENT"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let veiled = id(resource_id(test, owner_id, &format!("{SLUG}/{VEILED}.ics")).await);
+    let open = id(put_event(test, owner, &f.pair.dav, SLUG, OPEN, OPEN).await);
+
+    let reply = reader
+        .jmap_destroy_account(owner, "CalendarEvent", [veiled.as_str()], no_args())
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        set_error(reply.not_destroyed(&veiled)),
+        ("forbidden", Some(PRIVATE)),
+        "the grantee's destroy: {reply:?}"
+    );
+    let reply = reader
+        .jmap_method_call(
+            "CalendarEvent/set",
+            json!({
+                "accountId": owner.id_string(),
+                "update": { &veiled: { "privacy": "public", "title": "x" } },
+            }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        set_error(reply.not_updated(&veiled)),
+        ("forbidden", Some(PRIVATE)),
+        "the grantee's update: {reply:?}"
+    );
+    assert_eq!(uid_copies(test, owner_id, VEILED).await, 1);
+    let body = owner_body(test, f, VEILED).await;
+    assert!(
+        body.contains("CLASS:X-JMAPCAL-VEILED") && body.contains(TITLE),
+        "grantee_held_to_effective_privacy: the owner's event changed"
+    );
+
+    let reply = reader
+        .jmap_destroy_account(owner, "CalendarEvent", [open.as_str()], no_args())
+        .await;
+    assert_set_destroyed(&reply, &open);
+    assert_eq!(uid_copies(test, owner_id, OPEN).await, 0);
+
+    owner_delete(test, f, VEILED).await;
     share(test, owner, reader, f.reader_id, SLUG, "view").await;
 }

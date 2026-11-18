@@ -86,7 +86,7 @@ use groupware::{
             uid::za_take_uid_lease,
             update::{ZaEventUpdate, za_commit_update},
         },
-        privacy::{EventPrivacy, EventViewer},
+        privacy::{EventPrivacy, EventViewer, ICalendarPrivacy},
         rights::{EventAcl, EventChanges},
         schedule::{EventAlarmScheduler, EventAlarmUsers, EventAlarms},
         sequence::{ICalendarSequence, SCHEDULING_EVENT_FLAGS},
@@ -894,6 +894,21 @@ impl ZaEventWriter<'_> {
         let mut new_content = content
             .deserialize::<CalendarEventContent>()
             .caused_by(trc::location!())?;
+        // PR #90 review C4617611549: a caller that is not a member is held to
+        // the event's effective privacy, the higher of the row flags' and the
+        // unsealed tree's, as `CalendarEvent/get` reads it. A sealed
+        // extension `CLASS` leaves the flags public; checked before an
+        // occurrence resolves to the base event.
+        if !is_owner
+            && let Err(err) = assert_privacy_access(
+                EventPrivacy::from_flags(calendar_event.inner.flags.to_native())
+                    .max(new_content.data.event.privacy()),
+                EventViewer::new(is_owner),
+            )
+        {
+            update.fail(response, err);
+            return Ok(());
+        }
 
         // Resolve synthetic ids into recurrence instances
         let mut has_instances = false;
@@ -1496,6 +1511,26 @@ impl ZaEventWriter<'_> {
         ) {
             return Ok(Err(err));
         }
+        // PR #90 review C4617611549: a caller that is not a member is held to
+        // the event's effective privacy, the higher of the row flags' and the
+        // unsealed tree's, as `CalendarEvent/get` reads it. No view answers
+        // `notFound`, as the update does.
+        if !is_owner {
+            let calendar_ids = calendar_event.inner.calendar_ids().collect::<Vec<_>>();
+            let Some(event) = self
+                .view_tree(reader, document_id, &calendar_ids, calendar_event.inner)
+                .await?
+            else {
+                return Ok(Err(SetError::not_found()));
+            };
+            if let Err(err) = assert_privacy_access(
+                EventPrivacy::from_flags(calendar_event.inner.flags.to_native())
+                    .max(event.privacy()),
+                EventViewer::new(is_owner),
+            ) {
+                return Ok(Err(err));
+            }
+        }
         // The notification audience and the stored content (`:1468-1498`)
         // are not taken: the ownership is read from the event's view, once,
         // and only for a calendar that asks for it.
@@ -1569,6 +1604,21 @@ impl ZaEventWriter<'_> {
         calendar_ids: &[u32],
         meta: &ArchivedCalendarEvent,
     ) -> trc::Result<bool> {
+        Ok(self
+            .view_tree(reader, document_id, calendar_ids, meta)
+            .await?
+            .is_some_and(|event| self.identities.event_ownership(&event).may_write_own()))
+    }
+
+    /// The event's unsealed tree, through the request's reader; `None` for a
+    /// missing content or view.
+    async fn view_tree(
+        &self,
+        reader: &mut ZaEventReader,
+        document_id: u32,
+        calendar_ids: &[u32],
+        meta: &ArchivedCalendarEvent,
+    ) -> trc::Result<Option<ICalendar>> {
         let server = self.server;
         let Some(content_) = server
             .store()
@@ -1581,7 +1631,7 @@ impl ZaEventWriter<'_> {
             .await
             .caused_by(trc::location!())?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(view) = reader
             .view(
@@ -1594,15 +1644,15 @@ impl ZaEventWriter<'_> {
             )
             .await?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let content = view
             .content
             .unarchive::<CalendarEventContent>()
             .caused_by(trc::location!())?;
-        let event =
-            rkyv_deserialize::<_, ICalendar>(&content.data.event).caused_by(trc::location!())?;
-        Ok(self.identities.event_ownership(&event).may_write_own())
+        rkyv_deserialize::<_, ICalendar>(&content.data.event)
+            .caused_by(trc::location!())
+            .map(Some)
     }
 }
 
