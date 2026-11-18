@@ -67,6 +67,10 @@ use vault::session::SessionKeys;
 /// Upstream's text for a lost assertion (`calendar_set`'s `Err(err) if err.is_assertion_failure()`
 /// arm, after "Write changes").
 const ZA_MODIFIED: &str = "Another process modified this calendar, please try again.";
+/// PR #90 review C4617611521: a destroy whose one transaction would exceed
+/// the store's chunk size. The client can delete events first.
+const ZA_TOO_MANY_EVENTS: &str =
+    "This calendar holds too many events to delete at once. Delete some of its events first.";
 /// Upstream's text for a caller that may not modify the calendar (`calendar_set`'s update
 /// loop, "Validate ACL").
 const ZA_NOT_ALLOWED: &str = "You are not allowed to modify this calendar.";
@@ -841,6 +845,9 @@ fn za_calendar_set_error(error: ZaPipelineError) -> Result<SetError<CalendarProp
         ZaPipelineError::Forbidden(_) | ZaPipelineError::LinkedEvent => Ok(SetError::forbidden()),
         ZaPipelineError::NotFound => Ok(SetError::not_found()),
         ZaPipelineError::Busy(_) => Ok(SetError::forbidden().with_description(ZA_MODIFIED)),
+        ZaPipelineError::CalendarTooLarge => {
+            Ok(SetError::forbidden().with_description(ZA_TOO_MANY_EVENTS))
+        }
         // Not produced on these paths.
         ZaPipelineError::UidConflict { .. }
         | ZaPipelineError::TooManyRecipients
@@ -882,6 +889,10 @@ mod tests {
             "description": "Another process modified this calendar, please try again.",
         });
         let over_quota = json!({ "type": "overQuota", "description": "Account quota exceeded." });
+        let too_many_events = json!({
+            "type": "forbidden",
+            "description": "This calendar holds too many events to delete at once. Delete some of its events first.",
+        });
         for (label, error, expected) in [
             (
                 "Forbidden(Context)",
@@ -913,6 +924,11 @@ mod tests {
                 "Busy(CreateLost)",
                 ZaPipelineError::Busy(ZaBusy::CreateLost),
                 &modified,
+            ),
+            (
+                "CalendarTooLarge",
+                ZaPipelineError::CalendarTooLarge,
+                &too_many_events,
             ),
             (
                 "Store(AssertValueFailed)",

@@ -23,6 +23,10 @@ pub enum ZaPipelineError {
     },
     /// The fan-out's messages reach `itip_outbound_max_recipients`.
     TooManyRecipients,
+    /// A calendar delete whose one transaction would exceed the store's chunk
+    /// size, refused before any cancellation is delivered (PR #90 review
+    /// C4617611521). Deleting some of its events first lets it through.
+    CalendarTooLarge,
     /// Only for an error `za_itip_fails_write` accepts.
     Scheduling(ItipError),
     /// `ZaScheduling::Required` met a denied status; the text is `ItipSendStatus::reason()`.

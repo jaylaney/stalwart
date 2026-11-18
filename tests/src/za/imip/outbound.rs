@@ -27,7 +27,6 @@ use crate::{
     },
     za::{
         STRONG,
-        dav_seal::resource_id,
         drain::{DrainOn, body, partstat_of, set_partstat},
         fanout::{CONTENT_TYPE, MKCALENDAR, NO_REPLY, Party, attendee_statuses, uid_copies},
         mail::{Traced, TracedEvent, metadata_rows, row_is_stub, stored_blob},
@@ -1184,7 +1183,11 @@ async fn store_commit_failures(test: &TestServer, owner: &Party) {
         .with_status(StatusCode::NO_CONTENT);
 }
 
-/// 5.4: a chunked collection DELETE whose second chunk fails mails nothing.
+/// 5.4, rewritten by PR #90 review C4617611521: a collection DELETE is one
+/// physical transaction, so under a forced split whose second chunk would
+/// fail it commits whole and mails every CANCEL. Release 5 pinned the partial
+/// outcome here (the first chunk's event deleted, the second's kept, nothing
+/// mailed); that residual of iMIP spec 5.4 no longer holds for a key account.
 async fn chunked_collection_delete(test: &TestServer, owner: &Party) {
     let calendar = format!("/dav/cal/{}/imip-coll/", owner.name.replace('@', "%40"));
     owner
@@ -1192,7 +1195,6 @@ async fn chunked_collection_delete(test: &TestServer, owner: &Party) {
         .request("MKCALENDAR", &calendar, MKCALENDAR)
         .await
         .with_status(StatusCode::CREATED);
-    let mut ids = Vec::new();
     for uid in ["imip-out-k1", "imip-out-k2"] {
         // Each PUT mails ATT: the raw client (5 s, PR review T-2).
         assert_eq!(
@@ -1205,12 +1207,9 @@ async fn chunked_collection_delete(test: &TestServer, owner: &Party) {
             .await,
             201
         );
-        ids.push(resource_id(test, owner.id, &format!("imip-coll/{uid}.ics")).await);
     }
-    // `delete_with_events_za` walks the children in ascending order, one
-    // commit point after each: the first chunk holds the lower id.
-    assert!(ids[0] < ids[1], "{ids:?}");
     wait_for_queue(test).await;
+    wait_for_index_queue(test, owner.id, Duration::from_secs(30)).await;
     sink().clear();
     let traced = Traced::start(&[EventType::Calendar(CalendarEvent::ItipMessageError)]);
     let split = ForceCommitSplit::new(owner.id);
@@ -1218,54 +1217,29 @@ async fn chunked_collection_delete(test: &TestServer, owner: &Party) {
     let status = delete_raw(owner.name, STRONG, calendar.clone()).await;
     drop(split);
     test_hooks::set_second_chunk_fail_once(None);
-    assert_eq!(status, 500, "the chunked DELETE did not fail");
     assert_eq!(
-        uid_copies(test, owner.id, "imip-out-k1").await,
-        0,
-        "the first chunk's event stands deleted"
+        status, 204,
+        "the DELETE under a forced split did not commit"
     );
-    assert_eq!(
-        uid_copies(test, owner.id, "imip-out-k2").await,
-        1,
-        "the second chunk's event remains"
-    );
+    for uid in ["imip-out-k1", "imip-out-k2"] {
+        assert_eq!(uid_copies(test, owner.id, uid).await, 0, "{uid} remains");
+    }
     wait_for_queue(test).await;
-    assert_eq!(sink().count_to(ATT), 0, "the failed DELETE mailed a CANCEL");
-    let mut dropped = traced
-        .finish()
-        .await
+    let cancels = sink()
+        .take_to(ATT)
         .into_iter()
-        .filter(|event| {
-            event.details == ZA_IMIP_DROPPED && event.account_id == Some(owner.id as u64)
-        })
-        .map(|event| {
-            event
-                .keys
-                .iter()
-                .find_map(|(key, value)| match (key, value) {
-                    (Key::DocumentId, trc::Value::UInt(id)) => Some(*id as u32),
-                    _ => None,
-                })
-                .expect("a document id")
-        })
-        .collect::<Vec<_>>();
-    dropped.sort_unstable();
-    assert_eq!(dropped, ids, "one dropped trace per event of the batch");
-    owner
-        .client
-        .request_with_headers(
-            "DELETE",
-            &format!("{calendar}imip-out-k2.ics"),
-            [NO_REPLY],
-            "",
-        )
-        .await
-        .with_status(StatusCode::NO_CONTENT);
-    owner
-        .client
-        .request("DELETE", &calendar, "")
-        .await
-        .with_status(StatusCode::NO_CONTENT);
+        .filter(|message| message.calendar_method().as_deref() == Some("CANCEL"))
+        .count();
+    assert_eq!(cancels, 2, "one CANCEL per event of the DELETE");
+    assert!(
+        !traced
+            .finish()
+            .await
+            .into_iter()
+            .any(|event| event.details == ZA_IMIP_DROPPED
+                && event.account_id == Some(owner.id as u64)),
+        "the committed DELETE dropped its mail"
+    );
 }
 
 /// Review Focus 3.

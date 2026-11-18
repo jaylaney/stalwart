@@ -59,6 +59,7 @@ impl BatchBuilder {
             task_types: TaskTypes::default(),
             priority: CommitPriority::Default,
             za_chunk_asserts: Vec::new(),
+            za_one_transaction: false,
         }
     }
 
@@ -677,6 +678,9 @@ impl BatchBuilder {
 
     #[inline]
     pub fn commit_point(&mut self) -> &mut Self {
+        if self.za_one_transaction {
+            return self;
+        }
         #[cfg(feature = "test_mode")]
         if self.batch_ops > 0 && crate::za_test::force_commit_split(self.current_account_id) {
             return self.add_commit_point();
@@ -1268,6 +1272,23 @@ impl BatchBuilder {
             self.ops.push(Operation::DocumentId { document_id });
         }
         self
+    }
+
+    /// Zero-access fork (PR #90 review C4617611521): from here on
+    /// `commit_point()` adds no commit point, under `FORCE_COMMIT_SPLIT` too,
+    /// so a batch built after this call is written in one transaction. An
+    /// explicit `add_commit_point()` still adds one. The batch's size is then
+    /// the builder's own count of the whole batch (`za_exceeds_one_chunk`).
+    pub fn za_one_transaction(&mut self) -> &mut Self {
+        self.za_one_transaction = true;
+        self
+    }
+
+    /// Whether the current chunk exceeds the store's chunk size by the
+    /// builder's own count (`MAX_COMMIT_BYTES`). For a batch under
+    /// `za_one_transaction` the current chunk is the whole batch.
+    pub fn za_exceeds_one_chunk(&self) -> bool {
+        self.batch_size > MAX_COMMIT_BYTES
     }
 
     /// The assertions of `za_assert_absent_per_chunk`, pushed without

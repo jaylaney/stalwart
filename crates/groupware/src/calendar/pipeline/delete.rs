@@ -367,6 +367,10 @@ pub async fn za_delete_calendar(
     send_itip: bool,
 ) -> Result<ZaDeleted, ZaPipelineError> {
     let mut batch = BatchBuilder::new();
+    // PR #90 review C4617611521: the calendar and every event are deleted in
+    // one transaction, or nothing is (the per-event commit points become
+    // no-ops).
+    batch.za_one_transaction();
     let messages = DestroyArchive(
         target
             .stored
@@ -396,6 +400,11 @@ pub async fn za_delete_calendar(
         .with_collection(Collection::Principal)
         .with_document(0)
         .clear_if_equals(PrincipalField::DefaultCalendarId, calendar_id);
+    // A transaction past the store's chunk size is refused before the
+    // fan-out, so no cancellation goes out for a delete that cannot commit.
+    if batch.za_exceeds_one_chunk() {
+        return Err(ZaPipelineError::CalendarTooLarge);
+    }
 
     za_commit_delete(
         server,

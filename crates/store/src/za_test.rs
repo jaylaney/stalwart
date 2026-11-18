@@ -34,7 +34,9 @@
 //!   chunk can be tested. It stays set until cleared; batches whose current
 //!   account is another account are not affected.
 //!
-//!   It governs `commit_point()` only. It does not govern
+//!   It governs `commit_point()` only, and not in a batch under
+//!   `BatchBuilder::za_one_transaction` (PR #90 review C4617611521: a key
+//!   account's calendar delete). It does not govern
 //!   `bulk_commit_point()`, nor the `add_commit_point()` that `build_batch`
 //!   calls after every 1000 term merges (`search/term.rs`, by its own
 //!   count): an index pass splits between its term merges only when it holds
@@ -351,5 +353,75 @@ mod tests {
         set_second_chunk_fail_once(Some(FAILS));
         assert!(store.write_batch(&mut batch_of(OTHER)).await.is_ok());
         set_second_chunk_fail_once(None);
+    }
+
+    /// PR #90 review C4617611521: a batch under `za_one_transaction` gets no
+    /// commit point from `commit_point()`, whether forced (`FORCE_COMMIT_SPLIT`),
+    /// past `MAX_COMMIT_OPS` or past `MAX_COMMIT_BYTES`, and the builder's own
+    /// count of the whole batch tells when it exceeds one chunk.
+    #[test]
+    fn one_transaction_batch_never_splits() {
+        // Account ids no other test of this crate uses.
+        const ONE: u32 = 0x5a5a_0401;
+        let _hooks = hold_process_hooks();
+
+        set_force_commit_split(Some(ONE));
+        let split = batch_of(ONE).commit_point_count();
+        let mut whole = BatchBuilder::new();
+        whole.za_one_transaction();
+        whole
+            .with_account_id(ONE)
+            .with_collection(Collection::Email);
+        for document_id in 0..3 {
+            whole
+                .with_document(document_id)
+                .set(ValueClass::Property(1), vec![1u8])
+                .commit_point();
+        }
+        set_force_commit_split(None);
+        assert_eq!(split, 3, "the control splits under the hook");
+        assert!(!whole.has_commit_points(), "the forced split applied");
+
+        let mut whole = BatchBuilder::new();
+        whole.za_one_transaction();
+        whole
+            .with_account_id(ONE)
+            .with_collection(Collection::Email);
+        for document_id in 0..1500 {
+            whole
+                .with_document(document_id)
+                .set(ValueClass::Property(1), vec![1u8])
+                .commit_point();
+        }
+        assert!(!whole.has_commit_points(), "split past the operation count");
+        assert!(!whole.za_exceeds_one_chunk());
+        assert_eq!(whole.commit_points().iter().count(), 1);
+
+        let large = || vec![0u8; 5_000_001];
+        let mut control = BatchBuilder::new();
+        control
+            .with_account_id(ONE)
+            .with_collection(Collection::Email);
+        control
+            .with_document(1)
+            .set(ValueClass::Property(1), large());
+        assert!(control.za_exceeds_one_chunk());
+        control.commit_point();
+        assert!(control.has_commit_points(), "the control splits by size");
+        assert!(!control.za_exceeds_one_chunk(), "a new chunk starts empty");
+
+        let mut whole = BatchBuilder::new();
+        whole.za_one_transaction();
+        whole
+            .with_account_id(ONE)
+            .with_collection(Collection::Email);
+        whole.with_document(1).set(ValueClass::Property(1), large());
+        whole.commit_point();
+        whole
+            .with_document(2)
+            .set(ValueClass::Property(1), vec![1u8]);
+        whole.commit_point();
+        assert!(!whole.has_commit_points(), "split by size");
+        assert!(whole.za_exceeds_one_chunk(), "the whole batch's size");
     }
 }

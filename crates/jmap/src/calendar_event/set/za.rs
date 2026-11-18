@@ -1685,6 +1685,8 @@ pub(super) fn za_event_set_error(
         ZaPipelineError::Forbidden(_) | ZaPipelineError::LinkedEvent => Ok(SetError::forbidden()),
         ZaPipelineError::NotFound => Ok(SetError::not_found()),
         ZaPipelineError::Busy(_) => Ok(SetError::forbidden().with_description(ZA_MODIFIED)),
+        // A calendar delete's refusal; not produced on this path.
+        ZaPipelineError::CalendarTooLarge => Ok(SetError::forbidden()),
         ZaPipelineError::UidConflict { .. } => Ok(match uid {
             Some(uid) => duplicate_uid(uid),
             None => SetError::invalid_properties().with_property(JSCalendarProperty::Uid),
@@ -1931,6 +1933,11 @@ mod tests {
                 "NotFound",
                 ZaPipelineError::NotFound,
                 json!({ "type": "notFound" }),
+            ),
+            (
+                "CalendarTooLarge",
+                ZaPipelineError::CalendarTooLarge,
+                forbidden.clone(),
             ),
             (
                 "Busy(LeaseBusy)",

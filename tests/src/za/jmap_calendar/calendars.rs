@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{Pair, finish, make_calendar, pair, share};
+use super::{Pair, finish, make_calendar, pair, put_event, share};
 use crate::{
     utils::{
         account::Account,
@@ -14,8 +14,8 @@ use crate::{
         smtp_sink::sink,
         webdav::DummyWebDavClient,
         za::{
-            delete_inbox_item, inbox_ids, item_method, open_pending_item_as, wait_for_queue,
-            za_post,
+            delete_inbox_item, inbox_ids, item_method, open_pending_item_as, wait_for_index_queue,
+            wait_for_queue, za_post,
         },
     },
     za::{
@@ -28,16 +28,25 @@ use crate::{
     },
 };
 use calcard::icalendar::ICalendarMethod;
-use common::za::test_hooks::set_delete_commit_fail_once;
+use common::za::{
+    imip::ZA_IMIP_DROPPED,
+    test_hooks::{ForceCommitSplit, set_delete_commit_fail_once, set_second_chunk_fail_once},
+};
 use groupware::calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences, Timezone};
 use hyper::{Method, StatusCode};
+use jmap_proto::types::state::State;
 use serde_json::{Value, json};
+use std::time::Duration;
 use store::{
     ValueKey,
     write::{Archive, ArchiveBytes, BatchBuilder, ValueClass},
 };
-use trc::{EventType, Key, StoreEvent};
-use types::{collection::Collection, field::PrincipalField, id::Id};
+use trc::{CalendarEvent, EventType, Key, StoreEvent};
+use types::{
+    collection::{Collection, SyncCollection},
+    field::PrincipalField,
+    id::Id,
+};
 
 const SLUG: &str = "jmapcal-work";
 const PATH: &str = "/dav/cal/jmapcal-calendars%40example.com/jmapcal-work/";
@@ -68,6 +77,7 @@ pub async fn test(test: &mut TestServer) {
     update_without_entry_refused(test, &pair).await;
     colour_before_and_after_sharing(test, &pair).await;
     destroy_with_events_sends_cancellations(test, &pair).await;
+    destroy_is_one_transaction(test, &pair).await;
     destroy_non_empty_without_flag_refused(test, &pair).await;
     grantee_destroy_refused(test, &pair).await;
     on_success_set_is_default(test, &pair).await;
@@ -673,6 +683,165 @@ async fn destroy_with_events_sends_cancellations(test: &TestServer, pair: &Pair)
         assert_eq!(matching[0].calendar_method().as_deref(), Some("CANCEL"));
     }
     assert_eq!(uid_copies(test, pair.key_id, UID_J).await, 0);
+    delete_new_items(test, pair, &start).await;
+}
+
+/// The owner's Calendar log records after `tip`.
+async fn changes_after(test: &TestServer, owner: u32, tip: u64) -> Vec<u64> {
+    let records = test
+        .server
+        .store()
+        .za_changes_records_range(owner, SyncCollection::Calendar, tip, u64::MAX)
+        .await
+        .unwrap();
+    assert!(!records.truncated, "{records:?}");
+    records
+        .records
+        .into_iter()
+        .map(|(change_id, _)| change_id)
+        .collect()
+}
+
+async fn calendar_tip(test: &TestServer, owner: u32) -> u64 {
+    test.server
+        .store()
+        .get_last_change_id(owner, SyncCollection::Calendar.into())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn calendar_stored(test: &TestServer, owner: u32, document_id: u32) -> bool {
+    test.server
+        .store()
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+            owner,
+            Collection::Calendar,
+            document_id,
+        ))
+        .await
+        .unwrap()
+        .is_some()
+}
+
+/// PR #90 review C4617611521: a calendar destroy is one physical transaction.
+/// A forced split whose second chunk fails no longer leaves the first chunk's
+/// events deleted (the release 5 residual of a chunked collection DELETE); a
+/// failed commit leaves the calendar and every event, and mails nothing.
+async fn destroy_is_one_transaction(test: &TestServer, pair: &Pair) {
+    const SLUG: &str = "jmapcal-destroy-whole";
+    const UIDS: [&str; 3] = [
+        "jmapcal-cal-whole-1",
+        "jmapcal-cal-whole-2",
+        "jmapcal-cal-whole-3",
+    ];
+    let owner = pair.key_id;
+    let start = inbox_ids(test, pair.key2_id).await;
+    let calendar = make_calendar(test, &pair.key, &pair.dav, SLUG).await;
+    let calendar_id = Id::from(calendar).to_string();
+    put_invite(pair, SLUG, UIDS[0]).await;
+    put_invite(pair, SLUG, UIDS[1]).await;
+    put_event(test, &pair.key, &pair.dav, SLUG, UIDS[2], "whole").await;
+    let invited = [
+        resource_id(test, owner, &format!("{SLUG}/{}.ics", UIDS[0])).await,
+        resource_id(test, owner, &format!("{SLUG}/{}.ics", UIDS[1])).await,
+    ];
+    wait_for_queue(test).await;
+    // No queued index write of the account meets the forced split below.
+    wait_for_index_queue(test, owner, Duration::from_secs(30)).await;
+
+    // A forced commit failure: nothing is deleted and nothing is mailed; each
+    // invitation's mail is traced dropped.
+    sink().clear();
+    let traced = Traced::start(&[EventType::Calendar(CalendarEvent::ItipMessageError)]);
+    set_delete_commit_fail_once(Some(owner));
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "destroy": [&calendar_id], "onDestroyRemoveEvents": true }),
+    )
+    .await;
+    set_delete_commit_fail_once(None);
+    assert_eq!(
+        set_error(reply.not_destroyed(&calendar_id)),
+        ("forbidden", Some(INCOMPLETE)),
+        "{reply:?}"
+    );
+    assert!(calendar_stored(test, owner, calendar).await);
+    for uid in UIDS {
+        assert_eq!(uid_copies(test, owner, uid).await, 1, "{uid}");
+    }
+    wait_for_queue(test).await;
+    assert_eq!(sink().count_to(OUTSIDE), 0, "the failed destroy mailed");
+    let mut dropped = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| event.details == ZA_IMIP_DROPPED && event.account_id == Some(owner as u64))
+        .map(|event| {
+            event
+                .keys
+                .iter()
+                .find_map(|(key, value)| match (key, value) {
+                    (Key::DocumentId, trc::Value::UInt(id)) => Some(*id as u32),
+                    _ => None,
+                })
+                .expect("a document id")
+        })
+        .collect::<Vec<_>>();
+    dropped.sort_unstable();
+    assert_eq!(dropped, invited, "one dropped trace per invitation");
+    // The fan-out ran before the failed commit: key2's stranded items go.
+    delete_new_items(test, pair, &start).await;
+
+    // A forced split whose second chunk would fail: the destroy commits whole.
+    sink().clear();
+    let before = inbox_ids(test, pair.key2_id).await;
+    let tip = calendar_tip(test, owner).await;
+    let reply = {
+        let _split = ForceCommitSplit::new(owner);
+        set_second_chunk_fail_once(Some(owner));
+        let reply = calendar_set(
+            &pair.key,
+            &pair.key,
+            json!({ "destroy": [&calendar_id], "onDestroyRemoveEvents": true }),
+        )
+        .await;
+        set_second_chunk_fail_once(None);
+        reply
+    };
+    assert_eq!(
+        reply.destroyed().collect::<Vec<_>>(),
+        [calendar_id.as_str()],
+        "{reply:?}"
+    );
+    for uid in UIDS {
+        assert_eq!(uid_copies(test, owner, uid).await, 0, "{uid}");
+    }
+    assert!(!calendar_stored(test, owner, calendar).await);
+    let records = changes_after(test, owner, tip).await;
+    assert_eq!(records.len(), 1, "one log record: {records:?}");
+    assert_eq!(
+        reply.new_state().to_string(),
+        State::Exact(records[0]).to_string()
+    );
+    wait_for_queue(test).await;
+    let mail = sink().take_to(OUTSIDE);
+    assert_eq!(mail.len(), 2, "outside attendee's cancellation mail");
+    for message in &mail {
+        assert_eq!(message.calendar_method().as_deref(), Some("CANCEL"));
+    }
+    let mut cancelled = Vec::new();
+    for id in inbox_ids(test, pair.key2_id).await {
+        if before.contains(&id) {
+            continue;
+        }
+        let (ical, _) = open_pending_item_as(test, pair.key2_id, STRONG, id).await;
+        assert_eq!(item_method(&ical), Some(ICalendarMethod::Cancel));
+        cancelled.push(ical.uids().next().expect("item UID").to_string());
+    }
+    cancelled.sort();
+    assert_eq!(cancelled, [UIDS[0], UIDS[1]], "key2's new items");
     delete_new_items(test, pair, &start).await;
 }
 

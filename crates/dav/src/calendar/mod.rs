@@ -514,6 +514,9 @@ impl From<ZaPipelineError> for DavError {
             ZaPipelineError::LinkedEvent => Self::Code(StatusCode::CONFLICT),
             ZaPipelineError::NotFound => Self::Code(StatusCode::NOT_FOUND),
             ZaPipelineError::Busy(_) => Self::Code(StatusCode::SERVICE_UNAVAILABLE),
+            // PR #90 review C4617611521: a refusal that stands until the client
+            // deletes events, not a temporary condition (507 is one).
+            ZaPipelineError::CalendarTooLarge => Self::Code(StatusCode::FORBIDDEN),
             ZaPipelineError::UidConflict { href: Some(href) } => DavErrorCondition::new(
                 StatusCode::FORBIDDEN,
                 CalCondition::NoUidConflict(href.into()),
@@ -643,6 +646,10 @@ mod pipeline_error_tests {
         assert!(matches!(
             DavError::from(ZaPipelineError::NotFound),
             DavError::Code(StatusCode::NOT_FOUND)
+        ));
+        assert!(matches!(
+            DavError::from(ZaPipelineError::CalendarTooLarge),
+            DavError::Code(StatusCode::FORBIDDEN)
         ));
         for busy in [ZaBusy::LeaseBusy, ZaBusy::CreateLost] {
             assert!(matches!(
