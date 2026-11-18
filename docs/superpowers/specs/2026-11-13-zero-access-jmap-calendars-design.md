@@ -1,6 +1,8 @@
 # Zero-access calendar: JMAP calendars and browser sign-in (release 6) design spec
 
-Date: 2026-11-13. Status: revision 7. Revision 7 incorporates Jay's
+Date: 2026-11-13. Status: revision 7, with one wording correction of
+2026-11-18 on Jay's decision (3.3: the UID lease covers creates; a change
+of calendars checks without it; follow-up issue #91). Revision 7 incorporates Jay's
 approved [D29 amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md),
 recorded 2026-11-15: key-calendar continuations carry their original sync
 start explicitly (6.8, 9.1, 9.2, 9.8 and 10 to 12). Revision 6 applies Jay's decision
@@ -305,8 +307,11 @@ Accepted, each because the CalDAV behaviour is the qualified one:
 - **An unexpanded text query is matched in memory**, over the document
   the search index would hold for the event, with the index's own code
   for terms and text conditions (D12).
-- **UID uniqueness is CalDAV's rule**: one UID per calendar, checked under
-  the UID lease against current archives.
+- **UID uniqueness is CalDAV's rule**: one UID per calendar. A create
+  checks it under the UID lease against current archives. A change of an
+  event's calendars checks each calendar the event enters against current
+  archives without the lease, as CalDAV's `MOVE` does (5.2), so a create
+  of the same UID that crosses such a change is not excluded (issue #91).
 - **Destroying a calendar sends cancellations** for its events, as a
   CalDAV collection `DELETE` does (D16).
 - **No drafts, no per-user event data, no participant-visibility flags**
