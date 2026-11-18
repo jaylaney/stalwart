@@ -926,6 +926,11 @@ mod tests {
                 &modified,
             ),
             (
+                "Busy(CalendarChanged)",
+                ZaPipelineError::Busy(ZaBusy::CalendarChanged),
+                &modified,
+            ),
+            (
                 "CalendarTooLarge",
                 ZaPipelineError::CalendarTooLarge,
                 &too_many_events,

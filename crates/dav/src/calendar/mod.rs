@@ -651,7 +651,11 @@ mod pipeline_error_tests {
             DavError::from(ZaPipelineError::CalendarTooLarge),
             DavError::Code(StatusCode::FORBIDDEN)
         ));
-        for busy in [ZaBusy::LeaseBusy, ZaBusy::CreateLost] {
+        for busy in [
+            ZaBusy::LeaseBusy,
+            ZaBusy::CreateLost,
+            ZaBusy::CalendarChanged,
+        ] {
             assert!(matches!(
                 DavError::from(ZaPipelineError::Busy(busy)),
                 DavError::Code(StatusCode::SERVICE_UNAVAILABLE)

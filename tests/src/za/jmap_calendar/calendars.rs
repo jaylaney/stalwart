@@ -14,8 +14,8 @@ use crate::{
         smtp_sink::sink,
         webdav::DummyWebDavClient,
         za::{
-            delete_inbox_item, inbox_ids, item_method, open_pending_item_as, wait_for_index_queue,
-            wait_for_queue, za_post,
+            HookParked, delete_inbox_item, inbox_ids, item_method, open_pending_item_as,
+            wait_for_index_queue, wait_for_queue, za_post,
         },
     },
     za::{
@@ -30,7 +30,10 @@ use crate::{
 use calcard::icalendar::ICalendarMethod;
 use common::za::{
     imip::ZA_IMIP_DROPPED,
-    test_hooks::{ForceCommitSplit, set_delete_commit_fail_once, set_second_chunk_fail_once},
+    test_hooks::{
+        ForceCommitSplit, set_delete_commit_fail_once, set_fan_out_pause,
+        set_second_chunk_fail_once,
+    },
 };
 use groupware::calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences, Timezone};
 use hyper::{Method, StatusCode};
@@ -57,6 +60,7 @@ const OUTSIDE: &str = "jmapcal-calendars-out@remote.test";
 const SHARE_TEXT: &str = "Calendar sharing is managed on the account page.";
 const INCOMPLETE: &str = "The server could not complete this change, try again.";
 const NOT_ALLOWED: &str = "You are not allowed to modify this calendar.";
+const MODIFIED: &str = "Another process modified this calendar, please try again.";
 /// The fixed reason of `Calendar/set`'s store-failure trace (`calendar/set/za.rs`).
 const FAILURE_REASON: &str = "zero-access: calendar write failed";
 /// The delete-commit hook's own details: an inert canary that the original
@@ -78,6 +82,7 @@ pub async fn test(test: &mut TestServer) {
     colour_before_and_after_sharing(test, &pair).await;
     destroy_with_events_sends_cancellations(test, &pair).await;
     destroy_is_one_transaction(test, &pair).await;
+    destroy_fenced_against_a_concurrent_create(test, &pair).await;
     destroy_non_empty_without_flag_refused(test, &pair).await;
     grantee_destroy_refused(test, &pair).await;
     on_success_set_is_default(test, &pair).await;
@@ -842,6 +847,57 @@ async fn destroy_is_one_transaction(test: &TestServer, pair: &Pair) {
     }
     cancelled.sort();
     assert_eq!(cancelled, [UIDS[0], UIDS[1]], "key2's new items");
+    delete_new_items(test, pair, &start).await;
+}
+
+/// PR #90 review C4617611506: a destroy parked in its fan-out while a CalDAV
+/// PUT adds an event to the calendar is refused with upstream's "modified"
+/// text; the calendar and both events stay, and the outside attendee's
+/// cancellation is not mailed.
+async fn destroy_fenced_against_a_concurrent_create(test: &TestServer, pair: &Pair) {
+    const SLUG: &str = "jmapcal-destroy-fence";
+    const INVITED: &str = "jmapcal-cal-fence-invited";
+    const LATE: &str = "jmapcal-cal-fence-late";
+    let owner = pair.key_id;
+    let start = inbox_ids(test, pair.key2_id).await;
+    let calendar = make_calendar(test, &pair.key, &pair.dav, SLUG).await;
+    let calendar_id = Id::from(calendar).to_string();
+    put_invite(pair, SLUG, INVITED).await;
+    wait_for_queue(test).await;
+    sink().clear();
+
+    let parked = {
+        let (key, calendar_id) = (pair.key.clone(), calendar_id.clone());
+        HookParked::start(pair.key2_id, set_fan_out_pause, async move {
+            calendar_set(
+                &key,
+                &key,
+                json!({ "destroy": [&calendar_id], "onDestroyRemoveEvents": true }),
+            )
+            .await
+        })
+        .await
+    };
+    put_event(test, &pair.key, &pair.dav, SLUG, LATE, "late").await;
+    let reply = parked.finish().await;
+    assert_eq!(
+        set_error(reply.not_destroyed(&calendar_id)),
+        ("forbidden", Some(MODIFIED)),
+        "{reply:?}"
+    );
+    assert!(calendar_stored(test, owner, calendar).await);
+    assert_eq!(uid_copies(test, owner, INVITED).await, 1);
+    assert_eq!(uid_copies(test, owner, LATE).await, 1);
+    wait_for_queue(test).await;
+    assert_eq!(sink().count_to(OUTSIDE), 0, "the refused destroy mailed");
+    // The fan-out ran before the refusal: key2's stranded item goes.
+    delete_new_items(test, pair, &start).await;
+
+    destroy(pair, &calendar_id).await;
+    assert_eq!(uid_copies(test, owner, INVITED).await, 0);
+    assert_eq!(uid_copies(test, owner, LATE).await, 0);
+    wait_for_queue(test).await;
+    sink().clear();
     delete_new_items(test, pair, &start).await;
 }
 

@@ -1950,6 +1950,11 @@ mod tests {
                 modified.clone(),
             ),
             (
+                "Busy(CalendarChanged)",
+                ZaPipelineError::Busy(ZaBusy::CalendarChanged),
+                modified.clone(),
+            ),
+            (
                 "Store(AssertValueFailed)",
                 ZaPipelineError::Store(StoreEvent::AssertValueFailed.into_err()),
                 modified.clone(),

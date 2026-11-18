@@ -8,10 +8,11 @@ use super::{
     ZaDeleted,
     admission::ZaRoles,
     context::{za_mutation_context, za_write_contexts},
-    error::{ZaPipelineError, ZaRefusal},
+    error::{ZaBusy, ZaPipelineError, ZaRefusal},
 };
 use crate::{
     DestroyArchive,
+    cache::GroupwareCache,
     calendar::{
         Calendar, CalendarEvent, EVENT_HAS_ALARMS,
         delegation::{
@@ -30,8 +31,17 @@ use common::{
     storage::{dav::canonical_calcard_segment, metadata::ContainerCleanup},
     za::imip::ZaImipPending,
 };
-use std::future::{Future, Ready};
-use store::write::{Archive, ArchiveBytes, BatchBuilder, now};
+use std::{
+    future::{Future, Ready},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use store::{
+    Deserialize, ValueKey,
+    write::{Archive, ArchiveBytes, BatchBuilder, MergeResult, ValueClass, now},
+};
 use trc::AddContext;
 use types::{
     acl::Acl,
@@ -200,6 +210,7 @@ pub async fn za_delete_event(
         message,
         Some(rebuild),
         Vec::new(),
+        None,
     )
     .await
 }
@@ -288,6 +299,7 @@ pub async fn za_destroy_event(
         message,
         Some(rebuild),
         Vec::new(),
+        None,
     )
     .await
 }
@@ -371,6 +383,7 @@ pub async fn za_delete_calendar(
     // one transaction, or nothing is (the per-event commit points become
     // no-ops).
     batch.za_one_transaction();
+    let fence = ZaChildFence::new(token, calendar_id, &children);
     let messages = DestroyArchive(
         target
             .stored
@@ -394,17 +407,16 @@ pub async fn za_delete_calendar(
     .await
     .caused_by(trc::location!())?;
 
-    // Reset default calendar id
-    batch
-        .with_account_id(owner_id)
-        .with_collection(Collection::Principal)
-        .with_document(0)
-        .clear_if_equals(PrincipalField::DefaultCalendarId, calendar_id);
+    // The default calendar id is reset by the fence's merge operation
+    // (`ZaChildFence::assert_in`), in the same transaction.
     // A transaction past the store's chunk size is refused before the
     // fan-out, so no cancellation goes out for a delete that cannot commit.
     if batch.za_exceeds_one_chunk() {
         return Err(ZaPipelineError::CalendarTooLarge);
     }
+    // PR #90 review C4617611506: a stale child list is refused before any
+    // cancellation is delivered.
+    fence.current(server, owner_id).await?;
 
     za_commit_delete(
         server,
@@ -415,8 +427,102 @@ pub async fn za_delete_calendar(
         messages,
         None::<fn(trc::Error) -> Ready<_>>,
         target.deleted_grantees,
+        Some(fence),
     )
     .await
+}
+
+/// PR #90 review C4617611506: a calendar delete's child list, fenced against
+/// the account's Calendar change counter. A create or a placement into the
+/// calendar asserts only the calendar archive, which the delete leaves as it
+/// was, and writes nothing the delete reads; the counter is the one key both
+/// write. `current` compares the list with a snapshot no older than the
+/// counter; `assert_in` adds the merge operation that fails the delete's
+/// commit unless the change id assigned to it is the next one, so nothing
+/// was committed to the account's calendars in between. It relies on the
+/// delete being one transaction (`za_one_transaction`) and on the store
+/// allocating a batch's change ids before its merge functions run, and
+/// aborting the transaction on their error (`za_change_id_fence_tests`).
+struct ZaChildFence<'x> {
+    token: &'x AccessToken,
+    calendar_id: u32,
+    children: Vec<u32>,
+    lost: Arc<AtomicBool>,
+}
+
+impl<'x> ZaChildFence<'x> {
+    fn new(token: &'x AccessToken, calendar_id: u32, children: &[u32]) -> Self {
+        let mut children = children.to_vec();
+        children.sort_unstable();
+        children.dedup();
+        ZaChildFence {
+            token,
+            calendar_id,
+            children,
+            lost: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The counter's value once the child list is checked against a snapshot
+    /// that holds every change up to it; `Busy` when the lists differ.
+    async fn current(&self, server: &Server, owner_id: u32) -> Result<u64, ZaPipelineError> {
+        let counter = server
+            .store()
+            .get_counter(ValueKey {
+                account_id: owner_id,
+                collection: 0,
+                document_id: 0,
+                class: ValueClass::ChangeId(SyncCollection::Calendar.into()),
+            })
+            .await
+            .caused_by(trc::location!())?;
+        let tip =
+            u64::try_from(counter).map_err(|_| ZaPipelineError::Busy(ZaBusy::CalendarChanged))?;
+        let resources = server
+            .fetch_groupware_resources_at(
+                self.token.account_id(),
+                owner_id,
+                SyncCollection::Calendar,
+                tip,
+            )
+            .await
+            .caused_by(trc::location!())?;
+        let mut children = resources.children_ids(self.calendar_id).collect::<Vec<_>>();
+        children.sort_unstable();
+        children.dedup();
+        if children != self.children {
+            return Err(ZaPipelineError::Busy(ZaBusy::CalendarChanged));
+        }
+        Ok(tip)
+    }
+
+    /// The merge operation on the account's default calendar id: it fails
+    /// the commit unless the batch's Calendar change id is `tip + 1`, and
+    /// otherwise clears the id when it names the deleted calendar.
+    fn assert_in(&self, owner_id: u32, tip: u64, batch: &mut BatchBuilder) {
+        let (calendar_id, lost) = (self.calendar_id, self.lost.clone());
+        let expected = tip + 1;
+        batch
+            .with_account_id(owner_id)
+            .with_collection(Collection::Principal)
+            .with_document(0)
+            .merge_fnc(PrincipalField::DefaultCalendarId, move |ids, bytes| {
+                if ids.change_id(owner_id, SyncCollection::Calendar) != Some(expected) {
+                    lost.store(true, Ordering::Relaxed);
+                    return Err(trc::StoreEvent::AssertValueFailed.into_err());
+                }
+                match bytes {
+                    Some(bytes) if u32::deserialize(bytes)? == calendar_id => {
+                        Ok(MergeResult::Delete)
+                    }
+                    _ => Ok(MergeResult::Skip),
+                }
+            });
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -425,10 +531,11 @@ async fn za_commit_delete<F>(
     keys: &SessionKeys,
     roles: &ZaRoles,
     owner_id: u32,
-    batch: BatchBuilder,
+    mut batch: BatchBuilder,
     messages: impl IntoIterator<Item = ZaDeleteMessage>,
     rebuild: Option<impl FnOnce(trc::Error) -> F>,
     deleted_grantees: Vec<u32>,
+    fence: Option<ZaChildFence<'_>>,
 ) -> Result<ZaDeleted, ZaPipelineError>
 where
     F: Future<Output = Result<BatchBuilder, ZaPipelineError>>,
@@ -502,11 +609,25 @@ where
             .details("zero-access test hook: delete commit failure")
             .into());
     }
+    // PR #90 review C4617611506: the calendar delete's child list once more,
+    // immediately before the commit, and its change-id fence.
+    if let Some(fence) = &fence {
+        match fence.current(server, owner_id).await {
+            Ok(tip) => fence.assert_in(owner_id, tip, &mut batch),
+            Err(error) => {
+                za_mail.dropped();
+                return Err(error);
+            }
+        }
+    }
     // iMIP spec 5.4: every error return of the commit drops the mail
     // attempts, traced, before returning.
     let committed: Result<_, ZaPipelineError> = async {
         let error = match server.commit_batch(batch).await {
             Ok(ids) => return Ok(ids),
+            Err(_) if fence.as_ref().is_some_and(ZaChildFence::is_lost) => {
+                return Err(ZaPipelineError::Busy(ZaBusy::CalendarChanged));
+            }
             Err(error) => error,
         };
         let Some(rebuild) = rebuild.filter(|_| error.is_assertion_failure()) else {

@@ -36,6 +36,7 @@ use calcard::{
 use common::{
     DavName, Server,
     auth::{AccessToken, vault::RawValue},
+    storage::metadata::ContainerCleanup,
     za::{
         lease::ZaUidLease,
         test_hooks::{
@@ -56,7 +57,7 @@ use groupware::{
             admission::{za_roles, za_writer_keys},
             context::{ZaReadMemo, za_read_event_view, za_write_contexts},
             create::{ZaEventCreate, za_create_event},
-            delete::za_destroy_event,
+            delete::{za_calendar_delete_target, za_delete_calendar, za_destroy_event},
             error::{ZaBusy, ZaPipelineError, ZaRefusal},
             placement::{ZaPlacementContexts, ZaPlacementPlan, za_placement_contexts},
             schedule::{ZaScheduled, za_delete_send_itip, za_schedule_create},
@@ -518,6 +519,7 @@ pub async fn test(test: &mut TestServer) {
     destroy_required_denied(test, &fx).await;
     destroy_retry_after_source_rename(test, &fx).await;
     update_without_contexts_is_refused(test, &fx).await;
+    calendar_delete_with_a_stale_child_list(test, &fx).await;
     fx.cleanup(test).await;
     finish(test, "pipeline").await;
 }
@@ -1945,3 +1947,98 @@ async fn destroy_retry_after_source_rename(test: &TestServer, fx: &Fx) {
         .await
         .with_status(StatusCode::NO_CONTENT);
 }
+
+/// PR #90 review C4617611506: a calendar delete built from a child list that a
+/// create made stale is refused (`Busy`) and leaves the calendar and the new
+/// event; with a fresh list the same delete removes both.
+async fn calendar_delete_with_a_stale_child_list(test: &TestServer, fx: &Fx) {
+    const SLUG: &str = "pipe-fence";
+    let owner = fx.pair.key_id;
+    let uid = "jmapcal-pipe-fence-late";
+    let server = &test.server;
+    let token = session_token(test, owner).await;
+    let calendar = make_calendar(test, &fx.pair.key, &fx.pair.dav, SLUG).await;
+    let keys = za_writer_keys(server, &token, owner)
+        .await
+        .unwrap()
+        .expect("pipeline fixture is a key account");
+    let roles = za_roles(server, &token, owner).await.unwrap();
+    let delete = |resources: std::sync::Arc<common::GroupwareResources>| {
+        let (token, keys, roles) = (&token, &keys, &roles);
+        async move {
+            let stored: Archive<ArchiveBytes> = server
+                .store()
+                .get_value(ValueKey::archive(owner, Collection::Calendar, calendar))
+                .await
+                .unwrap()
+                .expect("calendar archive");
+            let target = za_calendar_delete_target(server, token, owner, calendar, stored)
+                .await
+                .unwrap();
+            let children = resources.children_ids(calendar).collect::<Vec<_>>();
+            let href = resources
+                .container_resource_path_by_id(calendar)
+                .map(|resource| resources.format_resource(resource));
+            (
+                children.clone(),
+                za_delete_calendar(
+                    server,
+                    token,
+                    &resources,
+                    keys,
+                    roles,
+                    owner,
+                    calendar,
+                    target,
+                    children,
+                    &ContainerCleanup::empty(Collection::CalendarEvent),
+                    href,
+                    false,
+                )
+                .await,
+            )
+        }
+    };
+
+    // The snapshot is taken while the calendar is empty; the PUT lands after.
+    let stale = server
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    let event = put_event(test, &fx.pair.key, &fx.pair.dav, SLUG, uid, "late").await;
+    let (children, result) = delete(stale).await;
+    assert!(children.is_empty(), "{children:?}");
+    match result {
+        Err(ZaPipelineError::Busy(ZaBusy::CalendarChanged)) => {}
+        Err(err) => panic!("calendar_delete_with_a_stale_child_list: unexpected refusal {err:?}"),
+        Ok(_) => panic!("calendar_delete_with_a_stale_child_list: deleted with a stale child list"),
+    }
+    assert!(
+        server
+            .store()
+            .get_value::<RawValue>(ValueKey::archive(owner, Collection::Calendar, calendar))
+            .await
+            .unwrap()
+            .is_some(),
+        "calendar_delete_with_a_stale_child_list: the calendar was deleted"
+    );
+    assert_eq!(parents_of(test, owner, event).await, [calendar]);
+
+    let fresh = server
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    let (children, result) = delete(fresh).await;
+    assert_eq!(children, [event]);
+    result.expect("calendar_delete_with_a_stale_child_list: the fresh delete");
+    assert!(
+        server
+            .store()
+            .get_value::<RawValue>(ValueKey::archive(owner, Collection::Calendar, calendar))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(uid_copies(test, owner, uid).await, 0);
+}
+

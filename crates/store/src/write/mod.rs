@@ -1829,3 +1829,7 @@ impl std::fmt::Debug for MergeOperation {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/store/src/write/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "za_change_id_fence_tests.rs"]
+mod za_change_id_fence_tests;

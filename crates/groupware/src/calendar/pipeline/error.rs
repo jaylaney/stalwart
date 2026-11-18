@@ -48,6 +48,10 @@ pub enum ZaRefusal {
 pub enum ZaBusy {
     LeaseBusy,
     CreateLost,
+    /// A calendar delete's child list is not the calendar's current one, or a
+    /// write to the account's calendars crossed the delete (PR #90 review
+    /// C4617611506).
+    CalendarChanged,
 }
 
 impl From<trc::Error> for ZaPipelineError {
