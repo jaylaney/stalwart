@@ -50,6 +50,9 @@
 //!   check and seal, immediately before storing the hand-off (release 6, D6).
 //! - `TOKEN_EXCHANGE_PAUSE`: in `za_token_issue` after the binding check
 //!   and before the batch, keyed by the account.
+//! - `TOKEN_FORGET_PAUSE`: at the head of `za_token_forget_grant`, before
+//!   `TOKEN_FORGET_FAIL_ONCE` and any read, keyed by the account (PR #90
+//!   review C4617611602: a grant's deletion parked in its token cleanup).
 //! - `TOKEN_FORGET_FAIL_ONCE`: at the head of `za_token_forget_grant`,
 //!   returns a store error before any read, keyed by the account.
 //! - `TOKEN_REFRESH_READ_PAUSE`: at the head of `za_token_refresh`, after
@@ -191,6 +194,7 @@ pub static TOKEN_HANDOFF_WRITE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(Non
 pub static TOKEN_EXCHANGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_REFRESH_READ_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_REFRESH_WRITE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static TOKEN_FORGET_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// Global: its `account_id` is ignored.
 pub static TASK_CONSUMER_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -305,6 +309,10 @@ pub fn set_token_refresh_read_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_token_refresh_write_pause(pause: Option<Arc<Pause>>) {
     set_slot(&TOKEN_REFRESH_WRITE_PAUSE, pause);
+}
+
+pub fn set_token_forget_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&TOKEN_FORGET_PAUSE, pause);
 }
 
 pub fn set_task_consumer_pause(pause: Option<Arc<Pause>>) {
@@ -538,6 +546,10 @@ pub async fn token_refresh_read_pause_point(account_id: u32) {
 
 pub async fn token_refresh_write_pause_point(account_id: u32) {
     wait(take_for(&TOKEN_REFRESH_WRITE_PAUSE, account_id)).await;
+}
+
+pub async fn token_forget_pause_point(account_id: u32) {
+    wait(take_for(&TOKEN_FORGET_PAUSE, account_id)).await;
 }
 
 pub async fn task_consumer_pause_point() {

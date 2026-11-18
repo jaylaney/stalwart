@@ -387,6 +387,7 @@ impl Server {
                         account_id,
                         grant_id: stored.id,
                     });
+                    self.za_evict_deleted_grant(account_id, stored.id).await;
                     self.za_forget_deleted_grant(account_id, stored.id).await;
                     return Ok(true);
                 }
@@ -408,7 +409,12 @@ impl Server {
                     }
                     match self.oauth_grant(stored.id).await? {
                         Some(current) => stored = current,
-                        None => return Ok(false),
+                        None => {
+                            // PR #90 review C4617611602 (FA-16): the grant went
+                            // in the meantime; its token entries still go.
+                            self.za_forget_deleted_grant(account_id, stored.id).await;
+                            return Ok(false);
+                        }
                     }
                 }
                 Err(err) => return Err(err.caused_by(trc::location!())),

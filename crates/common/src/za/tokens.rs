@@ -11,6 +11,7 @@ use crate::{
         vault::{RawValue, vault_read_usable_store},
     },
     cache::invalidate::CacheInvalidationBuilder,
+    ipc::{BroadcastEvent, CacheInvalidation},
 };
 use registry::schema::prelude::ObjectType;
 use std::{
@@ -495,6 +496,8 @@ impl Server {
     /// Spec 4.7: remove a grant's entries with only the token assertion.
     pub async fn za_token_forget_grant(&self, account_id: u32, grant_id: u64) -> trc::Result<()> {
         #[cfg(feature = "test_mode")]
+        super::test_hooks::token_forget_pause_point(account_id).await;
+        #[cfg(feature = "test_mode")]
         if super::test_hooks::take_token_forget_fail(account_id) {
             return Err(trc::StoreEvent::UnexpectedError.into_err());
         }
@@ -562,6 +565,21 @@ impl Server {
             }
         }
         Ok(changed)
+    }
+
+    /// PR #90 review C4617611602: a deleted grant's sessions are evicted on
+    /// this node and the eviction broadcast before the token record's cleanup
+    /// is awaited, so a slow or interrupted cleanup cannot delay it. The
+    /// caller's queued invalidation applies the same eviction again later; it
+    /// is idempotent.
+    pub(crate) async fn za_evict_deleted_grant(&self, account_id: u32, grant_id: u64) {
+        let evicted = vec![CacheInvalidation::OAuthGrant {
+            account_id,
+            grant_id,
+        }];
+        self.invalidate_local_caches(&evicted);
+        self.cluster_broadcast(BroadcastEvent::CacheInvalidate(evicted))
+            .await;
     }
 
     /// Grant deletion classifies the account before touching the token record.

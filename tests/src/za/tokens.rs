@@ -141,6 +141,7 @@ pub async fn test(test: &mut TestServer) {
     let registered =
         Arc::new(za_oauth_client(test, &admin, "za-token-consent", ZaClientKind::Registered).await);
     sign_in_gives_keyed_tokens(test, &app).await;
+    deleted_grant_evicted_before_cleanup(test, &app).await;
     sign_in_with_second_factor(test, &app).await;
     second_factor_change_ends_sessions(test, &app).await;
     consent_path(test, &registered).await;
@@ -1207,6 +1208,57 @@ async fn sign_in_gives_keyed_tokens(test: &TestServer, app: &ZaOAuthClient) {
     assert!(raw_token_record(test, id).await.is_none());
     assert_eq!(za_bearer_session(&tokens.access).await.0, 401);
     remove_sign_in_canaries(test, owner).await;
+}
+
+/// PR #90 review C4617611602: a grant's deletion evicts its cached session and
+/// resident keys before the token record's cleanup is awaited. With the
+/// cleanup parked, the registry holds no grant and the record still names it,
+/// yet the revoked token's next request is 401 and nothing of it is cached;
+/// after release the record is gone.
+async fn deleted_grant_evicted_before_cleanup(test: &TestServer, app: &Arc<ZaOAuthClient>) {
+    println!("  deleted_grant_evicted_before_cleanup");
+    let tokens = za_sign_in(test, app, OWNER, STRONG, None).await;
+    let id = test.account(OWNER).id().document_id();
+    let cache = &test.server.inner.cache;
+    assert_eq!(za_bearer_session(&tokens.access).await.0, 200);
+    assert!(cache.http_auth.get(&tokens.access).is_some());
+    assert!(cache.za_keys.contains_account(id));
+
+    let parked = HookParked::start(id, test_hooks::set_token_forget_pause, {
+        let (app, refresh) = (app.clone(), tokens.refresh.clone());
+        async move { za_revoke_token(&app, &refresh).await }
+    })
+    .await;
+    assert!(
+        test.server
+            .oauth_grant(tokens.grant_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        token_record(test, id)
+            .await
+            .unwrap()
+            .grant(tokens.grant_id)
+            .is_some(),
+        "the token record's cleanup is not parked"
+    );
+    assert_eq!(
+        za_bearer_session(&tokens.access).await.0,
+        401,
+        "a deleted grant's token was served while its cleanup was parked"
+    );
+    assert!(
+        cache.http_auth.get(&tokens.access).is_none(),
+        "a deleted grant's session stayed cached while its cleanup was parked"
+    );
+    assert!(
+        !cache.za_keys.contains_account(id),
+        "resident keys outlived the grant's deletion while its cleanup was parked"
+    );
+    assert_eq!(parked.finish().await, 200);
+    assert!(raw_token_record(test, id).await.is_none());
 }
 
 /// The binding (D19) of the account's stored vault record.
