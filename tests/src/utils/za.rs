@@ -1879,6 +1879,7 @@ impl<T> Drop for HookParked<T> {
 
 /// A later pause point a `HookParked` request reached (`HookParked::relay`).
 /// Dropping it clears the slot and releases the request.
+#[must_use = "dropping the guard releases the request at once"]
 pub struct RelayedPause {
     pause: Arc<HookPause>,
     clear: fn(Option<Arc<HookPause>>),

@@ -222,6 +222,33 @@ async fn calendar_set(caller: &Account, owner: &Account, mut args: Value) -> Jma
     caller.jmap_method_call("Calendar/set", args).await
 }
 
+/// `calendar_set` by the owner through a client that lives 60 seconds, for a
+/// call parked across pause points: the module's client gives up after five
+/// seconds, and this one outlives a relay's 30-second wait, so the relay's
+/// limit is what bounds the case.
+async fn calendar_set_parked(owner: &Account, mut args: Value) -> JmapResponse {
+    args["accountId"] = json!(owner.id_string());
+    let body = json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+        "methodCalls": [["Calendar/set", args, "0"]],
+    });
+    let bytes = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap()
+        .post(owner.api_url())
+        .header(hyper::header::AUTHORIZATION, owner.basic_auth())
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap_or_else(|_| panic!("the parked Calendar/set was not answered"))
+        .bytes()
+        .await
+        .unwrap_or_else(|_| panic!("the parked Calendar/set's answer was not read"));
+    JmapResponse(serde_json::from_slice(&bytes).unwrap())
+}
+
 async fn calendar_get(caller: &Account, owner: &Account) -> JmapResponse {
     let reply = caller
         .jmap_method_call(
@@ -1089,8 +1116,7 @@ async fn child_moved_out_and_back_refused(test: &TestServer, pair: &Pair) {
     let parked = {
         let (key, x, a_id) = (pair.key.clone(), x.clone(), a_id.clone());
         HookParked::start(pair.key2_id, set_fan_out_pause, async move {
-            calendar_set(
-                &key,
+            calendar_set_parked(
                 &key,
                 json!({ "destroy": [&x, &a_id], "onDestroyRemoveEvents": true }),
             )
@@ -1104,7 +1130,8 @@ async fn child_moved_out_and_back_refused(test: &TestServer, pair: &Pair) {
         .await
         .with_status(StatusCode::CREATED);
     // The rest of X's destroy (its comparison, commit and mail) and A's build:
-    // longer than reaching a pause, so a loaded host gets 30 seconds.
+    // longer than reaching a pause, so a loaded host gets 30 seconds. The relay
+    // bounds the case: the parked call's client lives 60 seconds from its POST.
     let built = parked
         .relay(
             owner,
@@ -1173,7 +1200,8 @@ async fn plant_name(test: &TestServer, owner: u32, document_id: u32, parent_id: 
 
 /// PR #90 second review C4633314492: a COPY of an event onto another event's
 /// name in the same calendar is refused with `no-uid-conflict`, as upstream
-/// answers an ordinary account, so no event gets two names in one calendar.
+/// refuses it for an ordinary account (a name the path index hides is not seen
+/// by the check).
 async fn same_calendar_copy_refused(test: &TestServer, pair: &Pair) {
     const SLUG: &str = "jmapcal-copy-same";
     const ONE: &str = "jmapcal-cal-copy-one";
