@@ -59,6 +59,10 @@
 //!   check and seal, immediately before storing the hand-off (release 6, D6).
 //! - `TOKEN_EXCHANGE_PAUSE`: in `za_token_issue` after the binding check
 //!   and before the batch, keyed by the account.
+//! - `TOKEN_VERSION_CHECK_PAUSE`: at the head of `za_refuse_unversioned_token`,
+//!   which sits between an access token's decode and its grant read, keyed by
+//!   the account (PR #90 review C4633314515: an authentication slowed after
+//!   the decode).
 //! - `TOKEN_FORGET_PAUSE`: at the head of `za_token_forget_grant`, before
 //!   `TOKEN_FORGET_FAIL_ONCE` and any read, keyed by the account (PR #90
 //!   review C4617611602: a grant's deletion parked in its token cleanup).
@@ -226,6 +230,7 @@ pub static TOKEN_EXCHANGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_REFRESH_READ_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_REFRESH_WRITE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_FORGET_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static TOKEN_VERSION_CHECK_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static CALENDAR_DELETE_FENCE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// The account whose key calendar delete takes the unfenced form.
@@ -382,6 +387,10 @@ pub fn set_token_refresh_write_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_token_forget_pause(pause: Option<Arc<Pause>>) {
     set_slot(&TOKEN_FORGET_PAUSE, pause);
+}
+
+pub fn set_token_version_check_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&TOKEN_VERSION_CHECK_PAUSE, pause);
 }
 
 pub fn set_task_consumer_pause(pause: Option<Arc<Pause>>) {
@@ -623,6 +632,10 @@ pub async fn token_refresh_write_pause_point(account_id: u32) {
 
 pub async fn token_forget_pause_point(account_id: u32) {
     wait(take_for(&TOKEN_FORGET_PAUSE, account_id)).await;
+}
+
+pub async fn token_version_check_pause_point(account_id: u32) {
+    wait(take_for(&TOKEN_VERSION_CHECK_PAUSE, account_id)).await;
 }
 
 pub async fn task_consumer_pause_point() {

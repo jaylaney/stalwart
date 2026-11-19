@@ -10,6 +10,7 @@ use common::{
     auth::{
         AccessToken, AuthRequest,
         authentication::{Authenticated, UsernameParts},
+        oauth::GrantType,
     },
     cache::http_auth::RevocationEpoch,
     network::limiter::InFlight,
@@ -285,9 +286,16 @@ async fn authenticate_uncached(
             if keys.generation != 0 && keys.generation == account.za_generation() {
                 // PR #90 review C4617611615: only a live entry is published; a
                 // key lookup that outlasted the token publishes nothing and
-                // the request is served uncached. W-1: the keys go in only
-                // under the revocation epoch read before verification.
-                if cache.http_auth.is_live(&entry) {
+                // the request is served uncached. C4633314515: a Bearer
+                // token's entry ends before its signed expiry. W-1: the keys
+                // go in only under the revocation epoch read before
+                // verification.
+                let entry = if keys_from_bearer {
+                    za_bearer_entry(server, token, entry)
+                } else {
+                    Some(entry)
+                };
+                if let Some(entry) = entry.filter(|entry| cache.http_auth.is_live(entry)) {
                     revocations.insert(&cache.http_auth, token, entry, epoch);
                     za_insert_keys_fenced(server, token, &keys, epoch);
                 }
@@ -310,6 +318,33 @@ async fn authenticate_uncached(
             access_token,
             epoch,
         })
+}
+
+/// PR #90 review C4633314515: the entry of keys opened from a Bearer token
+/// ends before the token's signed expiry. Upstream fixes the deadline after
+/// the account and grant lookups from a lifetime computed at the decode, so
+/// the token is opened again here (synchronously, emitting no event) and the
+/// deadline lowered, never raised, to the cache clock's now plus the fresh
+/// remaining lifetime less one second, which absorbs the rounding of the two
+/// whole-second clocks. Any decode error (`TokenExpired`, or a token that no
+/// longer opens or is of another grant type) publishes nothing: `None`, and
+/// the request is served with its keys, uncached.
+fn za_bearer_entry(
+    server: &Server,
+    token: &str,
+    mut entry: HttpAuthCache,
+) -> Option<HttpAuthCache> {
+    let remaining = server
+        .decode_access_token(Some(GrantType::AccessToken), token)
+        .ok()?
+        .expires_in;
+    let deadline = server
+        .inner
+        .cache
+        .http_auth
+        .expires_in(remaining.saturating_sub(1));
+    entry.expires = entry.expires.min(deadline);
+    Some(entry)
 }
 
 /// W-1 (fix-wave review): resident keys are inserted only while the

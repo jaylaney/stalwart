@@ -586,6 +586,9 @@ impl Server {
         account_id: u32,
         credential_version: u64,
     ) -> trc::Result<()> {
+        #[cfg(feature = "test_mode")]
+        crate::za::test_hooks::token_version_check_pause_point(account_id).await;
+
         if credential_version == 0
             && self
                 .account(account_id)
