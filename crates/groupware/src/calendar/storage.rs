@@ -474,6 +474,15 @@ impl CalendarEventNotification {
     }
 }
 
+/// PR #90 second review C4633314478: what a key account's collection delete
+/// built. `unwritten` counts the listed children it wrote nothing for (no
+/// archive, or no name under the calendar); such a child is not asserted, so
+/// the caller refuses the batch on a fenced store.
+pub struct ZaCalendarBuild {
+    pub messages: Vec<ZaDeleteMessage>,
+    pub unwritten: usize,
+}
+
 impl DestroyArchive<Archive<&ArchivedCalendar>> {
     #[allow(clippy::too_many_arguments)]
     pub async fn delete_with_events(
@@ -527,7 +536,7 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
         send_itip: bool,
         za_keys: Option<&SessionKeys>,
         batch: &mut BatchBuilder,
-    ) -> trc::Result<Vec<ZaDeleteMessage>> {
+    ) -> trc::Result<ZaCalendarBuild> {
         // Process deletions
         let calendar_id = document_id;
         let context = match za_keys {
@@ -545,6 +554,7 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
             None => None,
         };
         let mut za_messages = Vec::new();
+        let mut unwritten = 0;
         let cutoff = now() as i64;
         let mut resolver = DefaultAlertsResolver::default();
         let mut quota = NotificationQuota::default();
@@ -585,11 +595,22 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
 
             for &document_id in chunk {
                 let Some(event_) = archives.take_archive(document_id) else {
+                    unwritten += 1;
                     continue;
                 };
                 let event = event_
                     .to_unarchived::<CalendarEvent>()
                     .caused_by(trc::location!())?;
+                // PR #90 second review C4633314478: a listed child with no name
+                // under the calendar gets no write and no assertion below.
+                if !event
+                    .inner
+                    .names
+                    .iter()
+                    .any(|name| name.parent_id == calendar_id)
+                {
+                    unwritten += 1;
+                }
                 let event_flags = event.inner.flags.to_native();
                 let mut content = archives.take_value(document_id);
                 if let Some(calendars) = calendars.as_ref()
@@ -664,7 +685,10 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
             batch,
         )
         .await?;
-        Ok(za_messages)
+        Ok(ZaCalendarBuild {
+            messages: za_messages,
+            unwritten,
+        })
     }
 
     pub async fn delete(

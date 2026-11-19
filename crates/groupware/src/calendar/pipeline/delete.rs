@@ -394,7 +394,7 @@ pub async fn za_delete_calendar(
         batch.za_one_transaction();
         ZaChildFence::new(token, calendar_id, &children)
     });
-    let messages = DestroyArchive(
+    let built = DestroyArchive(
         target
             .stored
             .to_unarchived::<Calendar>()
@@ -416,8 +416,16 @@ pub async fn za_delete_calendar(
     )
     .await
     .caused_by(trc::location!())?;
+    #[cfg(feature = "test_mode")]
+    common::za::test_hooks::calendar_delete_built_pause_point(owner_id).await;
 
     if let Some(fence) = &fence {
+        // PR #90 second review C4633314478: a listed child the build wrote
+        // nothing for is not asserted, so it could name the calendar again at
+        // the commit; refused before the size check and any cancellation.
+        if built.unwritten > 0 {
+            return Err(ZaPipelineError::Busy(ZaBusy::CalendarChanged));
+        }
         // The default calendar id is reset by the fence's merge operation
         // (`ZaChildFence::assert_in`), in the same transaction.
         // A cap on the size of the one transaction, by the builder's own
@@ -444,7 +452,7 @@ pub async fn za_delete_calendar(
         roles,
         owner_id,
         batch,
-        messages,
+        built.messages,
         None::<fn(trc::Error) -> Ready<_>>,
         target.deleted_grantees,
         fence,

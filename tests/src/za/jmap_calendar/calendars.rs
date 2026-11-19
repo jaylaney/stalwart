@@ -31,15 +31,16 @@ use calcard::icalendar::ICalendarMethod;
 use common::za::{
     imip::ZA_IMIP_DROPPED,
     test_hooks::{
-        CommitBytesOverride, ForceCommitSplit, set_calendar_delete_fence_pause,
-        set_delete_commit_fail_once, set_fan_out_pause, set_second_chunk_fail_once,
+        CommitBytesOverride, ForceCommitSplit, Pause, set_calendar_delete_built_pause,
+        set_calendar_delete_fence_pause, set_delete_commit_fail_once, set_fan_out_pause,
+        set_second_chunk_fail_once,
     },
 };
 use groupware::calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences, Timezone};
 use hyper::{Method, StatusCode};
 use jmap_proto::types::state::State;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use store::{
     ValueKey,
     write::{Archive, ArchiveBytes, BatchBuilder, ValueClass},
@@ -87,6 +88,7 @@ pub async fn test(test: &mut TestServer) {
     destroy_fenced_against_a_concurrent_create(test, &pair).await;
     destroy_fence_lost_to_a_crossing_write(test, &pair).await;
     size_refusal_before_any_cancellation(test, &pair).await;
+    child_moved_out_and_back_refused(test, &pair).await;
     destroy_non_empty_without_flag_refused(test, &pair).await;
     grantee_destroy_refused(test, &pair).await;
     on_success_set_is_default(test, &pair).await;
@@ -1043,6 +1045,98 @@ async fn size_refusal_before_any_cancellation(test: &TestServer, pair: &Pair) {
 
     destroy(pair, &calendar_id).await;
     assert_eq!(uid_copies(test, owner, UID).await, 0);
+    wait_for_queue(test).await;
+    sink().clear();
+    delete_new_items(test, pair, &start).await;
+}
+
+/// PR #90 second review C4633314478: a child listed by the method's snapshot
+/// that leaves the calendar before its archive is read, and comes back before
+/// the first comparison, gets no write and no assertion in the batch; the
+/// delete is refused (`Busy`, the "modified" text) and leaves the event in the
+/// calendar. `Calendar/set` destroys X then A: parked in X's fan-out, E moves
+/// from A to B; parked after A's build, E moves back.
+async fn child_moved_out_and_back_refused(test: &TestServer, pair: &Pair) {
+    const X: &str = "jmapcal-destroy-moved-x";
+    const A: &str = "jmapcal-destroy-moved-a";
+    const B: &str = "jmapcal-destroy-moved-b";
+    const INVITE: &str = "jmapcal-cal-moved-invite";
+    const E: &str = "jmapcal-cal-moved";
+    let owner = pair.key_id;
+    let start = inbox_ids(test, pair.key2_id).await;
+    let x = Id::from(make_calendar(test, &pair.key, &pair.dav, X).await).to_string();
+    let a = make_calendar(test, &pair.key, &pair.dav, A).await;
+    let a_id = Id::from(a).to_string();
+    make_calendar(test, &pair.key, &pair.dav, B).await;
+    put_invite(pair, X, INVITE).await;
+    put_event(test, &pair.key, &pair.dav, A, E, "moved").await;
+    wait_for_queue(test).await;
+    sink().clear();
+    let moved = |from: &str, to: &str| {
+        (
+            format!("{HOME}{from}/{E}.ics"),
+            format!("{HOME}{to}/{E}.ics"),
+        )
+    };
+
+    let fan_out = Arc::new(Pause::new(pair.key2_id));
+    set_fan_out_pause(Some(fan_out.clone()));
+    let handle = {
+        let (key, x, a_id) = (pair.key.clone(), x.clone(), a_id.clone());
+        tokio::spawn(async move {
+            calendar_set(
+                &key,
+                &key,
+                json!({ "destroy": [&x, &a_id], "onDestroyRemoveEvents": true }),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), fan_out.arrived.notified())
+        .await
+        .expect("X's destroy did not reach its fan-out");
+    let (from, to) = moved(A, B);
+    pair.dav
+        .request_with_headers("MOVE", &from, [("destination", to.as_str())], "")
+        .await
+        .with_status(StatusCode::CREATED);
+    let built = Arc::new(Pause::new(owner));
+    set_calendar_delete_built_pause(Some(built.clone()));
+    fan_out.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), built.arrived.notified())
+        .await
+        .expect("A's destroy did not reach the end of its build");
+    let (from, to) = moved(B, A);
+    pair.dav
+        .request_with_headers("MOVE", &from, [("destination", to.as_str())], "")
+        .await
+        .with_status(StatusCode::CREATED);
+    built.release.notify_one();
+    let reply = handle.await.unwrap();
+    set_fan_out_pause(None);
+    set_calendar_delete_built_pause(None);
+
+    assert_eq!(
+        reply.destroyed().collect::<Vec<_>>(),
+        [x.as_str()],
+        "{reply:?}"
+    );
+    assert_eq!(
+        set_error(reply.not_destroyed(&a_id)),
+        ("forbidden", Some(MODIFIED)),
+        "{reply:?}"
+    );
+    assert!(calendar_stored(test, owner, a).await);
+    assert_eq!(uid_copies(test, owner, E).await, 1);
+    pair.dav
+        .request("GET", &format!("{HOME}{A}/{E}.ics"), "")
+        .await
+        .with_status(StatusCode::OK);
+
+    destroy(pair, &a_id).await;
+    assert_eq!(uid_copies(test, owner, E).await, 0);
+    assert!(!calendar_stored(test, owner, a).await);
+    dav_delete(pair, B).await;
     wait_for_queue(test).await;
     sink().clear();
     delete_new_items(test, pair, &start).await;
