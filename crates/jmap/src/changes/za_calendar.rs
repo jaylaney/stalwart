@@ -79,27 +79,38 @@ where
     // item change, which can lie below a sharing boundary (a container
     // change). From an initial or exact state the page read the log to its
     // end, so it covered every item change up to the tip. A `z` continuation
-    // that finishes its pinned range covered only the range: its state is
+    // of an exact-origin sync finished only its pinned range: its state is
     // raised only when the log holds no item change after it up to the tip,
-    // which the client's next call would otherwise not be sent.
-    let continues = matches!(since, State::ZaCalendarIntermediate { .. });
-    let tip =
-        if za_key && object == MethodObject::CalendarEvent && owner != access_token.account_id() {
-            Some(
-                server
-                    .fetch_groupware_resources(
-                        access_token.account_id(),
-                        owner,
-                        SyncCollection::Calendar,
-                    )
-                    .await
-                    .caused_by(trc::location!())
-                    .map_err(keyed)?
-                    .highest_change_id,
-            )
-        } else {
-            None
-        };
+    // which the client's next call would otherwise not be sent. A `z`
+    // continuation of an initial-origin sync is not raised: its pages are
+    // never checked against the boundary, so its final state, below a grant
+    // that completed while it paged, is what makes the next call restart.
+    let (continues, initial_origin) = match &since {
+        State::ZaCalendarIntermediate { origin, .. } => {
+            (true, matches!(origin, ZaCalendarOrigin::Initial))
+        }
+        _ => (false, false),
+    };
+    let tip = if za_key
+        && object == MethodObject::CalendarEvent
+        && owner != access_token.account_id()
+        && !initial_origin
+    {
+        Some(
+            server
+                .fetch_groupware_resources(
+                    access_token.account_id(),
+                    owner,
+                    SyncCollection::Calendar,
+                )
+                .await
+                .caused_by(trc::location!())
+                .map_err(keyed)?
+                .highest_change_id,
+        )
+    } else {
+        None
+    };
     let mut changes = page(request).await.map_err(keyed)?;
     changes.response.old_state = since;
     if let (Some(tip), State::Exact(change_id)) = (tip, &changes.response.new_state)

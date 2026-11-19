@@ -102,6 +102,8 @@ pub async fn test(test: &mut TestServer) {
     sync_boundary_matches_caldav(test, &fixture).await;
     grantee_state_above_the_boundary(test, &fixture).await;
     paged_sync_retention_collision(test, &fixture).await;
+    initial_sync_not_raised_over_a_grant(test, &fixture).await;
+    exact_sync_raised_over_a_container_change(test, &fixture).await;
     paged_sync_origin_survives_range_changes(test, &fixture).await;
     let ordinary = ordinary_accounts(test).await;
     paged_sync_legacy_and_ordinary(test, &fixture, &ordinary).await;
@@ -672,17 +674,9 @@ async fn paged_sync_retention_collision(test: &TestServer, f: &Sharing) {
     assert!(g_id < c, "{g_id} {c}");
     let served = changes(reader, owner, "CalendarEvent/changes", &initial, Some(1)).await;
     assert_eq!(created(&served), [id(second)], "{served:?}");
-    // PR #90 review C4617611565: a grantee's final state is the log's tip, at
-    // or above the rename's boundary, no longer the last item change `g`.
-    let tip = test
-        .server
-        .store()
-        .get_last_change_id(owner_id, SyncCollection::Calendar.into())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(tip >= c, "{tip} {c}");
-    assert_eq!(new_state(&served), State::Exact(tip));
+    // PR #90 review, fix round 2 (H1): the continuation of an initial-origin
+    // sync is not raised, so its final state is the last item change `g`.
+    assert_eq!(new_state(&served), State::Exact(g_id));
     assert_eq!(served.response_at(0)["oldState"], initial.to_string());
     assert_refused(
         &changes(reader, owner, "CalendarEvent/changes", &exact, Some(1)).await,
@@ -701,6 +695,139 @@ async fn paged_sync_retention_collision(test: &TestServer, f: &Sharing) {
         ],
     )
     .await;
+}
+
+/// PR #90 review, fix round 2 (H1): a grant that completes while an
+/// initial-origin sync pages does not lift the sync's final state over it.
+/// Calendar B is already shared with the module's second key account, so the
+/// grant to the reader writes no event; B's event is older than A's. The final
+/// state stays at or below the grant's boundary, the next call restarts, and a
+/// fresh sync reports B's event.
+async fn initial_sync_not_raised_over_a_grant(test: &TestServer, f: &Sharing) {
+    const B: &str = "jmapcal-sharing-granted";
+    const B1: &str = "jmapcal-sharing-b1";
+    const A_EVENTS: [&str; 2] = ["jmapcal-sharing-a1", "jmapcal-sharing-a2"];
+    let (owner, reader) = (&f.pair.key, &f.reader);
+    let method = "CalendarEvent/changes";
+    complete_boundary(test, f).await;
+    let b = make_calendar(test, owner, &f.pair.dav, B).await;
+    share(test, owner, &f.pair.key2, f.pair.key2_id, B, "view").await;
+    let b1 = put_event(test, owner, &f.pair.dav, B, B1, B1).await;
+    for uid in A_EVENTS {
+        put_event(test, owner, &f.pair.dav, SLUG, uid, uid).await;
+    }
+
+    let first = new_state(&changes(reader, owner, method, &State::Initial, Some(1)).await);
+    assert_eq!(za_parts(&first).1, &ZaCalendarOrigin::Initial);
+    share(test, owner, reader, f.reader_id, B, "view").await;
+    f.pair
+        .dav
+        .request("PROPFIND", &home(B), "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let token = session_token(test, f.reader_id).await;
+    let contexts =
+        za_foreign_calendar_contexts(&test.server, &token, f.pair.key_id, [b].into_iter(), None)
+            .await
+            .unwrap_or_else(|_| panic!("the reader's context of the granted calendar"));
+    let boundary = contexts[&b].boundary.unwrap();
+    assert!(!boundary.pending, "{boundary:?}");
+    let grant = boundary.grant_change_id.max(boundary.rename_change_id);
+
+    let pages = page_through(reader, owner, method, first, 1).await;
+    let last = pages.last().unwrap().clone();
+    assert!(matches!(last, State::Exact(_)), "{pages:?}");
+    assert!(
+        last.get_change_id() <= grant,
+        "the final state {last:?} is above the grant's boundary {grant}"
+    );
+    assert_refused(
+        &changes(reader, owner, method, &last, None).await,
+        "the next call after the grant",
+    );
+    let fresh = changes(reader, owner, method, &State::Initial, None).await;
+    assert!(
+        created(&fresh).contains(&id(b1)),
+        "a fresh sync omits the granted calendar's event: {fresh:?}"
+    );
+
+    for grantee in [reader.name(), f.pair.key2.name()] {
+        za_post(
+            "shares/revoke",
+            &json!({
+                "username": owner.name(), "password": STRONG,
+                "calendar": B, "address": grantee
+            }),
+        )
+        .await
+        .expect(200);
+    }
+    delete_events(f, B, &[B1]).await;
+    delete_events(f, SLUG, &A_EVENTS).await;
+    f.pair
+        .dav
+        .request_with_headers("DELETE", &home(B), [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+}
+
+/// PR #90 review, fix round 2 (H1): the final page of an exact-origin sync is
+/// raised to the log's tip past a container change that is not a boundary of
+/// the reader (the owner creates a calendar it does not share), and the next
+/// call from it is served and empty. The "an item change follows, so no
+/// raise" branch of an exact origin is `paged_sync_origin_survives_range_changes`.
+async fn exact_sync_raised_over_a_container_change(test: &TestServer, f: &Sharing) {
+    const UNSHARED: &str = "jmapcal-sharing-unshared-later";
+    const START: &str = "jmapcal-sharing-x0";
+    const PAGED: [&str; 2] = ["jmapcal-sharing-y1", "jmapcal-sharing-y2"];
+    let (owner, reader) = (&f.pair.key, &f.reader);
+    let owner_id = f.pair.key_id;
+    let method = "CalendarEvent/changes";
+    let b = complete_boundary(test, f).await;
+    put_event(test, owner, &f.pair.dav, SLUG, START, START).await;
+    let s = new_state(&changes(reader, owner, method, &State::Initial, None).await);
+    assert!(s.get_change_id() > b, "{s:?} {b}");
+    let mut paged = Vec::new();
+    for uid in PAGED {
+        paged.push(put_event(test, owner, &f.pair.dav, SLUG, uid, uid).await);
+    }
+    let page1 = new_state(&changes(reader, owner, method, &s, Some(1)).await);
+    assert_eq!(
+        za_parts(&page1).1,
+        &ZaCalendarOrigin::Exact(s.get_change_id())
+    );
+    make_calendar(test, owner, &f.pair.dav, UNSHARED).await;
+    let tip = test
+        .server
+        .store()
+        .get_last_change_id(owner_id, SyncCollection::Calendar.into())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let reply = changes(reader, owner, method, &page1, Some(1)).await;
+    assert_eq!(created(&reply), [id(paged[1])], "{reply:?}");
+    assert_eq!(reply.response_at(0)["hasMoreChanges"], false, "{reply:?}");
+    let last = new_state(&reply);
+    assert_eq!(
+        last,
+        State::Exact(tip),
+        "the final page is raised to the tip"
+    );
+    let reply = changes(reader, owner, method, &last, None).await;
+    assert_eq!(new_state(&reply), last, "{reply:?}");
+    for list in ["created", "updated", "destroyed"] {
+        assert_eq!(reply.response_at(0)[list], json!([]), "{list}: {reply:?}");
+    }
+
+    f.pair
+        .dav
+        .request_with_headers("DELETE", &home(UNSHARED), [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let mut uids = vec![START];
+    uids.extend(PAGED);
+    delete_events(f, SLUG, &uids).await;
 }
 
 async fn paged_sync_origin_survives_range_changes(test: &TestServer, f: &Sharing) {
