@@ -378,11 +378,22 @@ pub async fn za_delete_calendar(
     send_itip: bool,
 ) -> Result<ZaDeleted, ZaPipelineError> {
     let mut batch = BatchBuilder::new();
+    // PR #90 review RA-2: FoundationDB's transaction limits and stale reads,
+    // a read replica's lagging reads and the ephemeral store's missing
+    // rollback do not give the one transaction and the change-id fence their
+    // contract; those stores keep the earlier, chunked delete without them.
+    let fenced = !(server.store().is_foundationdb()
+        || server.store().is_read_replica()
+        || server.store().is_ephemeral());
+    #[cfg(feature = "test_mode")]
+    let fenced = fenced && !common::za::test_hooks::calendar_delete_unfenced(owner_id);
     // PR #90 review C4617611521: the calendar and every event are deleted in
     // one transaction, or nothing is (the per-event commit points become
     // no-ops).
-    batch.za_one_transaction();
-    let fence = ZaChildFence::new(token, calendar_id, &children);
+    let fence = fenced.then(|| {
+        batch.za_one_transaction();
+        ZaChildFence::new(token, calendar_id, &children)
+    });
     let messages = DestroyArchive(
         target
             .stored
@@ -406,16 +417,26 @@ pub async fn za_delete_calendar(
     .await
     .caused_by(trc::location!())?;
 
-    // The default calendar id is reset by the fence's merge operation
-    // (`ZaChildFence::assert_in`), in the same transaction.
-    // A transaction past the store's chunk size is refused before the
-    // fan-out, so no cancellation goes out for a delete that cannot commit.
-    if batch.za_exceeds_one_chunk() {
-        return Err(ZaPipelineError::CalendarTooLarge);
+    if let Some(fence) = &fence {
+        // The default calendar id is reset by the fence's merge operation
+        // (`ZaChildFence::assert_in`), in the same transaction.
+        // A cap on the size of the one transaction, by the builder's own
+        // count (which leaves out assertions and the change-log record),
+        // checked before the fan-out so a refusal sends no cancellation.
+        if batch.za_exceeds_one_chunk() {
+            return Err(ZaPipelineError::CalendarTooLarge);
+        }
+        // PR #90 review C4617611506: a stale child list is refused before any
+        // cancellation is delivered.
+        fence.current(server, owner_id).await?;
+    } else {
+        // Reset default calendar id
+        batch
+            .with_account_id(owner_id)
+            .with_collection(Collection::Principal)
+            .with_document(0)
+            .clear_if_equals(PrincipalField::DefaultCalendarId, calendar_id);
     }
-    // PR #90 review C4617611506: a stale child list is refused before any
-    // cancellation is delivered.
-    fence.current(server, owner_id).await?;
 
     za_commit_delete(
         server,
@@ -426,7 +447,7 @@ pub async fn za_delete_calendar(
         messages,
         None::<fn(trc::Error) -> Ready<_>>,
         target.deleted_grantees,
-        Some(fence),
+        fence,
     )
     .await
 }

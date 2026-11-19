@@ -27,6 +27,7 @@ use crate::{
     },
     za::{
         STRONG,
+        dav_seal::resource_id,
         drain::{DrainOn, body, partstat_of, set_partstat},
         fanout::{CONTENT_TYPE, MKCALENDAR, NO_REPLY, Party, attendee_statuses, uid_copies},
         mail::{Traced, TracedEvent, metadata_rows, row_is_stub, stored_blob},
@@ -178,6 +179,7 @@ pub async fn test(test: &mut TestServer) {
     commit_failures(test, &owner).await;
     store_commit_failures(test, &owner).await;
     chunked_collection_delete(test, &owner).await;
+    chunked_collection_delete_unfenced(test, &owner).await;
     rf_3_alias_attendee(test, &alias).await;
     rf_5_many_recipients(test, &owner).await;
     unrouted_local_addresses(test, &owner, &key2).await;
@@ -1240,6 +1242,99 @@ async fn chunked_collection_delete(test: &TestServer, owner: &Party) {
                 && event.account_id == Some(owner.id as u64)),
         "the committed DELETE dropped its mail"
     );
+}
+
+/// 5.4 as release 5 pinned it, under `UnfencedCalendarDelete` (PR #90 review
+/// RA-2): the form FoundationDB, a read replica and the ephemeral store keep,
+/// a chunked collection DELETE whose second chunk fails, mails nothing.
+async fn chunked_collection_delete_unfenced(test: &TestServer, owner: &Party) {
+    const UIDS: [&str; 2] = ["imip-out-k3", "imip-out-k4"];
+    let calendar = format!(
+        "/dav/cal/{}/imip-coll-chunked/",
+        owner.name.replace('@', "%40")
+    );
+    owner
+        .client
+        .request("MKCALENDAR", &calendar, MKCALENDAR)
+        .await
+        .with_status(StatusCode::CREATED);
+    let mut ids = Vec::new();
+    for uid in UIDS {
+        // Each PUT mails ATT: the raw client (5 s, PR review T-2).
+        assert_eq!(
+            put(
+                owner.name,
+                STRONG,
+                format!("{calendar}{uid}.ics"),
+                event(uid, owner.name, &[ATT], 0, "")
+            )
+            .await,
+            201
+        );
+        ids.push(resource_id(test, owner.id, &format!("imip-coll-chunked/{uid}.ics")).await);
+    }
+    // `delete_with_events_za` walks the children in ascending order, one
+    // commit point after each: the first chunk holds the lower id.
+    assert!(ids[0] < ids[1], "{ids:?}");
+    wait_for_queue(test).await;
+    wait_for_index_queue(test, owner.id, Duration::from_secs(30)).await;
+    sink().clear();
+    let traced = Traced::start(&[EventType::Calendar(CalendarEvent::ItipMessageError)]);
+    let unfenced = test_hooks::UnfencedCalendarDelete::new(owner.id);
+    let split = ForceCommitSplit::new(owner.id);
+    test_hooks::set_second_chunk_fail_once(Some(owner.id));
+    let status = delete_raw(owner.name, STRONG, calendar.clone()).await;
+    drop(split);
+    test_hooks::set_second_chunk_fail_once(None);
+    drop(unfenced);
+    assert_eq!(status, 500, "the chunked DELETE did not fail");
+    assert_eq!(
+        uid_copies(test, owner.id, UIDS[0]).await,
+        0,
+        "the first chunk's event stands deleted"
+    );
+    assert_eq!(
+        uid_copies(test, owner.id, UIDS[1]).await,
+        1,
+        "the second chunk's event remains"
+    );
+    wait_for_queue(test).await;
+    assert_eq!(sink().count_to(ATT), 0, "the failed DELETE mailed a CANCEL");
+    let mut dropped = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| {
+            event.details == ZA_IMIP_DROPPED && event.account_id == Some(owner.id as u64)
+        })
+        .map(|event| {
+            event
+                .keys
+                .iter()
+                .find_map(|(key, value)| match (key, value) {
+                    (Key::DocumentId, trc::Value::UInt(id)) => Some(*id as u32),
+                    _ => None,
+                })
+                .expect("a document id")
+        })
+        .collect::<Vec<_>>();
+    dropped.sort_unstable();
+    assert_eq!(dropped, ids, "one dropped trace per event of the batch");
+    owner
+        .client
+        .request_with_headers(
+            "DELETE",
+            &format!("{calendar}{}.ics", UIDS[1]),
+            [NO_REPLY],
+            "",
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    owner
+        .client
+        .request("DELETE", &calendar, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
 }
 
 /// Review Focus 3.

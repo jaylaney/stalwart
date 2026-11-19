@@ -116,9 +116,10 @@ async fn check(store: &Store, rolls_back: bool) {
         assert_eq!(last_log, Some(tip + 1), "the failed batch's log record");
         assert!(value.is_none(), "a write before the failed merge function");
     } else {
-        // The ephemeral store (bootstrap mode's registry store, never a data
-        // store) applies each operation as it goes, for a failed assertion
-        // as well: pinned so that a change is seen.
+        // The ephemeral store applies each operation as it goes, for a failed
+        // assertion as well: pinned so that a change is seen. It is the data
+        // store only in bootstrap mode, where no key account exists, and a
+        // key calendar's delete takes no fence on it (PR #90 review RA-2, RA-7).
         assert_eq!(counter, tip + 2);
         assert!(value.is_some());
     }

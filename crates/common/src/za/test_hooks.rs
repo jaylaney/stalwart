@@ -28,6 +28,11 @@
 //! - `DELETE_COMMIT_PAUSE`: immediately before an event DELETE commit,
 //!   after fan-out, keyed by the event owner
 //!   (`groupware::calendar::pipeline::delete`).
+//! - `UNFENCED_CALENDAR_DELETE` (PR #90 review RA-2): while it names an
+//!   account, that account's key calendar delete takes the form a store
+//!   without the fence's contract keeps (commit points, no size refusal, no
+//!   fence; `za_delete_calendar`). Set it through `UnfencedCalendarDelete`,
+//!   whose drop clears it.
 //! - `COMMIT_FAIL_ONCE`: the commit of a key account's PUT create fails once
 //!   with an internal error after its fan-out, keyed by the account
 //!   (`groupware::calendar::pipeline::uid::za_commit_create`).
@@ -195,6 +200,39 @@ pub static TOKEN_EXCHANGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_REFRESH_READ_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_REFRESH_WRITE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_FORGET_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+/// The account whose key calendar delete takes the unfenced form.
+pub static UNFENCED_CALENDAR_DELETE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// Sets `UNFENCED_CALENDAR_DELETE` to `account_id` for the guard's lifetime;
+/// the drop clears it, also when the test panics.
+#[must_use = "dropping the guard clears UNFENCED_CALENDAR_DELETE"]
+pub struct UnfencedCalendarDelete(());
+
+impl UnfencedCalendarDelete {
+    pub fn new(account_id: u32) -> Self {
+        *UNFENCED_CALENDAR_DELETE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(account_id);
+        UnfencedCalendarDelete(())
+    }
+}
+
+impl Drop for UnfencedCalendarDelete {
+    fn drop(&mut self) {
+        *UNFENCED_CALENDAR_DELETE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// Whether `account_id`'s key calendar delete takes the unfenced form.
+pub fn calendar_delete_unfenced(account_id: u32) -> bool {
+    *UNFENCED_CALENDAR_DELETE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        == Some(account_id)
+}
 
 /// Global: its `account_id` is ignored.
 pub static TASK_CONSUMER_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
