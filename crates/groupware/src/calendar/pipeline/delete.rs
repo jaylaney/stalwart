@@ -438,7 +438,10 @@ pub async fn za_delete_calendar(
         // A cap on the size of the one transaction, by the builder's own
         // count (which leaves out assertions and the change-log record),
         // checked before the fan-out so a refusal sends no cancellation.
-        if batch.za_exceeds_one_chunk() {
+        // PR #90 second review C4633314510: the reserve is what the fence's
+        // merge operation, added after this check, counts.
+        let reserve = ValueClass::from(PrincipalField::DefaultCalendarId).key_len_hint();
+        if batch.za_exceeds_one_chunk(reserve) {
             return Err(ZaPipelineError::CalendarTooLarge);
         }
         // PR #90 review C4617611506: a stale child list is refused before any

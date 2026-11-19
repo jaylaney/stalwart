@@ -1284,15 +1284,18 @@ impl BatchBuilder {
         self
     }
 
-    /// Whether the current chunk exceeds the store's chunk size by the
-    /// builder's own count (`MAX_COMMIT_BYTES`). For a batch under
-    /// `za_one_transaction` the current chunk is the whole batch.
-    pub fn za_exceeds_one_chunk(&self) -> bool {
+    /// Whether the current chunk, with `reserve` bytes still to be added,
+    /// exceeds the store's chunk size by the builder's own count
+    /// (`MAX_COMMIT_BYTES`). For a batch under `za_one_transaction` the current
+    /// chunk is the whole batch. PR #90 second review C4633314510: the caller
+    /// reserves what an operation added after the check will count.
+    pub fn za_exceeds_one_chunk(&self, reserve: usize) -> bool {
+        let size = self.batch_size.saturating_add(reserve);
         #[cfg(feature = "test_mode")]
         if let Some(bytes) = crate::za_test::commit_bytes_override(self.current_account_id) {
-            return self.batch_size > bytes;
+            return size > bytes;
         }
-        self.batch_size > MAX_COMMIT_BYTES
+        size > MAX_COMMIT_BYTES
     }
 
     /// The assertions of `za_assert_absent_per_chunk`, pushed without
@@ -1330,6 +1333,40 @@ mod tests;
 #[cfg(test)]
 mod za_chunk_assert_tests {
     use super::*;
+
+    /// PR #90 second review C4633314510: the size check counts the bytes a
+    /// later `merge_fnc` adds. A one-transaction batch counting exactly the
+    /// cap is not over by the plain check and is over with the reserve; one
+    /// counting the cap less the reserve is over neither way, and after the
+    /// `merge_fnc` it counts exactly the cap.
+    #[test]
+    fn size_check_reserves_the_fence_operation() {
+        let fence = ValueClass::from(types::field::PrincipalField::DefaultCalendarId);
+        let reserve = fence.key_len_hint();
+        let batch_of = |count: usize| {
+            let mut batch = BatchBuilder::new();
+            batch.za_one_transaction();
+            batch
+                .with_account_id(7)
+                .with_collection(Collection::Principal)
+                .with_document(0);
+            let class = ValueClass::Property(1);
+            let value = count - batch.len() - class.key_len_hint();
+            batch.set(class, vec![0u8; value]);
+            assert_eq!(batch.len(), count);
+            batch
+        };
+
+        let at_cap = batch_of(MAX_COMMIT_BYTES);
+        assert!(!at_cap.za_exceeds_one_chunk(0));
+        assert!(at_cap.za_exceeds_one_chunk(reserve));
+
+        let mut below = batch_of(MAX_COMMIT_BYTES - reserve);
+        assert!(!below.za_exceeds_one_chunk(0));
+        assert!(!below.za_exceeds_one_chunk(reserve));
+        below.merge_fnc(fence, |_, _| Ok(MergeResult::Skip));
+        assert_eq!(below.len(), MAX_COMMIT_BYTES);
+    }
 
     const VAULT: ValueClass = ValueClass::Property(150);
 

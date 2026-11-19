@@ -421,7 +421,7 @@ mod tests {
                 .commit_point();
         }
         assert!(!whole.has_commit_points(), "split past the operation count");
-        assert!(!whole.za_exceeds_one_chunk());
+        assert!(!whole.za_exceeds_one_chunk(0));
         assert_eq!(whole.commit_points().iter().count(), 1);
 
         let large = || vec![0u8; 5_000_001];
@@ -432,10 +432,10 @@ mod tests {
         control
             .with_document(1)
             .set(ValueClass::Property(1), large());
-        assert!(control.za_exceeds_one_chunk());
+        assert!(control.za_exceeds_one_chunk(0));
         control.commit_point();
         assert!(control.has_commit_points(), "the control splits by size");
-        assert!(!control.za_exceeds_one_chunk(), "a new chunk starts empty");
+        assert!(!control.za_exceeds_one_chunk(0), "a new chunk starts empty");
 
         let mut whole = BatchBuilder::new();
         whole.za_one_transaction();
@@ -449,6 +449,6 @@ mod tests {
             .set(ValueClass::Property(1), vec![1u8]);
         whole.commit_point();
         assert!(!whole.has_commit_points(), "split by size");
-        assert!(whole.za_exceeds_one_chunk(), "the whole batch's size");
+        assert!(whole.za_exceeds_one_chunk(0), "the whole batch's size");
     }
 }
