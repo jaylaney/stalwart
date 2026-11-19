@@ -32,7 +32,8 @@ reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not 
 - At most 32 browser sign-ins of an account hold keys at once; the 33rd ends the one used least
   recently (D20).
 - The token endpoint's successful answers leave the traces, for every account (D24).
-- Browser sessions end only on a password change, a recovery or a second-factor change (D19).
+- Browser sessions end only on a password change, a recovery or a second-factor change (D19),
+  and a grant's deletion (a sign-out, say) ends that grant's sessions.
   Other vault writes (a new recovery key, an app password's revocation, the first pin's rewrap)
   keep them. A second-factor change ends them for good: it draws a fresh salt, so removing the
   factor again does not revive the tokens it ended.
@@ -43,6 +44,20 @@ reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not 
   parameter named `code`.
 - A grantee does not find, by text search, an event of a shared key calendar whose details it
   cannot read.
+- Deleting a key account's calendar is all-or-nothing on RocksDB, SQLite, PostgreSQL and MySQL:
+  the calendar and its events go in one transaction. A calendar too large for one transaction is
+  refused before any cancellation is sent (JMAP `forbidden`, CalDAV 403; delete some events
+  first), and a delete that meets a concurrent calendar write answers "try again". FoundationDB
+  and read replicas keep the earlier, chunked delete.
+- A person a calendar is shared with can no longer delete or change, through JMAP, an event whose
+  details are private to its owner.
+- A sharing change (a grant or a rename) no longer leaves a grantee's client unable to sync
+  events.
+- One refused attachment link no longer fails the call's other occurrence edits of the same event.
+- Pending invitations are imported only by a sign-in whose scope covers calendars (and by
+  password clients), on CalDAV and JMAP.
+- A revoked browser sign-in stops being served at once, even while its token record is being
+  cleaned up, and a keyed cache entry no longer outlives its token.
 - `decode_access_token` strips a `~` suffix from every token that begins with the server's token
   header, for every account (D26). A shared calendar's colour is carried in each principal's
   sealed personal bundle (D14); a binary built before release 6 cannot read a coloured one, so

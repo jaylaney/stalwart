@@ -2,7 +2,19 @@
 
 Date: 2026-11-13. Status: revision 7, with one wording correction of
 2026-11-18 on Jay's decision (3.3: the UID lease covers creates; a change
-of calendars checks without it; follow-up issue #91). Revision 7 incorporates Jay's
+of calendars checks without it; follow-up issue #91), and with the
+changes of 2026-11-18 that follow the pull request's review. Decided by
+the project owner on 2026-11-18: 3.3 (an attendee's create sends no
+reply), 5.3 and 6.7 (a key calendar's delete in one transaction, its size
+refusal and its fence), 5.5 (the drain only within the token's scope), 6.5
+(a refused attachment link fails only its own occurrence) and section 10
+(the `code` masking confirmed; the amendments of the drain's and the
+search pass's triggers and of release 5's chunked collection `DELETE`).
+The controller's rulings on confirmed findings of that review: 3.3 and
+6.5 (a non-member held to an event's effective privacy), 6.8 (the event
+state of a caller who is not the owner) and section 10 (invariant 72's
+sentence on a key lookup that outlasted its token, and the costs).
+Revision 7 incorporates Jay's
 approved [D29 amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md),
 recorded 2026-11-15: key-calendar continuations carry their original sync
 start explicitly (6.8, 9.1, 9.2, 9.8 and 10 to 12). Revision 6 applies Jay's decision
@@ -317,6 +329,19 @@ Accepted, each because the CalDAV behaviour is the qualified one:
 - **No drafts, no per-user event data, no participant-visibility flags**
   (6.5).
 - **Default alerts are applied by value** (D11).
+- **An attendee's create sends no reply.** An attendee who creates, as
+  its own copy, the event of an invitation that has not reached the
+  calendar yet sends no reply from that create, and the copy does not
+  schedule later edits. Upstream's JMAP create falls back to the
+  attendee's reply; CalDAV's create does not, and the pipeline's create
+  is CalDAV's (D1). Decided by the project owner on 2026-11-18.
+- **A non-member is held to an event's effective privacy.** For a
+  caller who is not a member of the account, JMAP applies the higher of
+  the stored flags' privacy and the unsealed event's to reads, the text
+  query, destroy and update, and answers `notFound` for an event whose
+  view does not open for the caller (6.3, 6.4, 6.5). CalDAV applies the
+  stored flags, which a non-standard `CLASS` leaves public under field
+  policy 2, so here JMAP is the stricter side.
 
 ### 3.4 Inherited limitations, accepted
 
@@ -943,6 +968,47 @@ reflects them. An error before the first object fails the method, as
 upstream. The reason is D3: with one commit per object, a failed method
 would hide from the client what the call had already committed.
 
+**A calendar's delete is one object.** On a store that can establish it
+(RocksDB, SQLite, PostgreSQL, MySQL), a key account's calendar is deleted
+with its events in one transaction, on both protocols (`Calendar/set`
+destroy and a CalDAV collection `DELETE`). A delete whose batch would
+exceed the store's chunk size (5,000,000 bytes) by the builder's own
+count is refused before any cancellation is sent: `forbidden` with a
+fixed text over JMAP, 403 over CalDAV. The remedy is to delete events
+first. A write that crosses the delete makes it answer "try again"
+(`forbidden` with the "modified" text over JMAP, 503 over CalDAV): the
+child list is compared with a snapshot no older than the account's
+Calendar change counter before the first fan-out and again immediately
+before the commit, and the commit carries an operation that fails unless
+the commit is assigned the change id that follows the one read. The
+reason: split at commit points, a delete whose later chunk failed left
+the calendar with part of its events and an answer that contradicted the
+store, and a create that crossed it could leave an event whose calendar
+was gone. Upstream's JMAP destroy of an ordinary account's calendar is
+one transaction too.
+
+The fence's refusal can come after the cancellations went out: key
+attendees then hold a CANCEL for events the organizer still has, and the
+outside attendees' mail is dropped. That is the failure class every
+failed commit of this delete already had; it now has more triggers (a
+create into the calendar during the fan-out, any calendar commit of the
+account in the last window), and a retry converges. It is an accepted
+residual.
+
+On FoundationDB, a read replica and the ephemeral store the delete keeps
+its earlier form: chunked at the store's commit points, not fenced, with
+no size refusal, and a later chunk that fails leaves the earlier chunks'
+deletions committed. FoundationDB's limits on a transaction's time and
+size would make the delete of a calendar of a few thousand events fail
+on every attempt, each after its cancellations went out. A read
+replica's reads can lag the primary, so the comparison could pass on a
+stale child list. The ephemeral store applies each operation as it goes,
+with no rollback, and is the data store only in web bootstrap mode,
+where no key account exists. Issue #92 keeps what is open: very large
+calendars, the stores that keep the chunked form, an internal retry for
+the refusal after the cancellations, and a large delete's retries on
+RocksDB.
+
 ### 5.4 Scheduling
 
 **D4.** `sendSchedulingMessages` is honoured as JMAP defines it. When it
@@ -977,10 +1043,26 @@ stay as they are: the key branch leaves upstream's path before them.
 ### 5.5 The drain
 
 A JMAP request runs `za_drain` once, before dispatch, when its token
-holds its own account's keys and the request holds a method of
-`Calendar`, `CalendarEvent` or `ParticipantIdentity`. It never fails the
+holds its own account's keys, the token's scope admits calendars, and
+the request holds a call of `Calendar`, `CalendarEvent` or
+`ParticipantIdentity` that parsed and whose capability is among those
+the request declared and the token's scope left in place (the
+dispatcher's own check before a method runs). It never fails the
 request. The hook sits beside release 7's search pass hook in
 `handle_jmap_request` (`crates/jmap/src/api/request.rs`).
+
+A CalDAV request drains under the same scope rule (`za_drain_keys`,
+`crates/common/src/za/calendar.rs`). A Basic login, an app password and
+a full-scope token have no restricted scope and are unaffected; a token
+whose scope excludes calendars drains on neither protocol, so a key
+account used only through such tokens applies no invitation until a
+calendar-scoped or password client connects. The method's JMAP
+permission is not part of the rule: an account that lacks it still
+drains on a calendar call the dispatcher then refuses, and a call whose
+back-reference fails has drained, since references are resolved after
+the drain. Decided by the project owner on 2026-11-18. What a token's
+scope admits on DAV is upstream's scope model, unchanged; the drain's
+scope rule limits the drain, not what a token can read.
 
 Without it an account used only from a browser would never apply an
 invitation.
@@ -1137,6 +1219,10 @@ The rulings on `isDraft`, `mayInviteSelf`, `mayInviteOthers`,
 `hideAttendees` and `useDefaultAlerts` apply to the event's own patch. A
 patch of one occurrence is left to upstream, which refuses these
 properties there. The ruling on `blobId` links applies to every patch.
+A refused link fails only the occurrence operation that carries it: the
+call's other occurrence edits and destroys of the same event are applied
+and committed together, as upstream applies its other per-occurrence
+errors.
 
 **D10. No per-user event data.** Sealing refuses an event that holds
 per-user preferences (`seal_event_in_domain`), and that stays. CalDAV
@@ -1176,6 +1262,15 @@ so cancellations and declines go through the fan-out. Destroying one
 occurrence through its synthetic id is upstream's conversion to an
 update.
 
+For a caller who is not a member of the account, an update and a
+destroy are checked against the event's effective privacy, the higher of
+the stored flags' privacy and the unsealed event's, as `/get` and the
+text query apply it (3.3). An event whose view does not open for the
+caller answers `notFound`. A grantee at `edit` therefore cannot destroy,
+declassify or rewrite an event whose `CLASS` is a sealed non-standard
+value through JMAP. Over CalDAV it can still delete it and read it
+whole, under field policy 2's recorded limit.
+
 ### 6.6 `CalendarEvent/parse`
 
 Served when the token holds the keys of the account named in the call. A
@@ -1207,7 +1302,10 @@ from the cache, as upstream does, and opens nothing.
   handler never adds a preference entry: a grantee's
   entry exists from the grant, and a caller with no stored entry is
   refused.
-- **Destroy** runs the pipeline's collection delete (D16). Upstream's
+- **Destroy** runs the pipeline's collection delete (D16): one
+  transaction with its events where the store can establish it, refused
+  above the size cap before any cancellation, and answered "try again"
+  when a write crosses it (5.3). Upstream's
   refusal of a non-empty calendar without `onDestroyRemoveEvents` stays.
   A grantee cannot destroy a shared calendar, as on CalDAV.
 - **`onSuccessSetIsDefault`** writes the default calendar id, an id only.
@@ -1233,7 +1331,8 @@ none; that is recorded in 3.3.
 ### 6.8 `/changes` and `/queryChanges`
 
 The change log is keyless and is served as upstream serves it, with
-upstream's filtering for a grantee.
+upstream's filtering for a grantee. The event state given to a caller
+who is not the owner of a key account is the exception (below).
 
 **D15.** For a grantee, a `sinceState` at or before the sync boundary of
 a shared calendar it can see (the later of its grant and its last
@@ -1291,6 +1390,34 @@ check, never access rights. Upstream's log reader, retention, filtering
 and pagination remain unchanged, including their independent validity
 checks. No stored layout, database field, secret, setting or client code
 is added. Reference-client qualification remains a separate gate.
+
+**The event state of a caller who is not the owner.** Upstream's event
+state is the last item change of the log. A grant and a rename are
+container changes, so that state can lie at or below a sharing boundary,
+and a grantee given it would be refused at its next call until an event
+changed. For a caller who is not the owner of a key account:
+
+- `CalendarEvent/get`, `/query` and `/set` answer the snapshot's highest
+  change id. Every boundary the snapshot holds lies at or below it, and
+  its log record exists.
+- `/changes` and `/queryChanges` end at the highest change id of a
+  snapshot read before the page when the request's state was initial or
+  exact: the page read the log to its end.
+- A continuation of an exact-origin paged sync ends there only when the
+  log holds no event change between its last item change and that tip.
+  Otherwise it ends at its last item change, and the next call sends
+  what follows.
+- A continuation of an initial-origin paged sync ends where upstream ends
+  it. D29 exempts its pages from the boundary check, so its final state,
+  below a grant that completed while it paged, is what makes the next
+  call restart.
+
+The state therefore also moves on a container-only change, and a poll
+then returns empty lists. An owner's and an ordinary account's states
+are unchanged. One case stays open: an initial-origin paged sync crossed
+by a grant and then by a later event change ends above the grant, as it
+did before, since a `z` state does not carry the first page's tip; a
+follow-up is proposed to the project owner.
 
 ### 6.9 `ParticipantIdentity`
 
@@ -1678,7 +1805,9 @@ and server versions; codec and handler tests alone do not qualify them.
     has entries (D22).
 72. Keys opened from a token are served only at the account's current
     generation. On a mismatch the request is refused, never served
-    uncached (D23).
+    uncached (D23). A request whose key lookup outlasted the token's
+    signed expiry is not such a mismatch: it is served with its keys and
+    nothing is cached.
 73. A successful answer of the token endpoint is never traced, for any
     account (D24).
 74. Only a Bearer value that begins with the server's token header is
@@ -1699,7 +1828,8 @@ Amendments:
 - **Release 1, a key account's credential version**: it was the vault
   revision, so every vault write ended the account's OAuth sessions
   (kept on 2026-11-02). Superseded by D19: the credential version is the
-  binding, and only a credential change ends them.
+  binding, and only a credential change ends them (a grant's deletion
+  ends that grant's sessions, 4.7).
 - **Release 1 invariant 5** stands: `Server::authenticate` returns
   keyless tokens, and keys are attached by the HTTP layer for one
   request. The Bearer arm is a second source beside Basic.
@@ -1716,16 +1846,52 @@ Amendments:
 - **Upgrade design, "Per-user event data"**: stands, now enforced
   against a reachable path (D10).
 - **Search spec decision 1** stands.
+- **Invitations spec 6.1 and 6.2**: the drain's trigger gains the scope
+  clause of 5.5. A DAV request drains only when its token's scope admits
+  calendars, and a JMAP request as 5.5 says.
+- **Search spec 5.2**, the JMAP trigger: the pass runs before dispatch
+  only when a call that triggers it parsed and its capability is in
+  `using` as the token's scope filtered it. A `Blob` call is such a call
+  for every scope that carries the blob capability. The pass after a
+  committed message write is unchanged.
+- **Release 5, iMIP spec 5.4**: the recorded residual of a collection
+  `DELETE` whose commit fails in a later chunk no longer occurs for a key
+  account on RocksDB, SQLite, PostgreSQL or MySQL, where the delete is
+  one transaction (5.3). It stays on FoundationDB, a read replica and
+  the ephemeral store.
 - **The rule that ordinary accounts take upstream's paths unchanged**
-  (release 1 section 12) gains two exceptions. Both apply to every
+  (release 1 section 12) gains three exceptions. All apply to every
   account, ordinary ones included. `decode_access_token` strips a `~`
   suffix from every token that begins with the server's token header
   before it opens it (D26), because the account is not known until the
   token is open. The token endpoint's successful answers are untraced
-  (D24). Three costs also fall on ordinary accounts: one cached account
-  read at a code exchange, at a refresh and at a grant's deletion; one
+  (D24). The value of every `code` query parameter is masked in a traced
+  request URL and in a traced `Referer` header (`traced_url`), because no
+  account is known when the URL is traced; the project owner confirmed
+  this amendment on 2026-11-18. Three costs also fall on ordinary
+  accounts: one cached account read at a code exchange, at a refresh and
+  at a grant's deletion; one
   in-memory delete at a consent confirmation that carries no secret; one
   cached classification read in each calendar method.
+  The pull request's review adds these: one boolean test per
+  `commit_point()` call of every batch (the one-transaction flag of
+  5.3); a deleted grant's sessions are evicted twice on the deleting
+  node, in place and then through the queued invalidation, and on a
+  cluster broadcast twice, so the global revocation epoch advances at two
+  instants and an authentication of any account in flight at either one
+  is served but not cached, and a revocation of N grants makes N + 1
+  cache scans and broadcasts where upstream made one of each, with each
+  deletion on a cluster awaiting its broadcast before its cleanup; one
+  more cached account read where a deletion's re-read finds the grant
+  already gone; and, per `OAuthGrant` invalidation, the account's keys
+  removed after the epoch advances (the same work, later). The drain's
+  scope rule and the search pass's condition are reached only with keys,
+  and the grantee's event state, the effective privacy, the delete's
+  fence and size refusal and the guarded raise of 6.8 are on key-account
+  paths. A key account's grantee (not an ordinary account) pays one
+  content read and one unseal on a destroy; one more log read per event
+  poll when a container change is the last record of the calendar log;
+  and one log read on the last page of an exact-origin paged event sync.
   D29 adds state-codec fields and context checks, with no global account
   lookup or additional ordinary-account store I/O. Key-calendar pages
   carry the extra origin fields and classify the account even for an

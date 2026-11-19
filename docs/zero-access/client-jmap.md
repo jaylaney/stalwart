@@ -91,7 +91,7 @@ says otherwise.
 | 4 | Recurring events: this one, this and future, all | Create a weekly event; edit one occurrence; edit this and future; edit all; delete one occurrence | Each edit applies to the occurrences the choice names. |
 | 5 | Tasks | Create, complete and delete a task | Each step is shown and persists. |
 | 6 | Invite a key account or an outside address; see replies | As A, invite C and O to an event with the invitation sent; C accepts in its calendar; O answers by mail the server accepts as authenticated (setup, account O) | C sees the invitation; O's mail reaches the sink; A sees both replies. Without an authenticated sender for O, record O's reply as not run. |
-| 7 | After the first invitation to a key account | Row 6's invitation is A's first to C (A had not pinned C before). Keep using the same browser session; reload; wait past the access token's lifetime | The browser stays signed in (D19): the same session reads the event, and the client's refresh is granted. Only a password change, a recovery or a second-factor change ends a key account's browser sessions. |
+| 7 | After the first invitation to a key account | Row 6's invitation is A's first to C (A had not pinned C before). Keep using the same browser session; reload; wait past the access token's lifetime | The browser stays signed in (D19): the same session reads the event, and the client's refresh is granted. Only a password change, a recovery or a second-factor change ends a key account's browser sessions; a grant's deletion (a sign-out) ends that grant's. |
 | 8 | Accept or decline, from the calendar and from an invitation email | As C, accept one invitation from the calendar and decline another; for an invitation mailed from O (by a sender the server accepts as authenticated), answer from the email and from the calendar | Each answer reaches the organizer; the event shows the answer. Without an authenticated sender for O, record the mailed-invitation leg as not run. |
 | 9 | Calendars shared with the user, read and edit | As C, open A's calendar shared at `view`, then at `edit`: read, create and edit an event | At `view` C reads and cannot write; at `edit` C reads and writes, and A sees C's changes. |
 | 10 | Answer for the owner of a shared calendar | As C with `edit`, answer an invitation in A's shared calendar | The organizer receives the answer sent by C on A's behalf (`SENT-BY`). |
@@ -127,7 +127,7 @@ can show, recorded so it is not mistaken for a client fault):
   visibility and subscription flags included (Task 39, F3).
 - An attendee that creates, as its own copy, an event it does not organize and has already answered
   sends no reply from that create, and that copy does not schedule later edits either (R36-10, the
-  final review's FC1-1; the owner's decision is pending). Accepting an invitation whose event is
+  final review's FC1-1; decided by the project owner on 2026-11-18 with no code change, spec 3.3). Accepting an invitation whose event is
   not yet in the calendar, if the client does it by creating the event, therefore creates the copy
   and sends no reply: record whether the client accepts that way and whether the organizer sees
   the answer. Invitations that arrive through the drain carry a schedule tag and are unaffected.
@@ -142,6 +142,21 @@ can show, recorded so it is not mistaken for a client fault):
 - An event or invitation written through JMAP holds upstream's converter output (`DURATION` for
   `DTEND`, the export's property order), a `CREATED` stamp, and a SEQUENCE the server raises when
   the client omits `sequence` (Task 38). A CalDAV client of the same account sees that text.
+- A calendar destroy can be refused as too large for one transaction (`forbidden`, "This calendar
+  holds too many events to delete at once. Delete some of its events first."), before any
+  cancellation is sent: record whether the client shows the text and lets the user delete events
+  first (spec 5.3).
+- A calendar destroy that meets a concurrent write to the account's calendars answers "try again"
+  (`forbidden`, "Another process modified this calendar, please try again."), possibly after its
+  cancellations went out: record whether the client retries or tells the user (spec 5.3).
+- A grantee's destroy or update of an event whose details are private to its owner (a private or
+  sealed non-standard `CLASS`) is refused (`forbidden`, "Private events can only be modified by
+  the calendar owner."), and an event whose details the grantee cannot open answers `notFound`
+  (spec 3.3, 6.5): record what the client shows.
+- A grantee's event state from `CalendarEvent/get` lies at or above the sharing boundary and is
+  the state to sync from (spec 6.8): record whether the client takes its event state from
+  `CalendarEvent/get` (or from `/query` or `/changes`), and whether its next `/changes` is served
+  after a grant or a rename.
 
 ## Assumptions to confirm on a running instance
 
