@@ -55,8 +55,9 @@ reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not 
   details are private to its owner.
 - A sharing change (a grant or a rename) no longer leaves a grantee's client unable to sync
   events when it takes its state from `CalendarEvent/get` or `/query`, or syncs in one page or
-  from an exact state; a paged sync from the initial state still ends below the boundary and must
-  restart.
+  from an exact state; a paged sync from the initial state still ends below the boundary, its next
+  call is refused, and the way out is to take the state from `CalendarEvent/get` or to sync in one
+  page.
 - One refused attachment link no longer fails the call's other occurrence edits of the same event.
 - Pending invitations are imported only by a sign-in whose scope covers calendars (and by
   password clients), on CalDAV and JMAP.

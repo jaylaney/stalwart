@@ -12,13 +12,14 @@ attachment link fails only its own occurrence) and section 10 (the `code`
 masking confirmed; the amendments of the drain's and the search pass's
 triggers and of release 5's chunked collection `DELETE`). The
 controller's rulings on confirmed findings of that review: 3.3 and 6.5 (a
-non-member held to an event's effective privacy), 5.3 and two section 10
-amendment sentences, each put to the owner (FoundationDB, a read replica and the ephemeral
-store keep the chunked delete; the fence's refusal after the
-cancellations accepted as a residual; a `Blob` call still triggers the
-search pass for a token without the mail scope), 6.8 (the event state of
-a caller who is not the owner) and section 10 (invariant 72's sentence
-on a key lookup that outlasted its token, and the costs).
+non-member held to an event's effective privacy), 6.8 (the event state of
+a caller who is not the owner) and section 10 (invariant 72's sentence on
+a key lookup that outlasted its token, and the costs). The controller's
+rulings on findings of the reviews of the two fix waves, each put to the
+owner: 5.3 and two section 10 amendment sentences (FoundationDB, a read
+replica and the ephemeral store keep the chunked delete; the fence's
+refusal after the cancellations accepted as a residual; a `Blob` call
+still triggers the search pass for a token without the mail scope).
 Revision 7 incorporates Jay's
 approved [D29 amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md),
 recorded 2026-11-15: key-calendar continuations carry their original sync
@@ -1435,7 +1436,7 @@ changed. For a caller who is not the owner of a key account:
 
 The state therefore also moves on a container-only change, and a poll
 then returns empty lists. An owner's and an ordinary account's states
-are unchanged. Three cases stay open:
+are unchanged. Two cases stay open:
 
 - (a) A paged sync from the initial state ends below any sharing
   boundary above its last event change, whether the boundary completed
@@ -1445,15 +1446,17 @@ are unchanged. Three cases stay open:
   its state from `/get` or `/query`. A client that follows the protocol
   holds the state `/get` gave it and does not enter this flow. This is
   the cost the controller's ruling accepted.
-- (b) Such a sync crossed by a grant and then by a later event change
-  ends above the grant on upstream's own final state, before and after
-  this round.
-- (c) A grant that commits between a call's boundary check and its read
-  of the tip leaves the raised state of an exact request above the grant;
-  this is new with the raise, and reading the tip before the check would
-  close it.
+- (b) A grant that commits between a call's boundary check and its read
+  of the tip, in the same call, leaves a raised state above the grant:
+  the state of an exact request, or of the last page of an exact-origin
+  continuation, which the raise serves under its guard. This is new with
+  the raise.
 
-(b) and (c) are proposed to the project owner as one follow-up.
+One follow-up is proposed to the project owner: read the tip before the
+boundary check, which closes (b); and carry the first page's tip in the
+`z` state, which would let a paged initial sync end above a boundary that
+predates it and so remove (a). The second needs a new version of the
+state's codec.
 
 ### 6.9 `ParticipantIdentity`
 
