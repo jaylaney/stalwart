@@ -135,6 +135,7 @@ pub async fn test(test: &mut TestServer) {
     bearer_crossed_by_vault_write_is_refused(test, owner).await;
     keyed_entry_bounded_by_token_expiry(test, owner).await;
     keyed_entry_ends_before_signed_expiry(test, owner).await;
+    expired_second_decode_publishes_nothing(test, owner).await;
     keyed_request_crossed_by_revocation(test, owner).await;
     mail_bearer_login_stays_refused(test, owner).await;
     revocation_and_introspection_accept_the_suffix(test, owner).await;
@@ -592,21 +593,23 @@ async fn keyed_entry_bounded_by_token_expiry(test: &TestServer, id: u32) {
 
 /// PR #90 review C4633314515: an authentication slowed between the token's
 /// decode and its grant read does not carry the entry past the signed expiry.
-/// A ten-second token's first request is parked in the version check, after
-/// the decode, for five seconds and served; a second request more than a
-/// second past the signed expiry is refused, and nothing remains under the
-/// token. Without the lowered deadline the entry would end the park's length
-/// late and serve it. Margins, from the instant `keyed_grant` returns (the
-/// token is sealed just before it): the release comes about 5 s in, more
-/// than 3 s before the signed expiry (later than 9 s), so publication takes
-/// the lowering path; the second request goes at 11.2 s, at least 1.2 s past
-/// the signed expiry (by 10 s) and at least 1.8 s before an unlowered entry's
-/// end (after 13 s: the release, plus a first lifetime of at least 9 s, less a
-/// second of the cache clock's rounding).
+/// A fifteen-second token's first request is parked in the version check,
+/// after the decode, until ten seconds and served, and its entry is cached; a
+/// second request more than a second past the signed expiry is refused, and
+/// nothing remains under the token. Without the lowered deadline the entry
+/// would end the park's length late and serve it. Margins, from the instant
+/// `keyed_grant` returns (the token is sealed just before it, so its signed
+/// expiry lies after 14 s and by 15 s on the token clock): the release at
+/// 10 s comes more than 3 s before the signed expiry, so publication takes
+/// the lowering path; the second request at 16.2 s comes at least 1.2 s past
+/// the signed expiry; and an unlowered entry ends after 19 s (the release,
+/// plus a first lifetime of at least 10 s even when the first decode comes as
+/// late as the five seconds the pause allows, less a second of the cache
+/// clock's rounding), at least 2.8 s after the second request.
 async fn keyed_entry_ends_before_signed_expiry(test: &TestServer, id: u32) {
     println!("  keyed_entry_ends_before_signed_expiry");
     let (grant, keyed, _) = {
-        let _expiry = oauth_expiry(test, Some(10), None, None);
+        let _expiry = oauth_expiry(test, Some(15), None, None);
         keyed_grant(test, id).await
     };
     let sealed = tokio::time::Instant::now();
@@ -616,25 +619,94 @@ async fn keyed_entry_ends_before_signed_expiry(test: &TestServer, id: u32) {
         slow_session_status(keyed.clone()),
     )
     .await;
-    tokio::time::sleep_until(sealed + Duration::from_secs(5)).await;
+    tokio::time::sleep_until(sealed + Duration::from_secs(10)).await;
     assert_eq!(
         parked.finish().await,
         200,
         "a request slowed after its decode is served"
     );
-    tokio::time::sleep_until(sealed + Duration::from_millis(11_200)).await;
+    let cache = &test.server.inner.cache;
+    assert!(
+        cache.http_auth.get(&keyed).is_some(),
+        "no entry was published before the signed expiry, so the lowering was not tested"
+    );
+    tokio::time::sleep_until(sealed + Duration::from_millis(16_200)).await;
     assert_eq!(
         za_bearer_session(&keyed).await.0,
         401,
         "a cache entry outlived its token's signed expiry"
     );
-    let cache = &test.server.inner.cache;
-    assert!(cache.http_auth.get(&keyed).is_none());
+    assert!(
+        cache.http_auth.get(&keyed).is_none(),
+        "an expired token's entry stayed cached"
+    );
     assert!(
         cache
             .za_keys
             .get(&cache.za_fingerprint(&keyed), std::time::Instant::now())
-            .is_none()
+            .is_none(),
+        "an expired token's keys stayed resident"
+    );
+    za_revoke_grant(&test.server, grant).await;
+}
+
+/// PR #90 review C4633314515 (RC5-1): publication past the signed expiry
+/// publishes nothing even while the first deadline is still ahead; only the
+/// expired second decode stops a live entry. A ten-second token's request is
+/// parked in the version check, after the decode, until ten seconds, then
+/// after its key lookup until 11.2 s, and served. Margins, from the instant
+/// `keyed_grant` returns (the signed expiry lies after 9 s and by 10 s on the
+/// token clock): the publication at 11.2 s comes at least 1.2 s past the
+/// signed expiry; and the first deadline, built at the first release, ends
+/// after 14 s (the release, plus a first lifetime of at least 5 s even when
+/// the first decode comes as late as the five seconds the pause allows, less
+/// a second of the cache clock's rounding), at least 2.8 s after the
+/// publication.
+async fn expired_second_decode_publishes_nothing(test: &TestServer, id: u32) {
+    println!("  expired_second_decode_publishes_nothing");
+    let (grant, keyed, _) = {
+        let _expiry = oauth_expiry(test, Some(10), None, None);
+        keyed_grant(test, id).await
+    };
+    let sealed = tokio::time::Instant::now();
+    let version_check = Arc::new(test_hooks::Pause::new(id));
+    let publication = Arc::new(za_test::Pause::new(id));
+    test_hooks::set_token_version_check_pause(Some(version_check.clone()));
+    za_test::set(Some(publication.clone()));
+    let request = tokio::spawn(slow_session_status(keyed.clone()));
+    tokio::time::timeout(Duration::from_secs(5), version_check.arrived.notified())
+        .await
+        .expect("the request did not reach the version check");
+    tokio::time::sleep_until(sealed + Duration::from_secs(10)).await;
+    version_check.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), publication.arrived.notified())
+        .await
+        .expect("the request did not reach the publication pause");
+    tokio::time::sleep_until(sealed + Duration::from_millis(11_200)).await;
+    publication.release.notify_one();
+    assert_eq!(
+        request.await.unwrap(),
+        200,
+        "a request whose token expired before publication is served"
+    );
+    test_hooks::set_token_version_check_pause(None);
+    za_test::set(None);
+    let cache = &test.server.inner.cache;
+    assert!(
+        cache.http_auth.get(&keyed).is_none(),
+        "an entry was published after the signed expiry"
+    );
+    assert!(
+        cache
+            .za_keys
+            .get(&cache.za_fingerprint(&keyed), std::time::Instant::now())
+            .is_none(),
+        "keys were made resident after the signed expiry"
+    );
+    assert_eq!(
+        za_bearer_session(&keyed).await.0,
+        401,
+        "an expired token was served from the cache"
     );
     za_revoke_grant(&test.server, grant).await;
 }

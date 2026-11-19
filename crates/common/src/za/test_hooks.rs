@@ -64,9 +64,12 @@
 //! - `TOKEN_EXCHANGE_PAUSE`: in `za_token_issue` after the binding check
 //!   and before the batch, keyed by the account.
 //! - `TOKEN_VERSION_CHECK_PAUSE`: at the head of `za_refuse_unversioned_token`,
-//!   which sits between an access token's decode and its grant read, keyed by
-//!   the account (PR #90 review C4633314515: an authentication slowed after
-//!   the decode).
+//!   keyed by the account (PR #90 review C4633314515: an authentication
+//!   slowed after the decode). That function runs for an access token's
+//!   authentication, between its decode and its grant read, and for every
+//!   validation of a grant-bound token (the refresh grant, introspection,
+//!   `/api` token validation); an armed pause parks whichever call for that
+//!   account comes first.
 //! - `TOKEN_FORGET_PAUSE`: at the head of `za_token_forget_grant`, before
 //!   `TOKEN_FORGET_FAIL_ONCE` and any read, keyed by the account (PR #90
 //!   review C4617611602: a grant's deletion parked in its token cleanup).

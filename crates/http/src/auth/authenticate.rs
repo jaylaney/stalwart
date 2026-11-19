@@ -10,7 +10,6 @@ use common::{
     auth::{
         AccessToken, AuthRequest,
         authentication::{Authenticated, UsernameParts},
-        oauth::GrantType,
     },
     cache::http_auth::RevocationEpoch,
     network::limiter::InFlight,
@@ -211,7 +210,8 @@ async fn authenticate_uncached(
 
     // Cache credentials. The entry's deadline is fixed here, at verification,
     // so the key lookup below does not extend it past the token's signed
-    // expiry (PR #90 review C4617611615).
+    // expiry (PR #90 review C4617611615); for keys opened from a Bearer token
+    // it is lowered again at publication (`za_bearer_entry`, C4633314515).
     let cache = &server.inner.cache;
     let revocations = &cache.grant_revocations;
     let account_id = access_token.account_id();
@@ -328,21 +328,22 @@ async fn authenticate_uncached(
 /// remaining lifetime less one second, which absorbs the rounding of the two
 /// whole-second clocks. Any decode error (`TokenExpired`, or a token that no
 /// longer opens or is of another grant type) publishes nothing: `None`, and
-/// the request is served with its keys, uncached.
+/// the request is served with its keys, uncached. The cache clock is read
+/// before the token's, so a stall between the two reads ends the entry
+/// earlier, never later (RC5-7).
 fn za_bearer_entry(
     server: &Server,
     token: &str,
     mut entry: HttpAuthCache,
 ) -> Option<HttpAuthCache> {
-    let remaining = server
-        .decode_access_token(Some(GrantType::AccessToken), token)
-        .ok()?
-        .expires_in;
-    let deadline = server
-        .inner
-        .cache
-        .http_auth
-        .expires_in(remaining.saturating_sub(1));
+    let now = server.inner.cache.http_auth.expires_in(0);
+    let Ok(info) =
+        server.decode_access_token(Some(common::auth::oauth::GrantType::AccessToken), token)
+    else {
+        return None;
+    };
+    let remaining = u32::try_from(info.expires_in.saturating_sub(1)).unwrap_or(u32::MAX);
+    let deadline = now.saturating_add(remaining);
     entry.expires = entry.expires.min(deadline);
     Some(entry)
 }
