@@ -2004,7 +2004,6 @@ async fn calendar_delete_with_a_stale_child_list(test: &TestServer, fx: &Fx) {
                     owner,
                     calendar,
                     target,
-                    children,
                     &ContainerCleanup::empty(Collection::CalendarEvent),
                     href,
                     false,

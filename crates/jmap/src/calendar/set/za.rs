@@ -749,7 +749,6 @@ impl ZaCalendarWriter<'_> {
             account_id,
             document_id,
             target,
-            children,
             &cleanup,
             href,
             send_itip,

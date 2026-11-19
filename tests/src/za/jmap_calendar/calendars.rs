@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{Pair, finish, make_calendar, pair, put_event, share};
+use super::{Pair, event_ics, finish, make_calendar, pair, put_event, share};
 use crate::{
     utils::{
         account::Account,
@@ -32,11 +32,14 @@ use common::za::{
     imip::ZA_IMIP_DROPPED,
     test_hooks::{
         CommitBytesOverride, ForceCommitSplit, Pause, set_calendar_delete_built_pause,
-        set_calendar_delete_fence_pause, set_delete_commit_fail_once, set_fan_out_pause,
-        set_second_chunk_fail_once,
+        set_calendar_delete_fence_pause, set_commit_pause, set_delete_commit_fail_once,
+        set_fan_out_pause, set_second_chunk_fail_once,
     },
 };
-use groupware::calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences, Timezone};
+use groupware::{
+    cache::GroupwareCache,
+    calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences, Timezone},
+};
 use hyper::{Method, StatusCode};
 use jmap_proto::types::state::State;
 use serde_json::{Value, json};
@@ -91,6 +94,7 @@ pub async fn test(test: &mut TestServer) {
     child_moved_out_and_back_refused(test, &pair).await;
     same_calendar_copy_refused(test, &pair).await;
     delete_removes_every_name(test, &pair).await;
+    delete_reaches_a_shadowed_document(test, &pair).await;
     destroy_non_empty_without_flag_refused(test, &pair).await;
     grantee_destroy_refused(test, &pair).await;
     on_success_set_is_default(test, &pair).await;
@@ -1251,6 +1255,79 @@ async fn delete_removes_every_name(test: &TestServer, pair: &Pair) {
         .with_status(StatusCode::OK);
     dav_delete(pair, KEPT).await;
     assert_eq!(uid_copies(test, owner, uid).await, 0);
+}
+
+/// PR #90 second review C4633314503: two documents at one href (a PUT parked
+/// before its commit while a PUT of another UID creates the same href) show as
+/// one in the path index; the calendar's delete takes its members from the
+/// stored records and removes both, over JMAP and over a CalDAV collection
+/// DELETE.
+async fn delete_reaches_a_shadowed_document(test: &TestServer, pair: &Pair) {
+    let owner = pair.key_id;
+    for (slug, uids, over_jmap) in [
+        (
+            "jmapcal-destroy-shadowed",
+            ["jmapcal-cal-shadow-1", "jmapcal-cal-shadow-2"],
+            true,
+        ),
+        (
+            "jmapcal-destroy-shadowed-dav",
+            ["jmapcal-cal-shadow-dav-1", "jmapcal-cal-shadow-dav-2"],
+            false,
+        ),
+    ] {
+        let calendar = make_calendar(test, &pair.key, &pair.dav, slug).await;
+        let href = format!("{HOME}{slug}/shadowed.ics");
+        let parked = HookParked::start(
+            owner,
+            set_commit_pause,
+            put(
+                pair.key.name(),
+                STRONG,
+                href.clone(),
+                event_ics(uids[0], uids[0]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            put(
+                pair.key.name(),
+                STRONG,
+                href.clone(),
+                event_ics(uids[1], uids[1])
+            )
+            .await,
+            StatusCode::CREATED.as_u16(),
+            "{slug}: the second create"
+        );
+        assert_eq!(
+            parked.finish().await,
+            StatusCode::CREATED.as_u16(),
+            "{slug}: the parked create"
+        );
+        for uid in uids {
+            assert_eq!(uid_copies(test, owner, uid).await, 1, "{uid}");
+        }
+        let resources = test
+            .server
+            .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
+            .await
+            .unwrap();
+        assert_eq!(
+            resources.children_ids(calendar).count(),
+            1,
+            "{slug}: the path index shows one document"
+        );
+        if over_jmap {
+            destroy(pair, &Id::from(calendar).to_string()).await;
+        } else {
+            dav_delete(pair, slug).await;
+        }
+        for uid in uids {
+            assert_eq!(uid_copies(test, owner, uid).await, 0, "{uid}");
+        }
+        assert!(!calendar_stored(test, owner, calendar).await, "{slug}");
+    }
 }
 
 /// Upstream's refusal of a non-empty calendar stays, and sends nothing.

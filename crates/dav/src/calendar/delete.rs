@@ -200,7 +200,6 @@ impl CalendarDeleteRequestHandler for Server {
                     account_id,
                     document_id,
                     target,
-                    children_ids,
                     &cleanup,
                     resources.format_resource(delete_resource).into(),
                     send_itip,

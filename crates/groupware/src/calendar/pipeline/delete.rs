@@ -372,16 +372,23 @@ pub async fn za_delete_calendar(
     owner_id: u32,
     calendar_id: u32,
     target: ZaCalendarDeleteTarget,
-    children: Vec<u32>,
     cleanup: &ContainerCleanup,
     href: Option<String>,
     send_itip: bool,
 ) -> Result<ZaDeleted, ZaPipelineError> {
     let mut batch = BatchBuilder::new();
+    // PR #90 second review C4633314503: the calendar's members come from the
+    // snapshot's stored records, not from the path index, which shows one
+    // document per href.
+    let children = za_calendar_members(resources, calendar_id);
     // PR #90 review RA-2: FoundationDB's transaction limits and stale reads,
     // a read replica's lagging reads and the ephemeral store's missing
     // rollback do not give the one transaction and the change-id fence their
     // contract; those stores keep the earlier, chunked delete without them.
+    // The fenced branch adds the one transaction, the unwritten-child
+    // refusal, the size refusal (with its reserve) and the fence; on every
+    // store the members come from the stored records and every name under
+    // the calendar is removed, which are part of what the delete writes.
     let fenced = !(server.store().is_foundationdb()
         || server.store().is_read_replica()
         || server.store().is_ephemeral());
@@ -460,6 +467,27 @@ pub async fn za_delete_calendar(
     .await
 }
 
+/// PR #90 second review C4633314503: every event document with a name under
+/// `calendar_id`, read from the snapshot's resource records, sorted. The path
+/// index keeps one document per href, so two documents at one href show there
+/// as one.
+pub fn za_calendar_members(resources: &GroupwareResources, calendar_id: u32) -> Vec<u32> {
+    let mut members = resources
+        .resources
+        .iter_run(false)
+        .filter(|resource| {
+            resource
+                .child_names()
+                .iter()
+                .any(|name| name.parent_id == calendar_id)
+        })
+        .map(|resource| resource.document_id())
+        .collect::<Vec<_>>();
+    members.sort_unstable();
+    members.dedup();
+    members
+}
+
 /// PR #90 review C4617611506: a calendar delete's child list, fenced against
 /// the account's Calendar change counter. A create or a placement into the
 /// calendar asserts only the calendar archive, which the delete leaves as it
@@ -515,10 +543,7 @@ impl<'x> ZaChildFence<'x> {
             )
             .await
             .caused_by(trc::location!())?;
-        let mut children = resources.children_ids(self.calendar_id).collect::<Vec<_>>();
-        children.sort_unstable();
-        children.dedup();
-        if children != self.children {
+        if za_calendar_members(&resources, self.calendar_id) != self.children {
             return Err(ZaPipelineError::Busy(ZaBusy::CalendarChanged));
         }
         Ok(tip)
