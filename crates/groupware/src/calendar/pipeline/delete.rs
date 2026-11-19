@@ -427,9 +427,15 @@ pub async fn za_delete_calendar(
     common::za::test_hooks::calendar_delete_built_pause_point(owner_id).await;
 
     if let Some(fence) = &fence {
+        // PR #90 review C4617611506: a stale child list is refused before any
+        // cancellation is delivered. Run first (PR #90 second review RC-2): it
+        // publishes a snapshot no older than the counter, so a retry of a
+        // delete built from a stale list is built from a fresh one.
+        fence.current(server, owner_id).await?;
         // PR #90 second review C4633314478: a listed child the build wrote
         // nothing for is not asserted, so it could name the calendar again at
-        // the commit; refused before the size check and any cancellation.
+        // the commit; refused where the comparison cannot see it (the lists
+        // match), before the size check and any cancellation.
         if built.unwritten > 0 {
             return Err(ZaPipelineError::Busy(ZaBusy::CalendarChanged));
         }
@@ -444,9 +450,6 @@ pub async fn za_delete_calendar(
         if batch.za_exceeds_one_chunk(reserve) {
             return Err(ZaPipelineError::CalendarTooLarge);
         }
-        // PR #90 review C4617611506: a stale child list is refused before any
-        // cancellation is delivered.
-        fence.current(server, owner_id).await?;
     } else {
         // Reset default calendar id
         batch

@@ -2083,9 +2083,10 @@ async fn za_copy_move_stored_event(
         .caused_by(trc::location!())?;
     classify_event_storage(&content).map_err(|error| seal_error(error, owner, event_id))?;
     // PR #90 second review C4633314492: a COPY inside one calendar runs the
-    // UID check with or without an overwrite (403 `no-uid-conflict`, as
-    // upstream answers), so no event gets two names in one calendar; a rename
-    // (a MOVE inside one calendar) skips it, as upstream.
+    // UID check with or without an overwrite and is refused with
+    // `no-uid-conflict`, as upstream refuses it; a rename (a MOVE inside one
+    // calendar) skips it, as upstream. The check reads the path index, so a
+    // name the index hides is not seen by it.
     if source != target || !is_move {
         assert_is_unique_uid(
             server

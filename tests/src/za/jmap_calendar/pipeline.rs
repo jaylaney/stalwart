@@ -57,7 +57,10 @@ use groupware::{
             admission::{za_roles, za_writer_keys},
             context::{ZaReadMemo, za_read_event_view, za_write_contexts},
             create::{ZaEventCreate, za_create_event},
-            delete::{za_calendar_delete_target, za_delete_calendar, za_destroy_event},
+            delete::{
+                za_calendar_delete_target, za_calendar_members, za_delete_calendar,
+                za_destroy_event,
+            },
             error::{ZaBusy, ZaPipelineError, ZaRefusal},
             placement::{ZaPlacementContexts, ZaPlacementPlan, za_placement_contexts},
             schedule::{ZaScheduled, za_delete_send_itip, za_schedule_create},
@@ -532,7 +535,7 @@ pub async fn test(test: &mut TestServer) {
     destroy_required_denied(test, &fx).await;
     destroy_retry_after_source_rename(test, &fx).await;
     update_without_contexts_is_refused(test, &fx).await;
-    calendar_delete_with_a_stale_child_list(test, &fx).await;
+    calendar_delete_with_a_stale_snapshot(test, &fx).await;
     removed_href_from_the_asserted_parent(test, &fx).await;
     fx.cleanup(test).await;
     finish(test, "pipeline").await;
@@ -1962,10 +1965,11 @@ async fn destroy_retry_after_source_rename(test: &TestServer, fx: &Fx) {
         .with_status(StatusCode::NO_CONTENT);
 }
 
-/// PR #90 review C4617611506: a calendar delete built from a child list that a
-/// create made stale is refused (`Busy`) and leaves the calendar and the new
-/// event; with a fresh list the same delete removes both.
-async fn calendar_delete_with_a_stale_child_list(test: &TestServer, fx: &Fx) {
+/// PR #90 review C4617611506: a calendar delete handed a snapshot that a create
+/// made stale against the store (its members, from the snapshot's records,
+/// miss the new event) is refused (`Busy`) and leaves the calendar and the new
+/// event; handed a fresh snapshot, the same delete removes both.
+async fn calendar_delete_with_a_stale_snapshot(test: &TestServer, fx: &Fx) {
     const SLUG: &str = "pipe-fence";
     let owner = fx.pair.key_id;
     let uid = "jmapcal-pipe-fence-late";
@@ -1989,12 +1993,12 @@ async fn calendar_delete_with_a_stale_child_list(test: &TestServer, fx: &Fx) {
             let target = za_calendar_delete_target(server, token, owner, calendar, stored)
                 .await
                 .unwrap();
-            let children = resources.children_ids(calendar).collect::<Vec<_>>();
+            let members = za_calendar_members(&resources, calendar);
             let href = resources
                 .container_resource_path_by_id(calendar)
                 .map(|resource| resources.format_resource(resource));
             (
-                children.clone(),
+                members,
                 za_delete_calendar(
                     server,
                     token,
@@ -2019,12 +2023,12 @@ async fn calendar_delete_with_a_stale_child_list(test: &TestServer, fx: &Fx) {
         .await
         .unwrap();
     let event = put_event(test, &fx.pair.key, &fx.pair.dav, SLUG, uid, "late").await;
-    let (children, result) = delete(stale).await;
-    assert!(children.is_empty(), "{children:?}");
+    let (members, result) = delete(stale).await;
+    assert!(members.is_empty(), "{members:?}");
     match result {
         Err(ZaPipelineError::Busy(ZaBusy::CalendarChanged)) => {}
-        Err(err) => panic!("calendar_delete_with_a_stale_child_list: unexpected refusal {err:?}"),
-        Ok(_) => panic!("calendar_delete_with_a_stale_child_list: deleted with a stale child list"),
+        Err(err) => panic!("calendar_delete_with_a_stale_snapshot: unexpected refusal {err:?}"),
+        Ok(_) => panic!("calendar_delete_with_a_stale_snapshot: deleted with a stale child list"),
     }
     assert!(
         server
@@ -2033,7 +2037,7 @@ async fn calendar_delete_with_a_stale_child_list(test: &TestServer, fx: &Fx) {
             .await
             .unwrap()
             .is_some(),
-        "calendar_delete_with_a_stale_child_list: the calendar was deleted"
+        "calendar_delete_with_a_stale_snapshot: the calendar was deleted"
     );
     assert_eq!(parents_of(test, owner, event).await, [calendar]);
 
@@ -2041,9 +2045,9 @@ async fn calendar_delete_with_a_stale_child_list(test: &TestServer, fx: &Fx) {
         .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
-    let (children, result) = delete(fresh).await;
-    assert_eq!(children, [event]);
-    result.expect("calendar_delete_with_a_stale_child_list: the fresh delete");
+    let (members, result) = delete(fresh).await;
+    assert_eq!(members, [event]);
+    result.expect("calendar_delete_with_a_stale_snapshot: the fresh delete");
     assert!(
         server
             .store()

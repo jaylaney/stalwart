@@ -595,7 +595,9 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
 
             for &document_id in chunk {
                 let Some(event_) = archives.take_archive(document_id) else {
-                    unwritten += 1;
+                    if context.is_some() {
+                        unwritten += 1;
+                    }
                     continue;
                 };
                 let event = event_
@@ -603,11 +605,13 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
                     .caused_by(trc::location!())?;
                 // PR #90 second review C4633314478: a listed child with no name
                 // under the calendar gets no write and no assertion below.
-                if !event
-                    .inner
-                    .names
-                    .iter()
-                    .any(|name| name.parent_id == calendar_id)
+                // Counted for a key account's delete only (RC-8).
+                if context.is_some()
+                    && !event
+                        .inner
+                        .names
+                        .iter()
+                        .any(|name| name.parent_id == calendar_id)
                 {
                     unwritten += 1;
                 }
