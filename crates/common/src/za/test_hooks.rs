@@ -28,6 +28,10 @@
 //! - `DELETE_COMMIT_PAUSE`: immediately before an event DELETE commit,
 //!   after fan-out, keyed by the event owner
 //!   (`groupware::calendar::pipeline::delete`).
+//! - `CALENDAR_DELETE_FENCE_PAUSE` (PR #90 review RA-3): in a key calendar's
+//!   delete, after the second child-list comparison has added the change-id
+//!   fence and immediately before the commit, keyed by the owner
+//!   (`groupware::calendar::pipeline::delete::za_commit_delete`).
 //! - `UNFENCED_CALENDAR_DELETE` (PR #90 review RA-2): while it names an
 //!   account, that account's key calendar delete takes the form a store
 //!   without the fence's contract keeps (commit points, no size refusal, no
@@ -200,6 +204,7 @@ pub static TOKEN_EXCHANGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_REFRESH_READ_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_REFRESH_WRITE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static TOKEN_FORGET_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static CALENDAR_DELETE_FENCE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// The account whose key calendar delete takes the unfenced form.
 pub static UNFENCED_CALENDAR_DELETE: Mutex<Option<u32>> = Mutex::new(None);
@@ -331,6 +336,10 @@ pub fn set_update_commit_pause(pause: Option<Arc<Pause>>) {
 }
 pub fn set_delete_commit_pause(pause: Option<Arc<Pause>>) {
     set_slot(&DELETE_COMMIT_PAUSE, pause);
+}
+
+pub fn set_calendar_delete_fence_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&CALENDAR_DELETE_FENCE_PAUSE, pause);
 }
 
 pub fn set_token_handoff_write_pause(pause: Option<Arc<Pause>>) {
@@ -568,6 +577,10 @@ pub async fn update_commit_pause_point(account_id: u32) {
 }
 pub async fn delete_commit_pause_point(account_id: u32) {
     wait(take_for(&DELETE_COMMIT_PAUSE, account_id)).await;
+}
+
+pub async fn calendar_delete_fence_pause_point(account_id: u32) {
+    wait(take_for(&CALENDAR_DELETE_FENCE_PAUSE, account_id)).await;
 }
 
 pub async fn token_handoff_write_pause_point(account_id: u32) {

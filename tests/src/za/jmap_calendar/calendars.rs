@@ -31,8 +31,8 @@ use calcard::icalendar::ICalendarMethod;
 use common::za::{
     imip::ZA_IMIP_DROPPED,
     test_hooks::{
-        ForceCommitSplit, set_delete_commit_fail_once, set_fan_out_pause,
-        set_second_chunk_fail_once,
+        ForceCommitSplit, set_calendar_delete_fence_pause, set_delete_commit_fail_once,
+        set_fan_out_pause, set_second_chunk_fail_once,
     },
 };
 use groupware::calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences, Timezone};
@@ -83,6 +83,7 @@ pub async fn test(test: &mut TestServer) {
     destroy_with_events_sends_cancellations(test, &pair).await;
     destroy_is_one_transaction(test, &pair).await;
     destroy_fenced_against_a_concurrent_create(test, &pair).await;
+    destroy_fence_lost_to_a_crossing_write(test, &pair).await;
     destroy_non_empty_without_flag_refused(test, &pair).await;
     grantee_destroy_refused(test, &pair).await;
     on_success_set_is_default(test, &pair).await;
@@ -899,6 +900,83 @@ async fn destroy_fenced_against_a_concurrent_create(test: &TestServer, pair: &Pa
     wait_for_queue(test).await;
     sink().clear();
     delete_new_items(test, pair, &start).await;
+}
+
+/// PR #90 review RA-3: both child-list comparisons pass and the change-id
+/// fence alone refuses. The destroy is parked after its second comparison,
+/// immediately before its commit, while an event is written to another
+/// calendar of the account (the child list does not change); the commit is
+/// assigned a later change id than the fence expects.
+async fn destroy_fence_lost_to_a_crossing_write(test: &TestServer, pair: &Pair) {
+    const SLUG: &str = "jmapcal-destroy-crossed";
+    const KEPT: &str = "jmapcal-cal-crossed";
+    const CROSSING: &str = "jmapcal-cal-crossing";
+    const CROSSING_DAV: &str = "jmapcal-cal-crossing-dav";
+    let owner = pair.key_id;
+    let calendar = make_calendar(test, &pair.key, &pair.dav, SLUG).await;
+    let calendar_id = Id::from(calendar).to_string();
+    put_event(test, &pair.key, &pair.dav, SLUG, KEPT, "kept").await;
+
+    let parked = {
+        let (key, calendar_id) = (pair.key.clone(), calendar_id.clone());
+        HookParked::start(owner, set_calendar_delete_fence_pause, async move {
+            calendar_set(
+                &key,
+                &key,
+                json!({ "destroy": [&calendar_id], "onDestroyRemoveEvents": true }),
+            )
+            .await
+        })
+        .await
+    };
+    put_event(test, &pair.key, &pair.dav, "default", CROSSING, "crossing").await;
+    let reply = parked.finish().await;
+    assert_eq!(
+        set_error(reply.not_destroyed(&calendar_id)),
+        ("forbidden", Some(MODIFIED)),
+        "{reply:?}"
+    );
+    assert!(calendar_stored(test, owner, calendar).await);
+    assert_eq!(uid_copies(test, owner, KEPT).await, 1);
+
+    // The same over CalDAV: the collection DELETE answers 503 (`Busy`; a lost
+    // assertion would answer the same, so no answer tells the two apart).
+    let parked = {
+        let name = pair.key.name().to_string();
+        HookParked::start(owner, set_calendar_delete_fence_pause, async move {
+            HttpRequest::with_credentials(8899, &name, STRONG)
+                .send_full(Method::DELETE, &format!("{HOME}{SLUG}/"), None, None)
+                .await
+                .status
+        })
+        .await
+    };
+    put_event(
+        test,
+        &pair.key,
+        &pair.dav,
+        "default",
+        CROSSING_DAV,
+        "crossing",
+    )
+    .await;
+    assert_eq!(parked.finish().await, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(calendar_stored(test, owner, calendar).await);
+    assert_eq!(uid_copies(test, owner, KEPT).await, 1);
+
+    for uid in [CROSSING, CROSSING_DAV] {
+        pair.dav
+            .request_with_headers(
+                "DELETE",
+                &format!("{HOME}default/{uid}.ics"),
+                [NO_REPLY],
+                "",
+            )
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    destroy(pair, &calendar_id).await;
+    assert_eq!(uid_copies(test, owner, KEPT).await, 0);
 }
 
 /// Upstream's refusal of a non-empty calendar stays, and sends nothing.

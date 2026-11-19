@@ -639,6 +639,8 @@ where
                 return Err(error);
             }
         }
+        #[cfg(feature = "test_mode")]
+        common::za::test_hooks::calendar_delete_fence_pause_point(owner_id).await;
     }
     // iMIP spec 5.4: every error return of the commit drops the mail
     // attempts, traced, before returning.
