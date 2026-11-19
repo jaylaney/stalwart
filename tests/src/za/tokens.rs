@@ -549,18 +549,20 @@ async fn slow_session_status(token: String) -> u16 {
         .as_u16()
 }
 
-/// PR #90 review C4617611615: a keyed entry does not outlive its token. A
-/// three-second token's request parked after its key lookup until the token
-/// expired is served, uncached: no cache entry and no resident keys under the
-/// token, and its next request is refused.
+/// PR #90 review C4617611615: the fork's key lookup adds nothing to a keyed
+/// entry's life; upstream's own sub-second skew between the decode and the
+/// cache deadline remains. A five-second token's request parked after its key
+/// lookup for seven seconds, so past the token's expiry, is served, uncached:
+/// no cache entry and no resident keys under the token, and its next request
+/// is refused.
 async fn keyed_entry_bounded_by_token_expiry(test: &TestServer, id: u32) {
     println!("  keyed_entry_bounded_by_token_expiry");
     let (grant, keyed, _) = {
-        let _expiry = oauth_expiry(test, Some(3), None, None);
+        let _expiry = oauth_expiry(test, Some(5), None, None);
         keyed_grant(test, id).await
     };
     let parked = Parked::start(id, za_test::set, slow_session_status(keyed.clone())).await;
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    tokio::time::sleep(Duration::from_secs(7)).await;
     assert_eq!(
         parked.finish().await,
         200,

@@ -20,9 +20,9 @@ use crate::{
             CALENDAR_JMAP_USING, ZaClientKind, clear_received_scheduling, copy_href, event_records,
             hold_task_consumer, inbox_ids, item_method, item_partstat, itip_tasks_for,
             new_inbox_items, open_pending_item_as, pending_ids, token_record, trigger_drain,
-            wait_for_queue, za_bearer_dav, za_bearer_jmap, za_drop_oauth_client, za_keyed_grant,
-            za_oauth_client, za_refresh, za_revoke_grant, za_revoke_token, za_sign_in,
-            za_uid_leases, za_unlock,
+            wait_for_queue, za_bearer_dav, za_bearer_jmap, za_bearer_session, za_drop_oauth_client,
+            za_keyed_grant, za_oauth_client, za_refresh, za_revoke_grant, za_revoke_token,
+            za_sign_in, za_uid_leases, za_unlock,
         },
     },
     za::{
@@ -1768,7 +1768,9 @@ async fn drain_only_within_the_token_scope(s: &Scheduling<'_>) {
     still_pending("a mail-only PROPFIND").await;
 
     // A keyed contacts-only token's CardDAV request is served and does not
-    // drain the calendar inbox.
+    // drain the calendar inbox. A session read first caches the token, so the
+    // DAV request, through the 500 ms client, is a cache hit (the mail-only
+    // token's DAV step above follows its JMAP requests already).
     let (contacts_grant, contacts_token, _) = za_keyed_grant(
         test,
         pair.key2.name(),
@@ -1777,6 +1779,7 @@ async fn drain_only_within_the_token_scope(s: &Scheduling<'_>) {
         OAuthScopes::CONTACTS,
     )
     .await;
+    assert_eq!(za_bearer_session(&contacts_token).await.0, 200);
     let response = za_bearer_dav(&pair.key2, &contacts_token)
         .request_with_headers(
             "PROPFIND",
@@ -1812,6 +1815,17 @@ async fn drain_only_within_the_token_scope(s: &Scheduling<'_>) {
     assert_eq!(status, 200, "{reply:?}");
     assert_eq!(method_error(&reply), Some("unknownMethod"), "{reply:?}");
     still_pending("a Calendar/get without the calendars capability").await;
+    // A calendar call that does not parse keeps its name but is not
+    // admitted: it answers a method error and does not drain.
+    let (status, reply) = za_bearer_jmap(
+        &calendar_token,
+        CALENDAR_JMAP_USING,
+        json!([["Calendar/get", { "accountId": account, "ids": 5 }, "c0"]]),
+    )
+    .await;
+    assert_eq!(status, 200, "{reply:?}");
+    assert!(method_error(&reply).is_some(), "{reply:?}");
+    still_pending("a Calendar/get that did not parse").await;
     let (status, reply) = za_bearer_jmap(&calendar_token, CALENDAR_JMAP_USING, calendar_get).await;
     assert_eq!(status, 200, "{reply:?}");
     assert_eq!(method_error(&reply), None, "{reply:?}");

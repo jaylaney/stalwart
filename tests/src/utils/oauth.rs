@@ -434,8 +434,9 @@ fn bearer_client() -> reqwest::Client {
 /// to `scopes` (`za_grant_token`), the keys unlocked with `password`, and the
 /// grant's record entry issued as the keyed code exchange issues it (an hour
 /// for the access token, thirty days for the refresh token), its secret
-/// appended to the token. The token is sealed by a server built from the
-/// current configuration, so an `oauth_expiry` guard sets its signed expiry.
+/// appended to the token. The token is sealed after the entry is issued, by
+/// a server built from the current configuration, so an `oauth_expiry` guard
+/// sets its signed expiry and its lifetime starts after the slow steps.
 /// Returns the grant id, the token and the entry.
 pub async fn za_keyed_grant(
     test: &TestServer,
@@ -444,8 +445,8 @@ pub async fn za_keyed_grant(
     password: &str,
     scopes: OAuthScopes,
 ) -> (u64, String, ZaIssued) {
-    let (grant, mut token) =
-        super::za::za_grant_token(&test.server.inner.build_server(), name, scopes).await;
+    let server = test.server.inner.build_server();
+    let (grant, _) = super::za::za_grant_token(&server, name, scopes).await;
     let keys = super::za::za_unlock(test, account_id, password).await;
     let vault = test
         .server
@@ -468,6 +469,14 @@ pub async fn za_keyed_grant(
     else {
         panic!("the grant was not issued");
     };
+    let credential_version = server
+        .access_token(account_id)
+        .await
+        .unwrap()
+        .credential_version();
+    let mut token = server
+        .encode_grant_access_token(account_id, name, grant, credential_version)
+        .unwrap();
     append_secret(&mut token, &issued.access);
     (grant, token, issued)
 }

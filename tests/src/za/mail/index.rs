@@ -2015,7 +2015,9 @@ async fn case_blob_hook_does_not_create_mailboxes(test: &TestServer, key: &Accou
 /// that parsed and whose capability is in `using` as the HTTP layer filtered
 /// it by the token's scope. A keyed calendars-only token's `Email/get` is
 /// refused (`unknownMethod`) and runs no pass; a keyed mail-scoped token's
-/// same request runs it.
+/// call of an unknown method (parsed as `Thread/echo`, a mail object) and its
+/// `Email/get` whose arguments do not parse run none either; its parsed
+/// `Email/get` runs it.
 async fn case_scope_excludes_mail(test: &TestServer, key: &Account) {
     println!("case_scope_excludes_mail");
     let id = account_id(key);
@@ -2030,6 +2032,8 @@ async fn case_scope_excludes_mail(test: &TestServer, key: &Account) {
 
     let (calendar_grant, calendar_token, _) =
         za_keyed_grant(test, key.name(), id, key.secret(), OAuthScopes::CALENDARS).await;
+    let (mail_grant, mail_token, _) =
+        za_keyed_grant(test, key.name(), id, key.secret(), OAuthScopes::MAIL).await;
     let counter = common::za::test_hooks::SearchPassCounter::start(id);
     let (status, reply) = za_bearer_jmap(&calendar_token, &using, email_get.clone()).await;
     assert_eq!(status, 200, "{reply:?}");
@@ -2043,10 +2047,29 @@ async fn case_scope_excludes_mail(test: &TestServer, key: &Account) {
         "a calendars-only token's refused Email/get ran a search pass"
     );
     assert_eq!(index(test, id).await.indexed_to, before);
+
+    for (step, calls) in [
+        ("an unknown method", json!([["Foo/bar", {}, "x"]])),
+        (
+            "an Email/get that did not parse",
+            json!([["Email/get", { "accountId": key.id_string(), "ids": 5 }, "g"]]),
+        ),
+    ] {
+        let (status, reply) = za_bearer_jmap(&mail_token, &using, calls).await;
+        assert_eq!(status, 200, "{reply:?}");
+        assert_eq!(
+            reply.0["methodResponses"][0][0], "error",
+            "{step}: {reply:?}"
+        );
+        assert_eq!(
+            counter.counts(),
+            [0; 5],
+            "a mail-scoped token's call of {step} ran a search pass"
+        );
+        assert_eq!(index(test, id).await.indexed_to, before, "{step}");
+    }
     drop(counter);
 
-    let (mail_grant, mail_token, _) =
-        za_keyed_grant(test, key.name(), id, key.secret(), OAuthScopes::MAIL).await;
     let (status, reply) = za_bearer_jmap(&mail_token, &using, email_get).await;
     assert_eq!(status, 200, "{reply:?}");
     assert_eq!(reply.0["methodResponses"][0][0], "Email/get", "{reply:?}");
