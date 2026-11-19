@@ -508,7 +508,8 @@ async fn sync_boundary_matches_caldav(test: &TestServer, f: &Sharing) {
 /// completed boundary (both container changes), a grantee's event state from
 /// `/changes`, `/get` and `/query` lies at or above the boundary, so the next
 /// incremental call is served, and an `edit` grantee's `ifInState` matches it.
-/// The owner's states stay upstream's item state.
+/// The owner's `/changes` state stays upstream's item state (only that state of
+/// the owner is asserted).
 async fn grantee_state_above_the_boundary(test: &TestServer, f: &Sharing) {
     const UID: &str = "jmapcal-sharing-quiet";
     let (owner, reader) = (&f.pair.key, &f.reader);
@@ -805,6 +806,60 @@ async fn paged_sync_origin_survives_range_changes(test: &TestServer, f: &Sharing
     assert_eq!(created(&reply), [id(events[2])]);
     let page3 = new_state(&reply);
     assert_eq!(za_parts(&page3), (&range(3), &origin));
+
+    // PR #90 review RA-1: the final page of the pinned range ends at the range's
+    // last event change, since events were written after the range; the next call
+    // from it reports them, and nothing is reported twice. `/queryChanges` takes
+    // the same adapter and ends at the same state.
+    let reply = changes(reader, owner, method, &page3, Some(1)).await;
+    assert_eq!(created(&reply), [id(events[3])]);
+    assert_eq!(reply.response_at(0)["hasMoreChanges"], false, "{reply:?}");
+    let last = new_state(&reply);
+    assert_eq!(last, State::Exact(e4), "the range-final page");
+    let reply = reader
+        .jmap_method_call(
+            "CalendarEvent/queryChanges",
+            json!({
+                "accountId": owner.id_string(),
+                "sinceQueryState": page3.to_string(),
+                "maxChanges": 1,
+            }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        reply.response_at(0)["newQueryState"]
+            .as_str()
+            .and_then(State::parse),
+        Some(last.clone()),
+        "the range-final /queryChanges state: {reply:?}"
+    );
+    let reply = changes(reader, owner, method, &last, None).await;
+    let mut sent = created(&reply);
+    sent.sort();
+    let mut expected = later
+        .iter()
+        .map(|document_id| id(*document_id))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(sent, expected, "the events written while paging: {reply:?}");
+    let earlier = events
+        .iter()
+        .map(|document_id| id(*document_id))
+        .collect::<Vec<_>>();
+    for list in ["updated", "destroyed"] {
+        let listed = reply.response_at(0)[list]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            listed.iter().all(|item| item
+                .as_str()
+                .is_some_and(|item| !earlier.contains(&item.to_string())
+                    && !expected.contains(&item.to_string()))),
+            "{list} repeats an event: {reply:?}"
+        );
+    }
 
     // Upstream's range-exhausted branch (items_sent at or above the range's total)
     // reads past the range: the new range's first ID moved past q's folded records,
@@ -2685,17 +2740,54 @@ async fn grantee_held_to_effective_privacy(test: &TestServer, f: &Sharing) {
     let (owner, reader) = (&f.pair.key, &f.reader);
     let owner_id = f.pair.key_id;
     share(test, owner, reader, f.reader_id, SLUG, "edit").await;
+    let href = format!("{}{VEILED}.ics", home(SLUG));
+    let veiled_ics =
+        event_ics(VEILED, TITLE).replace("END:VEVENT", "CLASS:X-JMAPCAL-VEILED\r\nEND:VEVENT");
+    // PR #90 review RA-14: first as a series, for the synthetic id of its first
+    // occurrence, then as a single event, so that id resolves to the base event.
     f.pair
         .dav
         .request_with_headers(
             "PUT",
-            &format!("{}{VEILED}.ics", home(SLUG)),
+            &href,
             [CONTENT_TYPE],
-            event_ics(VEILED, TITLE).replace("END:VEVENT", "CLASS:X-JMAPCAL-VEILED\r\nEND:VEVENT"),
+            veiled_ics.replace("END:VEVENT", "RRULE:FREQ=DAILY;COUNT=2\r\nEND:VEVENT"),
         )
         .await
         .with_status(StatusCode::CREATED);
     let veiled = id(resource_id(test, owner_id, &format!("{SLUG}/{VEILED}.ics")).await);
+    let reply = owner
+        .jmap_method_call(
+            "CalendarEvent/query",
+            json!({
+                "accountId": owner.id_string(),
+                "filter": { "after": "2099-02-28T00:00:00", "before": "2099-03-05T00:00:00" },
+                "expandRecurrences": true,
+            }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let ids = reply.ids().map(str::to_string).collect::<Vec<_>>();
+    let reply = owner
+        .jmap_method_call(
+            "CalendarEvent/get",
+            json!({ "accountId": owner.id_string(), "ids": ids, "properties": ["id", "uid", "start"] }),
+        )
+        .await;
+    let first = reply
+        .list()
+        .iter()
+        .find(|event| event["uid"] == VEILED && event["start"] == "2099-03-01T10:00:00")
+        .and_then(|event| event["id"].as_str())
+        .unwrap_or_else(|| panic!("no first occurrence: {reply:?}"))
+        .to_string();
+    assert_ne!(first, veiled, "the first occurrence's id is synthetic");
+    f.pair
+        .dav
+        .request_with_headers("PUT", &href, [CONTENT_TYPE], veiled_ics)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let before = owner_body(test, f, VEILED).await;
     let open = id(put_event(test, owner, &f.pair.dav, SLUG, OPEN, OPEN).await);
 
     let reply = reader
@@ -2722,10 +2814,41 @@ async fn grantee_held_to_effective_privacy(test: &TestServer, f: &Sharing) {
         ("forbidden", Some(PRIVATE)),
         "the grantee's update: {reply:?}"
     );
+    // RA-14: an occurrence destroy that resolves to the base event, and a
+    // change of the event's calendars.
+    let reply = reader
+        .jmap_destroy_account(owner, "CalendarEvent", [first.as_str()], no_args())
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        set_error(reply.not_destroyed(&first)),
+        ("forbidden", Some(PRIVATE)),
+        "the grantee's occurrence destroy: {reply:?}"
+    );
+    let default = id(resource_id(test, owner_id, "default").await);
+    let reply = reader
+        .jmap_method_call(
+            "CalendarEvent/set",
+            json!({
+                "accountId": owner.id_string(),
+                "update": { &veiled: { format!("calendarIds/{default}"): true } },
+            }),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        set_error(reply.not_updated(&veiled)),
+        ("forbidden", Some(PRIVATE)),
+        "the grantee's calendarIds change: {reply:?}"
+    );
     assert_eq!(uid_copies(test, owner_id, VEILED).await, 1);
     let body = owner_body(test, f, VEILED).await;
     assert!(
         body.contains("CLASS:X-JMAPCAL-VEILED") && body.contains(TITLE),
+        "grantee_held_to_effective_privacy: the owner's event changed"
+    );
+    assert!(
+        body == before,
         "grantee_held_to_effective_privacy: the owner's event changed"
     );
 
@@ -2735,6 +2858,12 @@ async fn grantee_held_to_effective_privacy(test: &TestServer, f: &Sharing) {
     assert_set_destroyed(&reply, &open);
     assert_eq!(uid_copies(test, owner_id, OPEN).await, 0);
 
-    owner_delete(test, f, VEILED).await;
+    // The owner's destroy of the same synthetic id removes the event: the id
+    // resolves to the base event.
+    let reply = owner
+        .jmap_destroy_account(owner, "CalendarEvent", [first.as_str()], no_args())
+        .await;
+    assert_set_destroyed(&reply, &first);
+    assert_eq!(uid_copies(test, owner_id, VEILED).await, 0);
     share(test, owner, reader, f.reader_id, SLUG, "view").await;
 }

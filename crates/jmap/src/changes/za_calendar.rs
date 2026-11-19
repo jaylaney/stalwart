@@ -20,6 +20,7 @@ use jmap_proto::{
     types::state::{State, ZaCalendarOrigin},
 };
 use std::future::Future;
+use store::{query::log::Query, write::LogCollection};
 use trc::AddContext;
 use types::collection::SyncCollection;
 
@@ -74,9 +75,14 @@ where
         request.since_state = State::Intermediate(range.clone());
     }
     // PR #90 review C4617611565: a grantee's final event state is raised to
-    // the tip of a snapshot read before the page, which therefore covered
-    // every item change up to it. Upstream ends at the last item change,
-    // which can lie below a sharing boundary (a container change).
+    // the tip of a snapshot read before the page. Upstream ends at the last
+    // item change, which can lie below a sharing boundary (a container
+    // change). From an initial or exact state the page read the log to its
+    // end, so it covered every item change up to the tip. A `z` continuation
+    // that finishes its pinned range covered only the range: its state is
+    // raised only when the log holds no item change after it up to the tip,
+    // which the client's next call would otherwise not be sent.
+    let continues = matches!(since, State::ZaCalendarIntermediate { .. });
     let tip =
         if za_key && object == MethodObject::CalendarEvent && owner != access_token.account_id() {
             Some(
@@ -96,8 +102,24 @@ where
         };
     let mut changes = page(request).await.map_err(keyed)?;
     changes.response.old_state = since;
-    if let (Some(tip), State::Exact(change_id)) = (tip, &changes.response.new_state) {
-        changes.response.new_state = State::Exact((*change_id).max(tip));
+    if let (Some(tip), State::Exact(change_id)) = (tip, &changes.response.new_state)
+        && *change_id < tip
+    {
+        let raise = !continues
+            || server
+                .store()
+                .changes(
+                    owner,
+                    LogCollection::Sync(SyncCollection::Calendar),
+                    Query::RangeInclusive(*change_id + 1, tip),
+                )
+                .await
+                .caused_by(trc::location!())
+                .map(|log| !log.is_truncated && log.item_change_id.is_none())
+                .map_err(keyed)?;
+        if raise {
+            changes.response.new_state = State::Exact(tip);
+        }
     }
     changes.response.new_state = za_calendar_reattach_origin(changes.response.new_state, origin);
     Ok(changes)
