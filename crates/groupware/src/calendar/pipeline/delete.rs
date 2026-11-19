@@ -446,8 +446,7 @@ pub async fn za_delete_calendar(
         // checked before the fan-out so a refusal sends no cancellation.
         // PR #90 second review C4633314510: the reserve is what the fence's
         // merge operation, added after this check, counts.
-        let reserve = ValueClass::from(PrincipalField::DefaultCalendarId).key_len_hint();
-        if batch.za_exceeds_one_chunk(reserve) {
+        if batch.za_exceeds_one_chunk(ZaChildFence::reserve()) {
             return Err(ZaPipelineError::CalendarTooLarge);
         }
     } else {
@@ -513,6 +512,19 @@ struct ZaChildFence<'x> {
 }
 
 impl<'x> ZaChildFence<'x> {
+    /// The key of the fence's merge operation (the default calendar id it
+    /// also clears). PR #90 second review RC-6: the size check's reserve is
+    /// taken from the same definition, so the two cannot drift.
+    fn operation_class() -> ValueClass {
+        PrincipalField::DefaultCalendarId.into()
+    }
+
+    /// What the merge operation adds to the builder's count, reserved by the
+    /// size check that runs before it is added.
+    fn reserve() -> usize {
+        Self::operation_class().key_len_hint()
+    }
+
     fn new(token: &'x AccessToken, calendar_id: u32, children: &[u32]) -> Self {
         let mut children = children.to_vec();
         children.sort_unstable();
@@ -565,7 +577,7 @@ impl<'x> ZaChildFence<'x> {
             .with_account_id(owner_id)
             .with_collection(Collection::Principal)
             .with_document(0)
-            .merge_fnc(PrincipalField::DefaultCalendarId, move |ids, bytes| {
+            .merge_fnc(Self::operation_class(), move |ids, bytes| {
                 if ids.change_id(owner_id, SyncCollection::Calendar) != Some(expected) {
                     lost.store(true, Ordering::Relaxed);
                     return Err(trc::StoreEvent::AssertValueFailed.into_err());

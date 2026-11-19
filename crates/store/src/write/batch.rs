@@ -1366,6 +1366,13 @@ mod za_chunk_assert_tests {
         assert!(!below.za_exceeds_one_chunk(reserve));
         below.merge_fnc(fence, |_, _| Ok(MergeResult::Skip));
         assert_eq!(below.len(), MAX_COMMIT_BYTES);
+
+        // PR #90 second review RC-5: one byte over is over, on both sides.
+        let over_by_one = batch_of(MAX_COMMIT_BYTES - reserve + 1);
+        assert!(!over_by_one.za_exceeds_one_chunk(0));
+        assert!(over_by_one.za_exceeds_one_chunk(reserve));
+        let past_cap = batch_of(MAX_COMMIT_BYTES + 1);
+        assert!(past_cap.za_exceeds_one_chunk(0));
     }
 
     const VAULT: ValueClass = ValueClass::Property(150);
