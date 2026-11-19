@@ -15,7 +15,7 @@ use crate::{
         webdav::DummyWebDavClient,
         za::{
             HookParked, delete_inbox_item, inbox_ids, item_method, open_pending_item_as,
-            wait_for_index_queue, wait_for_queue, za_post,
+            stored_event, wait_for_index_queue, wait_for_queue, write_stored_event, za_post,
         },
     },
     za::{
@@ -89,6 +89,8 @@ pub async fn test(test: &mut TestServer) {
     destroy_fence_lost_to_a_crossing_write(test, &pair).await;
     size_refusal_before_any_cancellation(test, &pair).await;
     child_moved_out_and_back_refused(test, &pair).await;
+    same_calendar_copy_refused(test, &pair).await;
+    delete_removes_every_name(test, &pair).await;
     destroy_non_empty_without_flag_refused(test, &pair).await;
     grantee_destroy_refused(test, &pair).await;
     on_success_set_is_default(test, &pair).await;
@@ -1140,6 +1142,115 @@ async fn child_moved_out_and_back_refused(test: &TestServer, pair: &Pair) {
     wait_for_queue(test).await;
     sink().clear();
     delete_new_items(test, pair, &start).await;
+}
+
+/// The parents of a stored event's names, sorted.
+async fn name_parents(test: &TestServer, owner: u32, document_id: u32) -> Vec<u32> {
+    let mut parents = stored_event(test, owner, document_id)
+        .await
+        .za_event()
+        .meta
+        .names
+        .iter()
+        .map(|name| name.parent_id)
+        .collect::<Vec<_>>();
+    parents.sort_unstable();
+    parents
+}
+
+/// Adds a second name of `document_id` under `parent_id`, at store level.
+async fn plant_name(test: &TestServer, owner: u32, document_id: u32, parent_id: u32, name: &str) {
+    let stored = stored_event(test, owner, document_id).await;
+    let mut event = stored.za_event();
+    event.meta.names.push(common::DavName {
+        name: name.into(),
+        parent_id,
+    });
+    write_stored_event(test, owner, document_id, &stored, event).await;
+}
+
+/// PR #90 second review C4633314492: a COPY of an event onto another event's
+/// name in the same calendar is refused with `no-uid-conflict`, as upstream
+/// answers an ordinary account, so no event gets two names in one calendar.
+async fn same_calendar_copy_refused(test: &TestServer, pair: &Pair) {
+    const SLUG: &str = "jmapcal-copy-same";
+    const ONE: &str = "jmapcal-cal-copy-one";
+    const TWO: &str = "jmapcal-cal-copy-two";
+    let owner = pair.key_id;
+    make_calendar(test, &pair.key, &pair.dav, SLUG).await;
+    let one = put_event(test, &pair.key, &pair.dav, SLUG, ONE, ONE).await;
+    put_event(test, &pair.key, &pair.dav, SLUG, TWO, TWO).await;
+    let before = stored_event(test, owner, one).await.meta;
+    let response = pair
+        .dav
+        .request_with_headers(
+            "COPY",
+            &format!("{HOME}{SLUG}/{ONE}.ics"),
+            [("destination", format!("{HOME}{SLUG}/{TWO}.ics").as_str())],
+            "",
+        )
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    let body = response.body.as_ref().cloned().unwrap_or_default();
+    assert!(body.contains("no-uid-conflict"), "{body}");
+    assert!(
+        stored_event(test, owner, one).await.meta.as_bytes() == before.as_bytes(),
+        "same_calendar_copy_refused: the copied event's archive changed"
+    );
+    let body = pair
+        .dav
+        .request("GET", &format!("{HOME}{SLUG}/{TWO}.ics"), "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    assert!(body.contains(&format!("UID:{TWO}")), "{body}");
+    dav_delete(pair, SLUG).await;
+}
+
+/// PR #90 second review C4633314492: a calendar's delete removes every name an
+/// event has under it. Two names under the deleted calendar (planted at store
+/// level): the event is deleted, over JMAP and over a CalDAV collection DELETE.
+/// With a third name under another calendar, the event keeps exactly that one.
+async fn delete_removes_every_name(test: &TestServer, pair: &Pair) {
+    const TWICE: &str = "jmapcal-destroy-twice";
+    const TWICE_DAV: &str = "jmapcal-destroy-twice-dav";
+    const KEPT: &str = "jmapcal-destroy-twice-kept";
+    let owner = pair.key_id;
+    for (slug, uid, over_jmap) in [
+        (TWICE, "jmapcal-cal-twice", true),
+        (TWICE_DAV, "jmapcal-cal-twice-dav", false),
+    ] {
+        let calendar = make_calendar(test, &pair.key, &pair.dav, slug).await;
+        let event = put_event(test, &pair.key, &pair.dav, slug, uid, uid).await;
+        plant_name(test, owner, event, calendar, "second.ics").await;
+        assert_eq!(name_parents(test, owner, event).await, [calendar, calendar]);
+        if over_jmap {
+            destroy(pair, &Id::from(calendar).to_string()).await;
+        } else {
+            dav_delete(pair, slug).await;
+        }
+        assert_eq!(uid_copies(test, owner, uid).await, 0, "{slug}");
+        assert!(!calendar_stored(test, owner, calendar).await, "{slug}");
+    }
+
+    let uid = "jmapcal-cal-twice-kept";
+    let calendar = make_calendar(test, &pair.key, &pair.dav, TWICE).await;
+    let kept = make_calendar(test, &pair.key, &pair.dav, KEPT).await;
+    let event = put_event(test, &pair.key, &pair.dav, TWICE, uid, uid).await;
+    plant_name(test, owner, event, calendar, "second.ics").await;
+    plant_name(test, owner, event, kept, "kept.ics").await;
+    destroy(pair, &Id::from(calendar).to_string()).await;
+    assert_eq!(uid_copies(test, owner, uid).await, 1);
+    assert_eq!(name_parents(test, owner, event).await, [kept]);
+    pair.dav
+        .request("GET", &format!("{HOME}{KEPT}/kept.ics"), "")
+        .await
+        .with_status(StatusCode::OK);
+    dav_delete(pair, KEPT).await;
+    assert_eq!(uid_copies(test, owner, uid).await, 0);
 }
 
 /// Upstream's refusal of a non-empty calendar stays, and sends nothing.

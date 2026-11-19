@@ -666,6 +666,7 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
                             cleanup,
                             context.as_ref().map(|context| &context.domain),
                             cutoff,
+                            context.is_some(),
                             batch,
                         )
                         .await?,
@@ -820,6 +821,7 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
             &ContainerCleanup::empty(Collection::CalendarEvent),
             domain,
             cutoff,
+            false,
             batch,
         )
         .await
@@ -886,6 +888,7 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
             cleanup,
             None,
             now() as i64,
+            false,
             batch,
         )
         .await
@@ -908,6 +911,7 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
         cleanup: &ContainerCleanup,
         domain: Option<&ZaKeyDomain>,
         cutoff: i64,
+        all_names: bool,
         batch: &mut BatchBuilder,
     ) -> trc::Result<Option<ZaDeleteMessage>> {
         let mut za_message = None;
@@ -918,13 +922,28 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
             .iter()
             .position(|name| name.parent_id == calendar_id)
         {
-            if self.0.inner.names.len() > 1 {
+            // PR #90 second review C4633314492: with `all_names` (a key
+            // account's collection delete) every name under the calendar goes.
+            let keeps_a_name = if all_names {
+                self.0
+                    .inner
+                    .names
+                    .iter()
+                    .any(|name| name.parent_id != calendar_id)
+            } else {
+                self.0.inner.names.len() > 1
+            };
+            if keeps_a_name {
                 // Unlink calendar id from event
                 let event = self.0;
                 let mut new_event = event
                     .deserialize::<CalendarEvent>()
                     .caused_by(trc::location!())?;
-                new_event.names.swap_remove(delete_idx);
+                if all_names {
+                    new_event.names.retain(|name| name.parent_id != calendar_id);
+                } else {
+                    new_event.names.swap_remove(delete_idx);
+                }
                 server
                     .reschedule_event_alarms(
                         account_id,

@@ -2082,7 +2082,11 @@ async fn za_copy_move_stored_event(
         .deserialize::<CalendarEventContent>()
         .caused_by(trc::location!())?;
     classify_event_storage(&content).map_err(|error| seal_error(error, owner, event_id))?;
-    if source != target || (!is_move && overwrite.is_none()) {
+    // PR #90 second review C4633314492: a COPY inside one calendar runs the
+    // UID check with or without an overwrite (403 `no-uid-conflict`, as
+    // upstream answers), so no event gets two names in one calendar; a rename
+    // (a MOVE inside one calendar) skips it, as upstream.
+    if source != target || !is_move {
         assert_is_unique_uid(
             server
                 .fetch_groupware_resources(token.account_id(), owner, SyncCollection::Calendar)
