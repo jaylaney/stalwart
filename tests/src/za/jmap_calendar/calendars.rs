@@ -942,15 +942,15 @@ async fn destroy_fence_lost_to_a_crossing_write(test: &TestServer, pair: &Pair) 
     assert!(calendar_stored(test, owner, calendar).await);
     assert_eq!(uid_copies(test, owner, KEPT).await, 1);
 
-    // The same over CalDAV: the collection DELETE answers 503 (`Busy`; a lost
-    // assertion would answer the same, so no answer tells the two apart).
+    // The same over CalDAV: the fence's `Busy` answers a bare 503, where a lost
+    // assertion would answer 503 with `Retry-After` (`dav::request`), so the
+    // header tells the two apart (PR #90 review, fix round 2).
     let parked = {
         let name = pair.key.name().to_string();
         HookParked::start(owner, set_calendar_delete_fence_pause, async move {
             HttpRequest::with_credentials(8899, &name, STRONG)
                 .send_full(Method::DELETE, &format!("{HOME}{SLUG}/"), None, None)
                 .await
-                .status
         })
         .await
     };
@@ -963,7 +963,13 @@ async fn destroy_fence_lost_to_a_crossing_write(test: &TestServer, pair: &Pair) 
         "crossing",
     )
     .await;
-    assert_eq!(parked.finish().await, StatusCode::SERVICE_UNAVAILABLE);
+    let response = parked.finish().await;
+    assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.header("Retry-After"),
+        None,
+        "the fence's refusal answered as a lost assertion"
+    );
     assert!(calendar_stored(test, owner, calendar).await);
     assert_eq!(uid_copies(test, owner, KEPT).await, 1);
 
