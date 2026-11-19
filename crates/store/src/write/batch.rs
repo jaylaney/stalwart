@@ -1288,6 +1288,10 @@ impl BatchBuilder {
     /// builder's own count (`MAX_COMMIT_BYTES`). For a batch under
     /// `za_one_transaction` the current chunk is the whole batch.
     pub fn za_exceeds_one_chunk(&self) -> bool {
+        #[cfg(feature = "test_mode")]
+        if let Some(bytes) = crate::za_test::commit_bytes_override(self.current_account_id) {
+            return self.batch_size > bytes;
+        }
         self.batch_size > MAX_COMMIT_BYTES
     }
 

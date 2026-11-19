@@ -151,6 +151,10 @@
 //!   `store::za_test`; set it through `ForceCommitSplit`, whose drop clears
 //!   it, so a test that panics while it is set does not leave every later
 //!   batch splitting.
+//! - `COMMIT_BYTES_OVERRIDE` (PR #90 review): the byte count a named
+//!   account's key calendar delete is refused above, in place of the store's
+//!   5,000,000. Defined in `store::za_test`; set it through
+//!   `CommitBytesOverride`, whose drop clears it.
 //! - `SECOND_CHUNK_FAIL_ONCE` (iMIP spec 8.2): `Store::write_batch` fails a
 //!   batch whose current account is the named account before its second
 //!   commit chunk, after the first is written; one-shot. Defined in
@@ -189,6 +193,24 @@ impl ForceCommitSplit {
 impl Drop for ForceCommitSplit {
     fn drop(&mut self) {
         store::za_test::set_force_commit_split(None);
+    }
+}
+
+/// Sets `COMMIT_BYTES_OVERRIDE` (`store::za_test`) to `bytes` for
+/// `account_id`'s batches for the guard's lifetime; the drop clears it.
+#[must_use = "dropping the guard clears COMMIT_BYTES_OVERRIDE"]
+pub struct CommitBytesOverride(());
+
+impl CommitBytesOverride {
+    pub fn new(account_id: u32, bytes: usize) -> Self {
+        store::za_test::set_commit_bytes_override(Some((account_id, bytes)));
+        CommitBytesOverride(())
+    }
+}
+
+impl Drop for CommitBytesOverride {
+    fn drop(&mut self) {
+        store::za_test::set_commit_bytes_override(None);
     }
 }
 

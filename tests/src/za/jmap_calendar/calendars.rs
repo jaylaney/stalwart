@@ -31,8 +31,8 @@ use calcard::icalendar::ICalendarMethod;
 use common::za::{
     imip::ZA_IMIP_DROPPED,
     test_hooks::{
-        ForceCommitSplit, set_calendar_delete_fence_pause, set_delete_commit_fail_once,
-        set_fan_out_pause, set_second_chunk_fail_once,
+        CommitBytesOverride, ForceCommitSplit, set_calendar_delete_fence_pause,
+        set_delete_commit_fail_once, set_fan_out_pause, set_second_chunk_fail_once,
     },
 };
 use groupware::calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences, Timezone};
@@ -61,6 +61,8 @@ const SHARE_TEXT: &str = "Calendar sharing is managed on the account page.";
 const INCOMPLETE: &str = "The server could not complete this change, try again.";
 const NOT_ALLOWED: &str = "You are not allowed to modify this calendar.";
 const MODIFIED: &str = "Another process modified this calendar, please try again.";
+const TOO_MANY: &str =
+    "This calendar holds too many events to delete at once. Delete some of its events first.";
 /// The fixed reason of `Calendar/set`'s store-failure trace (`calendar/set/za.rs`).
 const FAILURE_REASON: &str = "zero-access: calendar write failed";
 /// The delete-commit hook's own details: an inert canary that the original
@@ -84,6 +86,7 @@ pub async fn test(test: &mut TestServer) {
     destroy_is_one_transaction(test, &pair).await;
     destroy_fenced_against_a_concurrent_create(test, &pair).await;
     destroy_fence_lost_to_a_crossing_write(test, &pair).await;
+    size_refusal_before_any_cancellation(test, &pair).await;
     destroy_non_empty_without_flag_refused(test, &pair).await;
     grantee_destroy_refused(test, &pair).await;
     on_success_set_is_default(test, &pair).await;
@@ -977,6 +980,66 @@ async fn destroy_fence_lost_to_a_crossing_write(test: &TestServer, pair: &Pair) 
     }
     destroy(pair, &calendar_id).await;
     assert_eq!(uid_copies(test, owner, KEPT).await, 0);
+}
+
+/// PR #90 review, fix round 1 (F4): a key calendar's delete past the size cap
+/// is refused before the fan-out, on both protocols: no cancellation item for
+/// the key attendee, nothing at the sink and no mail guard armed (no dropped
+/// trace). With the cap back the same delete succeeds.
+async fn size_refusal_before_any_cancellation(test: &TestServer, pair: &Pair) {
+    const SLUG: &str = "jmapcal-destroy-large";
+    const UID: &str = "jmapcal-cal-large";
+    let owner = pair.key_id;
+    let start = inbox_ids(test, pair.key2_id).await;
+    let calendar = make_calendar(test, &pair.key, &pair.dav, SLUG).await;
+    let calendar_id = Id::from(calendar).to_string();
+    put_invite(pair, SLUG, UID).await;
+    wait_for_queue(test).await;
+    sink().clear();
+    let before = inbox_ids(test, pair.key2_id).await;
+
+    let traced = Traced::start(&[EventType::Calendar(CalendarEvent::ItipMessageError)]);
+    let cap = CommitBytesOverride::new(owner, 1);
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "destroy": [&calendar_id], "onDestroyRemoveEvents": true }),
+    )
+    .await;
+    let response = HttpRequest::with_credentials(8899, pair.key.name(), STRONG)
+        .send_full(Method::DELETE, &format!("{HOME}{SLUG}/"), None, None)
+        .await;
+    drop(cap);
+    assert_eq!(
+        set_error(reply.not_destroyed(&calendar_id)),
+        ("forbidden", Some(TOO_MANY)),
+        "{reply:?}"
+    );
+    assert_eq!(response.status, StatusCode::FORBIDDEN);
+    assert!(calendar_stored(test, owner, calendar).await);
+    assert_eq!(uid_copies(test, owner, UID).await, 1);
+    assert_eq!(
+        inbox_ids(test, pair.key2_id).await,
+        before,
+        "a cancellation reached key2"
+    );
+    wait_for_queue(test).await;
+    assert!(sink().messages().is_empty(), "mail after a refused destroy");
+    assert!(
+        !traced
+            .finish()
+            .await
+            .iter()
+            .any(|event| event.details == ZA_IMIP_DROPPED
+                && event.account_id == Some(owner as u64)),
+        "a mail guard was armed"
+    );
+
+    destroy(pair, &calendar_id).await;
+    assert_eq!(uid_copies(test, owner, UID).await, 0);
+    wait_for_queue(test).await;
+    sink().clear();
+    delete_new_items(test, pair, &start).await;
 }
 
 /// Upstream's refusal of a non-empty calendar stays, and sends nothing.

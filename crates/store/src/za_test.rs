@@ -42,6 +42,10 @@
 //!   count): an index pass splits between its term merges only when it holds
 //!   more than 1000 of them, as a document with more than 1000 distinct terms
 //!   does.
+//! - `COMMIT_BYTES_OVERRIDE` (PR #90 review): the byte count
+//!   `BatchBuilder::za_exceeds_one_chunk` compares a named account's batch
+//!   with, in place of `MAX_COMMIT_BYTES`, so a fixture-sized key calendar
+//!   delete meets the size refusal. Set it through `CommitBytesOverride`.
 //! - `SECOND_CHUNK_FAIL_ONCE` (iMIP spec 5.4, 8.2): `Store::write_batch`
 //!   fails a batch before its second commit chunk, after its first chunk is
 //!   written, when the batch's current account is the named account; one
@@ -130,6 +134,29 @@ pub fn force_commit_split(account_id: Option<u32>) -> bool {
     match *FORCE_COMMIT_SPLIT.lock().unwrap_or_else(|e| e.into_inner()) {
         Some(forced) => account_id.is_none_or(|account_id| account_id == forced),
         None => false,
+    }
+}
+
+/// PR #90 review: while it names an account, `za_exceeds_one_chunk` compares
+/// a batch whose current account is that account with this byte count in
+/// place of `MAX_COMMIT_BYTES` (the product constant is unchanged). Set it
+/// through `common::za::test_hooks::CommitBytesOverride`.
+pub static COMMIT_BYTES_OVERRIDE: Mutex<Option<(u32, usize)>> = Mutex::new(None);
+
+pub fn set_commit_bytes_override(value: Option<(u32, usize)>) {
+    *COMMIT_BYTES_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = value;
+}
+
+/// The overridden byte count of a batch whose current account is `account_id`.
+pub fn commit_bytes_override(account_id: Option<u32>) -> Option<usize> {
+    match *COMMIT_BYTES_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        Some((named, bytes)) if account_id == Some(named) => Some(bytes),
+        _ => None,
     }
 }
 
