@@ -1848,9 +1848,43 @@ impl<T: Send + 'static> HookParked<T> {
         self.pause.release.notify_one();
         self.handle.take().unwrap().await.unwrap()
     }
+
+    /// Arms a later pause point of the same request (`set`, keyed by
+    /// `account_id`), releases this one and waits up to `limit` for the
+    /// request to reach the later one. The returned guard releases the
+    /// request and clears the slot when dropped, also on a failed assertion.
+    pub async fn relay(
+        &self,
+        account_id: u32,
+        set: fn(Option<Arc<HookPause>>),
+        limit: Duration,
+    ) -> RelayedPause {
+        let pause = Arc::new(HookPause::new(account_id));
+        set(Some(pause.clone()));
+        let relayed = RelayedPause { pause, clear: set };
+        self.pause.release.notify_one();
+        tokio::time::timeout(limit, relayed.pause.arrived.notified())
+            .await
+            .expect("the request did not reach the later pause point");
+        relayed
+    }
 }
 
 impl<T> Drop for HookParked<T> {
+    fn drop(&mut self) {
+        (self.clear)(None);
+        self.pause.release.notify_one();
+    }
+}
+
+/// A later pause point a `HookParked` request reached (`HookParked::relay`).
+/// Dropping it clears the slot and releases the request.
+pub struct RelayedPause {
+    pause: Arc<HookPause>,
+    clear: fn(Option<Arc<HookPause>>),
+}
+
+impl Drop for RelayedPause {
     fn drop(&mut self) {
         (self.clear)(None);
         self.pause.release.notify_one();

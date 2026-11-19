@@ -31,7 +31,7 @@ use calcard::icalendar::ICalendarMethod;
 use common::za::{
     imip::ZA_IMIP_DROPPED,
     test_hooks::{
-        CommitBytesOverride, ForceCommitSplit, Pause, set_calendar_delete_built_pause,
+        CommitBytesOverride, ForceCommitSplit, set_calendar_delete_built_pause,
         set_calendar_delete_fence_pause, set_commit_pause, set_delete_commit_fail_once,
         set_fan_out_pause, set_second_chunk_fail_once,
     },
@@ -43,7 +43,7 @@ use groupware::{
 use hyper::{Method, StatusCode};
 use jmap_proto::types::state::State;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use store::{
     ValueKey,
     write::{Archive, ArchiveBytes, BatchBuilder, ValueClass},
@@ -95,6 +95,7 @@ pub async fn test(test: &mut TestServer) {
     same_calendar_copy_refused(test, &pair).await;
     delete_removes_every_name(test, &pair).await;
     delete_reaches_a_shadowed_document(test, &pair).await;
+    remove_events_flag_sees_a_hidden_document(test, &pair).await;
     destroy_non_empty_without_flag_refused(test, &pair).await;
     grantee_destroy_refused(test, &pair).await;
     on_success_set_is_default(test, &pair).await;
@@ -1085,11 +1086,9 @@ async fn child_moved_out_and_back_refused(test: &TestServer, pair: &Pair) {
         )
     };
 
-    let fan_out = Arc::new(Pause::new(pair.key2_id));
-    set_fan_out_pause(Some(fan_out.clone()));
-    let handle = {
+    let parked = {
         let (key, x, a_id) = (pair.key.clone(), x.clone(), a_id.clone());
-        tokio::spawn(async move {
+        HookParked::start(pair.key2_id, set_fan_out_pause, async move {
             calendar_set(
                 &key,
                 &key,
@@ -1097,30 +1096,29 @@ async fn child_moved_out_and_back_refused(test: &TestServer, pair: &Pair) {
             )
             .await
         })
-    };
-    tokio::time::timeout(Duration::from_secs(5), fan_out.arrived.notified())
         .await
-        .expect("X's destroy did not reach its fan-out");
+    };
     let (from, to) = moved(A, B);
     pair.dav
         .request_with_headers("MOVE", &from, [("destination", to.as_str())], "")
         .await
         .with_status(StatusCode::CREATED);
-    let built = Arc::new(Pause::new(owner));
-    set_calendar_delete_built_pause(Some(built.clone()));
-    fan_out.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), built.arrived.notified())
-        .await
-        .expect("A's destroy did not reach the end of its build");
+    // The rest of X's destroy (its comparison, commit and mail) and A's build:
+    // longer than reaching a pause, so a loaded host gets 30 seconds.
+    let built = parked
+        .relay(
+            owner,
+            set_calendar_delete_built_pause,
+            Duration::from_secs(30),
+        )
+        .await;
     let (from, to) = moved(B, A);
     pair.dav
         .request_with_headers("MOVE", &from, [("destination", to.as_str())], "")
         .await
         .with_status(StatusCode::CREATED);
-    built.release.notify_one();
-    let reply = handle.await.unwrap();
-    set_fan_out_pause(None);
-    set_calendar_delete_built_pause(None);
+    drop(built);
+    let reply = parked.finish().await;
 
     assert_eq!(
         reply.destroyed().collect::<Vec<_>>(),
@@ -1328,6 +1326,78 @@ async fn delete_reaches_a_shadowed_document(test: &TestServer, pair: &Pair) {
         }
         assert!(!calendar_stored(test, owner, calendar).await, "{slug}");
     }
+}
+
+/// PR #90 second review RC-1: `onDestroyRemoveEvents` is decided from the
+/// members the delete removes. Two documents at one href, then a CalDAV DELETE
+/// of the href, which removes the document the path index lists: the other is
+/// hidden from the index. A destroy without the flag answers
+/// `calendarHasEvent` and keeps the calendar and the event; with the flag both go.
+async fn remove_events_flag_sees_a_hidden_document(test: &TestServer, pair: &Pair) {
+    const SLUG: &str = "jmapcal-destroy-hidden";
+    const UIDS: [&str; 2] = ["jmapcal-cal-hidden-1", "jmapcal-cal-hidden-2"];
+    let owner = pair.key_id;
+    let calendar = make_calendar(test, &pair.key, &pair.dav, SLUG).await;
+    let calendar_id = Id::from(calendar).to_string();
+    let href = format!("{HOME}{SLUG}/hidden.ics");
+    let parked = HookParked::start(
+        owner,
+        set_commit_pause,
+        put(
+            pair.key.name(),
+            STRONG,
+            href.clone(),
+            event_ics(UIDS[0], UIDS[0]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        put(
+            pair.key.name(),
+            STRONG,
+            href.clone(),
+            event_ics(UIDS[1], UIDS[1])
+        )
+        .await,
+        StatusCode::CREATED.as_u16()
+    );
+    assert_eq!(parked.finish().await, StatusCode::CREATED.as_u16());
+    pair.dav
+        .request_with_headers("DELETE", &href, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let mut remaining = Vec::new();
+    for uid in UIDS {
+        if uid_copies(test, owner, uid).await == 1 {
+            remaining.push(uid);
+        }
+    }
+    let [hidden] = remaining[..] else {
+        panic!("expected one remaining document: {remaining:?}");
+    };
+    let resources = test
+        .server
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    assert_eq!(
+        resources.children_ids(calendar).count(),
+        0,
+        "the path index lists the remaining document"
+    );
+
+    let reply = calendar_set(&pair.key, &pair.key, json!({ "destroy": [&calendar_id] })).await;
+    assert_eq!(
+        set_error(reply.not_destroyed(&calendar_id)).0,
+        "calendarHasEvent",
+        "{reply:?}"
+    );
+    assert!(calendar_stored(test, owner, calendar).await);
+    assert_eq!(uid_copies(test, owner, hidden).await, 1);
+
+    destroy(pair, &calendar_id).await;
+    assert!(!calendar_stored(test, owner, calendar).await);
+    assert_eq!(uid_copies(test, owner, hidden).await, 0);
 }
 
 /// Upstream's refusal of a non-empty calendar stays, and sends nothing.
