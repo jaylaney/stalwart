@@ -45,19 +45,25 @@ reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not 
 - A grantee does not find, by text search, an event of a shared key calendar whose details it
   cannot read.
 - Deleting a key account's calendar is all-or-nothing on RocksDB, SQLite, PostgreSQL and MySQL:
-  the calendar and its events go in one transaction. A calendar too large for one transaction is
+  the calendar and its events go in one transaction (the store behaviour this relies on is
+  pinned by a test on RocksDB and SQLite; for PostgreSQL and MySQL it was read, not run). A
+  calendar too large for one transaction is
   refused before any cancellation is sent (JMAP `forbidden`, CalDAV 403; delete some events
   first), and a delete that meets a concurrent calendar write answers "try again". FoundationDB
   and read replicas keep the earlier, chunked delete.
 - A person a calendar is shared with can no longer delete or change, through JMAP, an event whose
   details are private to its owner.
 - A sharing change (a grant or a rename) no longer leaves a grantee's client unable to sync
-  events.
+  events when it takes its state from `CalendarEvent/get` or `/query`, or syncs in one page or
+  from an exact state; a paged sync from the initial state still ends below the boundary and must
+  restart.
 - One refused attachment link no longer fails the call's other occurrence edits of the same event.
 - Pending invitations are imported only by a sign-in whose scope covers calendars (and by
   password clients), on CalDAV and JMAP.
 - A revoked browser sign-in stops being served at once, even while its token record is being
-  cleaned up, and a keyed cache entry no longer outlives its token.
+  cleaned up, and the fork's key lookup no longer extends a keyed cache entry's life past its
+  token (upstream's own skew remains: the time from the decode to the cache deadline, plus under
+  a second).
 - `decode_access_token` strips a `~` suffix from every token that begins with the server's token
   header, for every account (D26). A shared calendar's colour is carried in each principal's
   sealed personal bundle (D14); a binary built before release 6 cannot read a coloured one, so

@@ -5,15 +5,20 @@ Date: 2026-11-13. Status: revision 7, with one wording correction of
 of calendars checks without it; follow-up issue #91), and with the
 changes of 2026-11-18 that follow the pull request's review. Decided by
 the project owner on 2026-11-18: 3.3 (an attendee's create sends no
-reply), 5.3 and 6.7 (a key calendar's delete in one transaction, its size
-refusal and its fence), 5.5 (the drain only within the token's scope), 6.5
-(a refused attachment link fails only its own occurrence) and section 10
-(the `code` masking confirmed; the amendments of the drain's and the
-search pass's triggers and of release 5's chunked collection `DELETE`).
-The controller's rulings on confirmed findings of that review: 3.3 and
-6.5 (a non-member held to an event's effective privacy), 6.8 (the event
-state of a caller who is not the owner) and section 10 (invariant 72's
-sentence on a key lookup that outlasted its token, and the costs).
+reply), 5.3 and 6.7 (a key calendar's delete in one transaction on both
+protocols, its refusal above 5,000,000 bytes before any cancellation, and
+its fence), 5.5 (the drain only within the token's scope), 6.5 (a refused
+attachment link fails only its own occurrence) and section 10 (the `code`
+masking confirmed; the amendments of the drain's and the search pass's
+triggers and of release 5's chunked collection `DELETE`). The
+controller's rulings on confirmed findings of that review: 3.3 and 6.5 (a
+non-member held to an event's effective privacy), 5.3 and two section 10
+amendment sentences, each put to the owner (FoundationDB, a read replica and the ephemeral
+store keep the chunked delete; the fence's refusal after the
+cancellations accepted as a residual; a `Blob` call still triggers the
+search pass for a token without the mail scope), 6.8 (the event state of
+a caller who is not the owner) and section 10 (invariant 72's sentence
+on a key lookup that outlasted its token, and the costs).
 Revision 7 incorporates Jay's
 approved [D29 amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md),
 recorded 2026-11-15: key-calendar continuations carry their original sync
@@ -125,8 +130,9 @@ a web client needs from the server".
 - **Scheduling from JMAP.** Invitations, replies and cancellations written
   through JMAP go through the fan-out and the iMIP submitter, never the
   task queue (5.4).
-- **Pending invitations.** A keyed JMAP request that holds a calendar
-  method runs the drain (5.5).
+- **Pending invitations.** A keyed JMAP request whose token's scope
+  admits calendars, and that holds a calendar call that parsed with its
+  capability in the scope-filtered `using`, runs the drain (5.5).
 - **The session and principal objects** advertise the calendar capability
   for key accounts (6.10).
 
@@ -335,13 +341,17 @@ Accepted, each because the CalDAV behaviour is the qualified one:
   schedule later edits. Upstream's JMAP create falls back to the
   attendee's reply; CalDAV's create does not, and the pipeline's create
   is CalDAV's (D1). Decided by the project owner on 2026-11-18.
+
+A difference in which JMAP is the stricter side, by the controller's
+ruling on the pull request's review:
+
 - **A non-member is held to an event's effective privacy.** For a
   caller who is not a member of the account, JMAP applies the higher of
   the stored flags' privacy and the unsealed event's to reads, the text
   query, destroy and update, and answers `notFound` for an event whose
   view does not open for the caller (6.3, 6.4, 6.5). CalDAV applies the
   stored flags, which a non-standard `CLASS` leaves public under field
-  policy 2, so here JMAP is the stricter side.
+  policy 2.
 
 ### 3.4 Inherited limitations, accepted
 
@@ -974,8 +984,8 @@ with its events in one transaction, on both protocols (`Calendar/set`
 destroy and a CalDAV collection `DELETE`). A delete whose batch would
 exceed the store's chunk size (5,000,000 bytes) by the builder's own
 count is refused before any cancellation is sent: `forbidden` with a
-fixed text over JMAP, 403 over CalDAV. The remedy is to delete events
-first. A write that crosses the delete makes it answer "try again"
+fixed text over JMAP (section 8), 403 over CalDAV. The remedy is to
+delete events first. A write that crosses the delete makes it answer "try again"
 (`forbidden` with the "modified" text over JMAP, 503 over CalDAV): the
 child list is compared with a snapshot no older than the account's
 Calendar change counter before the first fan-out and again immediately
@@ -985,18 +995,24 @@ reason: split at commit points, a delete whose later chunk failed left
 the calendar with part of its events and an answer that contradicted the
 store, and a create that crossed it could leave an event whose calendar
 was gone. Upstream's JMAP destroy of an ordinary account's calendar is
-one transaction too.
+one transaction too. Decided by the project owner on 2026-11-18. The
+store behaviour the fence relies on (a batch's change id allocated in the
+transaction before its merge functions run, and an error from one
+aborting it) is pinned by a test on RocksDB and SQLite; for PostgreSQL
+and MySQL it was read, not run.
 
 The fence's refusal can come after the cancellations went out: key
 attendees then hold a CANCEL for events the organizer still has, and the
 outside attendees' mail is dropped. That is the failure class every
 failed commit of this delete already had; it now has more triggers (a
 create into the calendar during the fan-out, any calendar commit of the
-account in the last window), and a retry converges. It is an accepted
-residual.
+account in the last window), and a retry converges. It is accepted as a
+residual by the controller's ruling on the pull request's review, put to
+the owner.
 
-On FoundationDB, a read replica and the ephemeral store the delete keeps
-its earlier form: chunked at the store's commit points, not fenced, with
+By the controller's ruling on the pull request's review, put to the
+owner: on FoundationDB, a read replica and the ephemeral store the delete
+keeps its earlier form: chunked at the store's commit points, not fenced, with
 no size refusal, and a later chunk that fails leaves the earlier chunks'
 deletions committed. FoundationDB's limits on a transaction's time and
 size would make the delete of a calendar of a few thousand events fail
@@ -1004,10 +1020,11 @@ on every attempt, each after its cancellations went out. A read
 replica's reads can lag the primary, so the comparison could pass on a
 stale child list. The ephemeral store applies each operation as it goes,
 with no rollback, and is the data store only in web bootstrap mode,
-where no key account exists. Issue #92 keeps what is open: very large
-calendars, the stores that keep the chunked form, an internal retry for
-the refusal after the cancellations, and a large delete's retries on
-RocksDB.
+where no key account exists. Issue #92 carries a note that this pull
+request makes the delete one transaction; after the push it is narrowed
+to what stays open: a calendar too large for one transaction, the stores
+that keep the chunked form, the fence's refusal after the cancellations,
+and a large delete retried whole on a conflicting commit.
 
 ### 5.4 Scheduling
 
@@ -1392,7 +1409,8 @@ checks. No stored layout, database field, secret, setting or client code
 is added. Reference-client qualification remains a separate gate.
 
 **The event state of a caller who is not the owner.** Upstream's event
-state is the last item change of the log. A grant and a rename are
+state follows the log's item changes: the last one, or, after a snapshot
+rebuild, the log's tip. A grant and a rename are
 container changes, so that state can lie at or below a sharing boundary,
 and a grantee given it would be refused at its next call until an event
 changed. For a caller who is not the owner of a key account:
@@ -1408,16 +1426,34 @@ changed. For a caller who is not the owner of a key account:
   Otherwise it ends at its last item change, and the next call sends
   what follows.
 - A continuation of an initial-origin paged sync ends where upstream ends
-  it. D29 exempts its pages from the boundary check, so its final state,
-  below a grant that completed while it paged, is what makes the next
-  call restart.
+  it, at the range's last event change. D29 exempts its pages from the
+  boundary check, and a `z` state carries no tip of its first page, so a
+  boundary that completed while the sync paged cannot be told from one
+  that completed before it began. Raising over the first kind would hide
+  a newly shared calendar's events, which the next call's refusal and
+  restart deliver, so neither kind is raised.
 
 The state therefore also moves on a container-only change, and a poll
 then returns empty lists. An owner's and an ordinary account's states
-are unchanged. One case stays open: an initial-origin paged sync crossed
-by a grant and then by a later event change ends above the grant, as it
-did before, since a `z` state does not carry the first page's tip; a
-follow-up is proposed to the project owner.
+are unchanged. Three cases stay open:
+
+- (a) A paged sync from the initial state ends below any sharing
+  boundary above its last event change, whether the boundary completed
+  while it paged or before it began; its next call is refused, and a
+  restart that pages from the initial state again ends at the same state,
+  until an event is written, the client syncs in one page, or it takes
+  its state from `/get` or `/query`. A client that follows the protocol
+  holds the state `/get` gave it and does not enter this flow. This is
+  the cost the controller's ruling accepted.
+- (b) Such a sync crossed by a grant and then by a later event change
+  ends above the grant on upstream's own final state, before and after
+  this round.
+- (c) A grant that commits between a call's boundary check and its read
+  of the tip leaves the raised state of an exact request above the grant;
+  this is new with the raise, and reading the tip before the check would
+  close it.
+
+(b) and (c) are proposed to the project owner as one follow-up.
 
 ### 6.9 `ParticipantIdentity`
 
@@ -1501,6 +1537,8 @@ The pipeline's neutral errors map to JMAP as follows.
 | `sendSchedulingMessages` is true and the account may not send | set error `forbidden` with upstream's reason, from the pipeline, before any write (D18) |
 | More recipients than the cap, or a scheduling error CalDAV refuses the write for | set error `invalidProperties` on `participants`, with upstream's description |
 | The UID lease is busy, a create lost its fence, or a commit failed its assertion after the retry | set error `forbidden` with upstream's "modified by another process, try again" description, as upstream's `reject_uncommitted` gives |
+| A calendar delete whose one transaction would exceed the store's chunk size (5.3) | set error `forbidden` with the fixed description below, before any cancellation; CalDAV answers 403 |
+| A calendar delete crossed by a write to the account's calendars (5.3) | set error `forbidden` with "Another process modified this calendar, please try again."; CalDAV answers 503 |
 | Quota | upstream's `overQuota`, from upstream's pre-check or from the commit |
 | A keyless token, an impersonation, a caller the access check admits without keys of its own | method error `forbidden` (6.1) |
 | A caller with no access to the account | upstream's `accountNotFound`, from the method's access check (6.1) |
@@ -1513,6 +1551,8 @@ Fixed descriptions, where upstream's own check does not answer first:
 
 - a store error on an object (D28): "The server could not complete this
   change, try again."
+- a calendar too large to delete at once (5.3): "This calendar holds
+  too many events to delete at once. Delete some of its events first."
 - `shareWith`: "Calendar sharing is managed on the account page."
 - `isDraft: true`: "Drafts are not available for zero-access accounts."
 - a participant-visibility flag set true: "This property is not
@@ -1852,13 +1892,16 @@ Amendments:
 - **Search spec 5.2**, the JMAP trigger: the pass runs before dispatch
   only when a call that triggers it parsed and its capability is in
   `using` as the token's scope filtered it. A `Blob` call is such a call
-  for every scope that carries the blob capability. The pass after a
-  committed message write is unchanged.
+  for every scope that carries the blob capability, so a token without
+  the mail scope still triggers the pass through it (accepted by the
+  controller's ruling on the pull request's review, put to the owner).
+  The pass after a committed message write is unchanged.
 - **Release 5, iMIP spec 5.4**: the recorded residual of a collection
   `DELETE` whose commit fails in a later chunk no longer occurs for a key
   account on RocksDB, SQLite, PostgreSQL or MySQL, where the delete is
   one transaction (5.3). It stays on FoundationDB, a read replica and
-  the ephemeral store.
+  the ephemeral store, by the controller's ruling on the pull request's
+  review, put to the owner.
 - **The rule that ordinary accounts take upstream's paths unchanged**
   (release 1 section 12) gains three exceptions. All apply to every
   account, ordinary ones included. `decode_access_token` strips a `~`
