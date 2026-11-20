@@ -517,6 +517,22 @@ mod tests {
         SessionKeys::new(4, 1, Secret::random())
     }
 
+    /// Among several entries the account's own is found, else the first, and
+    /// an empty list has none.
+    #[test]
+    fn owner_index_among_several_entries() {
+        let mut calendar = calendar();
+        calendar.preferences.push(CalendarPreferences {
+            account_id: 9,
+            ..Default::default()
+        });
+        assert_eq!(owner_index(&calendar, 9), Some(1));
+        assert_eq!(owner_index(&calendar, 4), Some(0));
+        assert_eq!(owner_index(&calendar, 11), Some(0));
+        calendar.preferences.clear();
+        assert_eq!(owner_index(&calendar, 4), None);
+    }
+
     fn archive(calendar: &Calendar) -> Archive<ArchiveBytes> {
         let bytes = Archiver::new(calendar.clone()).serialize().unwrap();
         <Archive<ArchiveBytes> as store::Deserialize>::deserialize(&bytes).unwrap()

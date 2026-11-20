@@ -469,6 +469,19 @@ pub fn fingerprint(key: &[u8; 32], value: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
 
+    /// A key error names its kind only.
+    #[test]
+    fn key_errors_name_their_kind_only() {
+        for (error, text) in [
+            (KeyError::Argon2, "key derivation failed"),
+            (KeyError::Length, "invalid ciphertext length"),
+            (KeyError::Aead, "authentication failed"),
+            (KeyError::PublicKey, "invalid public key"),
+        ] {
+            assert_eq!(error.to_string(), text);
+        }
+    }
+
     const SALT: [u8; 16] = [7u8; 16];
 
     #[test]

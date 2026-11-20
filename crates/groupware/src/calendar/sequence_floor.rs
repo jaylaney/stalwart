@@ -393,6 +393,26 @@ mod tests {
         (committed, messages)
     }
 
+    /// An override's RECURRENCE-ID keeps its instance through a parameter
+    /// other than TZID and RANGE; one that is not a date names no instance,
+    /// so its component reads as the master's.
+    #[test]
+    fn instance_keys_of_odd_recurrence_ids() {
+        let ical = calendar(
+            None,
+            &[
+                by_alice(None, Some(0)),
+                by_alice(Some(";X-JMAPCAL=1:20990302T100000Z"), Some(0)),
+                by_alice(Some(";VALUE=TEXT:not-a-date"), Some(0)),
+            ],
+        );
+        let keys = za_instance_keys(&ical)
+            .into_iter()
+            .map(|(_, instance)| instance)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, [MASTER, Q, MASTER]);
+    }
+
     fn component(ical: &ICalendar, key: InstanceKey) -> Option<&ICalendarComponent> {
         za_instance_keys(ical)
             .into_iter()
