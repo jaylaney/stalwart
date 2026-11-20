@@ -33,13 +33,16 @@ calendar delete's members, every name removed, the unwritten-child
 refusal and the size check's reserve), section 8 and section 10 (the
 costs). The changes of 2026-11-20, which follow the pull request's third
 review and a second whole-branch review, are these: decided by the
-project owner on 2026-11-20, 6.8 (a non-owner's `destroyed` ids, inherited and
-accepted, with a pointer in 3.4; D15 a sync-correctness rule, not an
-access control); and the controller's rulings, reported to the owner,
-4.3 (the access entry a write adds is never the one removed), 3.4 (an
-alert-only or keyword-only update takes the round trip), 5.3, 6.7 and
+project owner on 2026-11-20, 6.8 (a non-owner's `destroyed` ids,
+inherited and accepted; D15 a sync-correctness rule, not an access
+control); the controller's rulings, reported to the owner, 4.3 (the
+access entry a write adds is never the one removed), 5.3, 6.7 and
 section 10 (the owner's destroy check made only without
-`onDestroyRemoveEvents`, stopping at the first member; the costs).
+`onDestroyRemoveEvents`, stopping at the first member; the costs); and,
+as documentation, a pointer in 3.4 to the `destroyed` ids and 3.3's
+statement that an alert-only or keyword-only JMAP update of a key
+account's event takes the converter's round trip, an item still open
+for the owner.
 Revision 7 incorporates Jay's
 approved [D29 amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md),
 recorded 2026-11-15: key-calendar continuations carry their original sync
@@ -354,7 +357,11 @@ Accepted, each because the CalDAV behaviour is the qualified one:
 - **Destroying a calendar sends cancellations** for its events, as a
   CalDAV collection `DELETE` does (D16).
 - **No drafts, no per-user event data, no participant-visibility flags**
-  (6.5).
+  (6.5). Because a key account's event holds no per-user data (D10),
+  every JMAP update of it, an alert-only or keyword-only one included,
+  stores the tree the converter produces, where upstream keeps the
+  stored tree for a per-user-only change, so 3.4's round-trip limitation
+  applies to those updates too.
 - **Default alerts are applied by value** (D11).
 - **An attendee's create sends no reply.** An attendee who creates, as
   its own copy, the event of an invitation that has not reached the
@@ -384,13 +391,11 @@ ruling on the pull request's review:
   through CalDAV is scheduled from that edit on, as upstream does for an
   ordinary account.
 - Upstream's JSCalendar conversion decides what survives a round trip
-  between the two protocols. Because a key account's event holds no
-  per-user data (D10), every JMAP update of it, an alert-only or
-  keyword-only one included, stores the tree the converter produces, so
-  this limitation applies to those updates too.
+  between the two protocols (for a key account's alert-only and
+  keyword-only updates too, 3.3).
 - A caller who is not the owner receives in `destroyed` the ids of the
-  owner's events outside its shared calendars (6.8); accepted by the
-  project owner on 2026-11-20.
+  owner's events it may not see (6.8); accepted by the project owner on
+  2026-11-20.
 - JMAP does not check a calendar's supported component set
   (`supported-calendar-component-set`), for any account. CalDAV does, on
   a `PUT` and on the target of a `COPY` or `MOVE`. A JMAP write can
@@ -1089,8 +1094,9 @@ that this pull request makes the delete one transaction, and a note
 added on 2026-11-19, after the push, of what it keeps: a calendar too
 large for one transaction, the stores that keep the chunked form, the
 fence's refusal after the cancellations, a large delete retried whole
-on a conflicting commit, and PostgreSQL and MySQL read, not run. Its
-title and body were not edited.
+on a conflicting commit, and PostgreSQL and MySQL read, not run, and a
+comment of 2026-11-20 on a default-calendar id written across a
+concurrent delete. Its title and body were not edited.
 
 ### 5.4 Scheduling
 
@@ -1423,8 +1429,9 @@ The change log is keyless and is served as upstream serves it, with
 upstream's filtering for a grantee. The event state given to a caller
 who is not the owner of a key account is the exception (below). A
 caller who is not the owner receives, as upstream gives them, the ids
-of the owner's events outside its shared calendars in `destroyed` when
-those events change or are deleted: ids only. This is inherited
+of the owner's events it may not see (those outside its shared
+calendars and confidential ones inside them) in `destroyed` when those
+events change or are deleted: ids only. This is inherited
 behaviour, accepted by the project owner on 2026-11-20.
 
 **D15.** For a grantee, a `sinceState` at or before the sync boundary of
@@ -2025,15 +2032,18 @@ Amendments:
   every-name removal, the size check's reserve and the keyed entry's
   lowering are on key-account paths, and the keyed `COPY`'s condition is
   in the fork's keyed handler. For a key account a calendar delete reads
-  the members with in-memory passes over the account's event records,
-  with no store read: three on a fenced store (the build and the two
+  the members with in-memory passes over the account's event records;
+  the passes read no store, though each of the two comparisons first
+  reads the calendar change counter and takes a snapshot at that tip.
+  There are three passes on a fenced store (the build and the two
   comparisons), for a CalDAV collection `DELETE` and for the owner's
   JMAP destroy with `onDestroyRemoveEvents`; the owner's JMAP destroy
   without the flag first checks for a member, stopping at the first, so
   it is refused after at most one pass when the calendar holds an event
   and makes four passes when it holds none; on the stores that keep the
   chunked form one (the build), or two for that destroy without the
-  flag. It adds one more token open per keyed cache miss; a keyed entry
+  flag. The second review's keyed-entry bound adds one more token open
+  per keyed cache miss; a keyed entry
   ends up to two seconds before its token, and with one whole second
   left nothing is
   published, so a keyed request in that window is verified in full and
