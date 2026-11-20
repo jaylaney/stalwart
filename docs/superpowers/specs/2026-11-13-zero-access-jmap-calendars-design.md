@@ -507,7 +507,8 @@ keyed grant. It holds:
     boundary as reconciliation: an entry lives while its expiry is after
     the write's time).
 
-An entry's expiry is computed when the entry is written. On a retried
+An entry's expiry is computed in the request that writes the entry,
+before its store reads. On a retried
 refresh the next generation's entry can therefore carry an expiry later
 than its token's, by the retry's delay. The token's own expiry and the
 sweep bound it. Two residuals of the rule that an expired access entry

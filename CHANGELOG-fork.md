@@ -73,9 +73,9 @@ reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not 
   deadline).
 - At a sign-in's cap of four keyed access tokens, a refresh no longer drops the access token it
   has just issued when that token expires before the stored ones (a lowered token lifetime, or
-  node clocks that differ); it drops the earliest-expiring older one. An access token that has
-  already expired when its entry is written gets no entry and drops none, so the live ones
-  keep opening; the refresh token is still written, so the client can refresh again.
+  node clocks that differ); it drops the earliest-expiring older one. An access entry whose
+  expiry has passed when it is written is not stored and drops none, so the live ones keep
+  opening; the refresh entry is still written, so the client can refresh again.
 - An owner's calendar destroy with `onDestroyRemoveEvents` no longer reads the calendar's
   members for the emptiness check, and without the flag the check stops at the first event it
   finds.
