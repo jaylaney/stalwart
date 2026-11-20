@@ -21,10 +21,12 @@ sentences (FoundationDB, a read replica and the ephemeral store keep the
 chunked delete; the fence's refusal after the cancellations accepted as a
 residual; a `Blob` call still triggers the search pass for a token
 without the mail scope). The follow-up of 6.8 was filed on his word of
-2026-11-19 as issues #93 and #94. With the changes of 2026-11-19 that
-follow the pull request's second review, all of them the controller's
-rulings on confirmed findings of that review, reported to the owner
-(none was put to him as a decision): 4.6 and invariant 72 (a keyed
+2026-11-19 as issues #93 and #94. The project owner's disposition of
+2026-11-19 on what a token's scope admits on DAV (no change) is stated
+in 5.5. The changes of 2026-11-19 that follow the pull request's second
+review are all the controller's rulings on confirmed findings of that
+review, reported to the owner (none was put to him as a decision):
+4.6 and invariant 72 (a keyed
 cache entry ends before its token's signed expiry), 5.2 (a keyed CalDAV
 `COPY` inside one calendar answers `no-uid-conflict`), 5.3 and 6.7 (the
 calendar delete's members, every name removed, the unwritten-child
@@ -734,7 +736,8 @@ secret, the HTTP layer reads the record, finds the access entry by the
 secret's tag, and opens MK. It also reads the vault record and requires
 its binding to equal the record's (D19). The session keys' generation is
 the vault revision of that read. A miss costs two point reads, one HKDF
-and one AEAD open; no Argon2 runs.
+and one AEAD open, and the token is opened a second time when its cache
+entry is published (the keyed entry's deadline, below); no Argon2 runs.
 
 **D23.** If that generation is not the account's current one, the
 request is refused with 401. It is never served uncached, as a password
@@ -1060,11 +1063,13 @@ on every attempt, each after its cancellations went out. A read
 replica's reads can lag the primary, so the comparison could pass on a
 stale child list. The ephemeral store applies each operation as it goes,
 with no rollback, and is the data store only in web bootstrap mode,
-where no key account exists. Issue #92 carries a note that this pull
-request makes the delete one transaction; after the push it is narrowed
-to what stays open: a calendar too large for one transaction, the stores
-that keep the chunked form, the fence's refusal after the cancellations,
-and a large delete retried whole on a conflicting commit.
+where no key account exists. Issue #92 carries a note of 2026-11-18
+that this pull request makes the delete one transaction, and a note
+added on 2026-11-19, after the push, of what it keeps: a calendar too
+large for one transaction, the stores that keep the chunked form, the
+fence's refusal after the cancellations, a large delete retried whole
+on a conflicting commit, and PostgreSQL and MySQL read, not run. Its
+title and body were not edited.
 
 ### 5.4 Scheduling
 
@@ -1988,9 +1993,14 @@ Amendments:
   no read and no write; the member list, the unwritten-child refusal, the
   every-name removal, the size check's reserve and the keyed entry's
   lowering are on key-account paths, and the keyed `COPY`'s condition is
-  in the fork's keyed handler. For a key account it adds three in-memory
-  passes over the account's event records per calendar delete, and one
-  more token open per keyed cache miss; a keyed entry ends up to two
+  in the fork's keyed handler. For a key account it takes the member
+  list up to four times for one calendar delete, each an in-memory pass
+  over the account's event records with no store read (the owner's
+  `onDestroyRemoveEvents` check over JMAP, the build and the two
+  comparisons on a fenced store; three times for a CalDAV collection
+  `DELETE`; once or twice on the stores that keep the chunked form),
+  and one more token open per keyed cache miss; a keyed entry ends up
+  to two
   seconds before its token, and with one whole second left nothing is
   published, so a keyed request in that window is verified in full and
   charged to its address's anonymous rate limit where one is configured

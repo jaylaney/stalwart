@@ -687,10 +687,12 @@ and the names `second.ics`, `kept.ics`, `shadowed.ics` and `hidden.ics`. Wave D 
 `events` the UIDs `jmapcal-events-many-cals`, `-many-parts`, `-many-kws`, `-metadata-cap`,
 `-too-large`, `-limits`, `-quota`, `-quota-count`, `-quota-disk`, `-quota-after`, `-privacy`,
 `-failed-1`, `-failed-2` and `-unreadable`, an event titled `jmapcal generated uid` (its UID is
-generated), the keyword `jmapcal-kw`, the outside addresses `jmapcal-events-out-1` to
+generated), the keywords `jmapcal-kw` and `jmapcal-kw-{i}`, the update id
+`jmapcal-not-an-id!` (also in `calendars`), the outside addresses `jmapcal-events-out-1` to
 `-21@remote.test` (refused before any mail) and a third series under the existing
 `jmapcal-events-rec` UID; `calendars` the calendar names `jmapcal-writer-a` to `-g`, the slug
-`jmapcal-grantee-viewed` and the default-alert ids `jmapcal-t1` and `jmapcal-t2`; `sharing` the
+`jmapcal-grantee-viewed`, the default-alert ids `jmapcal-t1` and `jmapcal-t2` and the metadata
+note `jmapcal canary`; `sharing` the
 slug `jmapcal-sharing-viewed`, the UIDs `jmapcal-sharing-classified`, `-confidential`, `-public`,
 `-mine` and `-in-viewed`, the resource `jmapcal-sharing-copy.ics` and the forwarded address
 `10.0.60.12`; `tokens` the hand-off keys `p`x40 and `q`x40 (never stored); `pinning` (outside
