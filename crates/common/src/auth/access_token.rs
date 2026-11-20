@@ -41,6 +41,7 @@ use tinyvec::TinyVec;
 use trc::{AddContext, CacheEvent};
 use types::{acl::Acl, collection::Collection, type_state::DataType};
 use utils::map::bitmap::{Bitmap, BitmapItem};
+use vault::record::za_session_binding;
 use xxhash_rust::xxh3;
 
 impl Server {
@@ -169,8 +170,8 @@ impl Server {
                     }
                 }
 
-                // A marker secret is constant, so OAuth token revocation on
-                // password change must follow the vault generation instead.
+                // A marker secret is constant. OAuth tokens bind to the
+                // credentials in the vault record (release 6 spec D19).
                 if is_marker == Some(true) {
                     let read = match self.za_vault_record(account_id).await {
                         Ok(read) => read,
@@ -180,7 +181,10 @@ impl Server {
                         }
                         Err(err) => return Err(err),
                     };
-                    credential_version = read.map(|read| read.record.revision).unwrap_or(0).max(1);
+                    credential_version = read
+                        .map(|read| za_session_binding(&read.record))
+                        .unwrap_or(0)
+                        .max(1);
                 }
 
                 Ok(AccessTokenInner {

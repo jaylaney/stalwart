@@ -89,6 +89,13 @@ impl RecoveryKey {
 mod tests {
     use super::*;
 
+    /// A recovery key's `Debug` shows none of its bytes.
+    #[test]
+    fn debug_shows_no_key() {
+        let key = RecoveryKey([0x5Au8; 16]);
+        assert_eq!(format!("{key:?}"), "RecoveryKey(..)");
+    }
+
     #[test]
     fn encode_has_27_characters_in_groups_of_four() {
         let key = RecoveryKey([0x5Au8; 16]);

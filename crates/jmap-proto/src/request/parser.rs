@@ -8,9 +8,12 @@ use super::{
     Call, Request, RequestMethod,
     method::{MethodFunction, MethodName, MethodObject},
 };
-use crate::request::{
-    CopyRequestMethod, GetRequestMethod, ParseRequestMethod, QueryChangesRequestMethod,
-    QueryRequestMethod, SetRequestMethod, deserialize::DeserializeArguments,
+use crate::{
+    request::{
+        CopyRequestMethod, GetRequestMethod, ParseRequestMethod, QueryChangesRequestMethod,
+        QueryRequestMethod, SetRequestMethod, deserialize::DeserializeArguments,
+    },
+    types::state::State,
 };
 use compact_str::{CompactString, ToCompactString};
 use serde::{
@@ -27,6 +30,7 @@ use std::{
 use utils::text::utf8_lossy;
 
 const MAX_ERROR_EXCERPT: usize = 1024;
+const ZA_STATE_OUT_OF_SCOPE: &str = "This state is only valid for calendar changes.";
 
 impl<'x> Request<'x> {
     pub fn parse(json: &'x [u8], max_calls: usize, max_size: usize) -> trc::Result<Self> {
@@ -125,7 +129,7 @@ impl<'de> DeserializeSeed<'de> for MethodArguments {
     where
         D: Deserializer<'de>,
     {
-        Ok(match (self.0.fnc, self.0.obj) {
+        let method = match (self.0.fnc, self.0.obj) {
             (MethodFunction::Get, MethodObject::Email) => RequestMethod::Get(
                 GetRequestMethod::Email(Deserialize::deserialize(deserializer)?),
             ),
@@ -378,7 +382,8 @@ impl<'de> DeserializeSeed<'de> for MethodArguments {
                         .details(self.0.as_str()),
                 )
             }
-        })
+        };
+        Ok(method.za_state_in_scope(self.0))
     }
 }
 
@@ -476,12 +481,51 @@ impl RequestMethod<'_> {
         )
     }
 
+    /// Release 6 spec 6.8 (D29): `z` is read only from the normal state slots of
+    /// Calendar/changes, CalendarEvent/changes and CalendarEvent/queryChanges; any
+    /// other method answers invalidArguments. No account is read here.
+    fn za_state_in_scope(self, name: MethodName) -> Self {
+        let since = match &self {
+            RequestMethod::Changes(request) => &request.since_state,
+            RequestMethod::QueryChanges(request) => za_since_query_state(request),
+            _ => return self,
+        };
+        if matches!(since, State::ZaCalendarIntermediate { .. })
+            && !matches!(
+                (name.obj, name.fnc),
+                (
+                    MethodObject::Calendar | MethodObject::CalendarEvent,
+                    MethodFunction::Changes
+                ) | (MethodObject::CalendarEvent, MethodFunction::QueryChanges)
+            )
+        {
+            RequestMethod::invalid(ZA_STATE_OUT_OF_SCOPE)
+        } else {
+            self
+        }
+    }
+
     fn unknown(method_name: Cow<'_, str>) -> Self {
         RequestMethod::Error(
             trc::JmapEvent::UnknownMethod
                 .into_err()
                 .details(method_name.into_owned()),
         )
+    }
+}
+
+fn za_since_query_state(request: &QueryChangesRequestMethod) -> &State {
+    match request {
+        QueryChangesRequestMethod::Email(request) => &request.since_query_state,
+        QueryChangesRequestMethod::Mailbox(request) => &request.since_query_state,
+        QueryChangesRequestMethod::EmailSubmission(request) => &request.since_query_state,
+        QueryChangesRequestMethod::Principal(request) => &request.since_query_state,
+        QueryChangesRequestMethod::Quota(request) => &request.since_query_state,
+        QueryChangesRequestMethod::ContactCard(request) => &request.since_query_state,
+        QueryChangesRequestMethod::FileNode(request) => &request.since_query_state,
+        QueryChangesRequestMethod::CalendarEvent(request) => &request.since_query_state,
+        QueryChangesRequestMethod::CalendarEventNotification(request) => &request.since_query_state,
+        QueryChangesRequestMethod::ShareNotification(request) => &request.since_query_state,
     }
 }
 

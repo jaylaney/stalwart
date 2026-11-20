@@ -10,8 +10,10 @@ use crate::{
         metadata::{MetadataDocuments, MetadataType, ObjectMetadata, select_properties},
     },
     blob::embedded::{EmbeddedBlobIds, import_error},
-    calendar_event::{CalendarSyntheticId, EventMap, EventValue, is_origin},
-    changes::state::JmapCacheState,
+    calendar_event::{
+        CalendarSyntheticId, EventMap, EventValue, is_origin,
+        za_read::{ZaEventReader, za_event_state},
+    },
 };
 use calcard::{
     common::{PartialDateTime, timezone::Tz},
@@ -33,8 +35,8 @@ use common::{
 use groupware::{
     cache::GroupwareCache,
     calendar::{
-        ArchivedCalendarEventContent, CalendarEventContent, CalendarEventData, EVENT_DRAFT,
-        EVENT_HIDE_ATTENDEES, EVENT_INVITE_OTHERS, EVENT_INVITE_SELF, EVENT_SECRET,
+        ArchivedCalendarEventContent, CalendarEvent, CalendarEventContent, CalendarEventData,
+        EVENT_DRAFT, EVENT_HIDE_ATTENDEES, EVENT_INVITE_OTHERS, EVENT_INVITE_SELF, EVENT_SECRET,
         alerts::{DefaultAlertsResolver, DefaultAlertsView, ICalendarDefaultAlerts},
         expand::{CalendarEventExpansion, SECONDS_PER_DAY, resolve_local},
         identity::{CalendarAddresses, EventOwnership, ParticipantIdentityAddresses},
@@ -51,7 +53,11 @@ use jmap_proto::{
 };
 use jmap_tools::{Key, Map, Value};
 use std::{ops::Range, str::FromStr};
-use store::{ahash::AHashSet, write::serialize::rkyv_deserialize};
+use store::{
+    ValueKey,
+    ahash::AHashSet,
+    write::{Archive, ArchiveBytes, serialize::rkyv_deserialize},
+};
 use trc::AddContext;
 use types::{
     acl::Acl,
@@ -153,9 +159,17 @@ impl CalendarEventGet for Server {
             }
             None => None,
         };
+        let mut za_reader = ZaEventReader::new(self, access_token, account_id).await?;
         let mut response = GetResponse {
             account_id: request.account_id.into(),
-            state: sampled.state(cache.get_state(false)).into(),
+            state: sampled
+                .state(za_event_state(
+                    za_reader.is_some(),
+                    access_token,
+                    account_id,
+                    &cache,
+                ))
+                .into(),
             list: Vec::with_capacity(ids.len()),
             not_found: vec![],
         };
@@ -255,10 +269,48 @@ impl CalendarEventGet for Server {
                             ProjectedEvent {
                                 cache: &cache,
                                 document_id,
-                                content: archive
-                                    .map(|archive| archive.unarchive::<CalendarEventContent>())
-                                    .transpose()
-                                    .caused_by(trc::location!())?,
+                                content: if let (Some(reader), Some(archive)) =
+                                    (&mut za_reader, archive)
+                                {
+                                    let Some(row) = self
+                                        .store()
+                                        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+                                            account_id,
+                                            Collection::CalendarEvent,
+                                            document_id,
+                                        ))
+                                        .await?
+                                    else {
+                                        results.push_not_found(group);
+                                        continue;
+                                    };
+                                    let calendar_ids = resource
+                                        .child_names()
+                                        .iter()
+                                        .map(|name| name.parent_id)
+                                        .collect::<Vec<_>>();
+                                    let Some(view) = reader
+                                        .view(
+                                            self,
+                                            access_token,
+                                            document_id,
+                                            &calendar_ids,
+                                            row.unarchive::<CalendarEvent>()?,
+                                            archive,
+                                        )
+                                        .await?
+                                    else {
+                                        results.push_not_found(group);
+                                        continue;
+                                    };
+                                    budget.add_archive(view.content.as_bytes().len(), 1)?;
+                                    Some(view.content.unarchive::<CalendarEventContent>()?)
+                                } else {
+                                    archive
+                                        .map(|archive| archive.unarchive::<CalendarEventContent>())
+                                        .transpose()
+                                        .caused_by(trc::location!())?
+                                },
                                 flags,
                                 privacy: EventPrivacy::from_flags(flags),
                                 calendar_ids: resource.child_names(),

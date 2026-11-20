@@ -122,8 +122,8 @@ impl SessionHandler for Server {
             .caused_by(trc::location!())?;
         session.username = account.name().to_string();
         let account_id = Id::from(access_token.account_id());
-        // Spec 9 and Task 6: no calendars or object metadata for key
-        // accounts (`za_hidden_capability`).
+        // Task 6: no object metadata for key accounts
+        // (`za_hidden_capability`).
         let primary_is_key = account.is_key_account();
         let mut primary_account = self.jmap_account(
             access_token,
@@ -273,7 +273,6 @@ pub fn allowed_capabilities(access_token: &AccessToken, using: CapabilityIds) ->
 /// Whether an account object leaves `capability` out, the account being a
 /// key account (`account_is_key`) or the session's or principal's caller
 /// being one (`caller_is_key`):
-/// - spec 9: JMAP calendars are not offered for key accounts;
 /// - Task 6: object metadata is refused for key accounts, as owner or as
 ///   caller (`api::metadata::za_metadata_refused`), so it is not offered
 ///   either; when no account offers it, upstream's rule drops the session's
@@ -284,7 +283,6 @@ pub(crate) fn za_hidden_capability(
     capability: Capability,
 ) -> bool {
     match capability {
-        Capability::Calendars | Capability::CalendarsParse => account_is_key,
         Capability::Metadata => account_is_key || caller_is_key,
         _ => false,
     }

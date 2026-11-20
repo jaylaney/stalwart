@@ -7,3 +7,4 @@
 pub mod authenticate;
 pub mod oauth;
 pub mod permissions;
+pub(crate) mod za_bearer;

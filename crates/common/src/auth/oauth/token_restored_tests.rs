@@ -221,3 +221,18 @@ fn claims_with_separators_round_trip_exactly() {
     let opened = open_token(KEY, &token).unwrap();
     assert_eq!(opened.claims.as_deref(), Some("a;b;c;d@e.org;999"));
 }
+
+#[test]
+fn a_secret_suffix_is_outside_the_token_alphabet() {
+    use vault::{keys::Secret, tokens::append_secret};
+
+    let sample = sample(GrantType::AccessToken, None, 3);
+    let mut keyed = seal_token(KEY, &sample, NAME).expect("seal the sample");
+    assert!(!keyed.contains('~'));
+    append_secret(&mut keyed, &Secret::random());
+    assert!(open_token(KEY, &keyed).is_err());
+    let opened = open_token(KEY, crate::za::tokens::za_split_bearer(&keyed).0)
+        .expect("open the upstream portion");
+    assert_eq_fields(&opened, &sample);
+    assert_eq!(opened.grant, sample.grant);
+}

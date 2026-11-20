@@ -546,6 +546,10 @@ pub struct BatchBuilder {
     /// Zero-access fork (upgrade ruling 173): the keys asserted absent at
     /// the head of every commit chunk (`za_assert_absent_per_chunk`).
     za_chunk_asserts: Vec<(u32, Collection, u32, ValueClass)>,
+    /// Zero-access fork (PR #90 review C4617611521): `commit_point()` adds
+    /// no commit point, so the batch is written in one transaction
+    /// (`za_one_transaction`).
+    za_one_transaction: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1825,3 +1829,7 @@ impl std::fmt::Debug for MergeOperation {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/store/src/write/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "za_change_id_fence_tests.rs"]
+mod za_change_id_fence_tests;

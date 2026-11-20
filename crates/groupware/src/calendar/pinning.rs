@@ -756,6 +756,36 @@ mod tests {
         ))
     }
 
+    /// Each builder answers nothing for a recipient that is not an address,
+    /// for a tree it cannot snapshot (no organizer) and for a tree organized
+    /// by an address that is not one of the account's.
+    #[test]
+    fn builders_answer_nothing_outside_their_inputs() {
+        let tree = parse(COPY);
+        let unorganized = parse(&COPY.replace("ORGANIZER:mailto:key1@example.com\r\n", ""));
+        let (alice, bob) = (vec![ALICE.to_string()], vec![BOB.to_string()]);
+        let mut instances = ZaInstances::default();
+        instances.add(Some(A));
+        let to = vec![BOB.to_string()];
+        for (tree, addresses, recipient) in [
+            (&tree, &alice, "not an address"),
+            (&unorganized, &alice, BOB),
+            (&tree, &bob, BOB),
+        ] {
+            assert!(
+                za_full_request_for(tree, addresses, recipient, policy())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(za_scheduled_forms(tree, addresses, recipient).is_empty());
+            assert!(
+                za_withheld_cancels(tree, addresses, recipient, &to, &instances, policy())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
     fn parse(text: &str) -> ICalendar {
         match Parser::new(text).entry() {
             Entry::ICalendar(ical) => ical,

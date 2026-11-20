@@ -245,6 +245,10 @@ pub async fn jmap_tests() {
     files::acl::test(&test).await;
 
     if key_mode {
+        // Release 6 spec 9.4: `za_variants::calendars` runs the calendar block
+        // for key accounts, in the order below: upstream's `calendars`,
+        // `instance` and `alarm` bodies unchanged, a variant for each of the
+        // others, and `principal::availability` among them.
         za_variants::calendars(&test).await;
         za_variants::principal_get(&test).await;
     } else {

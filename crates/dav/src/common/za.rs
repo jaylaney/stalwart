@@ -8,33 +8,35 @@ use crate::{DavError, DavResourceName};
 use common::{
     Server, auth::AccessToken, storage::metadata::ContainerChange, za::metadata::ZaMetadataFence,
 };
+pub(crate) use groupware::calendar::pipeline::context::{
+    ZaReadMemo, za_event_view_in, za_mutation_context, za_read_context,
+};
 use groupware::calendar::{
     ArchivedCalendarEvent, CalendarEvent, CalendarEventNotification,
+    pipeline::{admission::za_calendar_admission, context},
     seal::{
         SealError, ZaContainerOf, ZaContainerScope, ZaEventView, ZaKeyDomain,
-        archived_item_is_pending, calendar_view_in_domain, event_view_in_domain, open_container,
-        reseal_container, seal_container, seal_error, unseal_item_archive,
+        archived_item_is_pending, open_container, reseal_container, seal_container, seal_error,
+        unseal_item_archive,
     },
-    sharing::resolve::{ZaCalendarContext, ZaCalendarError, za_calendar_context},
+    sharing::resolve::ZaCalendarContext,
 };
+#[cfg(test)]
+use groupware::calendar::{pipeline::error::za_read_refusal, sharing::resolve::ZaCalendarError};
 use hyper::StatusCode;
-use registry::schema::enums::Permission;
-use std::{borrow::Cow, collections::HashMap, future::Future, sync::Arc};
+use std::{borrow::Cow, future::Future, sync::Arc};
 use store::{
     ValueKey,
     write::{
         Archive, ArchiveBytes, BatchBuilder,
         metadata::{MetadataBuf, StoredMetadata},
-        serialize::rkyv_deserialize,
     },
 };
 use trc::AddContext;
 use types::{
-    acl::Acl,
     collection::Collection,
     metadata::{EncodedMetadata, MetadataEdit, MetadataView},
 };
-use utils::map::bitmap::Bitmap;
 use vault::session::SessionKeys;
 
 /// What a free-busy computation may read from an account (ruling R6).
@@ -94,24 +96,7 @@ pub(crate) trait ZeroAccessGate: Sync + Send {
 
 impl ZeroAccessGate for Server {
     async fn za_calendar_gate(&self, token: &AccessToken, owner_id: u32) -> crate::Result<()> {
-        if !is_key_account(self, owner_id).await? || token.za_keys_for(owner_id).is_some() {
-            return Ok(());
-        }
-        if token
-            .session_keys()
-            .is_some_and(|keys| keys.account_id == token.account_id())
-            && !token.za_is_impersonated()
-            && !token.has_permission(Permission::Impersonate)
-            && token.has_shared_access(owner_id, Collection::Calendar)
-        {
-            return Ok(());
-        }
-        trc::event!(
-            Security(trc::SecurityEvent::Unauthorized),
-            AccountId = owner_id,
-            Details = "zero-access: calendar access without session keys",
-        );
-        Err(DavError::Code(StatusCode::FORBIDDEN))
+        Ok(za_calendar_admission(self, token, owner_id).await?)
     }
 
     async fn za_uri_gate(
@@ -196,23 +181,6 @@ pub(crate) fn za_calendar_report_uri(resource: DavResourceName) -> crate::Result
     } else {
         Err(DavError::Code(StatusCode::METHOD_NOT_ALLOWED))
     }
-}
-
-/// Spec 7.3 at 1.0: the read view of a stored event in `context`'s key
-/// domain. `meta` is the stored metadata row and `content` the stored
-/// content archive; the view's content keeps the stored archive's version,
-/// so identity stays bound to the stored bytes. Read-only, never written
-/// back.
-pub(crate) fn za_event_view_in(
-    context: &ZaCalendarContext,
-    meta: &ArchivedCalendarEvent,
-    content: &Archive<ArchiveBytes>,
-    owner_id: u32,
-    document_id: u32,
-) -> trc::Result<ZaEventView> {
-    let meta = rkyv_deserialize::<_, CalendarEvent>(meta).caused_by(trc::location!())?;
-    event_view_in_domain(&meta, content, &context.domain)
-        .map_err(|error| seal_error(error, owner_id, document_id))
 }
 
 /// Invitations spec 6.6: the inbox counterpart of the event view, on the
@@ -321,67 +289,15 @@ fn stored_item_is_pending(stored: &Archive<ArchiveBytes>) -> crate::Result<bool>
     ))
 }
 
-/// This map belongs to one read request only. Writers never consume it.
-pub(crate) type ZaReadMemo = HashMap<(u32, u32), Arc<ZaCalendarContext>>;
-
-/// Explicit owner-session repair; the groupware resolver remains read-only.
-pub(crate) async fn za_mutation_context(
-    server: &Server,
-    token: &AccessToken,
-    owner_id: u32,
-    calendar_id: u32,
-    required: Bitmap<Acl>,
-) -> Result<Option<ZaCalendarContext>, ZaCalendarError> {
-    let context = za_calendar_context(server, token, owner_id, calendar_id, required).await?;
-    match (context, token.session_keys()) {
-        (Some(context), Some(keys)) => {
-            groupware::calendar::sharing::boundary::za_repair_owned_context(server, keys, context)
-                .await
-                .map(Some)
-        }
-        (context, _) => Ok(context),
-    }
-}
-
-pub(crate) async fn za_read_context(
-    server: &Server,
-    token: &AccessToken,
-    owner_id: u32,
-    calendar_id: u32,
-    required: Bitmap<Acl>,
-    memo: &mut ZaReadMemo,
-) -> Result<Option<Arc<ZaCalendarContext>>, ZaCalendarError> {
-    if let Some(context) = memo.get(&(owner_id, calendar_id)) {
-        context.check_access(token, required)?;
-        return Ok(Some(context.clone()));
-    }
-    let context = za_mutation_context(server, token, owner_id, calendar_id, required)
-        .await?
-        .map(Arc::new);
-    if let Some(context) = &context {
-        memo.insert((owner_id, calendar_id), context.clone());
-    }
-    Ok(context)
-}
-
 /// Refusals fail the request; corrupt content and general store errors fail an
 /// individual listing item. Only the precise missing-resource error becomes 404.
+#[cfg(test)]
 fn calendar_item_error(
     error: ZaCalendarError,
     owner_id: u32,
     document_id: u32,
 ) -> crate::Result<trc::Error> {
-    match error {
-        ZaCalendarError::Forbidden => Err(DavError::Code(StatusCode::FORBIDDEN)),
-        ZaCalendarError::LinkedEvent => Err(DavError::Code(StatusCode::CONFLICT)),
-        ZaCalendarError::Seal(error) => Ok(seal_error(error, owner_id, document_id)),
-        ZaCalendarError::Store(error)
-            if error.matches(trc::EventType::Store(trc::StoreEvent::NotFound)) =>
-        {
-            Err(DavError::Code(StatusCode::NOT_FOUND))
-        }
-        ZaCalendarError::Store(error) => Ok(error),
-    }
+    za_read_refusal(error, owner_id, document_id).map_err(DavError::from)
 }
 
 /// The read context of an event's calendar, with `za_read_event_view`'s
@@ -394,19 +310,10 @@ pub(crate) async fn za_read_event_context(
     calendar_id: u32,
     memo: &mut ZaReadMemo,
 ) -> crate::Result<trc::Result<Option<Arc<ZaCalendarContext>>>> {
-    match za_read_context(
-        server,
-        token,
-        owner_id,
-        calendar_id,
-        Bitmap::new().with_item(Acl::ReadItems),
-        memo,
+    Ok(
+        context::za_read_event_context(server, token, owner_id, document_id, calendar_id, memo)
+            .await?,
     )
-    .await
-    {
-        Ok(context) => Ok(Ok(context)),
-        Err(error) => Ok(Err(calendar_item_error(error, owner_id, document_id)?)),
-    }
 }
 
 /// The read view of a stored event (`meta` row, `content` archive) through a
@@ -423,16 +330,17 @@ pub(crate) async fn za_read_event_view(
     content: &Archive<ArchiveBytes>,
     memo: &mut ZaReadMemo,
 ) -> crate::Result<trc::Result<Option<ZaEventView>>> {
-    Ok(
-        match za_read_event_context(server, token, owner_id, document_id, calendar_id, memo).await?
-        {
-            Ok(Some(context)) => {
-                za_event_view_in(&context, meta, content, owner_id, document_id).map(Some)
-            }
-            Ok(None) => Ok(None),
-            Err(error) => Err(error),
-        },
+    Ok(context::za_read_event_view(
+        server,
+        token,
+        owner_id,
+        document_id,
+        calendar_id,
+        meta,
+        content,
+        memo,
     )
+    .await?)
 }
 
 /// Ruling R6: the unsealed content of each of a key account's events a
@@ -506,26 +414,7 @@ pub(crate) async fn za_read_calendar_view(
     calendar_id: u32,
     memo: &mut ZaReadMemo,
 ) -> crate::Result<trc::Result<Option<(Archive<ArchiveBytes>, Arc<ZaCalendarContext>)>>> {
-    Ok(
-        match za_read_context(
-            server,
-            token,
-            owner_id,
-            calendar_id,
-            Bitmap::new().with_item(Acl::Read),
-            memo,
-        )
-        .await
-        {
-            Ok(Some(context)) => {
-                calendar_view_in_domain(&context.stored, &context.domain, context.personal_id)
-                    .map(|view| Some((view, context.clone())))
-                    .map_err(|error| seal_error(error, owner_id, calendar_id))
-            }
-            Ok(None) => Ok(None),
-            Err(error) => Err(calendar_item_error(error, owner_id, calendar_id)?),
-        },
-    )
+    Ok(context::za_read_calendar_view(server, token, owner_id, calendar_id, memo).await?)
 }
 
 pub(crate) async fn is_key_account(server: &Server, account_id: u32) -> crate::Result<bool> {

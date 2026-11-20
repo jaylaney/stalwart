@@ -8875,6 +8875,7 @@ dependencies = [
  "base32",
  "blake3",
  "chacha20poly1305",
+ "encodify",
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "rand 0.10.3",

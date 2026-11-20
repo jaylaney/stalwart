@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+pub use crate::utils::oauth::*;
+
 use crate::{
     utils::{
         account::Account,
@@ -1846,9 +1848,44 @@ impl<T: Send + 'static> HookParked<T> {
         self.pause.release.notify_one();
         self.handle.take().unwrap().await.unwrap()
     }
+
+    /// Arms a later pause point of the same request (`set`, keyed by
+    /// `account_id`), releases this one and waits up to `limit` for the
+    /// request to reach the later one. The returned guard releases the
+    /// request and clears the slot when dropped, also on a failed assertion.
+    pub async fn relay(
+        &self,
+        account_id: u32,
+        set: fn(Option<Arc<HookPause>>),
+        limit: Duration,
+    ) -> RelayedPause {
+        let pause = Arc::new(HookPause::new(account_id));
+        set(Some(pause.clone()));
+        let relayed = RelayedPause { pause, clear: set };
+        self.pause.release.notify_one();
+        tokio::time::timeout(limit, relayed.pause.arrived.notified())
+            .await
+            .expect("the request did not reach the later pause point");
+        relayed
+    }
 }
 
 impl<T> Drop for HookParked<T> {
+    fn drop(&mut self) {
+        (self.clear)(None);
+        self.pause.release.notify_one();
+    }
+}
+
+/// A later pause point a `HookParked` request reached (`HookParked::relay`).
+/// Dropping it clears the slot and releases the request.
+#[must_use = "dropping the guard releases the request at once"]
+pub struct RelayedPause {
+    pause: Arc<HookPause>,
+    clear: fn(Option<Arc<HookPause>>),
+}
+
+impl Drop for RelayedPause {
     fn drop(&mut self) {
         (self.clear)(None);
         self.pause.release.notify_one();
@@ -2731,6 +2768,47 @@ impl Keyless {
         };
         reply["methodResponses"][0].clone()
     }
+
+    /// A request of `calls` under the capabilities `using` (`call` keeps the
+    /// mail list); the whole response. The Bearer arm posts to
+    /// `{SERVER_URL}/jmap`.
+    pub async fn call_using(
+        &mut self,
+        using: &[&str],
+        calls: Value,
+    ) -> crate::utils::jmap::JmapResponse {
+        let reply: Value = match self {
+            Keyless::Bearer(token) => reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .post(format!("{SERVER_URL}/jmap"))
+                .bearer_auth(token)
+                .body(json!({ "using": using, "methodCalls": calls }).to_string())
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap(),
+            Keyless::WebSocket(socket) => serde_json::from_str(
+                &ws_call(
+                    socket,
+                    &json!({
+                        "@type": "Request",
+                        "id": "1",
+                        "using": using,
+                        "methodCalls": calls
+                    })
+                    .to_string(),
+                )
+                .await,
+            )
+            .unwrap(),
+        };
+        crate::utils::jmap::JmapResponse(reply)
+    }
 }
 
 /// A fresh TOTP enrolment URL (a random 20-byte secret).
@@ -3476,4 +3554,42 @@ pub async fn delete_event_records(test: &TestServer, account_id: u32, document_i
     test.server.notify_index_queue();
     test.server
         .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
+}
+
+/// Upstream's JSCalendar converter (`ICalendar::into_jscalendar_with`), with
+/// the options `CalendarEvent/get` uses for an event read with every
+/// property: the first entry, without the iCalendar components. The release 6
+/// oracle's JMAP input (spec 3.5): its JSCalendar comes from its iCalendar
+/// text by upstream's own code.
+pub fn jscalendar_of(ics: &str) -> Value {
+    let ical = calcard::icalendar::ICalendar::parse(ics)
+        .unwrap_or_else(|err| panic!("jscalendar_of: the text does not parse: {err:?}"));
+    let converted = ical
+        .into_jscalendar_with::<Id, types::blob::BlobId, _>(
+            calcard::jscalendar::import::ImportOptions::new()
+                .include_ical_components(false)
+                .return_first(true),
+        )
+        .unwrap_or_else(|err| panic!("jscalendar_of: the conversion failed: {err:?}"));
+    serde_json::to_value(converted.into_inner()).expect("jscalendar_of: the object serializes")
+}
+
+/// The release 6 oracle's projection (spec 3.5): `value` without `id`,
+/// `baseEventId`, `created` and `updated`, and without the keys of
+/// `calendarIds`, at any depth. A `calendarIds` holds nothing but its keys
+/// (each maps to `true`), so it goes with them. Nothing else is removed.
+pub fn normalize_jscal(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter_map(|(key, value)| match (key.as_str(), value) {
+                    ("id" | "baseEventId" | "created" | "updated", _) => None,
+                    ("calendarIds", Value::Object(_)) => None,
+                    (_, value) => Some((key, normalize_jscal(value))),
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(normalize_jscal).collect()),
+        value => value,
+    }
 }

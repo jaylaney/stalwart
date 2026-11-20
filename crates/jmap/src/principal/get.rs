@@ -183,7 +183,8 @@ impl PrincipalGet for Server {
                                     Value::Bool(
                                         has_availability_permission
                                             && (can_query_accounts
-                                                || principal.is_same_tenant(access_token)),
+                                                || principal.is_same_tenant(access_token))
+                                            && !is_key,
                                     ),
                                 ),
                                 (
@@ -367,10 +368,9 @@ impl IntoPrincipalValue for serde_json::Value {
     }
 }
 
-/// Spec 9: a key account's principal advertises no calendars capability, in
-/// its `capabilities` and in its account object; Task 6: an account object
-/// advertises no object metadata to or for a key account
-/// (`za_hidden_capability`).
+/// Spec 6.10: a key principal's calendar capability block is shown with
+/// `mayGetAvailability` false; Task 6: an account object advertises no object
+/// metadata to or for a key account (`za_hidden_capability`).
 fn za_shown_capability(
     is_key: bool,
     caller_is_key: bool,

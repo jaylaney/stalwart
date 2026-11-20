@@ -424,8 +424,9 @@ jobs:
       - name: JMAP Tests (key accounts)
         if: ${{ !cancelled() }}
         # The same for the JMAP suite (tests/src/jmap/za_variants.rs). Key
-        # mode runs the calendar modules as refusals, so upstream's
-        # timing-flaky calendar::notification sub-test does not run here.
+        # mode runs upstream's calendar bodies and the calendar variants; the
+        # notification variant is a refusal, so upstream's timing-flaky
+        # calendar::notification sub-test does not run here.
         run: cargo test -p tests jmap::jmap_tests -- --nocapture
         env:
           ZA_KEY_ACCOUNTS: "1"

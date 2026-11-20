@@ -203,6 +203,35 @@ impl CalendarEvent {
         modified: i64,
         batch: &mut BatchBuilder,
     ) -> trc::Result<String> {
+        let etag = self.enqueue_full_at(
+            content,
+            changed_by,
+            event,
+            event_content,
+            account_id,
+            document_id,
+            parent_id,
+            modified,
+            batch,
+        )?;
+        batch.commit_point();
+        Ok(etag)
+    }
+
+    /// Queue the full update without taking a commit point inside the caller's transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_full_at(
+        self,
+        content: CalendarEventContent,
+        changed_by: ChangedBy,
+        event: Archive<&ArchivedCalendarEvent>,
+        event_content: &ArchivedCalendarEventContent,
+        account_id: u32,
+        document_id: u32,
+        parent_id: Option<Slot>,
+        modified: i64,
+        batch: &mut BatchBuilder,
+    ) -> trc::Result<String> {
         let mut new_event = self;
         new_event.modified = modified;
 
@@ -213,8 +242,7 @@ impl CalendarEvent {
             .with_account_id(account_id)
             .with_collection(Collection::CalendarEvent)
             .with_document(document_id)
-            .custom(update.into_builder(changed_by, parent_id))?
-            .commit_point();
+            .custom(update.into_builder(changed_by, parent_id))?;
 
         Ok(etag)
     }
@@ -446,6 +474,15 @@ impl CalendarEventNotification {
     }
 }
 
+/// PR #90 second review C4633314478: what a key account's collection delete
+/// built. `unwritten` counts the listed children it wrote nothing for (no
+/// archive, or no name under the calendar); such a child is not asserted, so
+/// the caller refuses the batch on a fenced store.
+pub struct ZaCalendarBuild {
+    pub messages: Vec<ZaDeleteMessage>,
+    pub unwritten: usize,
+}
+
 impl DestroyArchive<Archive<&ArchivedCalendar>> {
     #[allow(clippy::too_many_arguments)]
     pub async fn delete_with_events(
@@ -499,7 +536,7 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
         send_itip: bool,
         za_keys: Option<&SessionKeys>,
         batch: &mut BatchBuilder,
-    ) -> trc::Result<Vec<ZaDeleteMessage>> {
+    ) -> trc::Result<ZaCalendarBuild> {
         // Process deletions
         let calendar_id = document_id;
         let context = match za_keys {
@@ -517,6 +554,7 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
             None => None,
         };
         let mut za_messages = Vec::new();
+        let mut unwritten = 0;
         let cutoff = now() as i64;
         let mut resolver = DefaultAlertsResolver::default();
         let mut quota = NotificationQuota::default();
@@ -557,11 +595,26 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
 
             for &document_id in chunk {
                 let Some(event_) = archives.take_archive(document_id) else {
+                    if context.is_some() {
+                        unwritten += 1;
+                    }
                     continue;
                 };
                 let event = event_
                     .to_unarchived::<CalendarEvent>()
                     .caused_by(trc::location!())?;
+                // PR #90 second review C4633314478: a listed child with no name
+                // under the calendar gets no write and no assertion below.
+                // Counted for a key account's delete only (RC-8).
+                if context.is_some()
+                    && !event
+                        .inner
+                        .names
+                        .iter()
+                        .any(|name| name.parent_id == calendar_id)
+                {
+                    unwritten += 1;
+                }
                 let event_flags = event.inner.flags.to_native();
                 let mut content = archives.take_value(document_id);
                 if let Some(calendars) = calendars.as_ref()
@@ -617,6 +670,7 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
                             cleanup,
                             context.as_ref().map(|context| &context.domain),
                             cutoff,
+                            context.is_some(),
                             batch,
                         )
                         .await?,
@@ -636,7 +690,10 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
             batch,
         )
         .await?;
-        Ok(za_messages)
+        Ok(ZaCalendarBuild {
+            messages: za_messages,
+            unwritten,
+        })
     }
 
     pub async fn delete(
@@ -768,6 +825,7 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
             &ContainerCleanup::empty(Collection::CalendarEvent),
             domain,
             cutoff,
+            false,
             batch,
         )
         .await
@@ -834,6 +892,7 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
             cleanup,
             None,
             now() as i64,
+            false,
             batch,
         )
         .await
@@ -856,6 +915,7 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
         cleanup: &ContainerCleanup,
         domain: Option<&ZaKeyDomain>,
         cutoff: i64,
+        all_names: bool,
         batch: &mut BatchBuilder,
     ) -> trc::Result<Option<ZaDeleteMessage>> {
         let mut za_message = None;
@@ -866,13 +926,28 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
             .iter()
             .position(|name| name.parent_id == calendar_id)
         {
-            if self.0.inner.names.len() > 1 {
+            // PR #90 second review C4633314492: with `all_names` (a key
+            // account's collection delete) every name under the calendar goes.
+            let keeps_a_name = if all_names {
+                self.0
+                    .inner
+                    .names
+                    .iter()
+                    .any(|name| name.parent_id != calendar_id)
+            } else {
+                self.0.inner.names.len() > 1
+            };
+            if keeps_a_name {
                 // Unlink calendar id from event
                 let event = self.0;
                 let mut new_event = event
                     .deserialize::<CalendarEvent>()
                     .caused_by(trc::location!())?;
-                new_event.names.swap_remove(delete_idx);
+                if all_names {
+                    new_event.names.retain(|name| name.parent_id != calendar_id);
+                } else {
+                    new_event.names.swap_remove(delete_idx);
+                }
                 server
                     .reschedule_event_alarms(
                         account_id,

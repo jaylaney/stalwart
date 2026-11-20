@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::get::IntermediateChangesResponse;
+use super::{get::IntermediateChangesResponse, za_calendar::za_state_out_of_scope};
 use common::Server;
 use email::{
     cache::email::MessageCacheAccess,
@@ -36,7 +36,7 @@ pub(crate) struct ZaChangesSince {
 }
 
 impl ZaChangesSince {
-    pub(crate) fn new(state: State) -> Self {
+    pub(crate) fn new(state: State) -> trc::Result<Self> {
         let range = match &state {
             State::Initial => Range {
                 since: 0,
@@ -50,8 +50,10 @@ impl ZaChangesSince {
                 since: page.from_id,
                 pinned: Some((page.to_id, page.items_sent)),
             },
+            // Release 6 spec 6.8 (D29): a calendar range is never a mail continuation.
+            State::ZaCalendarIntermediate { .. } => return Err(za_state_out_of_scope()),
         };
-        Self { state, range }
+        Ok(Self { state, range })
     }
 
     pub(crate) fn minimum(&self) -> Option<u64> {

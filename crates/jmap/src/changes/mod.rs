@@ -9,6 +9,7 @@ pub mod page;
 pub mod query;
 pub mod state;
 pub mod za;
+pub mod za_calendar;
 
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]

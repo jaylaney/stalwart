@@ -24,11 +24,7 @@ use calcard::icalendar::{
     ArchivedICalendar, ArchivedICalendarComponentType, ICalendar, ICalendarComponent,
     ICalendarComponentType,
 };
-use common::{
-    ArchivedDavName, GroupwareResources, Server,
-    auth::{AccessToken, AccountInfo},
-    za::lease::{ZaUidLease, ZaUidLeaseGuard},
-};
+use common::{ArchivedDavName, GroupwareResources, Server, auth::AccessToken};
 use dav_proto::schema::{
     property::{CalDavProperty, CalendarData, DavProperty, WebDavProperty},
     response::CalCondition,
@@ -40,16 +36,16 @@ use groupware::{
         alarm::ExpandAlarm,
         alerts::{DefaultAlertsResolver, DefaultAlertsView, ICalendarDefaultAlerts},
         compare::{ComparisonScope, RecurrenceComponents},
+        pipeline::{admission, context, error::ZaPipelineError},
         privacy::{EventPrivacy, EventViewer, ICalendarPrivacy, PrivacyDenied},
         user::{ICalendarUserData, UserDataError, UserDataView},
     },
     scheduling::ItipError,
 };
-use http_proto::HttpResponse;
 use hyper::StatusCode;
 use store::{
     ValueKey,
-    write::{Archive, ArchiveBytes, BatchBuilder, serialize::rkyv_deserialize},
+    write::{Archive, ArchiveBytes, serialize::rkyv_deserialize},
 };
 use trc::AddContext;
 use types::{collection::Collection, field::CalendarEventField};
@@ -480,255 +476,6 @@ pub(crate) fn user_data_error(err: UserDataError) -> DavError {
     )
 }
 
-/// Invitations spec 5.1, 6.3 step 1: takes the UID creation lease for a key
-/// account's PUT create, then checks the UID against current archives
-/// (`za_assert_is_unique_uid`) while holding it. A lease that stays held
-/// through the retries (two creators of one UID in one account within a
-/// second) answers 503 with a trace; a hit answers `NoUidConflict` after the
-/// lease is released.
-pub(crate) async fn za_take_uid_lease(
-    server: &Server,
-    resources: &GroupwareResources,
-    access_token: &AccessToken,
-    account_id: u32,
-    calendar_id: u32,
-    uid: &str,
-) -> crate::Result<ZaUidLeaseGuard> {
-    let Some(lease) = ZaUidLease::acquire(server.store(), account_id, uid)
-        .await
-        .caused_by(trc::location!())?
-    else {
-        trc::event!(
-            Store(trc::StoreEvent::AssertValueFailed),
-            AccountId = account_id,
-            Details = "zero-access: UID creation lease busy",
-        );
-        return Err(DavError::Code(StatusCode::SERVICE_UNAVAILABLE));
-    };
-    let lease = ZaUidLeaseGuard::new(server.store().clone(), lease);
-    if let Err(err) = za_assert_is_unique_uid(
-        server,
-        resources,
-        access_token,
-        account_id,
-        calendar_id,
-        uid,
-    )
-    .await
-    {
-        lease.release().await;
-        return Err(err);
-    }
-    Ok(lease)
-}
-
-/// Invitations spec 5.1: the archive-based counterpart of
-/// `assert_is_unique_uid` for a key account's create, run under the
-/// creation lease. The handler's resource snapshot can predate another
-/// creator's commit, so this reads the fresh UID-index hits and each hit's
-/// current archive, and refuses the UID when a stored copy names the target
-/// calendar (upstream's rule: a UID is unique within one calendar). The
-/// snapshot only formats the href.
-pub(crate) async fn za_assert_is_unique_uid(
-    server: &Server,
-    resources: &GroupwareResources,
-    access_token: &AccessToken,
-    account_id: u32,
-    calendar_id: u32,
-    uid: &str,
-) -> crate::Result<()> {
-    let hits = server
-        .document_ids_matching(
-            account_id,
-            Collection::CalendarEvent,
-            CalendarEventField::Uid,
-            uid.as_bytes(),
-        )
-        .await
-        .caused_by(trc::location!())?;
-    // Upstream's rule at 1.0 (`assert_is_unique_uid`): a conflict answers
-    // 403 `NoUidConflict`, and a sharee whose only conflict is a secret
-    // event gets a plain 403, without its href.
-    let is_owner = access_token.is_member(account_id);
-    let mut has_hidden_conflict = false;
-    for document_id in hits {
-        let Some(stored) = server
-            .store()
-            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
-                account_id,
-                Collection::CalendarEvent,
-                document_id,
-            ))
-            .await
-            .caused_by(trc::location!())?
-        else {
-            continue;
-        };
-        let event = stored
-            .unarchive::<CalendarEvent>()
-            .caused_by(trc::location!())?;
-        if let Some(name) = event
-            .names
-            .iter()
-            .find(|name| name.parent_id.to_native() == calendar_id)
-        {
-            if !is_owner
-                && EventPrivacy::from_flags(event.flags.to_native()) == EventPrivacy::Secret
-            {
-                has_hidden_conflict = true;
-                continue;
-            }
-            let href = resources
-                .container_resource_path_by_id(calendar_id)
-                .map(|calendar| {
-                    resources.format_item(&format!("{}/{}", calendar.path(), name.name))
-                })
-                .unwrap_or_default();
-            return Err(DavError::Condition(DavErrorCondition::new(
-                StatusCode::FORBIDDEN,
-                CalCondition::NoUidConflict(href.into()),
-            )));
-        }
-    }
-    if has_hidden_conflict {
-        Err(DavError::Code(StatusCode::FORBIDDEN))
-    } else {
-        Ok(())
-    }
-}
-
-/// Invitations spec 5.4 and 6.3 step 3: what a key account's create does
-/// when its lease was taken over while the request ran, found by the
-/// fan-out's fence or by the commit's. Traced first, so a busy lease or a
-/// 412 from the retake does not hide that the fence was lost; the lease
-/// is abandoned (the key holds a successor's value, or is gone); the lease
-/// is taken again to re-check current archives (`NoUidConflict` on a hit)
-/// and released; otherwise 503, so the client resends. Never `Ok`.
-pub(crate) async fn za_lost_create_fence(
-    server: &Server,
-    resources: &GroupwareResources,
-    access_token: &AccessToken,
-    lease: ZaUidLeaseGuard,
-    account_id: u32,
-    calendar_id: u32,
-    uid: &str,
-) -> crate::Result<HttpResponse> {
-    let Err(error) = za_finish_create_loss(
-        server,
-        resources,
-        access_token,
-        lease,
-        account_id,
-        calendar_id,
-        uid,
-        CreateLoss::ConfirmedLease,
-    )
-    .await;
-    Err(error)
-}
-
-enum CreateLoss {
-    ConfirmedLease,
-    OpaqueSecondCommit,
-}
-
-/// `za_lost_create_fence`'s body and the second commit's loss: its type
-/// cannot be `Ok` (final review, ledger 181), so the compiler keeps a lost
-/// create from reaching the mail submission (iMIP invariant 46).
-#[allow(clippy::too_many_arguments)]
-async fn za_finish_create_loss(
-    server: &Server,
-    resources: &GroupwareResources,
-    access_token: &AccessToken,
-    lease: ZaUidLeaseGuard,
-    account_id: u32,
-    calendar_id: u32,
-    uid: &str,
-    loss: CreateLoss,
-) -> crate::Result<std::convert::Infallible> {
-    trc::event!(
-        Store(trc::StoreEvent::AssertValueFailed),
-        AccountId = account_id,
-        Details = match &loss {
-            CreateLoss::ConfirmedLease => "zero-access: UID creation lease lost before the commit",
-            CreateLoss::OpaqueSecondCommit => "zero-access: create retry lost its assertion",
-        },
-    );
-    match loss {
-        CreateLoss::ConfirmedLease => lease.abandon(),
-        CreateLoss::OpaqueSecondCommit => {
-            // The second failure may still be the calendar assertion. Release
-            // only our exact fence before the existing UID retake. A false
-            // result is inconclusive; it does not prove successor ownership.
-            let _ = lease.release().await;
-        }
-    }
-    let retry = za_take_uid_lease(
-        server,
-        resources,
-        access_token,
-        account_id,
-        calendar_id,
-        uid,
-    )
-    .await?;
-    retry.release().await;
-    // The retake found no copy in this calendar. Keep the existing resend
-    // answer for either a confirmed lease loss or an opaque second loss.
-    Err(DavError::Code(StatusCode::SERVICE_UNAVAILABLE))
-}
-
-/// The bounded second create commit. Its assertion loss is opaque: release
-/// our fenced lease before the existing UID retake/outcome, without another
-/// calendar read, archive retry or fan-out.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn za_commit_create(
-    server: &Server,
-    resources: &GroupwareResources,
-    access_token: &AccessToken,
-    batch: BatchBuilder,
-    lease: ZaUidLeaseGuard,
-    account_id: u32,
-    calendar_id: u32,
-    uid: &str,
-) -> crate::Result<()> {
-    #[cfg(feature = "test_mode")]
-    if common::za::test_hooks::take_commit_fail(account_id) {
-        lease.release().await;
-        return Err(trc::StoreEvent::UnexpectedError
-            .into_err()
-            .details("zero-access test hook: sender commit failure")
-            .caused_by(trc::location!())
-            .into());
-    }
-    #[cfg(feature = "test_mode")]
-    common::za::test_hooks::commit_pause_point(account_id).await;
-    match server.commit_batch(batch).await {
-        Ok(_) => {
-            lease.release().await;
-            Ok(())
-        }
-        Err(err) if err.is_assertion_failure() => {
-            let Err(error) = za_finish_create_loss(
-                server,
-                resources,
-                access_token,
-                lease,
-                account_id,
-                calendar_id,
-                uid,
-                CreateLoss::OpaqueSecondCommit,
-            )
-            .await;
-            Err(error)
-        }
-        Err(err) => {
-            lease.release().await;
-            Err(err.caused_by(trc::location!()).into())
-        }
-    }
-}
-
 pub(crate) trait ItipPrecondition {
     fn failed_precondition(&self) -> Option<CalCondition>;
 }
@@ -758,23 +505,48 @@ impl ItipPrecondition for ItipError {
     }
 }
 
+impl From<ZaPipelineError> for DavError {
+    fn from(error: ZaPipelineError) -> Self {
+        match error {
+            ZaPipelineError::Forbidden(_)
+            | ZaPipelineError::UidConflict { href: None }
+            | ZaPipelineError::SchedulingDenied(_) => Self::Code(StatusCode::FORBIDDEN),
+            ZaPipelineError::LinkedEvent => Self::Code(StatusCode::CONFLICT),
+            ZaPipelineError::NotFound => Self::Code(StatusCode::NOT_FOUND),
+            ZaPipelineError::Busy(_) => Self::Code(StatusCode::SERVICE_UNAVAILABLE),
+            // PR #90 review C4617611521: a refusal that stands until the client
+            // deletes events, not a temporary condition (507 is one).
+            ZaPipelineError::CalendarTooLarge => Self::Code(StatusCode::FORBIDDEN),
+            ZaPipelineError::UidConflict { href: Some(href) } => DavErrorCondition::new(
+                StatusCode::FORBIDDEN,
+                CalCondition::NoUidConflict(href.into()),
+            )
+            .into(),
+            ZaPipelineError::TooManyRecipients => DavErrorCondition::new(
+                StatusCode::PRECONDITION_FAILED,
+                CalCondition::MaxAttendeesPerInstance,
+            )
+            .into(),
+            ZaPipelineError::Scheduling(error) => match error.failed_precondition() {
+                Some(condition) => {
+                    DavErrorCondition::new(StatusCode::PRECONDITION_FAILED, condition)
+                        .with_details(error.to_string())
+                        .into()
+                }
+                None => Self::Code(StatusCode::PRECONDITION_FAILED),
+            },
+            ZaPipelineError::Store(error) => Self::Internal(error),
+        }
+    }
+}
+
 /// Mutation adapters always resolve fresh state; response memos are read-only.
 pub(crate) fn za_calendar_error(
     error: groupware::calendar::sharing::resolve::ZaCalendarError,
     owner_id: u32,
     document_id: u32,
 ) -> DavError {
-    use groupware::calendar::sharing::resolve::ZaCalendarError;
-    match error {
-        ZaCalendarError::Forbidden => DavError::Code(StatusCode::FORBIDDEN),
-        ZaCalendarError::LinkedEvent => DavError::Code(StatusCode::CONFLICT),
-        ZaCalendarError::Store(error)
-            if error.matches(trc::EventType::Store(trc::StoreEvent::NotFound)) =>
-        {
-            DavError::Code(StatusCode::NOT_FOUND)
-        }
-        error => error.into_store_error(owner_id, document_id).into(),
-    }
+    ZaPipelineError::from_calendar(error, owner_id, document_id).into()
 }
 
 pub(crate) async fn za_write_contexts(
@@ -785,47 +557,7 @@ pub(crate) async fn za_write_contexts(
     calendar_id: u32,
     required: types::acl::Acl,
 ) -> crate::Result<Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>> {
-    let contexts = groupware::calendar::sharing::resolve::za_event_contexts(
-        server,
-        token,
-        owner_id,
-        event,
-        calendar_id,
-        utils::map::bitmap::Bitmap::new().with_item(required),
-    )
-    .await
-    .map_err(|error| za_calendar_error(error, owner_id, calendar_id))?;
-    if let Some(keys) = token.session_keys() {
-        groupware::calendar::sharing::boundary::za_repair_owned_contexts(server, keys, contexts)
-            .await
-            .map_err(|error| za_calendar_error(error, owner_id, calendar_id))
-    } else {
-        Ok(contexts)
-    }
-}
-
-/// Called once after an ambiguous assertion loss. Keep the original event
-/// assertion and already-sealed payload; only its key envelope can change.
-pub(crate) async fn za_refresh_event(
-    server: &Server,
-    token: &common::auth::AccessToken,
-    owner_id: u32,
-    calendar_id: u32,
-    required: types::acl::Acl,
-    before: &[groupware::calendar::sharing::resolve::ZaCalendarContext],
-    sealed: &mut groupware::calendar::seal::ZaEvent,
-) -> crate::Result<Option<Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>>> {
-    if before.is_empty() {
-        return Ok(None);
-    }
-    let after =
-        za_write_contexts(server, token, owner_id, &sealed.meta, calendar_id, required).await?;
-    if !groupware::calendar::sharing::resolve::calendars_changed(before, &after) {
-        return Ok(None);
-    }
-    groupware::calendar::seal::rewrap_event(sealed, &before[0].domain, &after[0].domain)
-        .map_err(|error| groupware::calendar::seal::seal_error(error, owner_id, calendar_id))?;
-    Ok(Some(after))
+    Ok(context::za_write_contexts(server, token, owner_id, event, calendar_id, required).await?)
 }
 
 /// Event writers keep the authenticated writer's keys. The fresh calendar
@@ -835,57 +567,17 @@ pub(crate) async fn za_writer_keys(
     token: &common::auth::AccessToken,
     owner_id: u32,
 ) -> crate::Result<Option<std::sync::Arc<vault::session::SessionKeys>>> {
-    if !server.za_is_key_account(owner_id).await? {
-        return Ok(None);
-    }
-    token
-        .session_keys()
-        .filter(|keys| keys.account_id == token.account_id() && !token.za_is_impersonated())
-        .cloned()
-        .map(Some)
-        .ok_or(DavError::Code(StatusCode::FORBIDDEN))
+    Ok(admission::za_writer_keys(server, token, owner_id).await?)
 }
 
-/// The scheduling roles of a key account's write (release 4 delegated
-/// scheduling): the sender is the writer's account info with the owner's
-/// addresses added (0.16's `scheduling_account_info`, which 1.0 removed; its
-/// handlers now pass the owner's), the writer's and the owner's own infos.
-pub(crate) struct ZaRoles {
-    pub sender: AccountInfo,
-    pub writer: AccountInfo,
-    pub owner: AccountInfo,
-}
+pub(crate) use groupware::calendar::pipeline::admission::ZaRoles;
 
 pub(crate) async fn za_roles(
     server: &Server,
     token: &AccessToken,
     owner_id: u32,
 ) -> crate::Result<ZaRoles> {
-    let writer = server
-        .account_info(token.account_id())
-        .await
-        .caused_by(trc::location!())?;
-    let owner = if owner_id == token.account_id() {
-        writer.clone()
-    } else {
-        server
-            .account_info(owner_id)
-            .await
-            .caused_by(trc::location!())?
-    };
-    let mut sender = writer.clone();
-    if owner_id != token.account_id() {
-        for address in &owner.addresses {
-            if !sender.addresses.contains(address) {
-                sender.addresses.push(address.clone());
-            }
-        }
-    }
-    Ok(ZaRoles {
-        sender,
-        writer,
-        owner,
-    })
+    Ok(admission::za_roles(server, token, owner_id).await?)
 }
 
 /// Exercise the actual private event MOVE helper before foreign DAV URI admission
@@ -922,4 +614,156 @@ pub async fn za_test_move_event(
         crate::DavError::Parse(_) => hyper::StatusCode::BAD_REQUEST,
         crate::DavError::Internal(_) => hyper::StatusCode::INTERNAL_SERVER_ERROR,
     })
+}
+
+#[cfg(test)]
+mod pipeline_error_tests {
+    use super::{CalCondition, DavError, ItipError, ItipPrecondition, StatusCode};
+    use calcard::icalendar::{ICalendarMethod, ICalendarProperty};
+    use dav_proto::schema::response::Condition;
+    use groupware::calendar::pipeline::error::{
+        ZaBusy, ZaPipelineError, ZaRefusal, za_itip_fails_write,
+    };
+    use trc::{EventType, SecurityEvent, StoreEvent};
+
+    #[test]
+    fn pipeline_errors_map_to_todays_answers() {
+        for refusal in [
+            ZaRefusal::NoKeys,
+            ZaRefusal::Context,
+            ZaRefusal::SharedCopy,
+            ZaRefusal::LinkedMove,
+        ] {
+            assert!(matches!(
+                DavError::from(ZaPipelineError::Forbidden(refusal)),
+                DavError::Code(StatusCode::FORBIDDEN)
+            ));
+        }
+        assert!(matches!(
+            DavError::from(ZaPipelineError::LinkedEvent),
+            DavError::Code(StatusCode::CONFLICT)
+        ));
+        assert!(matches!(
+            DavError::from(ZaPipelineError::NotFound),
+            DavError::Code(StatusCode::NOT_FOUND)
+        ));
+        assert!(matches!(
+            DavError::from(ZaPipelineError::CalendarTooLarge),
+            DavError::Code(StatusCode::FORBIDDEN)
+        ));
+        for busy in [
+            ZaBusy::LeaseBusy,
+            ZaBusy::CreateLost,
+            ZaBusy::CalendarChanged,
+        ] {
+            assert!(matches!(
+                DavError::from(ZaPipelineError::Busy(busy)),
+                DavError::Code(StatusCode::SERVICE_UNAVAILABLE)
+            ));
+        }
+
+        let href = "/dav/cal/a/b/c.ics";
+        let DavError::Condition(uid_conflict) = DavError::from(ZaPipelineError::UidConflict {
+            href: Some(href.to_owned()),
+        }) else {
+            panic!("expected a UID conflict condition");
+        };
+        assert_eq!(uid_conflict.code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            uid_conflict.condition,
+            Condition::Cal(CalCondition::NoUidConflict(href.into()))
+        );
+        assert_eq!(uid_conflict.details, None);
+        assert!(matches!(
+            DavError::from(ZaPipelineError::UidConflict { href: None }),
+            DavError::Code(StatusCode::FORBIDDEN)
+        ));
+
+        let DavError::Condition(too_many) = DavError::from(ZaPipelineError::TooManyRecipients)
+        else {
+            panic!("expected an attendee limit condition");
+        };
+        assert_eq!(too_many.code, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            too_many.condition,
+            Condition::Cal(CalCondition::MaxAttendeesPerInstance)
+        );
+        assert_eq!(too_many.details, None);
+
+        let DavError::Condition(scheduling) =
+            DavError::from(ZaPipelineError::Scheduling(ItipError::MultipleOrganizer))
+        else {
+            panic!("expected a scheduling condition");
+        };
+        assert_eq!(scheduling.code, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            scheduling.condition,
+            Condition::Cal(CalCondition::SameOrganizerInAllComponents)
+        );
+        assert_eq!(
+            scheduling.details,
+            Some(ItipError::MultipleOrganizer.to_string())
+        );
+        assert!(matches!(
+            DavError::from(ZaPipelineError::SchedulingDenied("denied")),
+            DavError::Code(StatusCode::FORBIDDEN)
+        ));
+
+        assert!(matches!(
+            DavError::from(ZaPipelineError::Store(StoreEvent::AssertValueFailed.into_err())),
+            DavError::Internal(error) if error.is_assertion_failure()
+        ));
+        assert!(matches!(
+            DavError::from(ZaPipelineError::Store(SecurityEvent::Unauthorized.into_err())),
+            DavError::Internal(error)
+                if error.matches(EventType::Security(SecurityEvent::Unauthorized))
+        ));
+    }
+
+    #[test]
+    fn itip_precondition_classes_agree() {
+        let errors = [
+            ItipError::NoSchedulingInfo,
+            ItipError::OtherSchedulingAgent,
+            ItipError::NotOrganizer,
+            ItipError::NotOrganizerNorAttendee,
+            ItipError::NothingToSend,
+            ItipError::MissingUid,
+            ItipError::MultipleUid,
+            ItipError::MultipleOrganizer,
+            ItipError::MultipleObjectTypes,
+            ItipError::MultipleObjectInstances,
+            ItipError::CannotModifyProperty(ICalendarProperty::Summary),
+            ItipError::CannotModifyInstance,
+            ItipError::CannotModifyAddress,
+            ItipError::OrganizerMismatch,
+            ItipError::MissingMethod,
+            ItipError::InvalidComponentType,
+            ItipError::OutOfSequence,
+            ItipError::OrganizerIsLocalAddress,
+            ItipError::SenderIsNotOrganizerNorAttendee,
+            ItipError::SenderIsNotOrganizer,
+            ItipError::SenderIsNotParticipant(String::new()),
+            ItipError::UnknownParticipant(String::new()),
+            ItipError::UnsupportedMethod(ICalendarMethod::Publish),
+            ItipError::ICalendarParseError,
+            ItipError::EventNotFound,
+            ItipError::EventTooLarge,
+            ItipError::QuotaExceeded,
+            ItipError::NoDefaultCalendar,
+            ItipError::AutoAddDisabled,
+            ItipError::TooManyRecipients,
+        ];
+        let mut fails_write_count = 0;
+        for error in &errors {
+            let fails_write = za_itip_fails_write(error);
+            assert_eq!(
+                fails_write,
+                error.failed_precondition().is_some(),
+                "{error:?}"
+            );
+            fails_write_count += usize::from(fails_write);
+        }
+        assert_eq!(fails_write_count, 17);
+    }
 }

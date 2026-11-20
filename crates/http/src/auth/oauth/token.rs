@@ -6,8 +6,11 @@
 
 use super::{
     ArchivedOAuthStatus, ArchivedPkceCodeChallenge, ErrorType, FormData, MAX_POST_LEN, OAuthCode,
-    OAuthResponse, OAuthStatus, TokenResponse, authorize::issuer,
-    registration::ClientRegistrationHandler, request_origin,
+    OAuthResponse, OAuthStatus, TokenResponse,
+    authorize::issuer,
+    registration::ClientRegistrationHandler,
+    request_origin,
+    za_token::{ZaGrantKeys, za_code_handoff, za_issue_keyed, za_refresh_keyed},
 };
 use crate::{api::BASIC_CHALLENGE, auth::authenticate::HttpHeaders};
 use common::{
@@ -25,6 +28,7 @@ use common::{
         },
     },
     cache::invalidate::CacheInvalidationBuilder,
+    za::tokens::{ZaRefreshPrecheck, za_split_bearer},
 };
 use encodify::base64::{STANDARD, URL_SAFE_NO_PAD};
 use http_proto::*;
@@ -38,6 +42,7 @@ use store::{
     write::{Archive, ArchiveBytes, now},
 };
 use trc::AddContext;
+use vault::tokens::{CODE_LEN, ZaSuffix, split_code};
 
 pub trait TokenHandler: Sync + Send {
     fn handle_token_request(
@@ -284,6 +289,10 @@ impl TokenHandler for Server {
             return Ok(TokenResponse::error(ErrorType::InvalidRequest));
         };
 
+        let (code, suffix) = split_code(code);
+        if !is_server_code(code) {
+            return Ok(TokenResponse::error(ErrorType::InvalidGrant));
+        }
         let Some(auth_code_) = self
             .in_memory_store()
             .key_get::<Archive<ArchiveBytes>>(KeyValue::<()>::build_key(KV_OAUTH, code.as_bytes()))
@@ -323,8 +332,14 @@ impl TokenHandler for Server {
             return Ok(TokenResponse::error(ErrorType::InvalidGrant));
         }
 
+        let account_id = oauth.account_id.into();
+        let za_grant = match za_code_handoff(self, account_id, code, suffix).await? {
+            Ok(keys) => keys,
+            Err(error) => return Ok(TokenResponse::error(error)),
+        };
+
         self.issue_new_grant(NewGrantRequest {
-            account_id: oauth.account_id.into(),
+            account_id,
             credential_version: oauth.credential_version.into(),
             client_id: oauth.client_id.as_str(),
             client: &client,
@@ -332,6 +347,7 @@ impl TokenHandler for Server {
             nonce: oauth.nonce.as_ref().map(|s| s.as_str()),
             issuer,
             remote_ip: ctx.remote_ip,
+            za_grant,
         })
         .await
     }
@@ -349,6 +365,9 @@ impl TokenHandler for Server {
             return Ok(TokenResponse::error(ErrorType::InvalidRequest));
         };
 
+        if !is_server_code(device_code) {
+            return Ok(TokenResponse::error(ErrorType::ExpiredToken));
+        }
         let Some(auth_code_) = self
             .in_memory_store()
             .key_get::<Archive<ArchiveBytes>>(KeyValue::<()>::build_key(
@@ -386,6 +405,7 @@ impl TokenHandler for Server {
                         nonce: oauth.nonce.as_ref().map(|s| s.as_str()),
                         issuer,
                         remote_ip: ctx.remote_ip,
+                        za_grant: None,
                     })
                     .await
                 } else {
@@ -481,6 +501,33 @@ impl TokenHandler for Server {
             return Ok(TokenResponse::error(ErrorType::InvalidGrant));
         }
 
+        let mut za_secret = None;
+        if self
+            .account(token_info.account_id)
+            .await
+            .caused_by(trc::location!())?
+            .is_key_account()
+        {
+            let suffix = za_split_bearer(refresh_token).1;
+            match self
+                .za_token_refresh_precheck(token_info.account_id, presented.id, &suffix)
+                .await?
+            {
+                ZaRefreshPrecheck::Keyless => {}
+                ZaRefreshPrecheck::Refused => {
+                    return Ok(TokenResponse::error(ErrorType::InvalidGrant));
+                }
+                // Spec 4.5: the secret opens the presented entry after the
+                // rotation. Without one the grant must not rotate keyless.
+                ZaRefreshPrecheck::Keyed => {
+                    let ZaSuffix::Secret(secret) = suffix else {
+                        return Ok(TokenResponse::error(ErrorType::InvalidGrant));
+                    };
+                    za_secret = Some(secret);
+                }
+            }
+        }
+
         match self
             .rotate_oauth_grant(stored, presented.generation)
             .await?
@@ -490,7 +537,7 @@ impl TokenHandler for Server {
                     .account(token_info.account_id)
                     .await
                     .caused_by(trc::location!())?;
-                self.grant_response(GrantResponse {
+                let mut response = self.grant_response(GrantResponse {
                     account_id: token_info.account_id,
                     account_name: account.name(),
                     credential_version: token_info.credential_version,
@@ -498,8 +545,21 @@ impl TokenHandler for Server {
                     rotated_at,
                     scope: granted_scope,
                     id_token: None,
-                })
-                .map(TokenResponse::Granted)
+                })?;
+                if let Some(secret) = &za_secret
+                    && let Err(error) = za_refresh_keyed(
+                        self,
+                        token_info.account_id,
+                        presented,
+                        next,
+                        secret,
+                        &mut response,
+                    )
+                    .await?
+                {
+                    return Ok(TokenResponse::error(error));
+                }
+                Ok(TokenResponse::Granted(response))
             }
             GrantRotation::Revoked | GrantRotation::Rejected => {
                 Ok(TokenResponse::error(ErrorType::InvalidGrant))
@@ -561,7 +621,7 @@ impl TokenHandler for Server {
             None
         };
 
-        self.grant_response(GrantResponse {
+        let mut response = self.grant_response(GrantResponse {
             account_id,
             account_name: account.name(),
             credential_version,
@@ -572,13 +632,17 @@ impl TokenHandler for Server {
             rotated_at: now(),
             scope,
             id_token,
-        })
-        .map(|mut response| {
-            if grant_id == RECOVERY_ADMIN_GRANT_ID {
-                response.refresh_token = None;
-            }
-            TokenResponse::Granted(response)
-        })
+        })?;
+        if grant_id == RECOVERY_ADMIN_GRANT_ID {
+            response.refresh_token = None;
+        }
+        if let Some(keys) = request.za_grant
+            && let Err(error) =
+                za_issue_keyed(self, account_id, grant_id, &keys, &mut response).await?
+        {
+            return Ok(TokenResponse::error(error));
+        }
+        Ok(TokenResponse::Granted(response))
     }
 
     fn grant_response(&self, response: GrantResponse<'_>) -> trc::Result<OAuthResponse> {
@@ -624,6 +688,18 @@ fn is_scope_subset(requested: &str, granted: &str) -> bool {
     })
 }
 
+/// The server issues codes and device codes as 40 ASCII alphanumeric
+/// characters. A lookup key built from other input could select another entry
+/// under the OAuth prefix, such as a zero-access hand-off (`~` and a code),
+/// whose bytes the archive reader would attach to its error.
+fn is_server_code(code: &str) -> bool {
+    code.len() == CODE_LEN && code.bytes().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+// Codes are generated with upstream's length and checked with the fork's: an upstream change
+// of the length stops the build here (final review FA-10).
+const _: () = assert!(CODE_LEN == common::auth::oauth::DEVICE_CODE_LEN);
+
 pub struct NewGrantRequest<'x> {
     account_id: u32,
     credential_version: u64,
@@ -633,6 +709,7 @@ pub struct NewGrantRequest<'x> {
     nonce: Option<&'x str>,
     issuer: &'x str,
     remote_ip: IpAddr,
+    za_grant: Option<ZaGrantKeys>,
 }
 
 pub struct GrantResponse<'x> {
@@ -660,7 +737,10 @@ pub(crate) fn token_response(response: TokenResponse, used_basic: bool) -> HttpR
     let response = JsonResponse::with_status(status, response)
         .no_cache()
         .into_http_response();
-    if status == StatusCode::UNAUTHORIZED && used_basic {
+    if status == StatusCode::OK {
+        // D24: successful answers carry credentials for every account.
+        response.with_untraced_body()
+    } else if status == StatusCode::UNAUTHORIZED && used_basic {
         response.with_header(WWW_AUTHENTICATE, BASIC_CHALLENGE)
     } else {
         response
@@ -768,3 +848,28 @@ fn verify_pkce(
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/http/src/auth/oauth/token/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod za_tests {
+    use super::*;
+
+    #[test]
+    fn granted_token_answer_is_untraced() {
+        let granted = TokenResponse::Granted(OAuthResponse {
+            access_token: "sample-access".to_owned(),
+            token_type: "bearer".to_owned(),
+            expires_in: 60,
+            refresh_token: Some("sample-refresh".to_owned()),
+            scope: String::new(),
+            username: "sample@example.org".to_owned(),
+            id_token: None,
+        });
+        assert!(token_response(granted, false).is_untraced());
+        assert!(
+            !token_response(TokenResponse::error(ErrorType::InvalidGrant), false).is_untraced()
+        );
+        assert!(
+            !token_response(TokenResponse::error(ErrorType::InvalidClient), true).is_untraced()
+        );
+    }
+}

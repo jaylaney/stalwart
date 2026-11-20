@@ -370,7 +370,7 @@ pub async fn assert_is_empty(server: &Server, include_registry: bool) {
     for (account_ids, what) in [
         (
             &account_state.vault_accounts,
-            "a zero-access vault or pin record",
+            "a zero-access vault, pin, search or token record",
         ),
         (
             &account_state.share_notification_accounts,

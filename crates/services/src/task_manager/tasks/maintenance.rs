@@ -282,6 +282,16 @@ async fn store_maintenance(server: &Server, task: &TaskStoreMaintenance) -> trc:
                 .await
                 .caused_by(trc::location!())?;
 
+            // Zero-access JMAP calendars spec 4.7 (D8): reconcile token
+            // records without stopping the rest of the purge on failure.
+            if let Err(err) = server.za_token_sweep().await {
+                trc::error!(
+                    trc::Error::new(err.event_type())
+                        .details("zero-access: token sweep failed")
+                        .caused_by(trc::location!())
+                );
+            }
+
             server
                 .registry()
                 .purge_dead_nodes()
