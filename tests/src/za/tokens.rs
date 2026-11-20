@@ -71,7 +71,8 @@ use vault::{
     record::za_session_binding,
     session::SessionKeys,
     tokens::{
-        CODE_LEN, TOKEN_RECORD_VERSION, ZaRefreshClass, ZaSuffix, append_code_secret, append_secret,
+        CODE_LEN, MAX_ACCESS_ENTRIES, TOKEN_RECORD_VERSION, ZaRefreshClass, ZaSuffix,
+        append_code_secret, append_secret,
     },
 };
 
@@ -127,6 +128,7 @@ pub async fn test(test: &mut TestServer) {
     forget_failure_does_not_fail_deletion(test, owner).await;
     ordinary_grant_deletion_reads_no_record(test, plain_id).await;
     server_token_answers(test, owner, plain_id).await;
+    refresh_past_its_access_deadline_keeps_live_entries(test, owner).await;
 
     let owner_account = test.account(OWNER).clone();
     keyed_bearer_reads_sealed_data(test, &owner_account).await;
@@ -3187,5 +3189,124 @@ async fn server_token_answers(test: &TestServer, id: u32, plain_id: u32) {
             "an issued access token does not open"
         );
     }
+    za_revoke_grant(&test.server, grant).await;
+}
+
+/// Upstream's rotation of `grant` from `presented`, then the record's
+/// refresh with the access deadline given, as the refresh grant runs them.
+async fn rotate_and_refresh(
+    test: &TestServer,
+    id: u32,
+    grant: u64,
+    presented: u64,
+    secret: &Secret,
+    access_expires: u64,
+) -> (u64, ZaTokenRefresh) {
+    let stored = test
+        .server
+        .oauth_grant(grant)
+        .await
+        .unwrap()
+        .expect("the keyed grant");
+    let GrantRotation::Issue { next, .. } = test
+        .server
+        .rotate_oauth_grant(stored, presented)
+        .await
+        .unwrap()
+    else {
+        panic!("upstream did not rotate the grant");
+    };
+    let refreshed = test
+        .server
+        .za_token_refresh(
+            id,
+            grant,
+            presented,
+            secret,
+            next.generation,
+            access_expires,
+            now() + MONTH,
+        )
+        .await
+        .unwrap();
+    (next.generation, refreshed)
+}
+
+/// PR #90 review C4646937244: a refresh that reaches its record write after
+/// its access deadline (a lowered access-token lifetime used up by the reads
+/// or a conditional-write retry) stores no access entry, so it removes none
+/// of the grant's four live ones, and is still answered with its refresh
+/// entry written.
+async fn refresh_past_its_access_deadline_keeps_live_entries(test: &TestServer, id: u32) {
+    println!("  refresh_past_its_access_deadline_keeps_live_entries");
+    let keys = za_unlock(test, id, STRONG).await;
+    let (grant, _, issued) = keyed_grant(test, id).await;
+    let mut presented = test
+        .server
+        .oauth_grant(grant)
+        .await
+        .unwrap()
+        .expect("the issued grant")
+        .grant
+        .generation;
+    let mut secret = issued.refresh;
+    let mut live = vec![issued.access];
+    // The issue's entry and three real refreshes: four live access entries.
+    for _ in 0..3 {
+        let (next, refreshed) =
+            rotate_and_refresh(test, id, grant, presented, &secret, now() + HOUR).await;
+        let ZaTokenRefresh::Issued(refreshed) = refreshed else {
+            panic!("a refresh was not issued");
+        };
+        live.push(refreshed.access);
+        presented = next;
+        secret = refreshed.refresh;
+    }
+    assert_eq!(
+        token_record(test, id)
+            .await
+            .unwrap()
+            .grant(grant)
+            .unwrap()
+            .access
+            .len(),
+        MAX_ACCESS_ENTRIES
+    );
+
+    let (next, refreshed) =
+        rotate_and_refresh(test, id, grant, presented, &secret, now() - 1).await;
+    let ZaTokenRefresh::Issued(late) = refreshed else {
+        panic!("the refresh past its access deadline was not issued");
+    };
+    for access in &live {
+        assert!(
+            test.server
+                .za_token_open_access(id, grant, access)
+                .await
+                .unwrap()
+                .is_some_and(|opened| opened.mk().as_bytes() == keys.mk().as_bytes()),
+            "a live access entry was removed"
+        );
+    }
+    let record = token_record(test, id).await.unwrap();
+    assert_eq!(
+        record.grant(grant).unwrap().access.len(),
+        MAX_ACCESS_ENTRIES
+    );
+    assert!(
+        test.server
+            .za_token_open_access(id, grant, &late.access)
+            .await
+            .unwrap()
+            .is_none(),
+        "the late refresh's access secret opens"
+    );
+    // At time 0 an entry opens whatever its expiry.
+    assert!(
+        record.open_access(id, grant, &late.access, 0).is_none(),
+        "an entry holds the late refresh's access secret"
+    );
+    // The refresh entry is still written, so the client can refresh again.
+    assert_eq!(generations(test, id, grant).await, [presented, next]);
     za_revoke_grant(&test.server, grant).await;
 }
