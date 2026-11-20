@@ -3000,12 +3000,15 @@ async fn account_destruction_removes_the_record(
 }
 
 /// Answers of the token record's server API that no request picks on a
-/// healthy store: taking a hand-off nobody stored; a hand-off put with keys
-/// of another account (the sign-in failure, nothing stored); an issue and a
-/// refresh for an account without a vault record (`VaultChanged`, no record
-/// written); an issue naming a grant that does not exist (an error, the record
-/// unchanged); a refresh presenting a secret no entry holds (no keys, the
-/// record unchanged); and a sweep over a current record (unchanged).
+/// healthy store: taking a hand-off nobody stored; a hand-off put for one
+/// account with another account's keys at the target's generation, so only
+/// the account check refuses it (the sign-in failure, nothing stored); an
+/// issue and a refresh for an account without a vault record (`VaultChanged`,
+/// no record written); an issue naming a grant that does not exist (an error,
+/// the record unchanged); a refresh presenting the grant's stored generation
+/// with a secret no entry holds (`Lost`: the grant has not rotated and its
+/// live entry of that generation does not open; the record unchanged); and a
+/// sweep over a current record (unchanged).
 async fn server_token_answers(test: &TestServer, id: u32, plain_id: u32) {
     println!("  server_token_answers");
     assert!(
@@ -3019,10 +3022,19 @@ async fn server_token_answers(test: &TestServer, id: u32, plain_id: u32) {
 
     let keys = za_unlock(test, id, STRONG).await;
     let mfa = test.account(MFA).id().document_id();
+    // The owner's key material and account id at the target's generation, so
+    // only the account check can refuse the put.
+    let foreign = SessionKeys::new(id, vault_revision(test, mfa).await, keys.mk().clone());
+    assert_ne!(foreign.account_id, mfa, "the keys name the target account");
+    assert_eq!(
+        foreign.generation,
+        vault_revision(test, mfa).await,
+        "the keys are not at the target's generation"
+    );
     let key_id = "q".repeat(CODE_LEN);
     let refused = test
         .server
-        .za_handoff_put(&key_id, mfa, &keys, now() + 60)
+        .za_handoff_put(&key_id, mfa, &foreign, now() + 60)
         .await
         .err()
         .unwrap_or_else(|| panic!("a hand-off was put with another account's keys"));
@@ -3097,8 +3109,8 @@ async fn server_token_answers(test: &TestServer, id: u32, plain_id: u32) {
         .await
         .unwrap();
     assert!(
-        matches!(refreshed, ZaTokenRefresh::Lost | ZaTokenRefresh::Superseded),
-        "a refresh with a secret no entry holds was given keys"
+        matches!(refreshed, ZaTokenRefresh::Lost),
+        "a refresh with a secret no entry holds at the grant's generation was not lost"
     );
     assert!(
         raw_token_record(test, id).await == raw,
