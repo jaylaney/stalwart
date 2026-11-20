@@ -31,7 +31,7 @@ use groupware::{
             ZaScheduling,
             admission::{ZaRoles, za_roles, za_writer_keys},
             context::za_mutation_context,
-            delete::{za_calendar_delete_target, za_calendar_members, za_delete_calendar},
+            delete::{za_calendar_delete_target, za_calendar_has_member, za_delete_calendar},
             error::ZaPipelineError,
             schedule::za_delete_send_itip,
         },
@@ -690,12 +690,15 @@ impl ZaCalendarWriter<'_> {
         // PR #90 second review RC-1: the owner's check reads the members the
         // delete removes (the stored records), which can hold a document the
         // path index hides; a caller who is not the owner keeps upstream's.
-        let has_events = if self.is_shared {
-            has_visible_children
-        } else {
-            !za_calendar_members(cache, document_id).is_empty()
+        // With the flag set nothing is read for it (C4644031673).
+        let has_events = || {
+            if self.is_shared {
+                has_visible_children
+            } else {
+                za_calendar_has_member(cache, document_id)
+            }
         };
-        if has_events && !on_destroy_remove_events {
+        if !on_destroy_remove_events && has_events() {
             return Ok(Err(SetError::calendar_has_event()));
         }
         if self.is_shared && has_restricted_children {

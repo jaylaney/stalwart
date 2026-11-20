@@ -24,7 +24,7 @@ use crate::{
     },
 };
 use common::{
-    GroupwareResources, Server,
+    GroupwareResourceRef, GroupwareResources, Server,
     auth::AccessToken,
     cache::invalidate::CacheInvalidationBuilder,
     ipc::CacheInvalidation,
@@ -480,17 +480,30 @@ pub fn za_calendar_members(resources: &GroupwareResources, calendar_id: u32) -> 
     let mut members = resources
         .resources
         .iter_run(false)
-        .filter(|resource| {
-            resource
-                .child_names()
-                .iter()
-                .any(|name| name.parent_id == calendar_id)
-        })
+        .filter(|resource| za_record_names_calendar(resource, calendar_id))
         .map(|resource| resource.document_id())
         .collect::<Vec<_>>();
     members.sort_unstable();
     members.dedup();
     members
+}
+
+/// PR #90 comment C4644031673: whether `za_calendar_members` would list any
+/// document, stopping at the first record that names the calendar.
+pub fn za_calendar_has_member(resources: &GroupwareResources, calendar_id: u32) -> bool {
+    resources
+        .resources
+        .iter_run(false)
+        .any(|resource| za_record_names_calendar(&resource, calendar_id))
+}
+
+/// A stored resource record names `calendar_id` when one of its names sits
+/// under it: the one definition both functions above use.
+fn za_record_names_calendar(resource: &GroupwareResourceRef<'_>, calendar_id: u32) -> bool {
+    resource
+        .child_names()
+        .iter()
+        .any(|name| name.parent_id == calendar_id)
 }
 
 /// PR #90 review C4617611506: a calendar delete's child list, fenced against
