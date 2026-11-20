@@ -361,7 +361,8 @@ Accepted, each because the CalDAV behaviour is the qualified one:
   every JMAP update of it, an alert-only or keyword-only one included,
   stores the tree the converter produces, where upstream keeps the
   stored tree for a per-user-only change, so 3.4's round-trip limitation
-  applies to those updates too.
+  applies to those updates too. Whether this stays is still open for the
+  project owner (the outcome note's item 15).
 - **Default alerts are applied by value** (D11).
 - **An attendee's create sends no reply.** An attendee who creates, as
   its own copy, the event of an invitation that has not reached the
@@ -1090,11 +1091,11 @@ replica's reads can lag the primary, so the comparison could pass on a
 stale child list. The ephemeral store applies each operation as it goes,
 with no rollback, and is the data store only in web bootstrap mode,
 where no key account exists. Issue #92 carries a note of 2026-11-18
-that this pull request makes the delete one transaction, and a note
-added on 2026-11-19, after the push, of what it keeps: a calendar too
-large for one transaction, the stores that keep the chunked form, the
-fence's refusal after the cancellations, a large delete retried whole
-on a conflicting commit, and PostgreSQL and MySQL read, not run, and a
+that this pull request makes the delete one transaction; a note added
+on 2026-11-19, after the push, of what it keeps (a calendar too large
+for one transaction, the stores that keep the chunked form, the fence's
+refusal after the cancellations, a large delete retried whole on a
+conflicting commit, and PostgreSQL and MySQL read, not run); and a
 comment of 2026-11-20 on a default-calendar id written across a
 concurrent delete. Its title and body were not edited.
 
