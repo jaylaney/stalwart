@@ -291,7 +291,10 @@ impl ZaTokenRecord {
         }
     }
 
-    /// Adds a fresh access entry, dropping the earliest expiry past the cap.
+    /// Adds a fresh access entry and returns its secret. At the cap it first
+    /// drops the earliest-expiring of the entries stored before this call
+    /// (the first on a tie), so the entry it adds is never the one dropped,
+    /// even when it expires before every stored one.
     pub fn put_access(
         &mut self,
         account_id: u32,
@@ -301,16 +304,7 @@ impl ZaTokenRecord {
     ) -> Secret {
         let secret = Secret::random();
         let grant = self.grant_or_insert(grant_id);
-        grant.access.push(ZaAccessEntry {
-            tag: derive_token_tag(&secret),
-            wrap: wrap_key(
-                mk,
-                &derive_token_wrap_key(&secret),
-                &token_aad(account_id, grant_id, ZaTokenKind::Access),
-            ),
-            expires,
-        });
-        if grant.access.len() > MAX_ACCESS_ENTRIES {
+        if grant.access.len() >= MAX_ACCESS_ENTRIES {
             // min_by_key returns the first entry on a tie.
             let (oldest, _) = grant
                 .access
@@ -320,6 +314,15 @@ impl ZaTokenRecord {
                 .unwrap();
             grant.access.remove(oldest);
         }
+        grant.access.push(ZaAccessEntry {
+            tag: derive_token_tag(&secret),
+            wrap: wrap_key(
+                mk,
+                &derive_token_wrap_key(&secret),
+                &token_aad(account_id, grant_id, ZaTokenKind::Access),
+            ),
+            expires,
+        });
         secret
     }
 
@@ -622,6 +625,75 @@ mod tests {
                 .len()
                 < 50_000
         );
+    }
+
+    #[test]
+    fn put_access_keeps_the_entry_it_adds() {
+        let mk = Secret::random();
+        let opens = |record: &ZaTokenRecord, secret: &Secret| {
+            record
+                .open_access(7, 23, secret, 0)
+                .is_some_and(|opened| opened.as_bytes() == mk.as_bytes())
+        };
+        let expiries = |record: &ZaTokenRecord| {
+            record
+                .grant(23)
+                .unwrap()
+                .access
+                .iter()
+                .map(|entry| entry.expires)
+                .collect::<Vec<_>>()
+        };
+
+        // The fifth entry expires before all four stored ones (a lowered
+        // access-token lifetime, or another node's clock): it stays, and the
+        // earliest-expiring stored entry goes.
+        let mut record = ZaTokenRecord::new(3);
+        let stored = [40, 20, 30, 50].map(|expires| record.put_access(7, 23, &mk, expires));
+        let added = record.put_access(7, 23, &mk, 10);
+        assert!(
+            opens(&record, &added),
+            "the access entry just added does not open"
+        );
+        assert_eq!(expiries(&record), [40, 30, 50, 10]);
+        for (index, secret) in stored.iter().enumerate() {
+            assert!(
+                opens(&record, secret) == (index != 1),
+                "an entry other than the earliest-expiring stored one was removed"
+            );
+        }
+
+        // A fifth entry with a later expiry evicts the earliest stored one.
+        let mut record = ZaTokenRecord::new(3);
+        let stored = [40, 20, 30, 50].map(|expires| record.put_access(7, 23, &mk, expires));
+        let added = record.put_access(7, 23, &mk, 60);
+        assert!(
+            opens(&record, &added),
+            "the access entry just added does not open"
+        );
+        assert_eq!(expiries(&record), [40, 30, 50, 60]);
+        for (index, secret) in stored.iter().enumerate() {
+            assert!(
+                opens(&record, secret) == (index != 1),
+                "an entry other than the earliest-expiring stored one was removed"
+            );
+        }
+
+        // A tie among the stored entries evicts the first of them.
+        let mut record = ZaTokenRecord::new(3);
+        let stored = [30, 10, 10, 40].map(|expires| record.put_access(7, 23, &mk, expires));
+        let added = record.put_access(7, 23, &mk, 50);
+        assert!(
+            opens(&record, &added),
+            "the access entry just added does not open"
+        );
+        assert_eq!(expiries(&record), [30, 10, 40, 50]);
+        for (index, secret) in stored.iter().enumerate() {
+            assert!(
+                opens(&record, secret) == (index != 1),
+                "an entry other than the first of the tied stored ones was removed"
+            );
+        }
     }
 
     #[test]
