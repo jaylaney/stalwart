@@ -27,6 +27,13 @@ use crate::{
         uid_lease::put,
     },
 };
+use ::registry::{
+    schema::{
+        enums::StorageQuota,
+        prelude::{ObjectType, Property},
+    },
+    types::EnumImpl,
+};
 use calcard::icalendar::ICalendarMethod;
 use common::za::{
     imip::ZA_IMIP_DROPPED,
@@ -100,6 +107,11 @@ pub async fn test(test: &mut TestServer) {
     grantee_destroy_refused(test, &pair).await;
     on_success_set_is_default(test, &pair).await;
     share_with_refused(test, &pair).await;
+    // PR #90 coverage: the key writer's remaining answers of upstream's checks.
+    calendar_writer_answers(test, &pair).await;
+    destroy_reads_each_privacy(test, &pair).await;
+    grantee_calendar_writes(test, &pair).await;
+    default_without_a_stored_id(test, &pair).await;
     per_object_commits(&pair).await;
     store_failure_stops_the_call(test, &pair).await;
     finish(test, "calendars").await;
@@ -1694,4 +1706,323 @@ fn document_id(id: &str) -> u32 {
     id.parse::<Id>()
         .unwrap_or_else(|_| panic!("invalid id {id}"))
         .document_id()
+}
+
+/// A display alert, as JMAP writes one.
+fn default_alert(offset: &str) -> Value {
+    json!({
+        "@type": "Alert",
+        "action": "display",
+        "trigger": { "@type": "OffsetTrigger", "relativeTo": "start", "offset": offset },
+    })
+}
+
+/// Upstream's answers the key writer of `Calendar/set` gives with upstream's
+/// texts: an update id that is malformed or also destroyed, a destroy of an id
+/// that names no calendar, object metadata without its capability, a value
+/// that cannot be set, a default alert id another calendar holds, and the
+/// calendar count quota. Nothing of a refused object is stored.
+async fn calendar_writer_answers(test: &TestServer, pair: &Pair) {
+    const UNSUPPORTED: &str = "Metadata is not supported on this object.";
+    const DUPLICATE: &str = "Default alert ids must be unique across all calendars in the account.";
+    let (key, owner) = (&pair.key, pair.key_id);
+    let reply = calendar_set(
+        key,
+        key,
+        json!({ "create": {
+            "i0": { "name": "jmapcal-writer-a", "defaultAlertsWithTime": { "jmapcal-t1": default_alert("-PT15M") } },
+            "i1": { "name": "jmapcal-writer-b" },
+        } }),
+    )
+    .await;
+    let (a, b) = (
+        reply.created_id(0).to_string(),
+        reply.created_id(1).to_string(),
+    );
+    let before = calendar_entry(key, key, &b).await;
+
+    // Ids: a malformed one, one also destroyed, one that names no calendar.
+    let missing = Id::from(999_997u32).to_string();
+    let reply = calendar_set(
+        key,
+        key,
+        json!({
+            "update": { "jmapcal-not-an-id!": { "name": "x" }, &a: { "name": "x" } },
+            "destroy": [&a, &missing],
+            "onDestroyRemoveEvents": true,
+        }),
+    )
+    .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    assert_eq!(
+        set_error(reply.not_updated("jmapcal-not-an-id!")).0,
+        "notFound",
+        "{reply:?}"
+    );
+    assert_eq!(
+        set_error(reply.not_updated(&a)).0,
+        "willDestroy",
+        "{reply:?}"
+    );
+    assert_eq!(
+        reply.destroyed().collect::<Vec<_>>(),
+        [a.as_str()],
+        "{reply:?}"
+    );
+    assert_eq!(
+        set_error(reply.not_destroyed(&missing)).0,
+        "notFound",
+        "{reply:?}"
+    );
+    assert!(!listed(&calendar_get(key, key).await, &a));
+
+    // Object metadata without its capability, and a value that cannot be set.
+    let reply = calendar_set(
+        key,
+        key,
+        json!({
+            "create": { "i0": { "name": "jmapcal-writer-c", "metadata": { "example.com": { "note": "jmapcal canary" } } } },
+            "update": { &b: { "metadata": { "example.com": { "note": "jmapcal canary" } } } },
+        }),
+    )
+    .await;
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        ("invalidProperties", Some(UNSUPPORTED)),
+        "{reply:?}"
+    );
+    assert_eq!(
+        set_error(reply.not_updated(&b)),
+        ("invalidProperties", Some(UNSUPPORTED)),
+        "{reply:?}"
+    );
+    let reply = calendar_set(
+        key,
+        key,
+        json!({ "update": { &b: { "color": "not a colour" } } }),
+    )
+    .await;
+    assert_eq!(
+        set_error(reply.not_updated(&b)),
+        ("invalidProperties", Some("Field could not be set.")),
+        "{reply:?}"
+    );
+
+    // A default alert id that another calendar of the account holds.
+    let reply = calendar_set(
+        key,
+        key,
+        json!({ "create": { "i0": {
+            "name": "jmapcal-writer-d",
+            "defaultAlertsWithTime": { "jmapcal-t2": default_alert("-PT5M") },
+        } } }),
+    )
+    .await;
+    let d = reply.created_id(0).to_string();
+    let reply = calendar_set(
+        key,
+        key,
+        json!({
+            "create": { "i0": {
+                "name": "jmapcal-writer-e",
+                "defaultAlertsWithTime": { "jmapcal-t2": default_alert("-PT1H") },
+            } },
+            "update": { &b: { "defaultAlertsWithTime": { "jmapcal-t2": default_alert("-PT2H") } } },
+        }),
+    )
+    .await;
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        ("invalidProperties", Some(DUPLICATE)),
+        "{reply:?}"
+    );
+    assert_eq!(
+        set_error(reply.not_updated(&b)),
+        ("invalidProperties", Some(DUPLICATE)),
+        "{reply:?}"
+    );
+    assert_eq!(calendar_entry(key, key, &b).await, before);
+
+    // The calendar count quota.
+    let admin = test.account("admin@example.com");
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key.id(),
+            json!({ Property::Quotas: { StorageQuota::MaxCalendars.as_str(): 1 } }),
+        )
+        .await;
+    let reply = calendar_set(
+        key,
+        key,
+        json!({ "create": { "i0": { "name": "jmapcal-writer-f" } } }),
+    )
+    .await;
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        (
+            "overQuota",
+            Some("There are too many calendars, please delete some before adding a new one.")
+        ),
+        "{reply:?}"
+    );
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key.id(),
+            json!({ Property::Quotas: {} }),
+        )
+        .await;
+    let names = calendar_get(key, key)
+        .await
+        .list()
+        .iter()
+        .filter_map(|entry| entry["name"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    for name in ["jmapcal-writer-c", "jmapcal-writer-e", "jmapcal-writer-f"] {
+        assert!(
+            !names.iter().any(|stored| stored == name),
+            "{name} was stored"
+        );
+    }
+    for id in [&b, &d] {
+        destroy(pair, id).await;
+    }
+    assert!(!calendar_stored(test, owner, document_id(&b)).await);
+}
+
+/// Upstream's destroy reads every member's privacy, public, private and
+/// confidential; the owner's destroy refuses the calendar without
+/// `onDestroyRemoveEvents` and removes it with the flag.
+async fn destroy_reads_each_privacy(test: &TestServer, pair: &Pair) {
+    const SLUG: &str = "jmapcal-destroy-classes";
+    let owner = pair.key_id;
+    let id = Id::from(make_calendar(test, &pair.key, &pair.dav, SLUG).await).to_string();
+    for (uid, class) in [
+        ("jmapcal-cal-class-public", "PUBLIC"),
+        ("jmapcal-cal-class-private", "PRIVATE"),
+        ("jmapcal-cal-class-confidential", "CONFIDENTIAL"),
+    ] {
+        pair.dav
+            .request_with_headers(
+                "PUT",
+                &format!("{HOME}{SLUG}/{uid}.ics"),
+                [("content-type", "text/calendar; charset=utf-8")],
+                event_ics(uid, uid).replace("END:VEVENT", &format!("CLASS:{class}\r\nEND:VEVENT")),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    let reply = calendar_set(&pair.key, &pair.key, json!({ "destroy": [&id] })).await;
+    assert_eq!(
+        set_error(reply.not_destroyed(&id)).0,
+        "calendarHasEvent",
+        "{reply:?}"
+    );
+    assert!(calendar_stored(test, owner, document_id(&id)).await);
+    destroy(pair, &id).await;
+    assert!(!calendar_stored(test, owner, document_id(&id)).await);
+    for uid in [
+        "jmapcal-cal-class-public",
+        "jmapcal-cal-class-private",
+        "jmapcal-cal-class-confidential",
+    ] {
+        assert_eq!(uid_copies(test, owner, uid).await, 0, "{uid}");
+    }
+}
+
+/// A grantee's `Calendar/set` in the owner's account: an update of a calendar
+/// not shared with it is `notFound`, an update of a calendar shared at
+/// `view` is `forbidden`, and its `onSuccessSetIsDefault` leaves the owner's
+/// default as it is. The owner's own request naming the current default
+/// writes nothing.
+async fn grantee_calendar_writes(test: &TestServer, pair: &Pair) {
+    const VIEWED: &str = "jmapcal-grantee-viewed";
+    make_calendar(test, &pair.key, &pair.dav, VIEWED).await;
+    share(test, &pair.key, &pair.key2, pair.key2_id, VIEWED, "view").await;
+    let viewed = calendar_named(&pair.key, &pair.key, VIEWED).await;
+    let default = the_default(pair).await;
+    let stored = stored_default(test, pair.key_id).await;
+
+    let reply = calendar_set(
+        &pair.key2,
+        &pair.key,
+        json!({
+            "update": { &default: { "name": "x" }, &viewed: { "name": "x" } },
+            "onSuccessSetIsDefault": &viewed,
+        }),
+    )
+    .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    assert_eq!(
+        set_error(reply.not_updated(&default)),
+        ("notFound", None),
+        "{reply:?}"
+    );
+    assert_eq!(
+        set_error(reply.not_updated(&viewed)),
+        ("forbidden", None),
+        "{reply:?}"
+    );
+    assert_eq!(the_default(pair).await, default);
+    assert_eq!(stored_default(test, pair.key_id).await, stored);
+
+    let reply = calendar_set(
+        &pair.key,
+        &pair.key,
+        json!({ "onSuccessSetIsDefault": &default }),
+    )
+    .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    assert_eq!(the_default(pair).await, default);
+    assert_eq!(stored_default(test, pair.key_id).await, stored);
+    dav_delete(pair, VIEWED).await;
+}
+
+/// Writes, or with `None` clears, the account's stored default calendar id.
+async fn set_stored_default(test: &TestServer, account_id: u32, id: Option<u32>) {
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::Principal)
+        .with_document(0);
+    match id {
+        Some(id) => batch.set(
+            PrincipalField::DefaultCalendarId,
+            store::write::PendingId::Assigned(id),
+        ),
+        None => batch.clear(PrincipalField::DefaultCalendarId),
+    };
+    test.server.commit_batch(batch).await.unwrap();
+}
+
+/// Upstream's default rule when the account stores no default calendar id: a
+/// created calendar is the default only when it has the lowest id, and
+/// `onSuccessSetIsDefault` naming the lowest id writes nothing.
+async fn default_without_a_stored_id(test: &TestServer, pair: &Pair) {
+    let (key, owner) = (&pair.key, pair.key_id);
+    let stored = stored_default(test, owner).await;
+    set_stored_default(test, owner, None).await;
+    let lowest = calendar_get(key, key)
+        .await
+        .list()
+        .iter()
+        .filter_map(|entry| entry["id"].as_str().map(document_id))
+        .min()
+        .expect("the account has a calendar");
+    let reply = calendar_set(
+        key,
+        key,
+        json!({
+            "create": { "i0": { "name": "jmapcal-writer-g" } },
+            "onSuccessSetIsDefault": Id::from(lowest).to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    assert_eq!(reply.created(0)["isDefault"], false, "{reply:?}");
+    let created = reply.created_id(0).to_string();
+    assert_eq!(stored_default(test, owner).await, None);
+    set_stored_default(test, owner, stored).await;
+    destroy(pair, &created).await;
 }
