@@ -31,6 +31,13 @@ use crate::{
         uid_lease::put,
     },
 };
+use ::registry::{
+    schema::{
+        enums::StorageQuota,
+        prelude::{ObjectType, Property},
+    },
+    types::EnumImpl,
+};
 use calcard::icalendar::ICalendarValue;
 use common::{
     auth::oauth::scope::OAuthScopes,
@@ -79,6 +86,7 @@ pub async fn test(test: &mut TestServer) {
     get_legacy_event(test, &pair).await;
     get_unreadable_event_is_not_found(test, &pair).await;
     get_completes_pending_boundary(test, &pair, shared).await;
+    unreadable_event_writes_are_not_found(test, &pair).await;
     read_store_errors_are_payload_free(test, &pair).await;
     changes_as_upstream(test, &pair).await;
     identity_get_and_changes(&pair).await;
@@ -95,6 +103,11 @@ pub async fn test(test: &mut TestServer) {
     create_stores_no_preferences_and_no_index_document(&events).await;
     tasks(&events).await;
     create_holds_the_lease(&events).await;
+    // PR #90 coverage: the key writer's remaining answers of upstream's checks.
+    writer_limits(&events).await;
+    writer_quotas(&events).await;
+    writer_uid_privacy(&events).await;
+    writer_create_failure_stops_the_call(&events).await;
     // Release 6 spec 6.5, 5.4: CalendarEvent/set updates (Task 31).
     update_keeps_pairs_and_display_name(&events).await;
     update_applies_sequence_floor(&events).await;
@@ -119,6 +132,8 @@ pub async fn test(test: &mut TestServer) {
     let series = Series::create(&events).await;
     destroy_occurrence_is_an_update(&events, &series).await;
     events.delete(series.document_id).await;
+    let series = Series::create(&events).await;
+    occurrence_answers(&events, &series).await;
     events.finish().await;
     pair.dav
         .request_with_headers("DELETE", &event_path("jmapcal-shared/"), [NO_REPLY], "")
@@ -2515,4 +2530,495 @@ async fn destroy_occurrence_is_an_update(events: &Events<'_>, series: &Series) {
             .any(|line| line.starts_with("RECURRENCE-ID") && line.contains("20310305")),
         "destroy_occurrence_is_an_update: the occurrence is still overridden: {body}"
     );
+}
+
+const INCOMPLETE: &str = "The server could not complete this change, try again.";
+const UNSUPPORTED_METADATA: &str = "Metadata is not supported on this object.";
+const PRIVACY_CONFLICT: &str = "All events with the same UID must have the same privacy.";
+
+/// `n` calendar ids that name no calendar of the account.
+fn absent_calendar_ids(n: u32) -> Value {
+    Value::Object(
+        (1..=n)
+            .map(|i| (Id::from(90_000u32 + i).to_string(), json!(true)))
+            .collect(),
+    )
+}
+
+/// An organizer and `attendees` outside parties, as JMAP writes them.
+fn participants(attendees: usize) -> Value {
+    let mut participants = serde_json::Map::new();
+    participants.insert(
+        "p0".to_string(),
+        json!({
+            "@type": "Participant",
+            "calendarAddress": "mailto:jmapcal-events@example.com",
+            "roles": { "owner": true, "chair": true },
+        }),
+    );
+    for index in 1..=attendees {
+        participants.insert(
+            format!("p{index}"),
+            json!({
+                "@type": "Participant",
+                "calendarAddress": format!("mailto:jmapcal-events-out-{index}@remote.test"),
+                "participationStatus": "needs-action",
+            }),
+        );
+    }
+    Value::Object(participants)
+}
+
+/// `n` distinct keywords.
+fn keywords(n: usize) -> Value {
+    Value::Object(
+        (0..n)
+            .map(|i| (format!("jmapcal-kw-{i}"), json!(true)))
+            .collect(),
+    )
+}
+
+/// Upstream's limits, as the key writer answers them on a create and on an
+/// update, with upstream's texts: calendars per event (10), participants per
+/// instance (20), the iCalendar size (512 KiB), the user-data limit of 64
+/// keywords, object metadata without its capability, a removed UID, and an
+/// update id that is malformed or names no event. Nothing is stored.
+async fn writer_limits(events: &Events<'_>) {
+    let (test, key_id) = (events.test, events.pair.key_id);
+    let too_large = "x".repeat(530_000);
+
+    // Creates.
+    let cases: [(&str, &str, Value, (&str, Option<&str>, Value)); 4] = [
+        (
+            "jmapcal-events-many-cals",
+            "calendarIds",
+            absent_calendar_ids(11),
+            (
+                "invalidProperties",
+                Some("A calendar event cannot belong to more than 10 calendars."),
+                json!(["calendarIds"]),
+            ),
+        ),
+        (
+            "jmapcal-events-many-parts",
+            "participants",
+            participants(21),
+            (
+                "invalidProperties",
+                Some("An event cannot have more than 20 participants."),
+                json!(["participants"]),
+            ),
+        ),
+        (
+            "jmapcal-events-many-kws",
+            "keywords",
+            keywords(65),
+            (
+                "invalidProperties",
+                Some("An event cannot have more than 64 keywords."),
+                json!(["keywords"]),
+            ),
+        ),
+        (
+            "jmapcal-events-metadata-cap",
+            "metadata",
+            json!({ "example.com": { "note": "jmapcal metadata canary" } }),
+            (
+                "invalidProperties",
+                Some(UNSUPPORTED_METADATA),
+                json!(["metadata"]),
+            ),
+        ),
+    ];
+    for (uid, property, value, expected) in cases {
+        let mut object = events.event(uid);
+        object[property] = value;
+        let reply = events.create(vec![object]).await;
+        assert_eq!(
+            set_error(reply.not_created(0)),
+            expected,
+            "{uid}: {reply:?}"
+        );
+        assert_eq!(uid_copies(test, key_id, uid).await, 0, "{uid}");
+    }
+    let mut object = events.event("jmapcal-events-too-large");
+    object["description"] = json!(too_large);
+    let reply = events.create(vec![object]).await;
+    let refused = reply.not_created(0);
+    assert_eq!(refused["type"], "tooLarge", "{reply:?}");
+    assert!(
+        refused["description"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Event size ")
+                && text.ends_with(" exceeds the maximum allowed size of 524288 bytes.")),
+        "{reply:?}"
+    );
+    assert_eq!(
+        uid_copies(test, key_id, "jmapcal-events-too-large").await,
+        0
+    );
+
+    // A create without a UID is given one, as upstream gives it.
+    let mut object = events.event("unused");
+    object.as_object_mut().unwrap().remove("uid");
+    object["title"] = json!("jmapcal generated uid");
+    let reply = events.create(vec![object]).await;
+    let generated = Events::created_document(&reply, 0);
+    let event = events.get(generated).await;
+    let uid = event["uid"].as_str().unwrap_or_default().to_string();
+    assert!(!uid.is_empty(), "no UID was generated: {event}");
+    assert!(
+        events.body(generated).await.contains(&format!("UID:{uid}")),
+        "the stored event holds another UID"
+    );
+    events.delete(generated).await;
+
+    // Updates of one event, each refused and leaving the event as it was.
+    const UID: &str = "jmapcal-events-limits";
+    let reply = events.create(vec![events.event(UID)]).await;
+    let document_id = Events::created_document(&reply, 0);
+    let id = Id::from(document_id).to_string();
+    let before = events.body(document_id).await;
+    let updates: [(Value, (&str, Option<&str>, Value)); 6] = [
+        (
+            json!({ "calendarIds": absent_calendar_ids(11) }),
+            (
+                "invalidProperties",
+                Some("A calendar event cannot belong to more than 10 calendars."),
+                json!(["calendarIds"]),
+            ),
+        ),
+        (
+            json!({ "participants": participants(21) }),
+            (
+                "invalidProperties",
+                Some("An event cannot have more than 20 participants."),
+                json!(["participants"]),
+            ),
+        ),
+        (
+            json!({ "keywords": keywords(65) }),
+            (
+                "invalidProperties",
+                Some("An event cannot have more than 64 keywords."),
+                json!(["keywords"]),
+            ),
+        ),
+        (
+            json!({ "metadata": { "example.com": { "note": "jmapcal metadata canary" } } }),
+            (
+                "invalidProperties",
+                Some(UNSUPPORTED_METADATA),
+                json!(["metadata"]),
+            ),
+        ),
+        (
+            json!({ "excluded": true }),
+            (
+                "invalidProperties",
+                Some("excluded can only be set in a recurrenceOverrides patch."),
+                json!(["excluded"]),
+            ),
+        ),
+        (
+            json!({ "uid": null }),
+            (
+                "invalidProperties",
+                Some("The UID of a calendar event cannot be removed."),
+                json!(["uid"]),
+            ),
+        ),
+    ];
+    for (patch, expected) in updates {
+        let reply = update_event(events, document_id, patch.clone()).await;
+        assert_eq!(
+            set_error(reply.not_updated(&id)),
+            expected,
+            "{patch}: {reply:?}"
+        );
+    }
+    let reply = update_event(events, document_id, json!({ "description": too_large })).await;
+    let refused = reply.not_updated(&id);
+    assert_eq!(refused["type"], "tooLarge", "{reply:?}");
+    assert!(
+        refused["description"].as_str().is_some_and(
+            |text| text.ends_with(" exceeds the maximum allowed size of 524288 bytes.")
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(
+        events.body(document_id).await,
+        before,
+        "a refused update changed the event"
+    );
+
+    // An update of the event's own keywords alone is not a scheduling change.
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "keywords": { "jmapcal-kw": true } }),
+    )
+    .await;
+    assert_updated(&reply, &id);
+    assert!(
+        events.body(document_id).await.contains("jmapcal-kw"),
+        "the keyword was not stored"
+    );
+
+    // An update id that is malformed, and one that names no event.
+    let missing = Id::from(999_998u32).to_string();
+    let reply = events
+        .pair
+        .key
+        .jmap_update(
+            "CalendarEvent",
+            [
+                ("jmapcal-not-an-id!".to_string(), json!({ "title": "x" })),
+                (missing.clone(), json!({ "title": "x" })),
+            ],
+            none(),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        reply.not_updated("jmapcal-not-an-id!")["type"],
+        "notFound",
+        "{reply:?}"
+    );
+    assert_eq!(reply.not_updated(&missing)["type"], "notFound", "{reply:?}");
+    events.delete(document_id).await;
+    assert_eq!(za_uid_leases(test).await, 0);
+}
+
+/// Upstream's account quotas on a key account's create and update: the
+/// event count (`overQuota` with upstream's text) and the disk quota
+/// (`overQuota`); nothing is stored, and the quotas are removed after.
+async fn writer_quotas(events: &Events<'_>) {
+    let (test, key_id) = (events.test, events.pair.key_id);
+    let admin = test.account("admin@example.com");
+    let account = events.pair.key.id();
+    let reply = events
+        .create(vec![events.event("jmapcal-events-quota")])
+        .await;
+    let document_id = Events::created_document(&reply, 0);
+    let id = Id::from(document_id).to_string();
+
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            account,
+            json!({ Property::Quotas: { StorageQuota::MaxCalendarEvents.as_str(): 1 } }),
+        )
+        .await;
+    let reply = events
+        .create(vec![events.event("jmapcal-events-quota-count")])
+        .await;
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        (
+            "overQuota",
+            Some("There are too many calendar events, please delete some before adding a new one."),
+            Value::Null
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(
+        uid_copies(test, key_id, "jmapcal-events-quota-count").await,
+        0
+    );
+
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            account,
+            json!({ Property::Quotas: { StorageQuota::MaxDiskQuota.as_str(): 1 } }),
+        )
+        .await;
+    let reply = events
+        .create(vec![events.event("jmapcal-events-quota-disk")])
+        .await;
+    assert_eq!(reply.not_created(0)["type"], "overQuota", "{reply:?}");
+    assert_eq!(
+        uid_copies(test, key_id, "jmapcal-events-quota-disk").await,
+        0
+    );
+    let before = events.body(document_id).await;
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "description": "jmapcal a description that makes the event larger" }),
+    )
+    .await;
+    assert_eq!(reply.not_updated(&id)["type"], "overQuota", "{reply:?}");
+    assert_eq!(
+        events.body(document_id).await,
+        before,
+        "an update past the quota was stored"
+    );
+
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            account,
+            json!({ Property::Quotas: {} }),
+        )
+        .await;
+    let reply = events
+        .create(vec![events.event("jmapcal-events-quota-after")])
+        .await;
+    let after = Events::created_document(&reply, 0);
+    events.delete(after).await;
+    events.delete(document_id).await;
+}
+
+/// Upstream's rule that every event of one UID has one privacy, on a key
+/// account's create (an event of the UID exists in another calendar) and
+/// update (of one of two events of the UID).
+async fn writer_uid_privacy(events: &Events<'_>) {
+    const UID: &str = "jmapcal-events-privacy";
+    let (test, key_id) = (events.test, events.pair.key_id);
+    let reply = events.create(vec![events.event(UID)]).await;
+    let first = Events::created_document(&reply, 0);
+
+    let mut object = event_in(UID, &events.second);
+    object["privacy"] = json!("private");
+    let reply = events.create(vec![object]).await;
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        (
+            "invalidProperties",
+            Some(PRIVACY_CONFLICT),
+            json!(["privacy"])
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(uid_copies(test, key_id, UID).await, 1);
+
+    let reply = events.create(vec![event_in(UID, &events.second)]).await;
+    let second = Events::created_document(&reply, 0);
+    let id = Id::from(first).to_string();
+    let reply = update_event(events, first, json!({ "privacy": "private" })).await;
+    assert_eq!(
+        set_error(reply.not_updated(&id)),
+        (
+            "invalidProperties",
+            Some(PRIVACY_CONFLICT),
+            json!(["privacy"])
+        ),
+        "{reply:?}"
+    );
+    assert!(
+        !events.body(first).await.contains("CLASS:PRIVATE"),
+        "a refused privacy change was stored"
+    );
+    events.delete(first).await;
+    events.delete(second).await;
+}
+
+/// D28 on a create: a store failure of the first create answers it and the
+/// create after it with the fixed text, and neither is stored.
+async fn writer_create_failure_stops_the_call(events: &Events<'_>) {
+    const UIDS: [&str; 2] = ["jmapcal-events-failed-1", "jmapcal-events-failed-2"];
+    let (test, key_id) = (events.test, events.pair.key_id);
+    test_hooks::set_commit_fail_once(Some(key_id));
+    let reply = events
+        .create(vec![events.event(UIDS[0]), events.event(UIDS[1])])
+        .await;
+    test_hooks::set_commit_fail_once(None);
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    let incomplete = ("forbidden", Some(INCOMPLETE), Value::Null);
+    assert_eq!(set_error(reply.not_created(0)), incomplete, "{reply:?}");
+    assert_eq!(set_error(reply.not_created(1)), incomplete, "{reply:?}");
+    for uid in UIDS {
+        assert_eq!(uid_copies(test, key_id, uid).await, 0, "{uid}");
+    }
+    assert_eq!(za_uid_leases(test).await, 0);
+}
+
+/// Upstream's grouping of one call: an occurrence whose only patch is refused
+/// leaves the event alone, and an occurrence destroyed with its event is
+/// answered `willDestroy` while the event is destroyed.
+async fn occurrence_answers(events: &Events<'_>, series: &Series) {
+    let (test, pair) = (events.test, events.pair);
+    let before = events.body(series.document_id).await;
+    let blob = pair
+        .key
+        .jmap_client()
+        .await
+        .upload(None, b"x".to_vec(), None)
+        .await
+        .unwrap()
+        .take_blob_id();
+    let reply = pair
+        .key
+        .jmap_update(
+            "CalendarEvent",
+            [(
+                series.second.clone(),
+                json!({ "links": { "l1": { "@type": "Link", "blobId": blob, "rel": "enclosure" } } }),
+            )],
+            none(),
+        )
+        .await;
+    assert_eq!(
+        set_error(reply.not_updated(&series.second)),
+        ("invalidProperties", Some(ATTACHMENTS), json!(["links"])),
+        "{reply:?}"
+    );
+    assert_eq!(events.body(series.document_id).await, before);
+
+    let base = Id::from(series.document_id).to_string();
+    let reply = events.destroy(&[&base, &series.second]).await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(destroyed(&reply), [base.clone()], "{reply:?}");
+    assert_eq!(
+        reply.not_destroyed(&series.second)["type"],
+        "willDestroy",
+        "{reply:?}"
+    );
+    assert_eq!(uid_copies(test, pair.key_id, Series::UID).await, 0);
+}
+
+/// An event whose key no longer opens is `notFound` to a write as to a read:
+/// the owner's update and the `view` grantee's destroy, before any right of
+/// the grantee is asked. Nothing is written.
+async fn unreadable_event_writes_are_not_found(test: &TestServer, pair: &Pair) {
+    const UID: &str = "jmapcal-events-unreadable";
+    let document_id = put_event(test, &pair.key, &pair.dav, "jmapcal-shared", UID, UID).await;
+    let stored = stored_event(test, pair.key_id, document_id).await;
+    let mut event = stored.za_event();
+    let carrier = event.content.data.event.components[0]
+        .entries
+        .iter_mut()
+        .find(|entry| is_carrier(entry, KEY_PROP))
+        .expect("sealed event has a key carrier");
+    let ICalendarValue::Text(value) = &mut carrier.values[0] else {
+        panic!("expected a text key carrier");
+    };
+    value.replace_range(..1, if value.starts_with('A') { "B" } else { "A" });
+    write_stored_event(test, pair.key_id, document_id, &stored, event).await;
+    let tampered = stored_event(test, pair.key_id, document_id).await;
+    let id = Id::from(document_id).to_string();
+
+    let reply = pair
+        .key
+        .jmap_update(
+            "CalendarEvent",
+            [(id.clone(), json!({ "title": "x" }))],
+            none(),
+        )
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(reply.not_updated(&id)["type"], "notFound", "{reply:?}");
+    let reply = pair
+        .key2
+        .jmap_destroy_account(&pair.key, "CalendarEvent", [id.as_str()], none())
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(reply.not_destroyed(&id)["type"], "notFound", "{reply:?}");
+    assert!(
+        stored_event(test, pair.key_id, document_id).await.version == tampered.version,
+        "a write of an unreadable event changed it"
+    );
+    delete_event_records(test, pair.key_id, document_id).await;
 }

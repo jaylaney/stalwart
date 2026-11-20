@@ -22,7 +22,8 @@ use crate::{
         za::{
             CALENDAR_JMAP_USING, assert_no_event_preferences, copy_href, inbox_ids, item_method,
             new_inbox_items, open_pending_item_as, pending_ids, stored_event, trigger_drain,
-            wait_for_queue, za_bearer_jmap, za_grant_token, za_post, za_revoke_grant, za_unlock,
+            wait_for_queue, za_bearer_jmap, za_grant_token, za_post, za_post_from, za_revoke_grant,
+            za_unlock,
         },
     },
     za::{
@@ -124,6 +125,7 @@ pub async fn test(test: &mut TestServer) {
     move_with_scheduling_into_shared(test, &fixture).await;
     grantee_destroy_sends_delegated_cancel(test, &fixture).await;
     grantee_held_to_effective_privacy(test, &fixture).await;
+    grantee_answers_of_upstreams_checks(test, &fixture).await;
 
     // Each case leaves a completed boundary, the two setup events and the view grant.
     let owner = &fixture.pair.key;
@@ -2992,5 +2994,222 @@ async fn grantee_held_to_effective_privacy(test: &TestServer, f: &Sharing) {
         .await;
     assert_set_destroyed(&reply, &first);
     assert_eq!(uid_copies(test, owner_id, VEILED).await, 0);
+    share(test, owner, reader, f.reader_id, SLUG, "view").await;
+}
+
+/// Upstream's checks an `edit` grantee's `CalendarEvent/set` meets, answered by
+/// the key writer with upstream's texts: a privacy other than public, set on a
+/// create or an update; an event the owner classified private, which the
+/// grantee may neither change nor destroy; a calendar shared at `view`, which
+/// the grantee may not add an event to; and, over
+/// CalDAV, a UID the owner holds in a confidential event, refused without
+/// naming it. Nothing of a refused write is stored.
+async fn grantee_answers_of_upstreams_checks(test: &TestServer, f: &Sharing) {
+    const VIEWED: &str = "jmapcal-sharing-viewed";
+    const CLASSIFIED: &str = "jmapcal-sharing-classified";
+    const CONFIDENTIAL: &str = "jmapcal-sharing-confidential";
+    const PUBLIC: &str = "jmapcal-sharing-public";
+    const MINE: &str = "jmapcal-sharing-mine";
+    const PRIVATE: &str = "Private events can only be modified by the calendar owner.";
+    const OWNER_ONLY: &str = "Only the calendar owner can set a privacy other than public.";
+    let (owner, reader) = (&f.pair.key, &f.reader);
+    let owner_id = f.pair.key_id;
+    share(test, owner, reader, f.reader_id, SLUG, "edit").await;
+    let viewed = make_calendar(test, owner, &f.pair.dav, VIEWED).await;
+    share(test, owner, reader, f.reader_id, VIEWED, "view").await;
+    // The owner's reads complete both calendars' sync boundaries.
+    complete_boundary(test, f).await;
+    f.pair
+        .dav
+        .request("PROPFIND", &home(VIEWED), "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let (shared, viewed) = (id(f.shared), id(viewed));
+    let event = |uid: &str, calendars: &[&str]| {
+        json!({
+            "@type": "Event",
+            "uid": uid,
+            "title": uid,
+            "start": "2031-03-04T10:00:00",
+            "duration": "PT1H",
+            "timeZone": "Etc/UTC",
+            "calendarIds": Value::Object(
+                calendars.iter().map(|id| (id.to_string(), json!(true))).collect()
+            ),
+        })
+    };
+    let classified = |uid: &str, class: &str| {
+        event_ics(uid, uid).replace("END:VEVENT", &format!("CLASS:{class}\r\nEND:VEVENT"))
+    };
+
+    // A create that sets a privacy other than public.
+    let mut object = event(MINE, &[&shared]);
+    object["privacy"] = json!("private");
+    let reply = reader
+        .jmap_create_account(owner, "CalendarEvent", [object], no_args())
+        .await;
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        ("invalidProperties", Some(OWNER_ONLY)),
+        "{reply:?}"
+    );
+    assert_eq!(uid_copies(test, owner_id, MINE).await, 0);
+
+    // An event the owner classified private.
+    f.pair
+        .dav
+        .request_with_headers(
+            "PUT",
+            &format!("{}{CLASSIFIED}.ics", home(SLUG)),
+            [CONTENT_TYPE],
+            classified(CLASSIFIED, "PRIVATE"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let private = id(resource_id(test, owner_id, &format!("{SLUG}/{CLASSIFIED}.ics")).await);
+    let before = owner_body(test, f, CLASSIFIED).await;
+    let reply = reader
+        .jmap_update_account(
+            owner,
+            "CalendarEvent",
+            [(private.clone(), json!({ "title": "x" }))],
+            no_args(),
+        )
+        .await;
+    assert_eq!(
+        set_error(reply.not_updated(&private)),
+        ("forbidden", Some(PRIVATE)),
+        "the grantee's update: {reply:?}"
+    );
+    let reply = reader
+        .jmap_destroy_account(owner, "CalendarEvent", [private.as_str()], no_args())
+        .await;
+    assert_eq!(
+        set_error(reply.not_destroyed(&private)),
+        ("forbidden", Some(PRIVATE)),
+        "the grantee's destroy: {reply:?}"
+    );
+    assert_eq!(owner_body(test, f, CLASSIFIED).await, before);
+
+    // A public event: no privacy change, and no calendar shared at `view`.
+    let reply = owner
+        .jmap_create("CalendarEvent", [event(PUBLIC, &[&shared])], no_args())
+        .await;
+    let public = reply.created_id(0).to_string();
+    let reply = reader
+        .jmap_update_account(
+            owner,
+            "CalendarEvent",
+            [(public.clone(), json!({ "privacy": "private" }))],
+            no_args(),
+        )
+        .await;
+    assert_eq!(
+        set_error(reply.not_updated(&public)),
+        ("invalidProperties", Some(OWNER_ONLY)),
+        "{reply:?}"
+    );
+    let reply = reader
+        .jmap_update_account(
+            owner,
+            "CalendarEvent",
+            [(
+                public.clone(),
+                json!({ format!("calendarIds/{viewed}"): true }),
+            )],
+            no_args(),
+        )
+        .await;
+    let added = format!("You are not allowed to add calendar events to calendar {viewed}.");
+    assert_eq!(
+        set_error(reply.not_updated(&public)),
+        ("forbidden", Some(added.as_str())),
+        "{reply:?}"
+    );
+    let document_id = Id::from_str(&public).unwrap().document_id();
+    let names = stored_event(test, owner_id, document_id)
+        .await
+        .za_event()
+        .meta
+        .names
+        .len();
+    assert_eq!(names, 1, "a refused update changed the event's calendars");
+
+    // Over CalDAV, a UID the owner holds in a confidential event.
+    f.pair
+        .dav
+        .request_with_headers(
+            "PUT",
+            &format!("{}{CONFIDENTIAL}.ics", home(SLUG)),
+            [CONTENT_TYPE],
+            classified(CONFIDENTIAL, "CONFIDENTIAL"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    f.reader_dav
+        .request_with_headers(
+            "PUT",
+            &format!("{}jmapcal-sharing-copy.ics", home(SLUG)),
+            [CONTENT_TYPE],
+            event_ics(CONFIDENTIAL, "jmapcal sharing copy"),
+        )
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    assert_eq!(uid_copies(test, owner_id, CONFIDENTIAL).await, 1);
+
+    // The account page's share endpoints refuse a wrong password before
+    // any change: the view grant stays.
+    for (path, body) in [
+        (
+            "shares/grant",
+            json!({ "calendar": VIEWED, "address": reader.name(), "level": "edit" }),
+        ),
+        (
+            "shares/revoke",
+            json!({ "calendar": VIEWED, "grant": f.reader_id }),
+        ),
+    ] {
+        let mut body = body;
+        body["username"] = json!(owner.name());
+        body["password"] = json!("not the password at all");
+        assert_eq!(
+            za_post_from("10.0.60.12", path, &body).await.status,
+            401,
+            "{path}"
+        );
+    }
+    let listed = za_post(
+        "shares",
+        &json!({ "username": owner.name(), "password": STRONG }),
+    )
+    .await
+    .expect(200);
+    assert!(
+        listed.to_string().contains(VIEWED) && listed.to_string().contains("\"view\""),
+        "the view grant changed: {listed}"
+    );
+
+    let reply = owner
+        .jmap_destroy("CalendarEvent", [public.as_str()], no_args())
+        .await;
+    assert_set_destroyed(&reply, &public);
+    owner_delete(test, f, CLASSIFIED).await;
+    owner_delete(test, f, CONFIDENTIAL).await;
+    let revoked = za_post(
+        "shares/revoke",
+        &json!({
+            "username": owner.name(), "password": STRONG,
+            "calendar": VIEWED, "grant": f.reader_id
+        }),
+    )
+    .await
+    .expect(200);
+    assert_eq!(revoked["changed"], true);
+    f.pair
+        .dav
+        .request_with_headers("DELETE", &home(VIEWED), [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
     share(test, owner, reader, f.reader_id, SLUG, "view").await;
 }
