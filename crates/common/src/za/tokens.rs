@@ -349,7 +349,8 @@ impl Server {
             let grants = self
                 .token_grant_states(account_id, &record, Some(grant_id))
                 .await?;
-            record.reconcile(account_id, now(), &grants);
+            let now = now();
+            record.reconcile(account_id, now, &grants);
             let evicted = record.eviction(grant_id, &grants);
             if let Some(evicted) = evicted {
                 record.remove_grant(evicted);
@@ -357,7 +358,7 @@ impl Server {
 
             let refresh = Secret::random();
             record.put_refresh(account_id, grant_id, mk, None, 0, &refresh, refresh_expires);
-            let access = record.put_access(account_id, grant_id, mk, access_expires);
+            let access = record.put_access(account_id, grant_id, mk, access_expires, now);
 
             #[cfg(feature = "test_mode")]
             super::test_hooks::token_exchange_pause_point(account_id).await;
@@ -442,7 +443,7 @@ impl Server {
                 &next_secret,
                 refresh_expires,
             );
-            let access = record.put_access(account_id, grant_id, &mk, access_expires);
+            let access = record.put_access(account_id, grant_id, &mk, access_expires, now);
 
             #[cfg(feature = "test_mode")]
             {
@@ -912,7 +913,7 @@ mod tests {
         let previous = token_read_store(&store, ACCOUNT).await.unwrap();
 
         let mut new_access = record.clone();
-        new_access.put_access(ACCOUNT, 9, &Secret::random(), 1_000);
+        new_access.put_access(ACCOUNT, 9, &Secret::random(), 1_000, 0);
         let mut new_grant = record.clone();
         new_grant
             .grants

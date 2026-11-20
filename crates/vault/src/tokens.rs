@@ -295,14 +295,23 @@ impl ZaTokenRecord {
     /// drops the earliest-expiring of the entries stored before this call
     /// (the first on a tie), so the entry it adds is never the one dropped,
     /// even when it expires before every stored one.
+    ///
+    /// `now` is the time of the write. An entry that has already expired at
+    /// it (`expires <= now`; `reconcile` keeps an entry while `expires > now`)
+    /// is not stored and removes no entry: the record is left unchanged and
+    /// the returned fresh secret is held by no entry.
     pub fn put_access(
         &mut self,
         account_id: u32,
         grant_id: u64,
         mk: &Secret,
         expires: u64,
+        now: u64,
     ) -> Secret {
         let secret = Secret::random();
+        if expires <= now {
+            return secret;
+        }
         let grant = self.grant_or_insert(grant_id);
         if grant.access.len() >= MAX_ACCESS_ENTRIES {
             // min_by_key returns the first entry on a tie.
@@ -430,7 +439,7 @@ mod tests {
         let refresh = Secret::random();
         let mut record = ZaTokenRecord::new(3);
         record.put_refresh(7, 23, &mk, None, 0, &refresh, 1_000);
-        let access = record.put_access(7, 23, &mk, 1_000);
+        let access = record.put_access(7, 23, &mk, 1_000, 0);
 
         assert!(record.open_access(7, 23, &access, 10).unwrap().as_bytes() == mk.as_bytes());
         assert!(matches!(
@@ -574,7 +583,7 @@ mod tests {
         record.put_refresh(7, 23, &mk, None, 0, &s0, 100);
         record.put_refresh(7, 23, &mk, Some((0, &s0)), 1, &s1, 200);
         record.put_refresh(7, 23, &mk, Some((1, &s1)), 2, &s2, 300);
-        let secrets = [50, 10, 40, 30, 20].map(|expires| record.put_access(7, 23, &mk, expires));
+        let secrets = [50, 10, 40, 30, 20].map(|expires| record.put_access(7, 23, &mk, expires, 0));
         let grant = record.grant(23).unwrap();
         assert_eq!(
             grant
@@ -616,7 +625,7 @@ mod tests {
             record.put_refresh(7, id, &mk, None, 0, &s0, 100);
             record.put_refresh(7, id, &mk, Some((0, &s0)), 1, &s1, 200);
             for expires in [10, 20, 30, 40] {
-                record.put_access(7, id, &mk, expires);
+                record.put_access(7, id, &mk, expires, 0);
             }
         }
         assert!(
@@ -649,8 +658,8 @@ mod tests {
         // access-token lifetime, or another node's clock): it stays, and the
         // earliest-expiring stored entry goes.
         let mut record = ZaTokenRecord::new(3);
-        let stored = [40, 20, 30, 50].map(|expires| record.put_access(7, 23, &mk, expires));
-        let added = record.put_access(7, 23, &mk, 10);
+        let stored = [40, 20, 30, 50].map(|expires| record.put_access(7, 23, &mk, expires, 0));
+        let added = record.put_access(7, 23, &mk, 10, 0);
         assert!(
             opens(&record, &added),
             "the access entry just added does not open"
@@ -665,8 +674,8 @@ mod tests {
 
         // A fifth entry with a later expiry evicts the earliest stored one.
         let mut record = ZaTokenRecord::new(3);
-        let stored = [40, 20, 30, 50].map(|expires| record.put_access(7, 23, &mk, expires));
-        let added = record.put_access(7, 23, &mk, 60);
+        let stored = [40, 20, 30, 50].map(|expires| record.put_access(7, 23, &mk, expires, 0));
+        let added = record.put_access(7, 23, &mk, 60, 0);
         assert!(
             opens(&record, &added),
             "the access entry just added does not open"
@@ -681,8 +690,8 @@ mod tests {
 
         // A tie among the stored entries evicts the first of them.
         let mut record = ZaTokenRecord::new(3);
-        let stored = [30, 10, 10, 40].map(|expires| record.put_access(7, 23, &mk, expires));
-        let added = record.put_access(7, 23, &mk, 50);
+        let stored = [30, 10, 10, 40].map(|expires| record.put_access(7, 23, &mk, expires, 0));
+        let added = record.put_access(7, 23, &mk, 50, 0);
         assert!(
             opens(&record, &added),
             "the access entry just added does not open"
@@ -697,6 +706,66 @@ mod tests {
     }
 
     #[test]
+    fn put_access_stores_no_entry_expired_at_its_write() {
+        const NOW: u64 = 100;
+        let mk = Secret::random();
+        // At time 0 an entry opens whatever its expiry: a secret that opens
+        // nothing here is held by no entry.
+        let opens = |record: &ZaTokenRecord, secret: &Secret| {
+            record
+                .open_access(7, 23, secret, 0)
+                .is_some_and(|opened| opened.as_bytes() == mk.as_bytes())
+        };
+        let expiries = |record: &ZaTokenRecord| {
+            record
+                .grant(23)
+                .unwrap()
+                .access
+                .iter()
+                .map(|entry| entry.expires)
+                .collect::<Vec<_>>()
+        };
+
+        // Four live entries; a fifth whose expiry is at or before the time
+        // of the write (an entry lives while `expires > now`) stores nothing
+        // and removes nothing.
+        let mut record = ZaTokenRecord::new(3);
+        let stored =
+            [140, 120, 130, 150].map(|expires| record.put_access(7, 23, &mk, expires, NOW));
+        let before = record.clone();
+        for expires in [NOW, NOW - 40] {
+            let added = record.put_access(7, 23, &mk, expires, NOW);
+            assert!(record == before, "an expired put changed the record");
+            assert_eq!(expiries(&record), [140, 120, 130, 150]);
+            assert!(!opens(&record, &added), "an expired put's secret opens");
+            for secret in &stored {
+                assert!(opens(&record, secret), "a live access entry was removed");
+            }
+        }
+
+        // One second later it is stored, and at the cap it evicts the
+        // earliest-expiring stored entry.
+        let added = record.put_access(7, 23, &mk, NOW + 1, NOW);
+        assert!(
+            opens(&record, &added),
+            "the access entry just added does not open"
+        );
+        assert_eq!(expiries(&record), [140, 130, 150, NOW + 1]);
+        for (index, secret) in stored.iter().enumerate() {
+            assert!(
+                opens(&record, secret) == (index != 1),
+                "an entry other than the earliest-expiring stored one was removed"
+            );
+        }
+
+        // No grant is added for an entry that has already expired.
+        let mut record = ZaTokenRecord::new(3);
+        let added = record.put_access(7, 23, &mk, NOW, NOW);
+        assert!(record.is_empty(), "an expired put added a grant");
+        assert!(!opens(&record, &added), "an expired put's secret opens");
+    }
+
+    #[test]
     fn reconcile_cases() {
         let mk = Secret::random();
         let s0 = Secret::random();
@@ -705,7 +774,7 @@ mod tests {
         for id in 1..=6 {
             let expires = if id == 5 { 500 } else { 1_000 };
             record.put_refresh(7, id, &mk, None, 0, &s0, expires);
-            record.put_access(7, id, &mk, expires);
+            record.put_access(7, id, &mk, expires, 0);
         }
         record.put_refresh(7, 4, &mk, Some((0, &s0)), 1, &s1, 1_000);
         let unchanged = record.grant(1).unwrap().clone();
@@ -823,7 +892,7 @@ mod tests {
         let mut record = ZaTokenRecord::new(3);
         let mut grants = HashMap::new();
         for id in 1..=31 {
-            record.put_access(7, id, &mk, 100);
+            record.put_access(7, id, &mk, 100, 0);
             grants.insert(
                 id,
                 Some(ZaGrantState {
@@ -834,7 +903,7 @@ mod tests {
             );
         }
         assert_eq!(record.eviction(99, &grants), None);
-        record.put_access(7, 32, &mk, 100);
+        record.put_access(7, 32, &mk, 100, 0);
         grants.insert(
             32,
             Some(ZaGrantState {
