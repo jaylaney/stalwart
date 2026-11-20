@@ -71,6 +71,12 @@ reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not 
   cleaned up, and a keyed sign-in's cached entry ends shortly before its token's signed expiry,
   so a client should refresh before `expires_in` (an ordinary account's entry keeps upstream's
   deadline).
+- At a sign-in's cap of four keyed access tokens, a refresh no longer drops the access token it
+  has just issued when that token expires before the stored ones (a lowered token lifetime, or
+  node clocks that differ); it drops the earliest-expiring older one.
+- An owner's calendar destroy with `onDestroyRemoveEvents` no longer reads the calendar's
+  members for the emptiness check, and without the flag the check stops at the first event it
+  finds.
 - `decode_access_token` strips a `~` suffix from every token that begins with the server's token
   header, for every account (D26). A shared calendar's colour is carried in each principal's
   sealed personal bundle (D14); a binary built before release 6 cannot read a coloured one, so

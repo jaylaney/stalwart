@@ -31,7 +31,15 @@ cache entry ends before its token's signed expiry), 5.2 (a keyed CalDAV
 `COPY` inside one calendar answers `no-uid-conflict`), 5.3 and 6.7 (the
 calendar delete's members, every name removed, the unwritten-child
 refusal and the size check's reserve), section 8 and section 10 (the
-costs).
+costs). The changes of 2026-11-20, which follow the pull request's third
+review and a second whole-branch review, are these: decided by the
+project owner on 2026-11-20, 6.8 (a non-owner's `destroyed` ids, inherited and
+accepted, with a pointer in 3.4; D15 a sync-correctness rule, not an
+access control); and the controller's rulings, reported to the owner,
+4.3 (the access entry a write adds is never the one removed), 3.4 (an
+alert-only or keyword-only update takes the round trip), 5.3, 6.7 and
+section 10 (the owner's destroy check made only without
+`onDestroyRemoveEvents`, stopping at the first member; the costs).
 Revision 7 incorporates Jay's
 approved [D29 amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md),
 recorded 2026-11-15: key-calendar continuations carry their original sync
@@ -376,7 +384,13 @@ ruling on the pull request's review:
   through CalDAV is scheduled from that edit on, as upstream does for an
   ordinary account.
 - Upstream's JSCalendar conversion decides what survives a round trip
-  between the two protocols.
+  between the two protocols. Because a key account's event holds no
+  per-user data (D10), every JMAP update of it, an alert-only or
+  keyword-only one included, stores the tree the converter produces, so
+  this limitation applies to those updates too.
+- A caller who is not the owner receives in `destroyed` the ids of the
+  owner's events outside its shared calendars (6.8); accepted by the
+  project owner on 2026-11-20.
 - JMAP does not check a calendar's supported component set
   (`supported-calendar-component-set`), for any account. CalDAV does, on
   a `PUT` and on the target of a `COPY` or `MOVE`. A JMAP write can
@@ -473,7 +487,11 @@ keyed grant. It holds:
     generation's secret sealed under this generation's secret (once
     issued), and the expiry of the refresh token;
   - at most four **access entries**: the secret's tag, the MK wrap and
-    the access token's expiry.
+    the access token's expiry. Past four, a write removes the
+    earliest-expiring of the entries stored before it (the first on a
+    tie), so the entry it adds is never the one removed, also when it
+    expires before every stored one (a lowered access-token lifetime, or
+    node clocks that differ).
 
 An entry's expiry is computed when the entry is written. On a retried
 refresh the next generation's entry can therefore carry an expiry later
@@ -1029,7 +1047,10 @@ and MySQL it was read, not run.
 The calendar's members are the events whose stored record has a name
 under it, read from the snapshot's records, not from the path index,
 which shows one document per href; on every store, and the owner's
-`onDestroyRemoveEvents` check uses the same list. Every name an event has
+`onDestroyRemoveEvents` check uses the same definition of membership.
+That check is made only when the flag is not set, and it stops at the
+first stored record that names the calendar; with the flag set nothing
+is read for it. Every name an event has
 under the deleted calendar is removed, and the event is deleted when no
 other calendar holds it. On a fenced store the steps run in this order:
 the build; the first comparison of the members; the refusal, with "try
@@ -1372,7 +1393,9 @@ from the cache, as upstream does, and opens nothing.
   (5.3). Upstream's refusal of a non-empty calendar without
   `onDestroyRemoveEvents` stays; for the owner it is decided from the
   calendar's members as 5.3 defines them, so an event the path index
-  hides also counts.
+  hides also counts. The check is made only when the flag is not set,
+  and it stops at the first stored record that names the calendar; with
+  the flag set nothing is read for it.
   A grantee cannot destroy a shared calendar, as on CalDAV.
 - **`onSuccessSetIsDefault`** writes the default calendar id, an id only.
 - **`shareWith`** in a create or an update is refused with the set error
@@ -1398,7 +1421,11 @@ none; that is recorded in 3.3.
 
 The change log is keyless and is served as upstream serves it, with
 upstream's filtering for a grantee. The event state given to a caller
-who is not the owner of a key account is the exception (below).
+who is not the owner of a key account is the exception (below). A
+caller who is not the owner receives, as upstream gives them, the ids
+of the owner's events outside its shared calendars in `destroyed` when
+those events change or are deleted: ids only. This is inherited
+behaviour, accepted by the project owner on 2026-11-20.
 
 **D15.** For a grantee, a `sinceState` at or before the sync boundary of
 a shared calendar it can see (the later of its grant and its last
@@ -1409,7 +1436,11 @@ for a sharer's calendars. This is the JMAP form of the 403
 `valid-sync-token` that CalDAV's `sync-collection` gives (sharing spec
 5.2). One predicate decides both, for the same callers and the same
 calendars. A JMAP state and a CalDAV sync token are the same change id,
-so the comparison is the same.
+so the comparison is the same. The project owner confirmed on
+2026-11-20 that D15 is a sync-correctness rule and not an access
+control: a state's origin is taken as the client presents it, and a
+client that presents another origin obtains item ids of the log's
+range, never content.
 
 **D29. A paged sync.** The predicate is applied to the state the sync
 started from, with the same comparison on every page. A key-account
@@ -1993,15 +2024,18 @@ Amendments:
   no read and no write; the member list, the unwritten-child refusal, the
   every-name removal, the size check's reserve and the keyed entry's
   lowering are on key-account paths, and the keyed `COPY`'s condition is
-  in the fork's keyed handler. For a key account it takes the member
-  list up to four times for one calendar delete, each an in-memory pass
-  over the account's event records with no store read (the owner's
-  `onDestroyRemoveEvents` check over JMAP, the build and the two
-  comparisons on a fenced store; three times for a CalDAV collection
-  `DELETE`; once or twice on the stores that keep the chunked form),
-  and one more token open per keyed cache miss; a keyed entry ends up
-  to two
-  seconds before its token, and with one whole second left nothing is
+  in the fork's keyed handler. For a key account a calendar delete reads
+  the members with in-memory passes over the account's event records,
+  with no store read: three on a fenced store (the build and the two
+  comparisons), for a CalDAV collection `DELETE` and for the owner's
+  JMAP destroy with `onDestroyRemoveEvents`; the owner's JMAP destroy
+  without the flag first checks for a member, stopping at the first, so
+  it is refused after at most one pass when the calendar holds an event
+  and makes four passes when it holds none; on the stores that keep the
+  chunked form one (the build), or two for that destroy without the
+  flag. It adds one more token open per keyed cache miss; a keyed entry
+  ends up to two seconds before its token, and with one whole second
+  left nothing is
   published, so a keyed request in that window is verified in full and
   charged to its address's anonymous rate limit where one is configured
   (a client that refreshes before `expires_in` never reaches it).
