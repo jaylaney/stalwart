@@ -15,11 +15,21 @@ controller's rulings on confirmed findings of that review: 3.3 and 6.5 (a
 non-member held to an event's effective privacy), 6.8 (the event state of
 a caller who is not the owner) and section 10 (invariant 72's sentence on
 a key lookup that outlasted its token, and the costs). The controller's
-rulings on findings of the reviews of the two fix waves, each put to the
-owner: 5.3 and two section 10 amendment sentences (FoundationDB, a read
-replica and the ephemeral store keep the chunked delete; the fence's
-refusal after the cancellations accepted as a residual; a `Blob` call
-still triggers the search pass for a token without the mail scope).
+rulings on findings of the reviews of the two fix waves, each confirmed
+by the project owner on 2026-11-19: 5.3 and two section 10 amendment
+sentences (FoundationDB, a read replica and the ephemeral store keep the
+chunked delete; the fence's refusal after the cancellations accepted as a
+residual; a `Blob` call still triggers the search pass for a token
+without the mail scope). The follow-up of 6.8 was filed on his word of
+2026-11-19 as issues #93 and #94. With the changes of 2026-11-19 that
+follow the pull request's second review, all of them the controller's
+rulings on confirmed findings of that review, reported to the owner
+(none was put to him as a decision): 4.6 and invariant 72 (a keyed
+cache entry ends before its token's signed expiry), 5.2 (a keyed CalDAV
+`COPY` inside one calendar answers `no-uid-conflict`), 5.3 and 6.7 (the
+calendar delete's members, every name removed, the unwritten-child
+refusal and the size check's reserve), section 8 and section 10 (the
+costs).
 Revision 7 incorporates Jay's
 approved [D29 amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md),
 recorded 2026-11-15: key-calendar continuations carry their original sync
@@ -756,7 +766,15 @@ one 401 and refreshes. A wrong password is counted as before.
 
 D7 is decided at a cache miss. A node that has a token's keys cached
 serves it until that cache entry ends, at most the token's remaining
-life, even if the record's entry was dropped by the cap of four. A
+life, even if the record's entry was dropped by the cap of four. A keyed
+entry ends before its token's signed expiry: at publication the HTTP
+layer opens the token again and lowers the entry's deadline to the fresh
+remaining lifetime less one second, never raising it; a token that has
+expired by then publishes nothing, and the request is served with its
+keys. The reason is that the lookups after the token's first decode
+would otherwise extend the entry past the signed expiry. An ordinary
+account's entry keeps upstream's deadline (inherited). This is the
+controller's ruling on the pull request's second review. A
 grant's deletion evicts the cached entry at once. A suffix on an
 ordinary account's token is refused with 401. That is a token of this
 server; a Bearer value that is not one is not split (D26).
@@ -926,7 +944,10 @@ only when all are unshared calendars of its owner. A shared calendar is
 an event's only calendar. Moving an event between an unshared and a
 shared calendar reseals it in the target domain and reseals its
 dead-property container, in one commit. What `COPY` and `MOVE` refuse,
-the JMAP update refuses. One function resolves the contexts of a
+the JMAP update refuses. A keyed CalDAV `COPY` inside one calendar, with
+or without an overwrite, is answered 403 `no-uid-conflict`, as upstream
+answers an ordinary account; release 4's keyed handler skipped the check
+for a `COPY` with an overwrite. One function resolves the contexts of a
 placement change for both protocols (5.1), so the rights it asks and the
 refusals it gives are the same by construction. A calendar's path name
 changes only by a CalDAV rename; JMAP's `name` is the display name.
@@ -1002,20 +1023,38 @@ transaction before its merge functions run, and an error from one
 aborting it) is pinned by a test on RocksDB and SQLite; for PostgreSQL
 and MySQL it was read, not run.
 
+The calendar's members are the events whose stored record has a name
+under it, read from the snapshot's records, not from the path index,
+which shows one document per href; on every store, and the owner's
+`onDestroyRemoveEvents` check uses the same list. Every name an event has
+under the deleted calendar is removed, and the event is deleted when no
+other calendar holds it. On a fenced store the steps run in this order:
+the build; the first comparison of the members; the refusal, with "try
+again", of a listed child the build wrote nothing for (one that left the
+calendar and came back while the delete was built would otherwise pass
+both comparisons unasserted); the size check, with the fence's operation
+counted in advance; then the fan-out, the second comparison and the
+commit. The reason: the path index can hide a second document stored at
+one href, and an event can hold two names in one calendar, and either
+would otherwise be left naming the deleted calendar. These are the
+controller's rulings on the pull request's second review.
+
 The fence's refusal can come after the cancellations went out: key
 attendees then hold a CANCEL for events the organizer still has, and the
 outside attendees' mail is dropped. That is the failure class every
 failed commit of this delete already had; it now has more triggers (a
 create into the calendar during the fan-out, any calendar commit of the
 account in the last window), and a retry converges. It is accepted as a
-residual by the controller's ruling on the pull request's review, put to
-the owner.
+residual by the controller's ruling on the pull request's review,
+confirmed by the project owner on 2026-11-19.
 
-By the controller's ruling on the pull request's review, put to the
-owner: on FoundationDB, a read replica and the ephemeral store the delete
-keeps its earlier form: chunked at the store's commit points, not fenced, with
-no size refusal, and a later chunk that fails leaves the earlier chunks'
-deletions committed. FoundationDB's limits on a transaction's time and
+By the controller's ruling on the pull request's review, confirmed by
+the project owner on 2026-11-19: on FoundationDB, a read replica and the
+ephemeral store the delete is chunked at the store's commit points and
+not fenced, without the unwritten-child refusal and without the size
+check, and a later chunk that fails leaves the earlier chunks' deletions
+committed; it takes the members from the stored records and removes
+every name under the calendar, as on the other stores. FoundationDB's limits on a transaction's time and
 size would make the delete of a calendar of a few thousand events fail
 on every attempt, each after its cancellations went out. A read
 replica's reads can lag the primary, so the comparison could pass on a
@@ -1080,7 +1119,8 @@ drains on a calendar call the dispatcher then refuses, and a call whose
 back-reference fails has drained, since references are resolved after
 the drain. Decided by the project owner on 2026-11-18. What a token's
 scope admits on DAV is upstream's scope model, unchanged; the drain's
-scope rule limits the drain, not what a token can read.
+scope rule limits the drain, not what a token can read. The project
+owner's disposition of 2026-11-19: no change for it in this pull request.
 
 Without it an account used only from a browser would never apply an
 invitation.
@@ -1323,8 +1363,11 @@ from the cache, as upstream does, and opens nothing.
 - **Destroy** runs the pipeline's collection delete (D16): one
   transaction with its events where the store can establish it, refused
   above the size cap before any cancellation, and answered "try again"
-  when a write crosses it (5.3). Upstream's
-  refusal of a non-empty calendar without `onDestroyRemoveEvents` stays.
+  when a write crosses it or an event moved while the delete was built
+  (5.3). Upstream's refusal of a non-empty calendar without
+  `onDestroyRemoveEvents` stays; for the owner it is decided from the
+  calendar's members as 5.3 defines them, so an event the path index
+  hides also counts.
   A grantee cannot destroy a shared calendar, as on CalDAV.
 - **`onSuccessSetIsDefault`** writes the default calendar id, an id only.
 - **`shareWith`** in a create or an update is refused with the set error
@@ -1452,11 +1495,11 @@ are unchanged. Two cases stay open:
   continuation, which the raise serves under its guard. This is new with
   the raise.
 
-One follow-up is proposed to the project owner: read the tip before the
-boundary check, which closes (b); and carry the first page's tip in the
-`z` state, which would let a paged initial sync end above a boundary that
-predates it and so remove (a). The second needs a new version of the
-state's codec.
+The follow-up, filed on the project owner's word of 2026-11-19: issue #94
+(read the calendar log's tip before the sharing-boundary check, which
+closes (b)) and issue #93 (carry the first page's tip in the `z` state,
+which would let a paged initial sync end above a boundary that predates
+it and so remove (a); it needs a new version of the state's codec).
 
 ### 6.9 `ParticipantIdentity`
 
@@ -1541,7 +1584,7 @@ The pipeline's neutral errors map to JMAP as follows.
 | More recipients than the cap, or a scheduling error CalDAV refuses the write for | set error `invalidProperties` on `participants`, with upstream's description |
 | The UID lease is busy, a create lost its fence, or a commit failed its assertion after the retry | set error `forbidden` with upstream's "modified by another process, try again" description, as upstream's `reject_uncommitted` gives |
 | A calendar delete whose one transaction would exceed the store's chunk size (5.3) | set error `forbidden` with the fixed description below, before any cancellation; CalDAV answers 403 |
-| A calendar delete crossed by a write to the account's calendars (5.3) | set error `forbidden` with "Another process modified this calendar, please try again."; CalDAV answers 503 |
+| A calendar delete crossed by a write to the account's calendars, or holding a listed child the build wrote nothing for (5.3) | set error `forbidden` with "Another process modified this calendar, please try again."; CalDAV answers 503 |
 | Quota | upstream's `overQuota`, from upstream's pre-check or from the commit |
 | A keyless token, an impersonation, a caller the access check admits without keys of its own | method error `forbidden` (6.1) |
 | A caller with no access to the account | upstream's `accountNotFound`, from the method's access check (6.1) |
@@ -1848,9 +1891,10 @@ and server versions; codec and handler tests alone do not qualify them.
     has entries (D22).
 72. Keys opened from a token are served only at the account's current
     generation. On a mismatch the request is refused, never served
-    uncached (D23). A request whose key lookup outlasted the token's
-    signed expiry is not such a mismatch: it is served with its keys and
-    nothing is cached.
+    uncached (D23). A request whose token expires before its cache
+    entry is published is not such a mismatch: it is served with its
+    keys and nothing is cached. A keyed cache entry ends before its
+    token's signed expiry (4.6).
 73. A successful answer of the token endpoint is never traced, for any
     account (D24).
 74. Only a Bearer value that begins with the server's token header is
@@ -1897,14 +1941,15 @@ Amendments:
   `using` as the token's scope filtered it. A `Blob` call is such a call
   for every scope that carries the blob capability, so a token without
   the mail scope still triggers the pass through it (accepted by the
-  controller's ruling on the pull request's review, put to the owner).
+  controller's ruling on the pull request's review, confirmed by the
+  project owner on 2026-11-19).
   The pass after a committed message write is unchanged.
 - **Release 5, iMIP spec 5.4**: the recorded residual of a collection
   `DELETE` whose commit fails in a later chunk no longer occurs for a key
   account on RocksDB, SQLite, PostgreSQL or MySQL, where the delete is
   one transaction (5.3). It stays on FoundationDB, a read replica and
   the ephemeral store, by the controller's ruling on the pull request's
-  review, put to the owner.
+  review, confirmed by the project owner on 2026-11-19.
 - **The rule that ordinary accounts take upstream's paths unchanged**
   (release 1 section 12) gains three exceptions. All apply to every
   account, ordinary ones included. `decode_access_token` strips a `~`
@@ -1938,6 +1983,18 @@ Amendments:
   content read and one unseal on a destroy; one more log read per event
   poll when a container change is the last record of the calendar log;
   and one log read on the last page of an exact-origin paged event sync.
+  The pull request's second review adds, for an ordinary account, a few
+  boolean tests per listed child of a calendar collection delete, with
+  no read and no write; the member list, the unwritten-child refusal, the
+  every-name removal, the size check's reserve and the keyed entry's
+  lowering are on key-account paths, and the keyed `COPY`'s condition is
+  in the fork's keyed handler. For a key account it adds three in-memory
+  passes over the account's event records per calendar delete, and one
+  more token open per keyed cache miss; a keyed entry ends up to two
+  seconds before its token, and with one whole second left nothing is
+  published, so a keyed request in that window is verified in full and
+  charged to its address's anonymous rate limit where one is configured
+  (a client that refreshes before `expires_in` never reaches it).
   D29 adds state-codec fields and context checks, with no global account
   lookup or additional ordinary-account store I/O. Key-calendar pages
   carry the extra origin fields and classify the account even for an

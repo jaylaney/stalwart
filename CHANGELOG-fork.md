@@ -50,7 +50,11 @@ reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not 
   calendar too large for one transaction is
   refused before any cancellation is sent (JMAP `forbidden`, CalDAV 403; delete some events
   first), and a delete that meets a concurrent calendar write answers "try again". FoundationDB
-  and read replicas keep the earlier, chunked delete.
+  and read replicas keep a chunked, unfenced delete.
+- A calendar delete also answers "try again" when one of its events moved while the delete was
+  prepared, and it removes every event filed under the calendar, including a second document at
+  one name and every name an event has there; without `onDestroyRemoveEvents` such an event also
+  makes the destroy refuse.
 - A person a calendar is shared with can no longer delete or change, through JMAP, an event whose
   details are private to its owner.
 - A sharing change (a grant or a rename) no longer leaves a grantee's client unable to sync
@@ -59,12 +63,14 @@ reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not 
   call is refused, and the way out is to take the state from `CalendarEvent/get` or to sync in one
   page.
 - One refused attachment link no longer fails the call's other occurrence edits of the same event.
+- A CalDAV `COPY` onto another name in the same calendar is refused for a key account
+  (`no-uid-conflict`), as it is for an ordinary account.
 - Pending invitations are imported only by a sign-in whose scope covers calendars (and by
   password clients), on CalDAV and JMAP.
 - A revoked browser sign-in stops being served at once, even while its token record is being
-  cleaned up, and the fork's key lookup no longer extends a keyed cache entry's life past its
-  token (upstream's own skew remains: the time from the decode to the cache deadline, plus under
-  a second).
+  cleaned up, and a keyed sign-in's cached entry ends shortly before its token's signed expiry,
+  so a client should refresh before `expires_in` (an ordinary account's entry keeps upstream's
+  deadline).
 - `decode_access_token` strips a `~` suffix from every token that begins with the server's token
   header, for every account (D26). A shared calendar's colour is carried in each principal's
   sealed personal bundle (D14); a binary built before release 6 cannot read a coloured one, so
