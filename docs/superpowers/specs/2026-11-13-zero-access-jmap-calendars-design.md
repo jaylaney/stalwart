@@ -41,8 +41,13 @@ section 10 (the owner's destroy check made only without
 `onDestroyRemoveEvents`, stopping at the first member; the costs); and,
 as documentation, a pointer in 3.4 to the `destroyed` ids and 3.3's
 statement that an alert-only or keyword-only JMAP update of a key
-account's event takes the converter's round trip, an item still open
-for the owner.
+account's event takes the converter's round trip, an item then open
+for the owner. The changes of 2026-11-20 that follow the pull request's
+fourth review: decided by the project owner, 3.3 (no change in this pull
+request for alert-only and keyword-only updates; issue #96); and the
+controller's rulings, reported to the owner, 4.3, 4.4 and 4.5 (an
+access entry already expired at its write is not stored and removes
+none; two residuals of that rule).
 Revision 7 incorporates Jay's
 approved [D29 amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md),
 recorded 2026-11-15: key-calendar continuations carry their original sync
@@ -361,8 +366,8 @@ Accepted, each because the CalDAV behaviour is the qualified one:
   every JMAP update of it, an alert-only or keyword-only one included,
   stores the tree the converter produces, where upstream keeps the
   stored tree for a per-user-only change, so 3.4's round-trip limitation
-  applies to those updates too. Whether this stays is still open for the
-  project owner (the outcome note's item 15).
+  applies to those updates too. The project owner decided on 2026-11-20
+  to make no change in this pull request (issue #96).
 - **Default alerts are applied by value** (D11).
 - **An attendee's create sends no reply.** An attendee who creates, as
   its own copy, the event of an invitation that has not reached the
@@ -497,12 +502,22 @@ keyed grant. It holds:
     earliest-expiring of the entries stored before it (the first on a
     tie), so the entry it adds is never the one removed, also when it
     expires before every stored one (a lowered access-token lifetime, or
-    node clocks that differ).
+    node clocks that differ). An access entry that has already expired
+    at the time of its write is not stored and removes none (the same
+    boundary as reconciliation: an entry lives while its expiry is after
+    the write's time).
 
 An entry's expiry is computed when the entry is written. On a retried
 refresh the next generation's entry can therefore carry an expiry later
 than its token's, by the retry's delay. The token's own expiry and the
-sweep bound it.
+sweep bound it. Two residuals of the rule that an expired access entry
+is not stored: an access entry's expiry is fixed from a clock read made
+just after its token was sealed, so it can be one second later than the
+token's signed expiry, and an entry written in that second is stored
+though its token is already refused; and on a cluster whose nodes'
+clocks differ by more than the write's overrun, a node with the lagging
+clock refuses a token whose entry the writing node did not store, and
+the client refreshes.
 
 **D19. The binding.** One function, `za_session_binding`, computes from
 the vault record the value that a key account's OAuth tokens and its
@@ -603,7 +618,8 @@ code exchange splits them, runs upstream's checks (client, redirect URI,
 PKCE, single use), takes and deletes the hand-off entry, opens MK, and
 after `issue_new_grant` has created the grant writes the grant's first
 refresh entry (generation 0) and access entry, each under a fresh token
-secret. That write carries the vault assertion of 4.3: the exchange
+secret (the access entry only if it has not already expired at the
+write, 4.3). That write carries the vault assertion of 4.3: the exchange
 reads the vault record, requires its binding to equal the hand-off's,
 and asserts those bytes. The device flow calls the same login function
 and drops the keys (4.8).
@@ -693,7 +709,9 @@ The fork follows that state machine without changing it:
    returns the same secret, and writes the next generation's entry again
    from MK and that secret if it is missing. Otherwise it draws a new
    one, writes its refresh entry and seals it into the presented entry.
-4. It draws a new access secret and writes its entry. Upstream's access
+4. It draws a new access secret and writes its entry, unless that entry
+   has already expired at the write (4.3); the refresh entry is written
+   either way, so the client can refresh again. Upstream's access
    token is a new string on every response, so a retry adds an entry.
 5. The record keeps the presented generation and the next one and drops
    lower ones. The write carries the two assertions of 4.3. If they
