@@ -684,6 +684,21 @@ mod tests {
 
     const ACCOUNT: u32 = 5;
 
+    /// The hand-off's in-memory value: read from a blob, empty from any other
+    /// value, and silent in `Debug`, since it holds a wrapped master key.
+    #[test]
+    fn a_hand_off_value_is_read_from_a_blob_and_redacted() {
+        use super::HandoffValue;
+        use std::borrow::Cow;
+        use store::{Deserialize, Value};
+
+        let value = HandoffValue::from(Value::Blob(Cow::Owned(b"wrapped".to_vec())));
+        assert_eq!(value.0, b"wrapped");
+        assert_eq!(format!("{value:?}"), "[redacted]");
+        assert!(HandoffValue::from(Value::Integer(5)).0.is_empty());
+        assert_eq!(HandoffValue::deserialize(b"stored").unwrap().0, b"stored");
+    }
+
     #[test]
     fn a_value_without_the_token_header_is_not_split() {
         let (opaque, suffix) = super::za_split_bearer("opaque~value");

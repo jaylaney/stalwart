@@ -39,7 +39,7 @@ use common::{
     },
     za::{
         ZA_MAIL_KEYLESS, ZA_MAIL_LOGIN_REFUSED, test_hooks,
-        tokens::{ZaIssued, ZaTokenIssue, za_split_bearer},
+        tokens::{ZaIssued, ZaTokenIssue, ZaTokenRefresh, za_split_bearer},
     },
 };
 use http::auth::{
@@ -126,6 +126,7 @@ pub async fn test(test: &mut TestServer) {
     cap_evicts_least_recently_used(test, cap).await;
     forget_failure_does_not_fail_deletion(test, owner).await;
     ordinary_grant_deletion_reads_no_record(test, plain_id).await;
+    server_token_answers(test, owner, plain_id).await;
 
     let owner_account = test.account(OWNER).clone();
     keyed_bearer_reads_sealed_data(test, &owner_account).await;
@@ -2996,4 +2997,144 @@ async fn account_destruction_removes_the_record(
     admin.destroy_account(gone).await;
     test.wait_for_tasks().await;
     assert!(raw_token_record(test, id).await.is_none());
+}
+
+/// Answers of the token record's server API that no request picks on a
+/// healthy store: taking a hand-off nobody stored; a hand-off put with keys
+/// of another account (the sign-in failure, nothing stored); an issue and a
+/// refresh for an account without a vault record (`VaultChanged`, no record
+/// written); an issue naming a grant that does not exist (an error, the record
+/// unchanged); a refresh presenting a secret no entry holds (no keys, the
+/// record unchanged); and a sweep over a current record (unchanged).
+async fn server_token_answers(test: &TestServer, id: u32, plain_id: u32) {
+    println!("  server_token_answers");
+    assert!(
+        test.server
+            .za_handoff_take(&"p".repeat(CODE_LEN), &Secret::random())
+            .await
+            .unwrap()
+            .is_none(),
+        "a hand-off nobody stored was taken"
+    );
+
+    let keys = za_unlock(test, id, STRONG).await;
+    let mfa = test.account(MFA).id().document_id();
+    let key_id = "q".repeat(CODE_LEN);
+    let refused = test
+        .server
+        .za_handoff_put(&key_id, mfa, &keys, now() + 60)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a hand-off was put with another account's keys"));
+    assert_eq!(refused.event_type(), AUTH_FAILED);
+    assert!(!handoff_exists(test, &key_id).await);
+
+    assert!(matches!(
+        issue(test, plain_id, 1, keys.mk(), 0).await,
+        ZaTokenIssue::VaultChanged
+    ));
+    assert!(matches!(
+        test.server
+            .za_token_refresh(
+                plain_id,
+                1,
+                0,
+                &Secret::random(),
+                1,
+                now() + HOUR,
+                now() + MONTH
+            )
+            .await
+            .unwrap(),
+        ZaTokenRefresh::VaultChanged
+    ));
+    assert!(raw_token_record(test, plain_id).await.is_none());
+
+    let (grant, _, keys, binding) = issued_for(test, OWNER, id).await;
+    let raw = raw_token_record(test, id).await;
+    assert!(raw.is_some());
+    assert!(
+        test.server
+            .za_token_issue(
+                id,
+                u64::MAX - 7,
+                keys.mk(),
+                binding,
+                now() + HOUR,
+                now() + MONTH
+            )
+            .await
+            .is_err(),
+        "an issue naming no grant succeeded"
+    );
+    assert_eq!(raw_token_record(test, id).await, raw);
+
+    let generation = test
+        .server
+        .oauth_grant(grant)
+        .await
+        .unwrap()
+        .expect("the issued grant")
+        .grant
+        .generation;
+    let refreshed = test
+        .server
+        .za_token_refresh(
+            id,
+            grant,
+            generation,
+            &Secret::random(),
+            generation + 1,
+            now() + HOUR,
+            now() + MONTH,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(refreshed, ZaTokenRefresh::Lost | ZaTokenRefresh::Superseded),
+        "a refresh with a secret no entry holds was given keys"
+    );
+    assert_eq!(raw_token_record(test, id).await, raw);
+
+    test.server.za_token_sweep().await.unwrap();
+    assert_eq!(raw_token_record(test, id).await, raw);
+
+    // A record under another binding opens no keys for a refresh; the
+    // record is left as it is.
+    use store::Serialize;
+    let mut stale = token_record(test, id).await.unwrap();
+    stale.binding ^= 1;
+    let archive = store::write::Archiver::with_compression(stale, store::write::Compression::None)
+        .serialize()
+        .unwrap();
+    let planted = [&[TOKEN_RECORD_VERSION][..], &archive].concat();
+    set_raw_token_record(test, id, Some(&planted)).await;
+    assert!(matches!(
+        test.server
+            .za_token_refresh(
+                id,
+                grant,
+                generation,
+                &Secret::random(),
+                generation + 1,
+                now() + HOUR,
+                now() + MONTH
+            )
+            .await
+            .unwrap(),
+        ZaTokenRefresh::VaultChanged
+    ));
+    assert_eq!(
+        raw_token_record(test, id).await.as_deref(),
+        Some(planted.as_slice())
+    );
+    set_raw_token_record(test, id, raw.as_deref()).await;
+
+    // A second issue for a grant the record holds replaces its entries.
+    assert!(matches!(
+        issue(test, id, grant, keys.mk(), binding).await,
+        ZaTokenIssue::Issued(_)
+    ));
+    assert!(token_record(test, id).await.unwrap().grant(grant).is_some());
+    za_revoke_grant(&test.server, grant).await;
 }
