@@ -5311,15 +5311,17 @@ async fn contacts_request_refusals(test: &TestServer) {
 
     // `contacts/forget` with null while a record exists starts over with an
     // empty record that keeps the repair time; the prior bytes are put back.
-    let record = pin_record(test, alice, STRONG)
+    let mut record = pin_record(test, alice, STRONG)
         .await
         .expect("alice holds a pin record");
+    record.key_repaired_at = Some(1_700_000_123);
+    write_pin_record(test, alice, STRONG, &record).await;
     assert_eq!(forget(ALICE, None).await.expect(200), json!({"ok": true}));
     let fresh = pin_record(test, alice, STRONG)
         .await
         .expect("a fresh record");
     assert!(fresh.pins.is_empty() && fresh.withheld.is_empty());
-    assert_eq!(fresh.key_repaired_at, record.key_repaired_at);
+    assert_eq!(fresh.key_repaired_at, Some(1_700_000_123));
     set_raw_pins(test, alice, before.as_deref()).await;
 }
 

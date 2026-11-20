@@ -2535,6 +2535,8 @@ async fn destroy_occurrence_is_an_update(events: &Events<'_>, series: &Series) {
 const INCOMPLETE: &str = "The server could not complete this change, try again.";
 const UNSUPPORTED_METADATA: &str = "Metadata is not supported on this object.";
 const PRIVACY_CONFLICT: &str = "All events with the same UID must have the same privacy.";
+/// `SetError::over_quota`'s own description, which the disk quota's answer keeps.
+const DISK_QUOTA: &str = "Account quota exceeded.";
 
 /// `n` calendar ids that name no calendar of the account.
 fn absent_calendar_ids(n: u32) -> Value {
@@ -2752,7 +2754,22 @@ async fn writer_limits(events: &Events<'_>) {
         "a refused update changed the event"
     );
 
-    // An update of the event's own keywords alone is not a scheduling change.
+    // An update of the event's own keywords alone is not a scheduling change:
+    // its SEQUENCE and its update stamps stay as they were. The second's
+    // wait lets a stamp written now differ from the stored one.
+    let stamps = |body: &str| {
+        body.lines()
+            .filter(|line| {
+                line.starts_with("SEQUENCE")
+                    || line.starts_with("DTSTAMP")
+                    || line.starts_with("LAST-MODIFIED")
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let before_stamps = stamps(&before);
+    assert!(!before_stamps.is_empty(), "no stamp to compare: {before}");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     let reply = update_event(
         events,
         document_id,
@@ -2760,9 +2777,12 @@ async fn writer_limits(events: &Events<'_>) {
     )
     .await;
     assert_updated(&reply, &id);
-    assert!(
-        events.body(document_id).await.contains("jmapcal-kw"),
-        "the keyword was not stored"
+    let after = events.body(document_id).await;
+    assert!(after.contains("jmapcal-kw"), "the keyword was not stored");
+    assert_eq!(
+        stamps(&after),
+        before_stamps,
+        "a keywords-only update changed the SEQUENCE or a stamp"
     );
 
     // An update id that is malformed, and one that names no event.
@@ -2837,7 +2857,13 @@ async fn writer_quotas(events: &Events<'_>) {
     let reply = events
         .create(vec![events.event("jmapcal-events-quota-disk")])
         .await;
-    assert_eq!(reply.not_created(0)["type"], "overQuota", "{reply:?}");
+    // The disk arm's answer carries `SetError::over_quota`'s own description;
+    // the count quota's names the event count.
+    assert_eq!(
+        set_error(reply.not_created(0)),
+        ("overQuota", Some(DISK_QUOTA), Value::Null),
+        "{reply:?}"
+    );
     assert_eq!(
         uid_copies(test, key_id, "jmapcal-events-quota-disk").await,
         0
@@ -2849,7 +2875,11 @@ async fn writer_quotas(events: &Events<'_>) {
         json!({ "description": "jmapcal a description that makes the event larger" }),
     )
     .await;
-    assert_eq!(reply.not_updated(&id)["type"], "overQuota", "{reply:?}");
+    assert_eq!(
+        set_error(reply.not_updated(&id)),
+        ("overQuota", Some(DISK_QUOTA), Value::Null),
+        "{reply:?}"
+    );
     assert_eq!(
         events.body(document_id).await,
         before,

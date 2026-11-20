@@ -3003,7 +3003,9 @@ async fn grantee_held_to_effective_privacy(test: &TestServer, f: &Sharing) {
 /// grantee may neither change nor destroy; a calendar shared at `view`, which
 /// the grantee may not add an event to; and, over
 /// CalDAV, a UID the owner holds in a confidential event, refused without
-/// naming it. Nothing of a refused write is stored.
+/// naming it where a visible UID is refused with its href. The share
+/// endpoints refuse a wrong password. Nothing of a
+/// refused write is stored.
 async fn grantee_answers_of_upstreams_checks(test: &TestServer, f: &Sharing) {
     const VIEWED: &str = "jmapcal-sharing-viewed";
     const CLASSIFIED: &str = "jmapcal-sharing-classified";
@@ -3147,7 +3149,8 @@ async fn grantee_answers_of_upstreams_checks(test: &TestServer, f: &Sharing) {
         )
         .await
         .with_status(StatusCode::CREATED);
-    f.reader_dav
+    let refused = f
+        .reader_dav
         .request_with_headers(
             "PUT",
             &format!("{}jmapcal-sharing-copy.ics", home(SLUG)),
@@ -3156,7 +3159,29 @@ async fn grantee_answers_of_upstreams_checks(test: &TestServer, f: &Sharing) {
         )
         .await
         .with_status(StatusCode::FORBIDDEN);
+    let body = refused.body.clone().unwrap_or_default();
+    assert!(
+        !body.contains("no-uid-conflict") && !body.contains(CONFIDENTIAL),
+        "the refusal names the owner's confidential event: {body}"
+    );
     assert_eq!(uid_copies(test, owner_id, CONFIDENTIAL).await, 1);
+    // The contrast: a UID the grantee may see is refused with its href.
+    let named = f
+        .reader_dav
+        .request_with_headers(
+            "PUT",
+            &format!("{}jmapcal-sharing-copy.ics", home(SLUG)),
+            [CONTENT_TYPE],
+            event_ics(PUBLIC, "jmapcal sharing copy"),
+        )
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    let body = named.body.clone().unwrap_or_default();
+    assert!(
+        body.contains("no-uid-conflict") && body.contains(&format!("{SLUG}/")),
+        "the refusal of a visible UID does not name it: {body}"
+    );
+    assert_eq!(uid_copies(test, owner_id, PUBLIC).await, 1);
 
     // The account page's share endpoints refuse a wrong password before
     // any change: the view grant stays.
@@ -3185,9 +3210,22 @@ async fn grantee_answers_of_upstreams_checks(test: &TestServer, f: &Sharing) {
     )
     .await
     .expect(200);
-    assert!(
-        listed.to_string().contains(VIEWED) && listed.to_string().contains("\"view\""),
-        "the view grant changed: {listed}"
+    let grants = listed["calendars"]
+        .as_array()
+        .and_then(|calendars| {
+            calendars
+                .iter()
+                .find(|calendar| calendar["calendar"] == VIEWED)
+        })
+        .map(|calendar| calendar["grants"].clone())
+        .unwrap_or_else(|| panic!("{VIEWED} is not listed: {listed}"));
+    let [grant] = grants.as_array().map(Vec::as_slice).unwrap_or_default() else {
+        panic!("{VIEWED} does not hold exactly one grant: {grants}");
+    };
+    assert_eq!(
+        (grant["grant"].as_u64(), grant["level"].as_str()),
+        (Some(u64::from(f.reader_id)), Some("view")),
+        "the view grant changed: {grant}"
     );
 
     let reply = owner

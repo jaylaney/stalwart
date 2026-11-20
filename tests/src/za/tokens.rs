@@ -3050,24 +3050,30 @@ async fn server_token_answers(test: &TestServer, id: u32, plain_id: u32) {
     ));
     assert!(raw_token_record(test, plain_id).await.is_none());
 
-    let (grant, _, keys, binding) = issued_for(test, OWNER, id).await;
+    let (grant, first, keys, binding) = issued_for(test, OWNER, id).await;
     let raw = raw_token_record(test, id).await;
     assert!(raw.is_some());
+    let missing = test
+        .server
+        .za_token_issue(
+            id,
+            u64::MAX - 7,
+            keys.mk(),
+            binding,
+            now() + HOUR,
+            now() + MONTH,
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("an issue naming no grant succeeded"));
     assert!(
-        test.server
-            .za_token_issue(
-                id,
-                u64::MAX - 7,
-                keys.mk(),
-                binding,
-                now() + HOUR,
-                now() + MONTH
-            )
-            .await
-            .is_err(),
-        "an issue naming no grant succeeded"
+        missing.matches(EventType::Store(trc::StoreEvent::UnexpectedError)),
+        "an issue naming no grant failed with another event"
     );
-    assert_eq!(raw_token_record(test, id).await, raw);
+    assert!(
+        raw_token_record(test, id).await == raw,
+        "the record changed"
+    );
 
     let generation = test
         .server
@@ -3094,10 +3100,16 @@ async fn server_token_answers(test: &TestServer, id: u32, plain_id: u32) {
         matches!(refreshed, ZaTokenRefresh::Lost | ZaTokenRefresh::Superseded),
         "a refresh with a secret no entry holds was given keys"
     );
-    assert_eq!(raw_token_record(test, id).await, raw);
+    assert!(
+        raw_token_record(test, id).await == raw,
+        "the record changed"
+    );
 
     test.server.za_token_sweep().await.unwrap();
-    assert_eq!(raw_token_record(test, id).await, raw);
+    assert!(
+        raw_token_record(test, id).await == raw,
+        "the sweep changed a current record"
+    );
 
     // A record under another binding opens no keys for a refresh; the
     // record is left as it is.
@@ -3124,17 +3136,44 @@ async fn server_token_answers(test: &TestServer, id: u32, plain_id: u32) {
             .unwrap(),
         ZaTokenRefresh::VaultChanged
     ));
-    assert_eq!(
-        raw_token_record(test, id).await.as_deref(),
-        Some(planted.as_slice())
+    assert!(
+        raw_token_record(test, id).await.as_deref() == Some(planted.as_slice()),
+        "the planted record changed"
     );
     set_raw_token_record(test, id, raw.as_deref()).await;
 
-    // A second issue for a grant the record holds replaces its entries.
-    assert!(matches!(
-        issue(test, id, grant, keys.mk(), binding).await,
-        ZaTokenIssue::Issued(_)
-    ));
-    assert!(token_record(test, id).await.unwrap().grant(grant).is_some());
+    // A second issue for a grant the record holds adds an access entry
+    // beside the first, both opening, and keeps the grant's refresh entry.
+    let held = token_record(test, id)
+        .await
+        .unwrap()
+        .grant(grant)
+        .cloned()
+        .unwrap();
+    let ZaTokenIssue::Issued(second) = issue(test, id, grant, keys.mk(), binding).await else {
+        panic!("the second issue was not issued");
+    };
+    assert!(second.access.as_bytes() != first.access.as_bytes());
+    let now_held = token_record(test, id)
+        .await
+        .unwrap()
+        .grant(grant)
+        .cloned()
+        .unwrap();
+    assert_eq!(now_held.access.len(), held.access.len() + 1);
+    assert!(
+        now_held.refresh == held.refresh,
+        "the refresh entry changed"
+    );
+    for access in [&first.access, &second.access] {
+        assert!(
+            test.server
+                .za_token_open_access(id, grant, access)
+                .await
+                .unwrap()
+                .is_some(),
+            "an issued access token does not open"
+        );
+    }
     za_revoke_grant(&test.server, grant).await;
 }

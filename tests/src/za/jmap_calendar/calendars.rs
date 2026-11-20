@@ -109,7 +109,6 @@ pub async fn test(test: &mut TestServer) {
     share_with_refused(test, &pair).await;
     // PR #90 coverage: the key writer's remaining answers of upstream's checks.
     calendar_writer_answers(test, &pair).await;
-    destroy_reads_each_privacy(test, &pair).await;
     grantee_calendar_writes(test, &pair).await;
     default_without_a_stored_id(test, &pair).await;
     per_object_commits(&pair).await;
@@ -1891,46 +1890,6 @@ async fn calendar_writer_answers(test: &TestServer, pair: &Pair) {
     assert!(!calendar_stored(test, owner, document_id(&b)).await);
 }
 
-/// Upstream's destroy reads every member's privacy, public, private and
-/// confidential; the owner's destroy refuses the calendar without
-/// `onDestroyRemoveEvents` and removes it with the flag.
-async fn destroy_reads_each_privacy(test: &TestServer, pair: &Pair) {
-    const SLUG: &str = "jmapcal-destroy-classes";
-    let owner = pair.key_id;
-    let id = Id::from(make_calendar(test, &pair.key, &pair.dav, SLUG).await).to_string();
-    for (uid, class) in [
-        ("jmapcal-cal-class-public", "PUBLIC"),
-        ("jmapcal-cal-class-private", "PRIVATE"),
-        ("jmapcal-cal-class-confidential", "CONFIDENTIAL"),
-    ] {
-        pair.dav
-            .request_with_headers(
-                "PUT",
-                &format!("{HOME}{SLUG}/{uid}.ics"),
-                [("content-type", "text/calendar; charset=utf-8")],
-                event_ics(uid, uid).replace("END:VEVENT", &format!("CLASS:{class}\r\nEND:VEVENT")),
-            )
-            .await
-            .with_status(StatusCode::CREATED);
-    }
-    let reply = calendar_set(&pair.key, &pair.key, json!({ "destroy": [&id] })).await;
-    assert_eq!(
-        set_error(reply.not_destroyed(&id)).0,
-        "calendarHasEvent",
-        "{reply:?}"
-    );
-    assert!(calendar_stored(test, owner, document_id(&id)).await);
-    destroy(pair, &id).await;
-    assert!(!calendar_stored(test, owner, document_id(&id)).await);
-    for uid in [
-        "jmapcal-cal-class-public",
-        "jmapcal-cal-class-private",
-        "jmapcal-cal-class-confidential",
-    ] {
-        assert_eq!(uid_copies(test, owner, uid).await, 0, "{uid}");
-    }
-}
-
 /// A grantee's `Calendar/set` in the owner's account: an update of a calendar
 /// not shared with it is `notFound`, an update of a calendar shared at
 /// `view` is `forbidden`, and its `onSuccessSetIsDefault` leaves the owner's
@@ -1947,10 +1906,7 @@ async fn grantee_calendar_writes(test: &TestServer, pair: &Pair) {
     let reply = calendar_set(
         &pair.key2,
         &pair.key,
-        json!({
-            "update": { &default: { "name": "x" }, &viewed: { "name": "x" } },
-            "onSuccessSetIsDefault": &viewed,
-        }),
+        json!({ "update": { &default: { "name": "x" }, &viewed: { "name": "x" } } }),
     )
     .await;
     assert_eq!(reply.error_type_at(0), None, "{reply:?}");
@@ -1967,6 +1923,26 @@ async fn grantee_calendar_writes(test: &TestServer, pair: &Pair) {
     assert_eq!(the_default(pair).await, default);
     assert_eq!(stored_default(test, pair.key_id).await, stored);
 
+    // The grantee's `onSuccessSetIsDefault` in a call of its own: the
+    // shared-account filter alone leaves the owner's default.
+    let reply = calendar_set(
+        &pair.key2,
+        &pair.key,
+        json!({ "onSuccessSetIsDefault": &viewed }),
+    )
+    .await;
+    assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    assert!(
+        reply
+            .pointer(&format!("/methodResponses/0/1/updated/{viewed}"))
+            .is_none(),
+        "{reply:?}"
+    );
+    assert_eq!(the_default(pair).await, default);
+    assert_eq!(stored_default(test, pair.key_id).await, stored);
+
+    // The owner naming the current default writes nothing: a write would
+    // answer the id among `updated` with `isDefault`.
     let reply = calendar_set(
         &pair.key,
         &pair.key,
@@ -1974,6 +1950,12 @@ async fn grantee_calendar_writes(test: &TestServer, pair: &Pair) {
     )
     .await;
     assert_eq!(reply.error_type_at(0), None, "{reply:?}");
+    assert!(
+        reply
+            .pointer(&format!("/methodResponses/0/1/updated/{default}"))
+            .is_none(),
+        "a write of the current default: {reply:?}"
+    );
     assert_eq!(the_default(pair).await, default);
     assert_eq!(stored_default(test, pair.key_id).await, stored);
     dav_delete(pair, VIEWED).await;

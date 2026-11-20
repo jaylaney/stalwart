@@ -476,14 +476,20 @@ mod tests {
     }
 
     /// Every seal error names its kind only; `entry_text` reads a text
-    /// value and nothing else; a carrier of two values is not a bundle.
+    /// value and nothing else; a carrier of two values or with a parameter is
+    /// not a bundle.
     #[test]
     fn errors_entries_and_carriers_of_other_shapes() {
-        assert_eq!(SealError::NotSealed.to_string(), "object is not sealed");
-        assert_eq!(
-            SealError::Structure("x").to_string(),
-            "unexpected structure: x"
-        );
+        for (error, text) in [
+            (SealError::NotSealed, "object is not sealed"),
+            (SealError::Structure("x"), "unexpected structure: x"),
+            (SealError::Format, "invalid bundle format"),
+            (SealError::Decode, "invalid bundle encoding"),
+            (SealError::Aead, "bundle authentication failed"),
+            (SealError::Policy(7), "unknown policy version 7"),
+        ] {
+            assert_eq!(error.to_string(), text);
+        }
         let ical = parse(concat!(
             "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\n",
             "UID:tree-unit\r\nDTSTART:20990301T100000Z\r\nSEQUENCE:3\r\n",
