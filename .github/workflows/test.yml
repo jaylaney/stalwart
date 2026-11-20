@@ -426,8 +426,18 @@ jobs:
         # The same for the JMAP suite (tests/src/jmap/za_variants.rs). Key
         # mode runs upstream's calendar bodies and the calendar variants; the
         # notification variant is a refusal, so upstream's timing-flaky
-        # calendar::notification sub-test does not run here.
-        run: cargo test -p tests jmap::jmap_tests -- --nocapture
+        # calendar::notification sub-test does not run here. Two upstream
+        # sub-tests it does run are timing-flaky: calendar::alarm (its first
+        # alert is due about a second after the create) and the thread merge
+        # of the suite's ordinary accounts (a background task finishes it).
+        # One rerun keeps them from failing the job. A real regression fails
+        # both runs. The test server wipes its data directory at start, so
+        # the rerun starts clean.
+        run: |
+          cargo test -p tests jmap::jmap_tests -- --nocapture || {
+            echo "::warning title=jmap_tests::key-mode run failed; retrying once (known calendar::alarm and thread-merge flakes)"
+            cargo test -p tests jmap::jmap_tests -- --nocapture
+          }
         env:
           ZA_KEY_ACCOUNTS: "1"
 

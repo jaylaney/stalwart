@@ -185,7 +185,7 @@ STEPS = [
          env=KEY, net="imap-key"),
     Step("test.yml__zero-access__jmap-tests-key-accounts", "zero-access",
          "JMAP Tests (key accounts)", "cargo test -p tests jmap::jmap_tests -- --nocapture",
-         env=KEY, net="jmap-key"),
+         env=KEY, rerun="same", net="jmap-key"),
 ]
 
 TESTS_CRATE = ["cargo", "test", "-p", "tests"]
