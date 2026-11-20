@@ -2869,10 +2869,24 @@ async fn writer_quotas(events: &Events<'_>) {
         0
     );
     let before = events.body(document_id).await;
+    // A small growth is measured against the stored sealed size and passes
+    // the pre-check; the commit refuses it.
     let reply = update_event(
         events,
         document_id,
         json!({ "description": "jmapcal a description that makes the event larger" }),
+    )
+    .await;
+    assert_eq!(
+        set_error(reply.not_updated(&id)),
+        ("overQuota", Some(DISK_QUOTA), Value::Null),
+        "{reply:?}"
+    );
+    // Tens of kilobytes outgrow the sealing overhead: the pre-check refuses.
+    let reply = update_event(
+        events,
+        document_id,
+        json!({ "description": "q".repeat(40_000) }),
     )
     .await;
     assert_eq!(

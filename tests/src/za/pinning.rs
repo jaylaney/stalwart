@@ -108,6 +108,7 @@ pub async fn test(test: &mut TestServer) {
     a2_remapped_pin_withholds_mail(test).await;
     contacts_request_refusals(test).await;
     fan_out_pin_read_failure(test).await;
+    fan_out_recipient_lookup_failure(test).await;
 }
 
 /// Spec 9 case 1: alice, who never pinned, invites bob. The fan-out pins
@@ -5309,6 +5310,28 @@ async fn contacts_request_refusals(test: &TestServer) {
     }
     assert_eq!(raw_pins(test, alice).await, before);
 
+    // An ordinary account presenting its own password is refused by all four.
+    for (path, extra) in [
+        ("contacts", json!({})),
+        ("contacts/lookup", json!({"address": BOB})),
+        (
+            "contacts/pin",
+            json!({"address": BOB, "fingerprint": fingerprint}),
+        ),
+        ("contacts/forget", json!({"address": BOB})),
+    ] {
+        let mut body =
+            json!({"username": "plain@example.com", "password": "plain secret with entropy 9"});
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        assert_eq!(
+            za_post(path, &body).await.expect(409)["error"],
+            "not a zero-access account",
+            "{path}"
+        );
+    }
+
     // `contacts/forget` with null while a record exists starts over with an
     // empty record that keeps the repair time; the prior bytes are put back.
     let mut record = pin_record(test, alice, STRONG)
@@ -5323,6 +5346,38 @@ async fn contacts_request_refusals(test: &TestServer) {
     assert!(fresh.pins.is_empty() && fresh.withheld.is_empty());
     assert_eq!(fresh.key_repaired_at, Some(1_700_000_123));
     set_raw_pins(test, alice, before.as_deref()).await;
+}
+
+/// Spec 5.2 phase 1: a fan-out whose recipient lookup fails records `5.1` for
+/// the recipient and writes no item for it; the organizer's write commits.
+/// The one-shot hook is taken by the owner's own fan-out.
+async fn fan_out_recipient_lookup_failure(test: &TestServer) {
+    const UID: &str = "pin-lookup-failure";
+    let (alice, _, carol) = parties(test);
+    let carol_start = inbox_ids(test, carol.id).await;
+    let path = event_path(&alice, UID);
+    test_hooks::set_delegation_lookup_fail_once(Some((alice.id, CAROL.to_string())));
+    let status = alice
+        .client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], invite(UID, START_B, &[CAROL]))
+        .await
+        .status;
+    let armed = test_hooks::take_delegation_lookup_fail_once(alice.id, CAROL);
+    test_hooks::set_delegation_lookup_fail_once(None);
+    assert!(!armed, "the fan-out did not take the lookup failure");
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        attendee_statuses(&alice.client, &path, CAROL).await,
+        ["5.1"]
+    );
+    assert!(
+        new_inbox_items(test, carol.id, &carol_start)
+            .await
+            .is_empty(),
+        "an item was written for a recipient whose lookup failed"
+    );
+    delete_event(&alice, &path).await;
+    clear_recipient(test, &carol, &carol_start, UID).await;
 }
 
 /// Spec 5.4: a fan-out whose pin-record read fails decides nothing: the

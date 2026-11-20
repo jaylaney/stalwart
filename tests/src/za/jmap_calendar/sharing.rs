@@ -3001,10 +3001,10 @@ async fn grantee_held_to_effective_privacy(test: &TestServer, f: &Sharing) {
 /// the key writer with upstream's texts: a privacy other than public, set on a
 /// create or an update; an event the owner classified private, which the
 /// grantee may neither change nor destroy; a calendar shared at `view`, which
-/// the grantee may not add an event to; and, over
+/// the grantee may not add an event to nor move one out of; and, over
 /// CalDAV, a UID the owner holds in a confidential event, refused without
 /// naming it where a visible UID is refused with its href. The share
-/// endpoints refuse a wrong password. Nothing of a
+/// endpoints refuse a wrong password and an ordinary account. Nothing of a
 /// refused write is stored.
 async fn grantee_answers_of_upstreams_checks(test: &TestServer, f: &Sharing) {
     const VIEWED: &str = "jmapcal-sharing-viewed";
@@ -3012,6 +3012,7 @@ async fn grantee_answers_of_upstreams_checks(test: &TestServer, f: &Sharing) {
     const CONFIDENTIAL: &str = "jmapcal-sharing-confidential";
     const PUBLIC: &str = "jmapcal-sharing-public";
     const MINE: &str = "jmapcal-sharing-mine";
+    const IN_VIEWED: &str = "jmapcal-sharing-in-viewed";
     const PRIVATE: &str = "Private events can only be modified by the calendar owner.";
     const OWNER_ONLY: &str = "Only the calendar owner can set a privacy other than public.";
     let (owner, reader) = (&f.pair.key, &f.reader);
@@ -3138,6 +3139,47 @@ async fn grantee_answers_of_upstreams_checks(test: &TestServer, f: &Sharing) {
         .len();
     assert_eq!(names, 1, "a refused update changed the event's calendars");
 
+    // A move out of the calendar shared at `view` into the one shared at
+    // `edit`: the add passes, the removal is refused, the event stays.
+    let reply = owner
+        .jmap_create("CalendarEvent", [event(IN_VIEWED, &[&viewed])], no_args())
+        .await;
+    let in_viewed = reply.created_id(0).to_string();
+    let reply = reader
+        .jmap_update_account(
+            owner,
+            "CalendarEvent",
+            [(
+                in_viewed.clone(),
+                json!({ "calendarIds": { (shared.as_str()): true } }),
+            )],
+            no_args(),
+        )
+        .await;
+    let removed = format!("You are not allowed to remove calendar events from calendar {viewed}.");
+    assert_eq!(
+        set_error(reply.not_updated(&in_viewed)),
+        ("forbidden", Some(removed.as_str())),
+        "{reply:?}"
+    );
+    let parents = stored_event(
+        test,
+        owner_id,
+        Id::from_str(&in_viewed).unwrap().document_id(),
+    )
+    .await
+    .za_event()
+    .meta
+    .names
+    .iter()
+    .map(|name| name.parent_id)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        parents,
+        [Id::from_str(&viewed).unwrap().document_id()],
+        "a refused move changed the event's calendars"
+    );
+
     // Over CalDAV, a UID the owner holds in a confidential event.
     f.pair
         .dav
@@ -3204,6 +3246,26 @@ async fn grantee_answers_of_upstreams_checks(test: &TestServer, f: &Sharing) {
             "{path}"
         );
     }
+    // An ordinary account presenting its own password is refused by both.
+    for (path, body) in [
+        (
+            "shares/grant",
+            json!({ "calendar": VIEWED, "address": reader.name(), "level": "edit" }),
+        ),
+        (
+            "shares/revoke",
+            json!({ "calendar": VIEWED, "grant": f.reader_id }),
+        ),
+    ] {
+        let mut body = body;
+        body["username"] = json!("plain@example.com");
+        body["password"] = json!("plain secret with entropy 9");
+        assert_eq!(
+            za_post(path, &body).await.expect(409)["error"],
+            "not a zero-access account",
+            "{path}"
+        );
+    }
     let listed = za_post(
         "shares",
         &json!({ "username": owner.name(), "password": STRONG }),
@@ -3229,9 +3291,14 @@ async fn grantee_answers_of_upstreams_checks(test: &TestServer, f: &Sharing) {
     );
 
     let reply = owner
-        .jmap_destroy("CalendarEvent", [public.as_str()], no_args())
+        .jmap_destroy(
+            "CalendarEvent",
+            [public.as_str(), in_viewed.as_str()],
+            no_args(),
+        )
         .await;
-    assert_set_destroyed(&reply, &public);
+    assert_eq!(method_error(&reply), None, "{reply:?}");
+    assert_eq!(reply.destroyed().count(), 2, "{reply:?}");
     owner_delete(test, f, CLASSIFIED).await;
     owner_delete(test, f, CONFIDENTIAL).await;
     let revoked = za_post(
