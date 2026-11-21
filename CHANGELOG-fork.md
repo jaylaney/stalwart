@@ -85,7 +85,8 @@ refusals), and every message was a thread of its own.
   upstream's covers (sender, recipients, subject, body, headers and extracted attachment text)
   with upstream's tokenizer and rules, so the results are an ordinary account's for the same
   mail, apart from the differences under "Known limits". The `threadId` sort stays unsupported,
-  as upstream's is for every account.
+  as upstream's is for every account. The sorts a key account's JMAP session advertises in
+  `emailQuerySortOptions` are now served, which closes #54.
 - **Threads.** Messages are grouped as upstream threads them (Message-ID, References, subject):
   JMAP `threadId`, `Thread/*`, `collapseThreads`, the thread filters and sorts and the thread
   counts of `Mailbox/get`; IMAP `THREAD`, `THREADID` and `EMAILID`. The thread id is sealed.
@@ -374,9 +375,6 @@ Release 7:
   so a request can take longer than `ZA_SEARCH_WAIT_SECS`. The first content search after a
   restart or eviction reads the sealed content: on 30,000 messages, about 23 to 26 s in the
   report's optimized builds on one machine.
-- #54: the JMAP session advertises the `from`, `to`, `subject` and `sentAt` sorts for a key
-  account. Release 7 serves them while the index is current and answers the "not available"
-  refusal otherwise; the issue is still open.
 
 Release 6 (the [outcome](docs/superpowers/plans/2026-11-14-zero-access-plan17-outcome.md)'s
 "Accepted residuals" holds the full list, and its "Decisions and remaining qualification" the
