@@ -10,6 +10,7 @@ use super::{
 use crate::utils::{
     account::Account,
     server::{TestServer, TestServerBuilder},
+    tls::fixture_https_client_builder,
     za::{manifest_bytes, principal_blob_links, read_manifest, write_manifest_bytes, za_unlock},
 };
 use common::{
@@ -78,8 +79,7 @@ struct Wire<'a> {
 
 impl<'a> Wire<'a> {
     fn new(account: &'a Account) -> Self {
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
+        let client = fixture_https_client_builder()
             .timeout(WIRE_TIMEOUT)
             .build()
             .unwrap();

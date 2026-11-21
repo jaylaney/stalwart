@@ -21,6 +21,7 @@ use crate::{
         imap::{AssertResult, ImapConnection, Type},
         jmap::JmapResponse,
         server::TestServer,
+        tls::fixture_https_client_builder,
         za::{
             HookParked, manifest_bytes, run_search_pass, search_config_guard, search_keys,
             wait_for_delivery, write_manifest_bytes, za_bearer_token, za_unlock,
@@ -1172,8 +1173,7 @@ async fn jmap_served_content_filters_and_sorts(key: &Fixture, plain: &Fixture) {
 
 async fn keyless_search_refused(test: &TestServer, account: &Account) {
     let token = za_bearer_token(&test.server, account.name()).await;
-    let reply: Value = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let reply: Value = fixture_https_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap()

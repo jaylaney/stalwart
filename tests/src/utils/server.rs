@@ -13,6 +13,7 @@ use crate::{
         registry::UnwrapRegistryId,
         storage::{RegistryEnvStores, assert_is_empty, build_data_store, wait_for_tasks},
         temp_dir::TempDir,
+        tls::fixture_tls_server_key,
     },
 };
 use ahash::AHashMap;
@@ -418,7 +419,8 @@ impl TestServerBuilder {
 
         // Parse components
         let core = Box::pin(Core::parse(&mut self.bootstrap, storage)).await;
-        let data = Data::parse(&mut self.bootstrap).await;
+        let mut data = Data::parse(&mut self.bootstrap).await;
+        data.tls_self_signed_cert = Some(fixture_tls_server_key());
         let (cache, swap_rx) = Caches::parse(&mut self.bootstrap, &core.storage).await;
 
         // Enable telemetry. As boot does: there is no test licence (upgrade

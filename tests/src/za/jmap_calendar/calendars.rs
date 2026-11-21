@@ -12,6 +12,7 @@ use crate::{
         jmap::JmapResponse,
         server::TestServer,
         smtp_sink::sink,
+        tls::fixture_https_client_builder,
         webdav::DummyWebDavClient,
         za::{
             HookParked, delete_inbox_item, inbox_ids, item_method, open_pending_item_as,
@@ -243,8 +244,7 @@ async fn calendar_set_parked(owner: &Account, mut args: Value) -> JmapResponse {
         "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
         "methodCalls": [["Calendar/set", args, "0"]],
     });
-    let bytes = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let bytes = fixture_https_client_builder()
         .timeout(Duration::from_secs(60))
         .build()
         .unwrap()

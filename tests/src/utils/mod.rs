@@ -23,5 +23,6 @@ pub mod smtp;
 pub mod smtp_sink;
 pub mod storage;
 pub mod temp_dir;
+pub mod tls;
 pub mod webdav;
 pub mod za;
