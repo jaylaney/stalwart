@@ -19,6 +19,7 @@ pub const NONCE_LEN: usize = 24;
 pub const TAG_LEN: usize = 16;
 pub const WRAP_LEN: usize = NONCE_LEN + KEY_LEN + TAG_LEN;
 pub const SALT_LEN: usize = 16;
+pub const TOKEN_TAG_LEN: usize = 8;
 
 const LABEL_VERIFIER: &[u8] = b"za/v1/verifier";
 const LABEL_KEK: &[u8] = b"za/v1/kek";
@@ -28,6 +29,10 @@ const LABEL_EVENTS: &[u8] = b"za/v1/events";
 const LABEL_PK: &[u8] = b"za/v1/pk";
 const LABEL_MAIL: &[u8] = b"za/v1/mail";
 const LABEL_SEARCH: &[u8] = b"za/v1/search";
+const LABEL_TOKEN_WRAP: &[u8] = b"za/v1/token/wrap";
+const LABEL_TOKEN_TAG: &[u8] = b"za/v1/token/tag";
+const LABEL_TOKEN_NEXT: &[u8] = b"za/v1/token/next";
+const LABEL_HANDOFF: &[u8] = b"za/v1/handoff";
 const AAD_PREFIX: &[u8] = b"za/v1|";
 
 /// A 32-byte secret that is zeroed on drop and never printed.
@@ -41,6 +46,10 @@ impl Secret {
 
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
         Secret(Zeroizing::new(bytes))
+    }
+
+    pub(crate) fn from_zeroizing(bytes: Zeroizing<[u8; KEY_LEN]>) -> Self {
+        Secret(bytes)
     }
 
     pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
@@ -163,6 +172,23 @@ pub fn derive_search_key(mk: &Secret) -> Secret {
     hkdf_expand(mk.as_bytes(), LABEL_SEARCH)
 }
 
+pub fn derive_token_wrap_key(secret: &Secret) -> Secret {
+    hkdf_expand(secret.as_bytes(), LABEL_TOKEN_WRAP)
+}
+
+pub fn derive_token_tag(secret: &Secret) -> [u8; TOKEN_TAG_LEN] {
+    let tag = hkdf_expand(secret.as_bytes(), LABEL_TOKEN_TAG);
+    *tag.as_bytes().first_chunk().unwrap()
+}
+
+pub fn derive_token_next_key(secret: &Secret) -> Secret {
+    hkdf_expand(secret.as_bytes(), LABEL_TOKEN_NEXT)
+}
+
+pub fn derive_handoff_key(secret: &Secret) -> Secret {
+    hkdf_expand(secret.as_bytes(), LABEL_HANDOFF)
+}
+
 /// AAD purpose of the primary-password wrap of MK.
 pub const AAD_PASSWORD: &str = "password";
 /// AAD purpose of the recovery-key wrap of MK.
@@ -198,6 +224,29 @@ pub fn aad(purpose: &str, account_id: u32) -> Vec<u8> {
 /// router and the endpoints cannot disagree on the string.
 pub fn app_aad(account_id: u32, credential_id: u32) -> Vec<u8> {
     aad(&format!("app/{credential_id}"), account_id)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZaTokenKind {
+    Access,
+    Refresh { generation: u64 },
+}
+
+pub fn token_aad(account_id: u32, grant_id: u64, kind: ZaTokenKind) -> Vec<u8> {
+    let purpose = match kind {
+        ZaTokenKind::Access => format!("token/{grant_id}/access"),
+        ZaTokenKind::Refresh { generation } => format!("token/{grant_id}/refresh/{generation}"),
+    };
+    aad(&purpose, account_id)
+}
+
+pub fn token_next_aad(account_id: u32, grant_id: u64, generation: u64) -> Vec<u8> {
+    aad(&format!("token/{grant_id}/next/{generation}"), account_id)
+}
+
+/// The key id is the authorization code or consent token.
+pub fn handoff_aad(account_id: u32, binding: u64, key_id: &str) -> Vec<u8> {
+    aad(&format!("handoff/{binding}/{key_id}"), account_id)
 }
 
 fn cipher(key: &Secret) -> XChaCha20Poly1305 {
@@ -420,7 +469,55 @@ pub fn fingerprint(key: &[u8; 32], value: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
 
+    /// A key error names its kind only.
+    #[test]
+    fn key_errors_name_their_kind_only() {
+        for (error, text) in [
+            (KeyError::Argon2, "key derivation failed"),
+            (KeyError::Length, "invalid ciphertext length"),
+            (KeyError::Aead, "authentication failed"),
+            (KeyError::PublicKey, "invalid public key"),
+        ] {
+            assert_eq!(error.to_string(), text);
+        }
+    }
+
     const SALT: [u8; 16] = [7u8; 16];
+
+    #[test]
+    fn token_labels_and_associated_data_are_fixed() {
+        let secret = Secret::from_bytes([9; 32]);
+        let wrap = derive_token_wrap_key(&secret);
+        let next = derive_token_next_key(&secret);
+        assert!(wrap.as_bytes() == hkdf_expand(secret.as_bytes(), b"za/v1/token/wrap").as_bytes());
+        assert!(next.as_bytes() == hkdf_expand(secret.as_bytes(), b"za/v1/token/next").as_bytes());
+        assert!(
+            derive_handoff_key(&secret).as_bytes()
+                == hkdf_expand(secret.as_bytes(), b"za/v1/handoff").as_bytes()
+        );
+        assert!(
+            derive_token_tag(&secret)
+                == hkdf_expand(secret.as_bytes(), b"za/v1/token/tag").as_bytes()[..8]
+        );
+        assert!(wrap.as_bytes() != next.as_bytes());
+
+        assert_eq!(
+            token_aad(7, 23, ZaTokenKind::Access),
+            b"za/v1|token/23/access|\0\0\0\x07"
+        );
+        assert_eq!(
+            token_aad(7, 23, ZaTokenKind::Refresh { generation: 4 }),
+            b"za/v1|token/23/refresh/4|\0\0\0\x07"
+        );
+        assert_eq!(
+            token_next_aad(7, 23, 4),
+            b"za/v1|token/23/next/4|\0\0\0\x07"
+        );
+        assert_eq!(
+            handoff_aad(7, 12, "c0de"),
+            b"za/v1|handoff/12/c0de|\0\0\0\x07"
+        );
+    }
 
     fn fast_params() -> Argon2Params {
         // Small parameters keep the unit tests fast; production uses Default.

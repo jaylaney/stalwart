@@ -13,7 +13,7 @@ use ::vault::{
         verifier_matches, wrap_private_key,
     },
     pins::{ZaPinRecord, open_pin_record, seal_pin_record},
-    record::{VAULT_RECORD_VERSION, VaultRecord, VaultState, WrapState},
+    record::{VAULT_RECORD_VERSION, VaultRecord, VaultState, WrapState, za_session_binding},
     session::SessionKeys,
 };
 use directory::core::secret::verify_totp_code;
@@ -191,9 +191,10 @@ pub(crate) async fn vault_delete_store(
     store.write_batch(&mut batch).await.map(|_| ())
 }
 
-/// The vault record, optional pins, and setup manifest share this Principal
-/// document 0 batch. Check every assertion before any set, including on the
-/// ephemeral store which does not roll back a batch.
+/// The vault record, optional pins and setup manifest share this Principal
+/// document 0 batch with the token-record clear on a credential change
+/// (release 6 spec 4.7). Check every assertion before any set or clear,
+/// including on the ephemeral store which does not roll back a batch.
 async fn vault_batch_write(
     store: &Store,
     account_id: u32,
@@ -227,6 +228,11 @@ async fn vault_batch_write(
     }
     if let Some(extra) = &extra {
         batch.assert_value(extra.field, AssertValue::None);
+    }
+    if previous
+        .is_none_or(|previous| za_session_binding(&previous.record) != za_session_binding(record))
+    {
+        batch.clear(PrincipalField::ZeroAccessTokens);
     }
     batch.set(PrincipalField::ZeroAccessVault, value);
     if let Some(pins) = pins {
@@ -565,8 +571,9 @@ impl Server {
         }
     }
 
-    /// Upgrade ruling 185: a key account's credential version is its vault
-    /// revision, at least 1, so an OAuth grant's token (access or refresh) of
+    /// Upgrade ruling 185: a key account's credential version is the binding
+    /// of release 6's D19 (`za_session_binding`), which is never 0, so an
+    /// OAuth grant's token (access or refresh) of
     /// version 0 was minted while the account had no credential. Tokens
     /// bound to no grant (live tokens, RSVP links) carry 0 by design and are
     /// not checked here. Upstream exempts version 0 from the
@@ -579,6 +586,9 @@ impl Server {
         account_id: u32,
         credential_version: u64,
     ) -> trc::Result<()> {
+        #[cfg(feature = "test_mode")]
+        crate::za::test_hooks::token_version_check_pause_point(account_id).await;
+
         if credential_version == 0
             && self
                 .account(account_id)
@@ -1527,6 +1537,108 @@ mod tests {
         assert_eq!(read2.record.revision, 2);
         assert_ne!(read2.cas, read.cas);
         assert!(vault_read_store(&store, 6).await.unwrap().is_none());
+    }
+
+    const PLANTED_TOKENS: &[u8] = &[1, 0xde, 0xad];
+
+    async fn plant_token_record(store: &Store) {
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(5)
+            .with_collection(Collection::Principal)
+            .with_document(0)
+            .set(PrincipalField::ZeroAccessTokens, PLANTED_TOKENS.to_vec());
+        store.write_batch(&mut batch).await.unwrap();
+    }
+
+    async fn raw_token_record(store: &Store) -> Option<Vec<u8>> {
+        store
+            .get_value::<RawValue>(ValueKey::property(
+                5,
+                Collection::Principal,
+                0,
+                PrincipalField::ZeroAccessTokens,
+            ))
+            .await
+            .unwrap()
+            .map(|raw| raw.0)
+    }
+
+    #[tokio::test]
+    async fn credential_change_clears_the_token_record() {
+        use ::vault::record::AppWrap;
+
+        let store = EphemeralStore::open();
+        let mut record = VaultRecord::pending(vec![1; 32], 100);
+        plant_token_record(&store).await;
+        vault_commit_store(&store, 5, &mut record, None, None, None)
+            .await
+            .unwrap();
+        assert!(raw_token_record(&store).await.is_none());
+
+        plant_token_record(&store).await;
+        let noncredentials: [fn(&mut VaultRecord); 5] = [
+            |_| {}, // only the commit's revision increment
+            |record| record.recovery_wrap.push(2),
+            |record| {
+                record.app_wraps.push(AppWrap {
+                    credential_id: 9,
+                    wrap: vec![3; 72],
+                    state: WrapState::Pending,
+                    created: 100,
+                    publication_id: 1,
+                });
+            },
+            |record| record.public_key = vec![4; 32],
+            |record| record.private_key_wrap = vec![5; 72],
+        ];
+        for change in noncredentials {
+            let read = vault_read_store(&store, 5).await.unwrap().unwrap();
+            change(&mut record);
+            vault_commit_store(&store, 5, &mut record, Some(&read), None, None)
+                .await
+                .unwrap();
+            assert!(raw_token_record(&store).await.as_deref() == Some(PLANTED_TOKENS));
+        }
+
+        let credentials: [fn(&mut VaultRecord); 4] = [
+            |record| record.verifier_hash = vec![6; 32],
+            |record| record.salt = vec![7; 16],
+            |record| record.argon2_m_cost_kib += 1,
+            |record| record.totp_url = Some("otpauth://totp/test".into()),
+        ];
+        for change in credentials {
+            plant_token_record(&store).await;
+            let read = vault_read_store(&store, 5).await.unwrap().unwrap();
+            change(&mut record);
+            vault_commit_store(&store, 5, &mut record, Some(&read), None, None)
+                .await
+                .unwrap();
+            assert!(raw_token_record(&store).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lost_vault_write_keeps_the_token_record() {
+        let store = EphemeralStore::open();
+        let mut record = VaultRecord::pending(vec![1; 32], 100);
+        vault_commit_store(&store, 5, &mut record, None, None, None)
+            .await
+            .unwrap();
+        let stale = vault_read_store(&store, 5).await.unwrap().unwrap();
+        vault_commit_store(&store, 5, &mut record, Some(&stale), None, None)
+            .await
+            .unwrap();
+
+        // A credential change would clear the field if its assertion won.
+        // The ephemeral store applies operations before a failed assertion.
+        plant_token_record(&store).await;
+        record.verifier_hash = vec![2; 32];
+        let err = vault_commit_store(&store, 5, &mut record, Some(&stale), None, None)
+            .await
+            .unwrap_err();
+        assert!(err.is_assertion_failure());
+        assert!(raw_token_record(&store).await.as_deref() == Some(PLANTED_TOKENS));
     }
 
     /// Mail ruling R46 at 1.0: a destroyed message's metadata archive

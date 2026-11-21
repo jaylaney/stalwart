@@ -30,8 +30,9 @@ use dav_proto::schema::response::{BaseCondition, MultiStatus};
 use groupware::calendar::{
     ArchivedCalendarEvent, ArchivedCalendarEventContent, ArchivedCalendarEventNotificationContent,
     Calendar, CalendarEvent, CalendarEventContent, CalendarEventNotificationContent,
+    pipeline::context::za_foreign_calendar_contexts,
     seal::{ZaContainerOf, ZaEvent, open_drained_item, seal_error, unseal_event_in_domain},
-    sharing::resolve::{ZaCalendarContext, ZaCalendarError, za_calendar_context},
+    sharing::resolve::{ZaCalendarContext, ZaCalendarError},
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
@@ -462,29 +463,14 @@ pub(super) async fn foreign_calendar_contexts(
     resources: &GroupwareResources,
     requested: Option<u32>,
 ) -> crate::Result<BTreeMap<u32, Arc<ZaCalendarContext>>> {
-    let mut eligible = BTreeMap::new();
-    for id in resources
-        .document_ids(true)
-        .filter(|id| requested.is_none_or(|requested| requested == *id))
-    {
-        match za_calendar_context(
-            server,
-            token,
-            owner_id,
-            id,
-            Bitmap::new().with_item(Acl::Read),
-        )
-        .await
-        {
-            Ok(Some(context)) => {
-                eligible.insert(id, Arc::new(context));
-            }
-            Ok(None) | Err(ZaCalendarError::Forbidden) => (),
-            Err(ZaCalendarError::Store(error))
-                if error.matches(trc::EventType::Store(trc::StoreEvent::NotFound)) => {}
-            Err(error) => return Err(crate::calendar::za_calendar_error(error, owner_id, id)),
-        }
-    }
+    let eligible = za_foreign_calendar_contexts(
+        server,
+        token,
+        owner_id,
+        resources.document_ids(true),
+        requested,
+    )
+    .await?;
     #[cfg(feature = "test_mode")]
     common::za::test_hooks::propfind_admitted_pause_point(token.account_id()).await;
     Ok(eligible)

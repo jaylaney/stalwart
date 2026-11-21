@@ -156,10 +156,9 @@ pub(super) async fn get(
         if let Some((id, _)) = token_range {
             for (&calendar_id, context) in eligible {
                 if requested_calendar.is_none_or(|id| id == calendar_id)
-                    && context.boundary.is_some_and(|boundary| {
-                        boundary.pending
-                            || id <= boundary.grant_change_id.max(boundary.rename_change_id)
-                    })
+                    && context
+                        .boundary
+                        .is_some_and(|boundary| boundary.refuses(id))
                 {
                     return Err(invalid_calendar_sync_token());
                 }

@@ -17,7 +17,7 @@ use crate::utils::{
     server::TestServer,
     za::{za_setup, za_setup_token},
 };
-use common::za::ZA_MAIL_KEYLESS;
+use common::za::{ZA_CALENDAR_KEYLESS, ZA_MAIL_KEYLESS};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -72,11 +72,15 @@ pub async fn test(test: &mut TestServer) {
             .is_key_account()
     );
 
-    // Same socket, same token: the calendar call is now refused.
+    // Release 6 spec 6.1: the same socket still holds the impersonating token.
     let (name, args) = first_response(&ws_call(&mut socket, &calendar_get(&account_id)).await);
     assert_eq!(
-        (name.as_str(), args["type"].as_str()),
-        ("error", Some("accountNotSupportedByMethod")),
+        (
+            name.as_str(),
+            args["type"].as_str(),
+            args["description"].as_str()
+        ),
+        ("error", Some("forbidden"), Some(ZA_CALENDAR_KEYLESS)),
         "{args}"
     );
     ws_close(socket).await;

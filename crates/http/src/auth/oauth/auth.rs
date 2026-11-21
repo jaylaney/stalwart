@@ -36,7 +36,7 @@ use directory::Credentials;
 use http_proto::*;
 use hyper::{StatusCode, body::Bytes};
 use registry::schema::enums::OAuthGrantType;
-use std::{borrow::Cow, future::Future};
+use std::{borrow::Cow, future::Future, sync::Arc};
 use store::{
     Serialize, blake3,
     dispatch::lookup::KeyValue,
@@ -51,6 +51,11 @@ use store::{
     write::ArchiveBytes,
 };
 use trc::AddContext;
+use vault::{
+    record::za_session_binding,
+    session::SessionKeys,
+    tokens::{ZaSuffix, append_code_secret, split_code},
+};
 
 #[derive(Debug, serde::Serialize)]
 pub struct ProtectedResourceMetadata<'x> {
@@ -606,6 +611,7 @@ struct LoginAccount {
     tenant_id: Option<u32>,
     // SPDX-SnippetEnd
     credential_version: u64,
+    za_keys: Option<Arc<SessionKeys>>,
 }
 
 async fn authenticate_login(
@@ -618,7 +624,7 @@ async fn authenticate_login(
     mfa_token: Option<String>,
 ) -> trc::Result<Result<LoginAccount, LoginResponse>> {
     match server
-        .authenticate(&AuthRequest {
+        .authenticate_with_keys(&AuthRequest {
             credentials: Credentials::Basic {
                 username,
                 secret,
@@ -629,7 +635,7 @@ async fn authenticate_login(
         })
         .await
     {
-        Ok(authenticated) => {
+        Ok((authenticated, za_keys)) => {
             let access_token = authenticated.access_token;
             // Mail ruling R36: no code for an impersonated login of a key
             // account (the authorization-code and device logins both pass here).
@@ -671,6 +677,7 @@ async fn authenticate_login(
                 tenant_id: access_token.tenant_id(),
                 // SPDX-SnippetEnd
                 credential_version: access_token.credential_version(),
+                za_keys,
             }))
         }
         Err(err) => {
@@ -714,6 +721,7 @@ trait ConsentHandler: Sync + Send {
         authorization: Authorization,
         login: &LoginAccount,
         query: &str,
+        za_keys: Option<&SessionKeys>,
     ) -> impl Future<Output = trc::Result<LoginResponse>> + Send;
 
     fn confirm_consent(
@@ -737,6 +745,7 @@ trait ConsentHandler: Sync + Send {
         account_id: u32,
         credential_version: u64,
         issuer: &str,
+        za_keys: Option<&SessionKeys>,
     ) -> impl Future<Output = trc::Result<LoginResponse>> + Send;
 }
 
@@ -830,7 +839,9 @@ impl ConsentHandler for Server {
                     )
                     .await? => {}
             None => {
-                return self.request_consent(authorization, &login, query).await;
+                return self
+                    .request_consent(authorization, &login, query, login.za_keys.as_deref())
+                    .await;
             }
         }
 
@@ -839,6 +850,7 @@ impl ConsentHandler for Server {
             login.account_id,
             login.credential_version,
             &issuer,
+            login.za_keys.as_deref(),
         )
         .await
     }
@@ -848,34 +860,26 @@ impl ConsentHandler for Server {
         authorization: Authorization,
         login: &LoginAccount,
         query: &str,
+        za_keys: Option<&SessionKeys>,
     ) -> trc::Result<LoginResponse> {
-        let token = rng()
-            .sample_iter(Alphanumeric)
-            .take(DEVICE_CODE_LEN)
-            .map(char::from)
-            .collect::<String>();
-        let value = Archiver::new(OAuthCode {
-            status: OAuthStatus::ConsentPending,
-            account_id: login.account_id,
-            credential_version: login.credential_version,
-            client_id: authorization.client_id,
-            nonce: None,
-            params: query_digest(query).to_hex().to_string(),
-            code_challenge: PkceCodeChallenge::None,
-            scope: None,
-        })
-        .untrusted()
-        .serialize()
-        .caused_by(trc::location!())?;
-
-        self.in_memory_store()
-            .key_set(
-                KeyValue::with_prefix(KV_OAUTH, token.as_bytes(), value)
-                    .expires(self.core.oauth.oauth_expiry_auth_code),
+        issue_login_entry(self, login.account_id, za_keys, |token| {
+            (
+                OAuthCode {
+                    status: OAuthStatus::ConsentPending,
+                    account_id: login.account_id,
+                    credential_version: login.credential_version,
+                    client_id: authorization.client_id,
+                    nonce: None,
+                    params: query_digest(query).to_hex().to_string(),
+                    code_challenge: PkceCodeChallenge::None,
+                    scope: None,
+                },
+                LoginResponse::ConsentRequired {
+                    token: token.to_owned(),
+                },
             )
-            .await?;
-
-        Ok(LoginResponse::ConsentRequired { token })
+        })
+        .await
     }
 
     async fn confirm_consent(
@@ -886,6 +890,7 @@ impl ConsentHandler for Server {
         query: &str,
         consent: bool,
     ) -> trc::Result<LoginResponse> {
+        let (token, suffix) = split_code(token);
         let Some((account_id, credential_version)) =
             self.take_pending_consent(token, query).await?
         else {
@@ -895,6 +900,27 @@ impl ConsentHandler for Server {
                     .into(),
             });
         };
+        let handoff = match suffix {
+            ZaSuffix::Secret(secret) => self.za_handoff_take(token, &secret).await?,
+            _ => {
+                self.za_handoff_delete(token).await?;
+                None
+            }
+        };
+        let za_keys = if let Some(handoff) =
+            handoff.filter(|handoff| handoff.account_id == account_id)
+            && let Some(read) = self.za_vault_record(account_id).await?
+            && za_session_binding(&read.record) == handoff.binding
+        {
+            Some(SessionKeys::new(
+                account_id,
+                read.record.revision,
+                handoff.mk,
+            ))
+        } else {
+            None
+        };
+
         let issuer = issuer(self, origin);
         let authorization = match self
             .validate_login_query(session, origin, query, &issuer)
@@ -905,8 +931,14 @@ impl ConsentHandler for Server {
         };
 
         if consent {
-            self.issue_auth_code(authorization, account_id, credential_version, &issuer)
-                .await
+            self.issue_auth_code(
+                authorization,
+                account_id,
+                credential_version,
+                &issuer,
+                za_keys.as_ref(),
+            )
+            .await
         } else {
             Ok(LoginResponse::Redirect {
                 location: authorization.error_location(ErrorType::AccessDenied, &issuer),
@@ -952,37 +984,67 @@ impl ConsentHandler for Server {
         account_id: u32,
         credential_version: u64,
         issuer: &str,
+        za_keys: Option<&SessionKeys>,
     ) -> trc::Result<LoginResponse> {
-        let client_code = rng()
-            .sample_iter(Alphanumeric)
-            .take(DEVICE_CODE_LEN)
-            .map(char::from)
-            .collect::<String>();
-        let location = authorization.code_location(&client_code, issuer);
-
-        let value = Archiver::new(OAuthCode {
-            status: OAuthStatus::Authorized,
-            account_id,
-            credential_version,
-            client_id: authorization.client_id,
-            nonce: authorization.nonce,
-            params: authorization.redirect_uri,
-            code_challenge: authorization.code_challenge,
-            scope: authorization.scope,
-        })
-        .untrusted()
-        .serialize()
-        .caused_by(trc::location!())?;
-
-        self.in_memory_store()
-            .key_set(
-                KeyValue::with_prefix(KV_OAUTH, client_code.as_bytes(), value)
-                    .expires(self.core.oauth.oauth_expiry_auth_code),
+        issue_login_entry(self, account_id, za_keys, |code| {
+            let location = authorization.code_location(code, issuer);
+            (
+                OAuthCode {
+                    status: OAuthStatus::Authorized,
+                    account_id,
+                    credential_version,
+                    client_id: authorization.client_id,
+                    nonce: authorization.nonce,
+                    params: authorization.redirect_uri,
+                    code_challenge: authorization.code_challenge,
+                    scope: authorization.scope,
+                },
+                LoginResponse::Authenticated { location },
             )
-            .await?;
-
-        Ok(LoginResponse::Authenticated { location })
+        })
+        .await
     }
+}
+
+/// A consent token and an authorization code both store their hand-off first
+/// and keep the upstream entry's key at its original length.
+async fn issue_login_entry(
+    server: &Server,
+    account_id: u32,
+    za_keys: Option<&SessionKeys>,
+    build_entry: impl FnOnce(&str) -> (OAuthCode, LoginResponse) + Send,
+) -> trc::Result<LoginResponse> {
+    let mut code = rng()
+        .sample_iter(Alphanumeric)
+        .take(DEVICE_CODE_LEN)
+        .map(char::from)
+        .collect::<String>();
+    let expires = server.core.oauth.oauth_expiry_auth_code;
+    if let Some(keys) = za_keys {
+        let secret = server
+            .za_handoff_put(&code, account_id, keys, expires)
+            .await?;
+        append_code_secret(&mut code, &secret);
+    }
+
+    let (entry, response) = build_entry(&code);
+    let key_id = &code[..DEVICE_CODE_LEN];
+    let stored = async {
+        let value = Archiver::new(entry)
+            .untrusted()
+            .serialize()
+            .caused_by(trc::location!())?;
+        server
+            .in_memory_store()
+            .key_set(KeyValue::with_prefix(KV_OAUTH, key_id.as_bytes(), value).expires(expires))
+            .await
+    }
+    .await;
+    if stored.is_err() && za_keys.is_some() {
+        let _ = server.za_handoff_delete(key_id).await;
+    }
+    stored?;
+    Ok(response)
 }
 
 async fn approve_device(
@@ -1049,13 +1111,17 @@ async fn approve_device(
                 #[cfg(feature = "enterprise")]
                 Ok(login) if !client.allows_tenant(login.tenant_id) => denied(),
                 // SPDX-SnippetEnd
-                Ok(login) => (
-                    OAuthStatus::Authorized,
-                    login.account_id,
-                    login.credential_version,
-                    server.core.oauth.oauth_expiry_auth_code,
-                    LoginResponse::Verified,
-                ),
+                Ok(login) => {
+                    // D9: a device grant never receives the password step's keys.
+                    drop(login.za_keys);
+                    (
+                        OAuthStatus::Authorized,
+                        login.account_id,
+                        login.credential_version,
+                        server.core.oauth.oauth_expiry_auth_code,
+                        LoginResponse::Verified,
+                    )
+                }
                 Err(LoginResponse::Expired) => {
                     let (status, account_id, credential_version, expiry, _) = denied();
                     (

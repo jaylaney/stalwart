@@ -6,6 +6,84 @@ The inherited [CHANGELOG.md](CHANGELOG.md) records upstream Stalwart history.
 
 ## Unreleased
 
+### Release 6: JMAP calendars and browser sign-in
+
+Design `docs/superpowers/specs/2026-11-13-zero-access-jmap-calendars-design.md`, revision 7;
+qualification in `docs/superpowers/plans/2026-11-14-zero-access-plan17-outcome.md`. The
+reference client's manual checklist (`docs/zero-access/client-jmap.md`) has not been run.
+
+- Browser sign-in carries keys: an OAuth token of a key account issued through the
+  authorization-code flow carries a secret that opens the account's keys on every HTTP request
+  that presents it. A per-account token record (principal field 153) holds the wraps. The
+  device-code flow and the mail protocols' Bearer logins stay keyless.
+- JMAP calendars for key accounts: `Calendar/get`, `/changes`, `/query`, `/set`;
+  `CalendarEvent/get`, `/query`, `/queryChanges`, `/set`, `/changes`, `/parse`;
+  `ParticipantIdentity/get`, `/changes` and the default switch of `/set`. A grantee reads and
+  writes a shared key calendar under the rules CalDAV applies. Still refused: granting a share
+  through JMAP (`shareWith`), `CalendarEventNotification/*`, `CalendarEvent/copy`, per-user event
+  data, drafts, participant-visibility flags, object metadata, inline attachment blobs, and
+  identity creates, updates and destroys.
+- A keyed token whose entry is gone, expired or does not open is refused with 401, never served
+  keyless (D7); such refusals are not counted for banning.
+- Default alerts are applied by value: a create or update with `useDefaultAlerts: true` writes
+  the calendar's current default alerts into the event (D11).
+- Destroying a calendar through JMAP sends cancellations for its events, as a CalDAV collection
+  `DELETE` does (D16).
+- At most 32 browser sign-ins of an account hold keys at once; the 33rd ends the one used least
+  recently (D20).
+- The token endpoint's successful answers leave the traces, for every account (D24).
+- Browser sessions end only on a password change, a recovery or a second-factor change (D19),
+  and a grant's deletion (a sign-out, say) ends that grant's sessions.
+  Other vault writes (a new recovery key, an app password's revocation, the first pin's rewrap)
+  keep them. A second-factor change ends them for good: it draws a fresh salt, so removing the
+  factor again does not revive the tokens it ended.
+- On upgrade to release 6, every key account's existing OAuth token is refused once (its
+  credential version changes), and the user signs in again.
+- The value of a `code` query parameter is masked in traced request URLs and traced `Referer`
+  headers, for every account, so an authorization code no longer appears in a trace as a query
+  parameter named `code`.
+- A grantee does not find, by text search, an event of a shared key calendar whose details it
+  cannot read.
+- Deleting a key account's calendar is all-or-nothing on RocksDB, SQLite, PostgreSQL and MySQL:
+  the calendar and its events go in one transaction (the store behaviour this relies on is
+  pinned by a test on RocksDB and SQLite; for PostgreSQL and MySQL it was read, not run). A
+  calendar too large for one transaction is
+  refused before any cancellation is sent (JMAP `forbidden`, CalDAV 403; delete some events
+  first), and a delete that meets a concurrent calendar write answers "try again". FoundationDB
+  and read replicas keep a chunked, unfenced delete.
+- A calendar delete also answers "try again" when one of its events moved while the delete was
+  prepared, and it removes every event filed under the calendar, including a second document at
+  one name and every name an event has there; without `onDestroyRemoveEvents` such an event also
+  makes the destroy refuse.
+- A person a calendar is shared with can no longer delete or change, through JMAP, an event whose
+  details are private to its owner.
+- A sharing change (a grant or a rename) no longer leaves a grantee's client unable to sync
+  events when it takes its state from `CalendarEvent/get` or `/query`, or syncs in one page or
+  from an exact state; a paged sync from the initial state still ends below the boundary, its next
+  call is refused, and the way out is to take the state from `CalendarEvent/get` or to sync in one
+  page.
+- One refused attachment link no longer fails the call's other occurrence edits of the same event.
+- A CalDAV `COPY` onto another name in the same calendar is refused for a key account
+  (`no-uid-conflict`), as it is for an ordinary account.
+- Pending invitations are imported only by a sign-in whose scope covers calendars (and by
+  password clients), on CalDAV and JMAP.
+- A revoked browser sign-in stops being served at once, even while its token record is being
+  cleaned up, and a keyed sign-in's cached entry ends shortly before its token's signed expiry,
+  so a client should refresh before `expires_in` (an ordinary account's entry keeps upstream's
+  deadline).
+- At a sign-in's cap of four keyed access tokens, a refresh no longer drops the access token it
+  has just issued when that token expires before the stored ones (a lowered token lifetime, or
+  node clocks that differ); it drops the earliest-expiring older one. An access entry whose
+  expiry has passed when it is written is not stored and drops none, so the live ones keep
+  opening; the refresh entry is still written, so the client can refresh again.
+- An owner's calendar destroy with `onDestroyRemoveEvents` no longer reads the calendar's
+  members for the emptiness check, and without the flag the check stops at the first event it
+  finds.
+- `decode_access_token` strips a `~` suffix from every token that begins with the server's token
+  header, for every account (D26). A shared calendar's colour is carried in each principal's
+  sealed personal bundle (D14); a binary built before release 6 cannot read a coloured one, so
+  a rollback below release 6 leaves such a calendar unreadable.
+
 ## 0.4.0-beta.1 — 2026-11-05
 
 Limited prerelease candidate `55bb9ca67d91fe84e9b7122681f71c5746c86214`. Fully integrated upstream Stalwart `v1.0.3`, commit

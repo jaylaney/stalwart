@@ -17,24 +17,41 @@
 //! - `PUT_PAUSE`: in the CalDAV PUT handler right after the resource
 //!   snapshot (`fetch_dav_resources`), keyed by the account
 //!   (`dav::calendar::update`).
-//! - `COMMIT_PAUSE`: in the CalDAV PUT handler immediately before the key
-//!   account's leased create commits (`za_commit_create`), after the fan-out
-//!   and the seal.
-//! - `UPDATE_COMMIT_PAUSE`: immediately before an event PUT update commit,
-//!   after fan-out and sealing, keyed by the event owner.
+//! - `COMMIT_PAUSE`: immediately before a key account's leased create
+//!   commits, after the fan-out and the seal
+//!   (`groupware::calendar::pipeline::create::za_create_event`, and again
+//!   in `groupware::calendar::pipeline::uid::za_commit_create`).
+//! - `UPDATE_COMMIT_PAUSE`: immediately before an event update commit,
+//!   keyed by the event owner. The plain commit is in `dav::calendar::update`;
+//!   the key commit follows fan-out and sealing
+//!   (`groupware::calendar::pipeline::update::za_commit_update`).
 //! - `DELETE_COMMIT_PAUSE`: immediately before an event DELETE commit,
-//!   after fan-out, keyed by the event owner.
+//!   after fan-out, keyed by the event owner
+//!   (`groupware::calendar::pipeline::delete`).
+//! - `CALENDAR_DELETE_FENCE_PAUSE` (PR #90 review RA-3): in a key calendar's
+//!   delete, after the second child-list comparison has added the change-id
+//!   fence and immediately before the commit, keyed by the owner
+//!   (`groupware::calendar::pipeline::delete::za_commit_delete`).
+//! - `CALENDAR_DELETE_BUILT_PAUSE` (PR #90 second review C4633314478): in a
+//!   key calendar's delete, after the batch is built and before the
+//!   unwritten-child refusal and the size check, keyed by the owner
+//!   (`groupware::calendar::pipeline::delete::za_delete_calendar`).
+//! - `UNFENCED_CALENDAR_DELETE` (PR #90 review RA-2): while it names an
+//!   account, that account's key calendar delete takes the form a store
+//!   without the fence's contract keeps (commit points, no size refusal, no
+//!   fence; `za_delete_calendar`). Set it through `UnfencedCalendarDelete`,
+//!   whose drop clears it.
 //! - `COMMIT_FAIL_ONCE`: the commit of a key account's PUT create fails once
 //!   with an internal error after its fan-out, keyed by the account
-//!   (`dav::calendar::za_commit_create`).
+//!   (`groupware::calendar::pipeline::uid::za_commit_create`).
 //! - `UPDATE_COMMIT_FAIL_ONCE`: the first commit of a key account's PUT
 //!   update fails once with an internal error after its fan-out, in place of
 //!   `commit_batch`'s result, keyed by the event owner
-//!   (`dav::calendar::update`, iMIP spec 8.2).
+//!   (`groupware::calendar::pipeline::update::za_commit_update`, iMIP spec 8.2).
 //! - `DELETE_COMMIT_FAIL_ONCE`: the commit of a key account's event or
 //!   collection DELETE fails once with an internal error after its
 //!   fan-outs, in place of `commit_batch`'s result, keyed by the event owner
-//!   (`dav::calendar::delete`, iMIP spec 8.2).
+//!   (`groupware::calendar::pipeline::delete`, iMIP spec 8.2).
 //! - `IMIP_SUBMIT_FAIL_ONCE`: the account's next iMIP submission answers
 //!   `Failed` without reaching the submitter, keyed by the event's account
 //!   (`common::za::imip::za_imip_submit`, iMIP spec 5.3).
@@ -42,6 +59,30 @@
 //!   (`Server::za_pin_state`) fails once with a store error, keyed by the
 //!   session's account (`common::auth::vault`; the drain's REFRESH answer,
 //!   iMIP spec 7's transient class, PR review ruling O-4).
+//! - `TOKEN_HANDOFF_WRITE_PAUSE`: in `za_handoff_put` after the revision
+//!   check and seal, immediately before storing the hand-off (release 6, D6).
+//! - `TOKEN_EXCHANGE_PAUSE`: in `za_token_issue` after the binding check
+//!   and before the batch, keyed by the account.
+//! - `TOKEN_VERSION_CHECK_PAUSE`: at the head of `za_refuse_unversioned_token`,
+//!   keyed by the account (PR #90 review C4633314515: an authentication
+//!   slowed after the decode). That function runs for an access token's
+//!   authentication, between its decode and its grant read, and for every
+//!   validation of a grant-bound token (the refresh grant, introspection,
+//!   `/api` token validation); an armed pause parks whichever call for that
+//!   account comes first.
+//! - `TOKEN_FORGET_PAUSE`: at the head of `za_token_forget_grant`, before
+//!   `TOKEN_FORGET_FAIL_ONCE` and any read, keyed by the account (PR #90
+//!   review C4617611602: a grant's deletion parked in its token cleanup).
+//! - `TOKEN_FORGET_FAIL_ONCE`: at the head of `za_token_forget_grant`,
+//!   returns a store error before any read, keyed by the account.
+//! - `TOKEN_REFRESH_READ_PAUSE`: at the head of `za_token_refresh`, after
+//!   the grant's rotation and before the refresh's first record read, keyed
+//!   by the account (release 6, spec 4.5).
+//! - `TOKEN_REFRESH_WRITE_PAUSE`: in `za_token_refresh` after MK opened and
+//!   the entries built, before the batch, keyed by the account.
+//! - `TOKEN_REFRESH_WRITE_FAIL_ONCE`: in `za_token_refresh` after the write
+//!   pause point, the batch is not written and a store error returns, keyed
+//!   by the account.
 //! - `TASK_CONSUMER_PAUSE`: the task manager's consumer loop takes no task
 //!   while it is held; global (`services::task_manager::manager`).
 //! - The lease-duration override: stands in for `ZA_UID_LEASE_SECS`, which
@@ -121,6 +162,10 @@
 //!   `store::za_test`; set it through `ForceCommitSplit`, whose drop clears
 //!   it, so a test that panics while it is set does not leave every later
 //!   batch splitting.
+//! - `COMMIT_BYTES_OVERRIDE` (PR #90 review): the byte count a named
+//!   account's key calendar delete is refused above, in place of the store's
+//!   5,000,000. Defined in `store::za_test`; set it through
+//!   `CommitBytesOverride`, whose drop clears it.
 //! - `SECOND_CHUNK_FAIL_ONCE` (iMIP spec 8.2): `Store::write_batch` fails a
 //!   batch whose current account is the named account before its second
 //!   commit chunk, after the first is written; one-shot. Defined in
@@ -162,6 +207,24 @@ impl Drop for ForceCommitSplit {
     }
 }
 
+/// Sets `COMMIT_BYTES_OVERRIDE` (`store::za_test`) to `bytes` for
+/// `account_id`'s batches for the guard's lifetime; the drop clears it.
+#[must_use = "dropping the guard clears COMMIT_BYTES_OVERRIDE"]
+pub struct CommitBytesOverride(());
+
+impl CommitBytesOverride {
+    pub fn new(account_id: u32, bytes: usize) -> Self {
+        store::za_test::set_commit_bytes_override(Some((account_id, bytes)));
+        CommitBytesOverride(())
+    }
+}
+
+impl Drop for CommitBytesOverride {
+    fn drop(&mut self) {
+        store::za_test::set_commit_bytes_override(None);
+    }
+}
+
 pub static FAN_OUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 pub static PUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -169,6 +232,47 @@ pub static PUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static UPDATE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static DELETE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static TOKEN_HANDOFF_WRITE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static TOKEN_EXCHANGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static TOKEN_REFRESH_READ_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static TOKEN_REFRESH_WRITE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static TOKEN_FORGET_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static TOKEN_VERSION_CHECK_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static CALENDAR_DELETE_FENCE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static CALENDAR_DELETE_BUILT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+/// The account whose key calendar delete takes the unfenced form.
+pub static UNFENCED_CALENDAR_DELETE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// Sets `UNFENCED_CALENDAR_DELETE` to `account_id` for the guard's lifetime;
+/// the drop clears it, also when the test panics.
+#[must_use = "dropping the guard clears UNFENCED_CALENDAR_DELETE"]
+pub struct UnfencedCalendarDelete(());
+
+impl UnfencedCalendarDelete {
+    pub fn new(account_id: u32) -> Self {
+        *UNFENCED_CALENDAR_DELETE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(account_id);
+        UnfencedCalendarDelete(())
+    }
+}
+
+impl Drop for UnfencedCalendarDelete {
+    fn drop(&mut self) {
+        *UNFENCED_CALENDAR_DELETE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// Whether `account_id`'s key calendar delete takes the unfenced form.
+pub fn calendar_delete_unfenced(account_id: u32) -> bool {
+    *UNFENCED_CALENDAR_DELETE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        == Some(account_id)
+}
 
 /// Global: its `account_id` is ignored.
 pub static TASK_CONSUMER_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -187,6 +291,12 @@ pub static IMIP_SUBMIT_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 
 /// The account whose next pin-state read fails.
 pub static PIN_READ_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// The account whose next token-record removal fails before reading the record.
+pub static TOKEN_FORGET_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// The account whose next token-refresh batch is not written.
+pub static TOKEN_REFRESH_WRITE_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 
 pub static DRAIN_LOOKUP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
@@ -263,6 +373,38 @@ pub fn set_delete_commit_pause(pause: Option<Arc<Pause>>) {
     set_slot(&DELETE_COMMIT_PAUSE, pause);
 }
 
+pub fn set_calendar_delete_fence_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&CALENDAR_DELETE_FENCE_PAUSE, pause);
+}
+
+pub fn set_calendar_delete_built_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&CALENDAR_DELETE_BUILT_PAUSE, pause);
+}
+
+pub fn set_token_handoff_write_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&TOKEN_HANDOFF_WRITE_PAUSE, pause);
+}
+
+pub fn set_token_exchange_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&TOKEN_EXCHANGE_PAUSE, pause);
+}
+
+pub fn set_token_refresh_read_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&TOKEN_REFRESH_READ_PAUSE, pause);
+}
+
+pub fn set_token_refresh_write_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&TOKEN_REFRESH_WRITE_PAUSE, pause);
+}
+
+pub fn set_token_forget_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&TOKEN_FORGET_PAUSE, pause);
+}
+
+pub fn set_token_version_check_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&TOKEN_VERSION_CHECK_PAUSE, pause);
+}
+
 pub fn set_task_consumer_pause(pause: Option<Arc<Pause>>) {
     set_slot(&TASK_CONSUMER_PAUSE, pause);
 }
@@ -291,6 +433,18 @@ pub fn set_imip_submit_fail_once(account_id: Option<u32>) {
 
 pub fn set_pin_read_fail_once(account_id: Option<u32>) {
     *PIN_READ_FAIL_ONCE.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_token_forget_fail_once(account_id: Option<u32>) {
+    *TOKEN_FORGET_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_token_refresh_write_fail_once(account_id: Option<u32>) {
+    *TOKEN_REFRESH_WRITE_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
 }
 
 pub fn set_lease_secs_override(secs: Option<u64>) {
@@ -468,6 +622,38 @@ pub async fn delete_commit_pause_point(account_id: u32) {
     wait(take_for(&DELETE_COMMIT_PAUSE, account_id)).await;
 }
 
+pub async fn calendar_delete_fence_pause_point(account_id: u32) {
+    wait(take_for(&CALENDAR_DELETE_FENCE_PAUSE, account_id)).await;
+}
+
+pub async fn calendar_delete_built_pause_point(account_id: u32) {
+    wait(take_for(&CALENDAR_DELETE_BUILT_PAUSE, account_id)).await;
+}
+
+pub async fn token_handoff_write_pause_point(account_id: u32) {
+    wait(take_for(&TOKEN_HANDOFF_WRITE_PAUSE, account_id)).await;
+}
+
+pub async fn token_exchange_pause_point(account_id: u32) {
+    wait(take_for(&TOKEN_EXCHANGE_PAUSE, account_id)).await;
+}
+
+pub async fn token_refresh_read_pause_point(account_id: u32) {
+    wait(take_for(&TOKEN_REFRESH_READ_PAUSE, account_id)).await;
+}
+
+pub async fn token_refresh_write_pause_point(account_id: u32) {
+    wait(take_for(&TOKEN_REFRESH_WRITE_PAUSE, account_id)).await;
+}
+
+pub async fn token_forget_pause_point(account_id: u32) {
+    wait(take_for(&TOKEN_FORGET_PAUSE, account_id)).await;
+}
+
+pub async fn token_version_check_pause_point(account_id: u32) {
+    wait(take_for(&TOKEN_VERSION_CHECK_PAUSE, account_id)).await;
+}
+
 pub async fn task_consumer_pause_point() {
     let pause = TASK_CONSUMER_PAUSE
         .lock()
@@ -551,6 +737,16 @@ pub fn take_imip_submit_fail(account_id: u32) -> bool {
 /// Whether the account's pin-state read must fail now; clears the flag.
 pub fn take_pin_read_fail(account_id: u32) -> bool {
     take_flag(&PIN_READ_FAIL_ONCE, account_id)
+}
+
+/// Whether the next token-record removal for this account must fail.
+pub fn take_token_forget_fail(account_id: u32) -> bool {
+    take_flag(&TOKEN_FORGET_FAIL_ONCE, account_id)
+}
+
+/// Whether the account's token-refresh batch must fail now; clears the flag.
+pub fn take_token_refresh_write_fail(account_id: u32) -> bool {
+    take_flag(&TOKEN_REFRESH_WRITE_FAIL_ONCE, account_id)
 }
 
 /// Whether the account's next private-key unwrap must fail; clears the flag.

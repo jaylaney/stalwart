@@ -8,10 +8,20 @@
 //! Keyed search and threading use upstream's results (release 7 spec 9.3).
 //! The remaining differences cover keyless mail calls, cross-account copy,
 //! sharing, raw sealed sources and push content. The admin and Sales group
-//! stay plain. The calendar variants assert the key-account refusal.
+//! stay plain. The calendar block (release 6 spec 9.4) runs upstream's
+//! `calendar::calendars`, `instance` and `alarm` bodies for key accounts and
+//! mirrors `event`, `identity`, `acl` and `principal::availability` where a
+//! ruling changes an assertion; event notifications are refused (6.11).
 
 use crate::{
     jmap::{
+        calendar::{
+            self,
+            event::{
+                assert_eq_ignoring_updated, test_jscalendar_1, test_jscalendar_2,
+                test_jscalendar_3, test_jscalendar_4,
+            },
+        },
         files,
         mail::{
             acl::{assert_account_not_found, assert_forbidden, assert_from_account_not_found},
@@ -23,12 +33,12 @@ use crate::{
     },
     utils::{
         account::Account,
-        jmap::{ChangeType, JmapResponse, JmapUtils},
+        jmap::{ChangeType, IntoJmapSet, JmapResponse, JmapUtils},
         push::spawn_mock_push_server,
         server::{DestroyAllMailboxes, TestServer},
         smtp::SmtpConnection,
         za::{
-            Keyless, finish_bulk_delivery_indexing, za_grant_token, za_index_current,
+            Keyless, finish_bulk_delivery_indexing, za_grant_token, za_index_current, za_post,
             za_revoke_grant,
         },
     },
@@ -45,11 +55,14 @@ use ::email::{
 };
 use ahash::{AHashMap, AHashSet};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use calcard::jscalendar::JSCalendarProperty;
 use common::{
     auth::{AccessToken, oauth::scope::OAuthScopes},
     storage::index::ObjectIndexBuilder,
     za::ZA_MAIL_KEYLESS,
 };
+use dav_proto::Depth;
+use groupware::{DavResourceName, cache::GroupwareCache};
 use hyper::StatusCode;
 use jmap_client::{
     Error,
@@ -66,8 +79,9 @@ use jmap_client::{
 use jmap_proto::{
     method::query::Filter as ProtoFilter,
     object::{
-        email::EmailFilter, file_node::FileNodeProperty, principal::PrincipalProperty,
-        push_subscription::EmailPushProperty,
+        calendar::CalendarProperty, email::EmailFilter, file_node::FileNodeProperty,
+        participant_identity::ParticipantIdentityProperty, principal::PrincipalProperty,
+        push_subscription::EmailPushProperty, share_notification::ShareNotificationProperty,
     },
     request::method::MethodObject,
     types::state::State,
@@ -87,6 +101,7 @@ use store::{
 use tokio::sync::mpsc;
 use types::{
     collection::{Collection, SyncCollection},
+    field::PrincipalField,
     id::Id,
     keyword::Keyword,
 };
@@ -3507,46 +3522,1458 @@ pub async fn file_node(test: &TestServer) {
     files::node::test_options(test).await;
 }
 
-/// The `calendar::*` modules and `principal::availability` in key mode:
-/// JMAP calendars are not offered to key accounts in this release (release
-/// 1 spec 9, plan 3), so every calendar method on a key account answers
-/// `accountNotSupportedByMethod`, its availability is empty and nothing is
-/// stored.
+/// The calendar block of `jmap_tests` in key mode (release 6 spec 9.4), in
+/// upstream's order. `calendar::calendars`, `calendar::instance` and
+/// `calendar::alarm` run upstream's bodies unchanged; the others are the
+/// variants below, each naming the upstream body it mirrors and the rulings
+/// that change its assertions.
 pub async fn calendars(test: &TestServer) {
     println!("Running key-account Calendar tests...");
+    calendar::calendars::test(test).await;
+    calendar_event(test).await;
+    calendar::instance::test(test).await;
+    calendar_notification(test).await;
+    calendar::alarm::test(test).await;
+    calendar_identity(test).await;
+    calendar_acl(test).await;
+    calendar_availability(test).await;
+}
+
+/// `calendar::event::test` in key mode, line for line except where a ruling
+/// changes an assertion (rule R44):
+/// - release 6 spec 6.5: the create of event 1 with `isDraft`,
+///   `mayInviteSelf`, `mayInviteOthers` and `hideAttendees` true is refused
+///   with `invalidProperties`, and event 1 is created without them; 6.3:
+///   those flags then read false;
+/// - D11: `useDefaultAlerts: true` is applied by value, so event 2 and the
+///   patched event 1 read `useDefaultAlerts: false`, and event 2's `alerts`
+///   hold the calendar's default alert as `events::create_use_default_alerts`
+///   pins it;
+/// - D11, D1: the alarms are stored per component with the component's
+///   title at the time the defaults were written, and a read is upstream's
+///   projection of the stored tree, so in the windowed and property-subset
+///   reads of event 2 an override whose title differed from the master's
+///   holds the patch `alerts/abc/iCalendar` with that title as its
+///   description;
+/// - spec 3.3: a UID is unique within one calendar, so the duplicate UID is
+///   created in calendar 1 and refused in calendar 2, which holds event 2.
+///
+/// `event_participants` and `EVENT_ICAL_1` are copies of the private
+/// `test_jscalendar_participants` and `TEST_ICAL_1` of `event.rs`.
+async fn calendar_event(test: &TestServer) {
+    println!("Running key-account Calendar Event tests...");
+    let account = test.account("jdoe@example.com");
+
+    // Create test calendars
+    let response = account
+        .jmap_create(
+            MethodObject::Calendar,
+            [
+                json!({
+                    "name": "Holy Calendar, Batman!",
+                    "timeZone": "Europe/Vatican",
+                }),
+                json!({
+                    "name": "Calendar with Alerts",
+                    "defaultAlertsWithTime": {
+                        "abc": {
+                            "action": "display",
+                            "trigger": {
+                                "relativeTo": "start",
+                                "offset": "PT15M"
+                            }
+                        }
+                    },
+                }),
+            ],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await;
+    let calendar1_id = response.created(0).id().to_string();
+    let calendar2_id = response.created(1).id().to_string();
+
+    // Obtain state
+    let change_id = account
+        .jmap_get(
+            MethodObject::CalendarEvent,
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+        )
+        .await
+        .state()
+        .to_string();
+
+    // Create test events
+    let event_1 = test_jscalendar_1().with_property(
+        JSCalendarProperty::<Id>::CalendarIds,
+        [calendar1_id.as_str()].into_jmap_set(),
+    );
+    let event_2 = test_jscalendar_2().with_property(
+        JSCalendarProperty::<Id>::CalendarIds,
+        [calendar2_id.as_str()].into_jmap_set(),
+    );
+    let event_3 = test_jscalendar_3().with_property(
+        JSCalendarProperty::<Id>::CalendarIds,
+        [calendar1_id.as_str(), calendar2_id.as_str()].into_jmap_set(),
+    );
+    let event_4 = test_jscalendar_4().with_property(
+        JSCalendarProperty::<Id>::CalendarIds,
+        [calendar1_id.as_str()].into_jmap_set(),
+    );
+    // Release 6 spec 6.5: a key account refuses `isDraft`, `mayInviteSelf`,
+    // `mayInviteOthers` and `hideAttendees` set true; event 1 is created
+    // without them.
+    assert_eq!(
+        account
+            .jmap_create(
+                MethodObject::CalendarEvent,
+                [event_1
+                    .clone()
+                    .with_property(JSCalendarProperty::<Id>::IsDraft, true)
+                    .with_property(JSCalendarProperty::<Id>::MayInviteSelf, true)
+                    .with_property(JSCalendarProperty::<Id>::MayInviteOthers, true)
+                    .with_property(JSCalendarProperty::<Id>::HideAttendees, true)],
+                Vec::<(&str, &str)>::new(),
+            )
+            .await
+            .not_created(0)
+            .typ(),
+        "invalidProperties"
+    );
+    let response = account
+        .jmap_create(
+            MethodObject::CalendarEvent,
+            [
+                event_1.clone(),
+                event_2
+                    .clone()
+                    .with_property(JSCalendarProperty::<Id>::UseDefaultAlerts, true),
+                event_3
+                    .clone()
+                    .with_property(JSCalendarProperty::<Id>::UseDefaultAlerts, false),
+                event_4,
+            ],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await;
+    let event_1_id = response.created(0).id().to_string();
+    let event_2_id = response.created(1).id().to_string();
+    let event_3_id = response.created(2).id().to_string();
+    let event_4_id = response.created(3).id().to_string();
+
+    // Destroy tmp event
+    test.wait_for_tasks().await;
+    assert_eq!(
+        account
+            .jmap_destroy(
+                MethodObject::CalendarEvent,
+                [event_4_id.as_str()],
+                Vec::<(&str, &str)>::new(),
+            )
+            .await
+            .destroyed()
+            .next(),
+        Some(event_4_id.as_str())
+    );
+
+    // Validate changes
+    assert_eq!(
+        account
+            .jmap_changes(MethodObject::CalendarEvent, &change_id)
+            .await
+            .changes()
+            .collect::<AHashSet<_>>(),
+        [
+            ChangeType::Created(&event_1_id),
+            ChangeType::Created(&event_2_id),
+            ChangeType::Created(&event_3_id)
+        ]
+        .into_iter()
+        .collect::<AHashSet<_>>(),
+    );
+
+    // Verify event contents. A full get at 1.0 also returns the JMAP for
+    // Calendars properties (asserted on their own below) and JSCalendar's
+    // `version`, and a server-set `created` that `assert_eq_ignoring_updated`
+    // leaves out like `updated`.
+    let response = account
+        .jmap_get(
+            MethodObject::CalendarEvent,
+            Vec::<&str>::new(),
+            [&event_1_id, &event_2_id, &event_3_id],
+        )
+        .await;
+
+    assert_eq_ignoring_updated(
+        &response.list()[0],
+        event_1
+            .with_property(JSCalendarProperty::<Id>::Id, event_1_id.as_str())
+            // Release 6 spec 6.3: the flags were not set (6.5) and read false.
+            .with_property(JSCalendarProperty::<Id>::MayInviteSelf, false)
+            .with_property(JSCalendarProperty::<Id>::MayInviteOthers, false)
+            .with_property(JSCalendarProperty::<Id>::HideAttendees, false)
+            .with_property(JSCalendarProperty::<Id>::UseDefaultAlerts, false)
+            .with_property("version", "2.0")
+            .with_property(JSCalendarProperty::<Id>::IsDraft, false)
+            .with_property(JSCalendarProperty::<Id>::IsOrigin, true),
+    );
+    assert_eq_ignoring_updated(
+        &response.list()[1],
+        event_2
+            .with_property(JSCalendarProperty::<Id>::Id, event_2_id.as_str())
+            .with_property(JSCalendarProperty::<Id>::MayInviteSelf, false)
+            .with_property(JSCalendarProperty::<Id>::MayInviteOthers, false)
+            .with_property(JSCalendarProperty::<Id>::HideAttendees, false)
+            // Release 6 D11: the default alerts were written into the event by
+            // value, so the flag reads false and `alerts` holds the calendar's
+            // default alert under its id, as `events::create_use_default_alerts`
+            // pins it.
+            .with_property(JSCalendarProperty::<Id>::UseDefaultAlerts, false)
+            .with_property("version", "2.0")
+            .with_property(JSCalendarProperty::<Id>::IsDraft, false)
+            .with_property(JSCalendarProperty::<Id>::IsOrigin, true)
+            // 1.0 keeps the calendar's default alert id ("abc"; 0.16 numbered
+            // it k1) and leaves out an override's unchanged duration.
+            .with_property(
+                JSCalendarProperty::<Id>::Alerts,
+                json!({
+                  "abc": {
+                    "action": "display",
+                    "trigger": {
+                      "@type": "OffsetTrigger",
+                      "offset": "PT15M"
+                    },
+                    "@type": "Alert"
+                  }
+                }),
+            )
+            .with_property(
+                JSCalendarProperty::<Id>::RecurrenceOverrides,
+                json!({
+                  "2006-01-04T12:00:00": {
+                    "title": "Event #2 bis",
+                    "start": "2006-01-04T14:00:00",
+                    "updated": "2006-02-06T00:11:21Z"
+                  },
+                  "2006-01-06T12:00:00": {
+                    "title": "Event #2 bis bis",
+                    "start": "2006-01-06T14:00:00",
+                    "updated": "2006-02-06T00:11:21Z"
+                  }
+                }),
+            ),
+    );
+    assert_eq_ignoring_updated(
+        &response.list()[2],
+        event_3
+            .with_property(JSCalendarProperty::<Id>::Id, event_3_id.as_str())
+            .with_property(JSCalendarProperty::<Id>::MayInviteSelf, false)
+            .with_property(JSCalendarProperty::<Id>::MayInviteOthers, false)
+            .with_property(JSCalendarProperty::<Id>::HideAttendees, false)
+            .with_property(JSCalendarProperty::<Id>::UseDefaultAlerts, false)
+            .with_property("version", "2.0")
+            .with_property(JSCalendarProperty::<Id>::IsDraft, false)
+            .with_property(JSCalendarProperty::<Id>::IsOrigin, false),
+    );
+
+    // Verify JMAP for Calendars properties
+    let response = account
+        .jmap_get(
+            MethodObject::CalendarEvent,
+            [
+                JSCalendarProperty::<Id>::Id,
+                JSCalendarProperty::BaseEventId,
+                JSCalendarProperty::MayInviteSelf,
+                JSCalendarProperty::MayInviteOthers,
+                JSCalendarProperty::HideAttendees,
+                JSCalendarProperty::UseDefaultAlerts,
+                JSCalendarProperty::UtcStart,
+                JSCalendarProperty::UtcEnd,
+            ],
+            [&event_1_id, &event_2_id, &event_3_id],
+        )
+        .await;
+    // Release 6 spec 6.3: event 1's flags read false; D11: event 2's
+    // `useDefaultAlerts` reads false.
+    response.list()[0].assert_is_equal(json!({
+      "id": &event_1_id,
+      "baseEventId": null,
+      "mayInviteSelf": false,
+      "mayInviteOthers": false,
+      "hideAttendees": false,
+      "useDefaultAlerts": false,
+      "utcStart": "2006-01-02T15:00:00Z",
+      "utcEnd": "2006-01-02T16:00:00Z"
+    }));
+    response.list()[1].assert_is_equal(json!({
+      "id": &event_2_id,
+      "baseEventId": null,
+      "mayInviteSelf": false,
+      "mayInviteOthers": false,
+      "hideAttendees": false,
+      "useDefaultAlerts": false,
+      "utcStart": "2006-01-02T17:00:00Z",
+      "utcEnd": "2006-01-02T18:00:00Z"
+    }));
+    response.list()[2].assert_is_equal(json!({
+        "id": &event_3_id,
+        "baseEventId": null,
+        "mayInviteSelf": false,
+        "mayInviteOthers": false,
+        "hideAttendees": false,
+        "useDefaultAlerts": false,
+        "utcStart": "2006-01-04T15:00:00Z",
+        "utcEnd": "2006-01-04T16:00:00Z"
+    }));
+
+    // Test /get parameters
+    let response = account
+        .jmap_method_calls(json!([[
+            "CalendarEvent/get",
+            {
+                "accountId": account.id_string(),
+                "properties": ["id", "title", "recurrenceOverrides", "participants"],
+                "ids": [&event_2_id, &event_3_id],
+                "recurrenceOverridesBefore": "2006-01-07T00:00:00Z",
+                "recurrenceOverridesAfter": "2006-01-06T00:00:00Z",
+                "reduceParticipants": true,
+            },
+            "0"
+        ]]))
+        .await;
+    assert_eq_ignoring_updated(
+        response.list_array(),
+        json!([
+          {
+            "title": "Event #2",
+            // Release 6 D11, D1: the default alert was written into every
+            // component with that component's title as its description, so
+            // the override's alarm differs from the master's and upstream's
+            // projection shows it as a patch. The description is the title
+            // at the time the defaults were written.
+            "recurrenceOverrides": {
+              "2006-01-06T12:00:00": {
+                "updated": "2006-02-06T00:11:21Z",
+                "start": "2006-01-06T14:00:00",
+                "title": "Event #2 bis bis",
+                "alerts/abc/iCalendar": {
+                  "name": "valarm",
+                  "properties": [["description", {}, "unknown", "Event #2 bis bis"]]
+                }
+              }
+            },
+            "id": "c"
+          },
+          {
+            "title": "Event #3",
+            // 1.0's reduceParticipants keeps the participants it returns
+            // whole (their status and roles); 0.16 kept the address and the
+            // owner role only.
+            "participants": {
+              "3f5bc8c0-c722-5345-b7d9-5a899db08a30": {
+                "calendarAddress": "mailto:cyrus@example.com",
+                "@type": "Participant",
+                "roles": {
+                  "owner": true,
+                  "chair": true
+                },
+                "participationStatus": "accepted"
+              }
+            },
+            "id": "d"
+          }
+        ]),
+    );
+
+    let response = account
+        .jmap_method_calls(json!([[
+            "CalendarEvent/get",
+            {
+                "accountId": account.id_string(),
+                "properties": [],
+                "ids": [&event_2_id, &event_3_id],
+            },
+            "0"
+        ]]))
+        .await;
+    response.list()[0].assert_is_equal(json!({ "id": &event_2_id }));
+    response.list()[1].assert_is_equal(json!({ "id": &event_3_id }));
+
+    // Creating an event without calendar should fail
+    assert_eq!(
+        account
+            .jmap_create(
+                MethodObject::CalendarEvent,
+                [json!({
+                    "title": "Event #5",
+                    "start": "2006-01-22T10:00:00",
+                    "duration": "PT1H",
+                    "timeZone": "US/Eastern",
+                    "calendarIds": {},
+                }),],
+                Vec::<(&str, &str)>::new()
+            )
+            .await
+            .not_created(0)
+            .description(),
+        "Event has to belong to at least one calendar."
+    );
+
+    // Release 6 spec 3.3: a key account's UID is unique within one calendar,
+    // as CalDAV's is. Event 2 holds the UID in calendar 2, so the same UID is
+    // created in calendar 1 (and destroyed at once) and refused in calendar 2.
+    let duplicate_event_id = account
+        .jmap_create(
+            MethodObject::CalendarEvent,
+            [json!({
+                "title": "Event #5",
+                "start": "2006-01-22T10:00:00",
+                "duration": "PT1H",
+                "timeZone": "US/Eastern",
+                "uid": "00959BC664CA650E933C892C@example.com",
+                "calendarIds": {
+                    &calendar1_id: true
+                },
+            })],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .created(0)
+        .id()
+        .to_string();
+    account
+        .jmap_destroy(
+            MethodObject::CalendarEvent,
+            [duplicate_event_id.as_str()],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .assert_destroyed(&[Id::from_str(&duplicate_event_id).unwrap()]);
+    let response = account
+        .jmap_create(
+            MethodObject::CalendarEvent,
+            [json!({
+                "title": "Event #5",
+                "start": "2006-01-22T10:00:00",
+                "duration": "PT1H",
+                "timeZone": "US/Eastern",
+                "uid": "00959BC664CA650E933C892C@example.com",
+                "calendarIds": {
+                    &calendar2_id: true
+                },
+            })],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await;
+    assert_eq!(response.not_created(0).typ(), "invalidProperties");
+    assert_eq!(
+        response.not_created(0).description(),
+        "An event with UID 00959BC664CA650E933C892C@example.com already exists."
+    );
+
+    // Patching tests
+    let response = account
+        .jmap_update(
+            MethodObject::CalendarEvent,
+            [
+                (
+                    &event_1_id,
+                    json!({
+                        "isDraft": false,
+                        "mayInviteSelf": false,
+                        "mayInviteOthers": false,
+                        "hideAttendees": false,
+                        "useDefaultAlerts": true,
+                        "description": null,
+                        "title": "Event one",
+                        "keywords": {"work": true},
+                        format!("calendarIds/{calendar2_id}"): true
+                    }),
+                ),
+                (
+                    &event_2_id,
+                    json!({
+                        "calendarIds": {
+                            &calendar1_id: true,
+                            &calendar2_id: true
+                        },
+                        "title": "Event two",
+                        "useDefaultAlerts": false,
+                        "description": "Updated description",
+                        "recurrenceOverrides/2006-01-04T12:00:00/title":
+                        "Event two overridden",
+                        "recurrenceOverrides/2006-01-06T12:00:00/title":
+                        "Event two overridden twice",
+
+                    }),
+                ),
+                (
+                    &event_3_id,
+                    json!({
+                        format!("calendarIds/{calendar2_id}"): false,
+                        "title": "Event three",
+                        "utcStart": "2006-01-04T14:00:00Z",
+                        "utcEnd": "2006-01-04T16:00:00Z",
+                        "participants/3f5bc8c0-c722-5345-b7d9-5a899db08a30/roles/chair": false,
+                        "participants/3f5bc8c0-c722-5345-b7d9-5a899db08a30/roles/owner": true,
+                        "participants/ec5e7db5-22a3-5ed5-89bf-c8894ab86805" : null,
+                        "participants/7f2bd210-6c66-5b64-8562-0176b74462b1": {
+                            "calendarAddress": "mailto:rupert@example.com",
+                            "@type": "Participant",
+                            "participationStatus": "needs-action"
+                        }
+                    }),
+                ),
+            ],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await;
+
+    response.updated(&event_1_id);
+    response.updated(&event_2_id);
+    response.updated(&event_3_id);
+
+    // Verify patches
+    let response = account
+        .jmap_get(
+            MethodObject::CalendarEvent,
+            [
+                JSCalendarProperty::<Id>::Id,
+                JSCalendarProperty::CalendarIds,
+                JSCalendarProperty::Title,
+                JSCalendarProperty::Start,
+                JSCalendarProperty::Description,
+                JSCalendarProperty::Keywords,
+                JSCalendarProperty::RecurrenceOverrides,
+                JSCalendarProperty::Participants,
+                JSCalendarProperty::MayInviteOthers,
+                JSCalendarProperty::MayInviteSelf,
+                JSCalendarProperty::HideAttendees,
+                JSCalendarProperty::UseDefaultAlerts,
+                JSCalendarProperty::IsDraft,
+            ],
+            [&event_1_id, &event_2_id, &event_3_id],
+        )
+        .await;
+
+    response.list()[0].assert_is_equal(json!({
+      "id": &event_1_id,
+      "calendarIds":  {
+        &calendar1_id: true,
+        &calendar2_id: true
+      },
+      "isDraft": false,
+      "mayInviteSelf": false,
+      "mayInviteOthers": false,
+      "hideAttendees": false,
+      // Release 6 D11: the patch's `useDefaultAlerts: true` was applied by
+      // value and reads false.
+      "useDefaultAlerts": false,
+      "title": "Event one",
+      "start": "2006-01-02T10:00:00",
+      "keywords": {
+        "work": true
+      }
+    }));
+
+    assert_eq_ignoring_updated(
+        &response.list()[1],
+        json!({
+            "id": &event_2_id,
+            "calendarIds": {
+              &calendar1_id: true,
+              &calendar2_id: true
+            },
+            "title": "Event two",
+            "start": "2006-01-02T12:00:00",
+            "description": "Updated description",
+            // Release 6 D11, D1: each override's alarm keeps the title it had
+            // when the defaults were written; the patch renamed the
+            // overrides and did not write the defaults again.
+            "recurrenceOverrides": {
+                "2006-01-04T12:00:00": {
+                    "title": "Event two overridden",
+                    "start": "2006-01-04T14:00:00",
+                    "updated": "2006-02-06T00:11:21Z",
+                    "alerts/abc/iCalendar": {
+                        "name": "valarm",
+                        "properties": [["description", {}, "unknown", "Event #2 bis"]]
+                    }
+                },
+                "2006-01-06T12:00:00": {
+                    "title": "Event two overridden twice",
+                    "start": "2006-01-06T14:00:00",
+                    "updated": "2006-02-06T00:11:21Z",
+                    "alerts/abc/iCalendar": {
+                        "name": "valarm",
+                        "properties": [["description", {}, "unknown", "Event #2 bis bis"]]
+                    }
+                }
+            },
+            "title": "Event two",
+            "start": "2006-01-02T12:00:00",
+            "mayInviteOthers": false,
+            "mayInviteSelf": false,
+            "hideAttendees": false,
+            "useDefaultAlerts": false,
+            "isDraft": false
+        }),
+    );
+
+    response.list()[2].assert_is_equal(json!({
+        "id": event_3_id,
+        "calendarIds": {
+            &calendar1_id: true,
+        },
+        "title": "Event three",
+        "start": "2006-01-04T09:00:00",
+        "participants": {
+            "3f5bc8c0-c722-5345-b7d9-5a899db08a30": {
+                "calendarAddress": "mailto:cyrus@example.com",
+                "@type": "Participant",
+                "roles": {
+                    "owner": true
+                },
+                "participationStatus": "accepted"
+            },
+            "7f2bd210-6c66-5b64-8562-0176b74462b1": {
+                "calendarAddress": "mailto:rupert@example.com",
+                "@type": "Participant",
+                "participationStatus": "needs-action"
+            }
+        },
+        "mayInviteOthers": false,
+        "mayInviteSelf": false,
+        "hideAttendees": false,
+        "useDefaultAlerts": false,
+        "isDraft": false
+    }));
+
+    // Query tests
+    test.wait_for_tasks().await;
+    assert_eq!(
+        account
+            .jmap_query(
+                MethodObject::CalendarEvent,
+                [
+                    ("text", "Event one"),
+                    ("inCalendar", calendar1_id.as_str()),
+                    ("uid", "74855313FA803DA593CD579A@example.com"),
+                    ("after", "2006-01-02T10:59:59"),
+                    ("before", "2006-01-02T10:00:01"),
+                ],
+                ["start"],
+                [("timeZone", "US/Eastern")],
+            )
+            .await
+            .ids()
+            .collect::<AHashSet<_>>(),
+        [event_1_id.as_str()].into_iter().collect::<AHashSet<_>>()
+    );
+
+    // Recurrence expansion tests
+    let response = account
+        .jmap_query(
+            MethodObject::CalendarEvent,
+            [
+                ("after", "2006-01-01T00:00:00"),
+                ("before", "2006-01-08T00:00:00"),
+            ],
+            ["start"],
+            [
+                ("timeZone", Value::String("US/Eastern".into())),
+                ("expandRecurrences", Value::Bool(true)),
+            ],
+        )
+        .await;
+    let ids = response.ids().collect::<Vec<_>>();
+    assert_eq!(ids.len(), 7);
+    account
+        .jmap_get(
+            MethodObject::CalendarEvent,
+            [
+                JSCalendarProperty::<Id>::Id,
+                JSCalendarProperty::BaseEventId,
+                JSCalendarProperty::Start,
+                JSCalendarProperty::Duration,
+                JSCalendarProperty::TimeZone,
+                JSCalendarProperty::Title,
+                JSCalendarProperty::RecurrenceId,
+            ],
+            ids.clone(),
+        )
+        .await
+        .list_array()
+        // 1.0: a non-recurring event's instance has no base event
+        // (`baseEventId` null); 0.16 named the event itself.
+        .assert_is_equal(json!([
+          {
+            "duration": "PT1H",
+            "title": "Event one",
+            "start": "2006-01-02T10:00:00",
+            "timeZone": "US/Eastern",
+            "id": &ids[0],
+            "baseEventId": null
+          },
+          {
+            "recurrenceId": "2006-01-02T12:00:00",
+            "title": "Event two",
+            "duration": "PT1H",
+            "start": "2006-01-02T12:00:00",
+            "timeZone": "US/Eastern",
+            "id": &ids[1],
+            "baseEventId": &event_2_id
+          },
+          {
+            "duration": "PT1H",
+            "start": "2006-01-03T12:00:00",
+            "timeZone": "US/Eastern",
+            "title": "Event two",
+            "recurrenceId": "2006-01-03T12:00:00",
+            "id": &ids[2],
+            "baseEventId": &event_2_id
+          },
+          {
+            "start": "2006-01-04T09:00:00",
+            "timeZone": "US/Eastern",
+            "duration": "PT2H",
+            "title": "Event three",
+            "id": &ids[3],
+            "baseEventId": null
+          },
+          {
+            "recurrenceId": "2006-01-04T12:00:00",
+            "title": "Event two overridden",
+            "start": "2006-01-04T14:00:00",
+            "timeZone": "US/Eastern",
+            "duration": "PT1H",
+            "id": &ids[4],
+            "baseEventId": &event_2_id
+          },
+          {
+            "recurrenceId": "2006-01-05T12:00:00",
+            "duration": "PT1H",
+            "timeZone": "US/Eastern",
+            "start": "2006-01-05T12:00:00",
+            "title": "Event two",
+            "id": &ids[5],
+            "baseEventId": &event_2_id
+          },
+          {
+            "recurrenceId": "2006-01-06T12:00:00",
+            "duration": "PT1H",
+            "title": "Event two overridden twice",
+            "timeZone": "US/Eastern",
+            "start": "2006-01-06T14:00:00",
+            "id": &ids[6],
+            "baseEventId": &event_2_id
+          }
+        ]));
+
+    // Parse tests
+    account
+        .jmap_method_calls(json!([
+         [
+          "Blob/upload",
+          {
+           "accountId": account.id_string(),
+           "create": {
+            "ical": {
+             "data": [
+              {
+               "data:asText": r#"BEGIN:VCALENDAR
+PRODID:-//xyz Corp//NONSGML PDA Calendar Version 1.0//EN
+VERSION:2.0
+BEGIN:VEVENT
+DTSTAMP:19960704T120000Z
+UID:uid1@example.com
+ORGANIZER:mailto:jsmith@example.com
+DTSTART:19960918T143000Z
+DTEND:19960920T220000Z
+STATUS:CONFIRMED
+CATEGORIES:CONFERENCE
+SUMMARY:Networld+Interop Conference
+DESCRIPTION:Networld+Interop Conference
+ and Exhibit\nAtlanta World Congress Center\n
+Atlanta\, Georgia
+END:VEVENT
+END:VCALENDAR
+"#
+              }
+            ]
+           }
+          }
+         },
+         "S4"
+        ],
+        [
+          "CalendarEvent/parse",
+          {
+           "accountId": account.id_string(),
+           "blobIds": [
+             "#ical"
+           ]
+          },
+          "G4"
+         ]
+        ]))
+        .await
+        .pointer("/methodResponses/1/1/parsed")
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap()
+        .1
+        .assert_is_equal(json!([
+  {
+    "updated": "1996-07-04T12:00:00Z",
+    "title": "Networld+Interop Conference",
+    "description": "Networld+Interop Conferenceand Exhibit\nAtlanta World Congress Center\n",
+    "timeZone": "Etc/UTC",
+    "start": "1996-09-18T14:30:00",
+    "status": "confirmed",
+    "iCalendar": {
+      "convertedProperties": {
+        "duration": {
+          "name": "dtend"
+        }
+      },
+      "name": "vevent"
+    },
+    "@type": "Event",
+    "uid": "uid1@example.com",
+    "participants": {
+      "25d7647e-52fc-559b-88df-d66f08da079c": {
+        "calendarAddress": "mailto:jsmith@example.com",
+        "@type": "Participant",
+        "roles": {
+          "owner": true
+        }
+      }
+    },
+    "keywords": {
+      "CONFERENCE": true
+    },
+    "organizerCalendarAddress": "mailto:jsmith@example.com",
+    "duration": "P2DT7H30M",
+    // 1.0's parse also lists the server-set properties, null for a parsed
+    // event, and the JSCalendar version.
+    "id": null,
+    "baseEventId": null,
+    "calendarIds": null,
+    "isDraft": null,
+    "isOrigin": null,
+    "version": "2.0"
+  }
+]));
+
+    // Deletion tests
+    test.wait_for_tasks().await;
+    assert_eq!(
+        account
+            .jmap_destroy(
+                MethodObject::CalendarEvent,
+                [event_2_id.as_str(), event_3_id.as_str()],
+                Vec::<(&str, &str)>::new()
+            )
+            .await
+            .destroyed()
+            .collect::<AHashSet<_>>(),
+        [event_2_id.as_str(), event_3_id.as_str()]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+
+    // CardDAV compatibility tests
+    let account_id = account.id().document_id();
+    let dav_client = account.webdav_client();
+    let resources = test
+        .server
+        .fetch_groupware_resources(account_id, account_id, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    let path = format!(
+        "{}{}",
+        resources.base_path,
+        resources
+            .paths
+            .iter()
+            .find(|(_, v)| v.parent_id != common::NO_ID)
+            .map(|(chunk, v)| chunk.path_str(v))
+            .unwrap()
+    );
+
+    let ical = dav_client
+        .request("GET", &path, "")
+        .await
+        .with_status(StatusCode::OK)
+        .expect_body()
+        .lines()
+        .filter(|line| !line.starts_with("DTSTAMP") && !line.starts_with("CREATED"))
+        .map(String::from)
+        .collect::<AHashSet<_>>();
+    let expected_ical = EVENT_ICAL_1
+        .lines()
+        .filter(|line| !line.starts_with("DTSTAMP"))
+        .map(String::from)
+        .collect::<AHashSet<_>>();
+    assert_eq!(ical, expected_ical);
+
+    // Organizer assignment tests
+    let response = account
+        .jmap_create(
+            MethodObject::CalendarEvent,
+            [
+                event_participants("organizer-auto@example.com", None).with_property(
+                    JSCalendarProperty::<Id>::CalendarIds,
+                    [calendar1_id.as_str()].into_jmap_set(),
+                ),
+                event_participants(
+                    "organizer-explicit@example.com",
+                    Some("mailto:cyrus@example.com"),
+                )
+                .with_property(
+                    JSCalendarProperty::<Id>::CalendarIds,
+                    [calendar1_id.as_str()].into_jmap_set(),
+                ),
+                test_jscalendar_4()
+                    .with_property(JSCalendarProperty::<Id>::Uid, "organizer-none@example.com")
+                    .with_property(
+                        JSCalendarProperty::<Id>::CalendarIds,
+                        [calendar1_id.as_str()].into_jmap_set(),
+                    ),
+            ],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await;
+    let auto_event_id = response.created(0).id().to_string();
+    let explicit_event_id = response.created(1).id().to_string();
+    let no_participants_event_id = response.created(2).id().to_string();
+
+    let response = account
+        .jmap_get(
+            MethodObject::CalendarEvent,
+            [
+                JSCalendarProperty::<Id>::Id,
+                JSCalendarProperty::OrganizerCalendarAddress,
+            ],
+            [
+                &auto_event_id,
+                &explicit_event_id,
+                &no_participants_event_id,
+            ],
+        )
+        .await;
+
+    // The server assigns an organizer when participants are present but none was supplied
+    response.list()[0].assert_is_equal(json!({
+        "id": &auto_event_id,
+        "organizerCalendarAddress": "mailto:jdoe@example.com"
+    }));
+
+    // An organizer supplied by the client is never overwritten
+    response.list()[1].assert_is_equal(json!({
+        "id": &explicit_event_id,
+        "organizerCalendarAddress": "mailto:cyrus@example.com"
+    }));
+
+    // An event without participants is left without an organizer
+    response.list()[2].assert_is_equal(json!({
+        "id": &no_participants_event_id
+    }));
+
+    // Adding participants to an event that had none assigns the organizer
+    account
+        .jmap_update(
+            MethodObject::CalendarEvent,
+            [(
+                &no_participants_event_id,
+                json!({
+                    "participants": {
+                        "8584f8f9-5414-55e3-8a1c-ad6fc2f3ffb6": {
+                            "calendarAddress": "mailto:jdoe@example.com",
+                            "participationStatus": "accepted",
+                            "roles": {
+                                "chair": true,
+                                "owner": true
+                            },
+                            "@type": "Participant"
+                        },
+                        "a0171748-fe8d-57d8-879e-56036a5251d1": {
+                            "calendarAddress": "mailto:rupert@example.com",
+                            "participationStatus": "needs-action",
+                            "kind": "individual",
+                            "@type": "Participant"
+                        }
+                    }
+                }),
+            )],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .updated(&no_participants_event_id);
+
+    account
+        .jmap_get(
+            MethodObject::CalendarEvent,
+            [
+                JSCalendarProperty::<Id>::Id,
+                JSCalendarProperty::OrganizerCalendarAddress,
+            ],
+            [&no_participants_event_id],
+        )
+        .await
+        .list()[0]
+        .assert_is_equal(json!({
+            "id": &no_participants_event_id,
+            "organizerCalendarAddress": "mailto:jdoe@example.com"
+        }));
+
+    // Moving an event between calendars tombstones the previous CalDAV href
+    test.wait_for_tasks().await;
+    let cal_base_path = format!("{}/jdoe%40example.com/", DavResourceName::Cal.base_path());
+    let sync_token = dav_client
+        .sync_collection(&cal_base_path, "", Depth::Infinity, None, ["D:getetag"])
+        .await
+        .sync_token()
+        .to_string();
+    let moved_event_id = account
+        .jmap_create(
+            MethodObject::CalendarEvent,
+            [json!({
+                "@type": "Event",
+                "uid": "d3a15a44-fe25-4b6a-9e2f-58d40f0f1d4c",
+                "title": "Moving Event",
+                "start": "2026-01-15T13:00:00",
+                "timeZone": "America/New_York",
+                "duration": "PT1H",
+                "calendarIds": {
+                    &calendar1_id: true
+                },
+            })],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .created(0)
+        .id()
+        .to_string();
+    let response = dav_client
+        .sync_collection(
+            &cal_base_path,
+            &sync_token,
+            Depth::Infinity,
+            None,
+            ["D:getetag"],
+        )
+        .await
+        .with_href_count(1);
+    let sync_token = response.sync_token().to_string();
+    let href_in_calendar1 = response.hrefs()[0].to_string();
+
+    account
+        .jmap_update(
+            MethodObject::CalendarEvent,
+            [(
+                &moved_event_id,
+                json!({
+                    "calendarIds": {
+                        &calendar2_id: true
+                    }
+                }),
+            )],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .updated(&moved_event_id);
+
+    let response = dav_client
+        .sync_collection(
+            &cal_base_path,
+            &sync_token,
+            Depth::Infinity,
+            None,
+            ["D:getetag"],
+        )
+        .await
+        .with_href_count(2);
+    let sync_token = response.sync_token().to_string();
+    let href_in_calendar2 = response
+        .hrefs()
+        .into_iter()
+        .find(|href| *href != href_in_calendar1)
+        .unwrap()
+        .to_string();
+    let response = response.into_propfind_response(None);
+    response
+        .properties(&href_in_calendar1)
+        .with_status(StatusCode::NOT_FOUND);
+    response
+        .properties(&href_in_calendar2)
+        .with_status(StatusCode::OK);
+
+    account
+        .jmap_destroy(
+            MethodObject::CalendarEvent,
+            [moved_event_id.as_str()],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .assert_destroyed(&[Id::from_str(&moved_event_id).unwrap()]);
+
+    dav_client
+        .sync_collection(
+            &cal_base_path,
+            &sync_token,
+            Depth::Infinity,
+            None,
+            ["D:getetag"],
+        )
+        .await
+        .with_href_count(1)
+        .into_propfind_response(None)
+        .properties(&href_in_calendar2)
+        .with_status(StatusCode::NOT_FOUND);
+
+    // Unbounded yearly recurrences remain queryable far beyond their first instance
+    let yearly_event_id = account
+        .jmap_create(
+            MethodObject::CalendarEvent,
+            [json!({
+                "@type": "Event",
+                "uid": "yearly-unbounded@example.com",
+                "title": "Unbounded yearly event",
+                "start": "2018-06-01T09:00:00",
+                "duration": "PT1H",
+                "timeZone": "Etc/UTC",
+                "calendarIds": {
+                    &calendar1_id: true
+                },
+                "recurrenceRule": {
+                    "@type": "RecurrenceRule",
+                    "frequency": "yearly"
+                }
+            })],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .created(0)
+        .id()
+        .to_string();
+    test.wait_for_tasks().await;
+
+    assert!(
+        account
+            .jmap_query(
+                MethodObject::CalendarEvent,
+                [
+                    ("after", "2027-06-01T00:00:00"),
+                    ("before", "2027-07-01T00:00:00"),
+                ],
+                ["start"],
+                [("timeZone", "Etc/UTC")],
+            )
+            .await
+            .ids()
+            .any(|id| id == yearly_event_id),
+        "unbounded yearly event was pruned from a June 2027 query"
+    );
+
+    account
+        .jmap_destroy(
+            MethodObject::CalendarEvent,
+            [yearly_event_id.as_str()],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .assert_destroyed(&[Id::from_str(&yearly_event_id).unwrap()]);
+
+    // Clean up
+    test.wait_for_tasks().await;
+    account.destroy_all_calendars().await;
+    test.assert_is_empty().await;
+}
+
+fn event_participants(uid: &str, organizer: Option<&str>) -> Value {
+    let mut event = json!({
+      "@type": "Event",
+      "uid": uid,
+      "title": "Organizer assignment",
+      "start": "2006-01-04T10:00:00",
+      "duration": "PT1H",
+      "timeZone": "US/Eastern",
+      "updated": "2006-02-06T00:11:02Z",
+      "participants": {
+        "8584f8f9-5414-55e3-8a1c-ad6fc2f3ffb6": {
+          "calendarAddress": "mailto:jdoe@example.com",
+          "participationStatus": "accepted",
+          "roles": {
+            "chair": true,
+            "owner": true
+          },
+          "@type": "Participant"
+        },
+        "a0171748-fe8d-57d8-879e-56036a5251d1": {
+          "calendarAddress": "mailto:rupert@example.com",
+          "participationStatus": "needs-action",
+          "kind": "individual",
+          "@type": "Participant"
+        }
+      }
+    });
+
+    if let Some(organizer) = organizer {
+        event.as_object_mut().unwrap().insert(
+            "organizerCalendarAddress".to_string(),
+            Value::String(organizer.to_string()),
+        );
+    }
+
+    event
+}
+
+// 1.0's CalDAV view of the JMAP event: its PRODID, the referenced time zone,
+// the description, SEQUENCE and the alert (with its JSCalendar id) the event
+// holds by then, and a server CREATED (left out of the comparison).
+const EVENT_ICAL_1: &str = r#"BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Stalwart Labs LLC//Stalwart Server//EN
+BEGIN:VEVENT
+DTSTART;TZID=US/Eastern:20060102T100000
+UID:74855313FA803DA593CD579A@example.com
+DURATION:PT1H
+SUMMARY:Event one
+DESCRIPTION:Event one
+DTSTAMP:20060206T001102Z
+CATEGORIES:work
+SEQUENCE:1
+BEGIN:VALARM
+ACTION:DISPLAY
+TRIGGER:PT15M
+JSID:abc
+END:VALARM
+END:VEVENT
+BEGIN:VTIMEZONE
+TZID:US/Eastern
+BEGIN:STANDARD
+DTSTART:20051230T190000
+TZNAME:EST
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0500
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:20060402T020000
+TZNAME:EDT
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+END:DAYLIGHT
+BEGIN:STANDARD
+DTSTART:20061029T020000
+TZNAME:EST
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:20070311T020000
+TZNAME:EDT
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+END:DAYLIGHT
+BEGIN:STANDARD
+DTSTART:20071104T020000
+TZNAME:EST
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+END:STANDARD
+END:VTIMEZONE
+END:VCALENDAR
+"#;
+
+/// `calendar::identity::test` in key mode (rule R44). Release 6 spec 6.9: a
+/// key account's identities follow its addresses; destroy and create are
+/// refused with `forbidden`, both identities remain, and the default is set
+/// with a `/set` that holds only `onSuccessSetIsDefault`. The cleanup is
+/// upstream's.
+async fn calendar_identity(test: &TestServer) {
+    println!("Running key-account Participant Identity tests...");
+    let account = test.account("jdoe@example.com");
+
+    // Obtain all identities
+    let response = account
+        .jmap_get(
+            MethodObject::ParticipantIdentity,
+            [
+                ParticipantIdentityProperty::Id,
+                ParticipantIdentityProperty::Name,
+                ParticipantIdentityProperty::CalendarAddress,
+                ParticipantIdentityProperty::IsDefault,
+            ],
+            Vec::<&str>::new(),
+        )
+        .await;
+    response.list_array().assert_is_equal(json!([
+      {
+        "id": "a",
+        "name": "John Doe",
+        "calendarAddress": "mailto:jdoe@example.com",
+        "isDefault": true
+      },
+      {
+        "id": "b",
+        "name": "John Doe",
+        "calendarAddress": "mailto:john.doe@example.com",
+        "isDefault": false
+      }
+    ]));
+
+    // Destroy identity b. Release 6 spec 6.9: a key account's identities
+    // follow its addresses, so a destroy is refused.
+    let response = account
+        .jmap_destroy(
+            MethodObject::ParticipantIdentity,
+            ["b"],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await;
+    assert_eq!(response.not_destroyed("b").typ(), "forbidden");
+    let response = account
+        .jmap_get(
+            MethodObject::ParticipantIdentity,
+            [
+                ParticipantIdentityProperty::Id,
+                ParticipantIdentityProperty::Name,
+                ParticipantIdentityProperty::CalendarAddress,
+                ParticipantIdentityProperty::IsDefault,
+            ],
+            Vec::<&str>::new(),
+        )
+        .await;
+    // Release 6 spec 6.9: both identities remain, `a` the default.
+    response.list_array().assert_is_equal(json!([
+      {
+        "id": "a",
+        "name": "John Doe",
+        "calendarAddress": "mailto:jdoe@example.com",
+        "isDefault": true
+      },
+      {
+        "id": "b",
+        "name": "John Doe",
+        "calendarAddress": "mailto:john.doe@example.com",
+        "isDefault": false
+      }
+    ]));
+
+    // Creating a new identity with an unauthorized calendar address should
+    // fail. Release 6 spec 6.9: a key account refuses every create.
+    let response = account
+        .jmap_create(
+            MethodObject::ParticipantIdentity,
+            [
+                json!({
+                    "name": "Work",
+                    "calendarAddress": "mailto:work@example.com"
+                }),
+                json!({
+                    "name": "Work",
+                    "calendarAddress": "work@example.com"
+                }),
+            ],
+            [("onSuccessSetIsDefault", "#i0")],
+        )
+        .await;
+    assert_eq!(response.not_created(0).typ(), "forbidden");
+    assert_eq!(response.not_created(1).typ(), "forbidden");
+
+    // Create a new identity and set it as default. Release 6 spec 6.9: the
+    // create is refused, and the default is chosen among the account's own
+    // identities with `onSuccessSetIsDefault` alone.
+    let response = account
+        .jmap_create(
+            MethodObject::ParticipantIdentity,
+            [json!({
+                "name": "Johnny B Goode",
+                "calendarAddress": "mailto:john.doe@example.com"
+            })],
+            [("onSuccessSetIsDefault", "#i0")],
+        )
+        .await;
+    assert_eq!(response.not_created(0).typ(), "forbidden");
+    let response = account
+        .jmap_method_call(
+            "ParticipantIdentity/set",
+            json!({
+                "accountId": account.id_string(),
+                "onSuccessSetIsDefault": "b"
+            }),
+        )
+        .await;
+    assert_eq!(response.error_type_at(0), None, "{response:?}");
+    let response = account
+        .jmap_get(
+            MethodObject::ParticipantIdentity,
+            [
+                ParticipantIdentityProperty::Id,
+                ParticipantIdentityProperty::Name,
+                ParticipantIdentityProperty::CalendarAddress,
+                ParticipantIdentityProperty::IsDefault,
+            ],
+            Vec::<&str>::new(),
+        )
+        .await;
+    response.list_array().assert_is_equal(json!([
+      {
+        "id": "a",
+        "name": "John Doe",
+        "calendarAddress": "mailto:jdoe@example.com",
+        "isDefault": false
+      },
+      {
+        "id": "b",
+        "name": "John Doe",
+        "calendarAddress": "mailto:john.doe@example.com",
+        "isDefault": true
+      }
+    ]));
+
+    // Cleanup
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account.id().document_id())
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .clear(PrincipalField::ParticipantIdentities);
+    test.server.commit_batch(batch).await.unwrap();
+    test.assert_is_empty().await;
+}
+
+/// Release 6 spec 6.11: `jdoe`'s event notifications are refused over JMAP,
+/// in place of `calendar::notification::test`.
+async fn calendar_notification(test: &TestServer) {
+    println!("Running key-account Calendar Event Notification tests...");
     let account = test.account("jdoe@example.com");
     let id = account.id_string();
     for (method, args) in [
-        ("Calendar/get", json!({ "accountId": id, "ids": null })),
-        (
-            "Calendar/set",
-            json!({ "accountId": id, "create": { "c": { "name": "Test Calendar" } } }),
-        ),
-        ("CalendarEvent/get", json!({ "accountId": id, "ids": null })),
-        ("CalendarEvent/query", json!({ "accountId": id })),
-        (
-            "CalendarEvent/set",
-            json!({ "accountId": id, "create": { "e": {
-                "@type": "Event",
-                "title": "Test",
-                "start": "2025-01-01T09:00:00",
-                "duration": "PT1H",
-                "calendarIds": { "a": true }
-            } } }),
-        ),
         (
             "CalendarEventNotification/get",
             json!({ "accountId": id, "ids": null }),
         ),
         (
-            "ParticipantIdentity/get",
-            json!({ "accountId": id, "ids": null }),
+            "CalendarEventNotification/set",
+            json!({ "accountId": id, "destroy": [] }),
         ),
-        // New at 1.0 (0.16 answered `cannotCalculateChanges`): refused as
-        // `/get` and `/set` are, naming the request's account.
         (
-            "ParticipantIdentity/changes",
+            "CalendarEventNotification/changes",
             json!({ "accountId": id, "sinceState": "n" }),
+        ),
+        (
+            "CalendarEventNotification/query",
+            json!({ "accountId": id }),
+        ),
+        (
+            "CalendarEventNotification/queryChanges",
+            json!({ "accountId": id, "sinceQueryState": "n" }),
         ),
     ] {
         let reply = account.jmap_method_call(method, args).await;
@@ -3556,27 +4983,1022 @@ pub async fn calendars(test: &TestServer) {
             "{method}: {reply:?}"
         );
     }
-    // A key account holds no JMAP-visible calendar, so its availability is
-    // empty.
-    let reply = account
-        .jmap_method_call(
-            "Principal/getAvailability",
-            json!({
-                "accountId": id,
-                "id": id,
-                "utcStart": "2006-01-01T00:00:00Z",
-                "utcEnd": "2006-01-08T00:00:00Z",
-            }),
+    account.destroy_all_calendars().await;
+    test.assert_is_empty().await;
+}
+
+/// `calendar::acl::test` in key mode, with the grant made through the
+/// account API (`contacts/pin`, then `shares/grant` and `shares/revoke`), the
+/// calendar named by its path from `fetch_groupware_resources` (rule R44):
+/// - release 6 spec 6.11: `shareWith` is refused with `forbidden`, for the
+///   owner and the grantee; `CalendarEvent/copy` answers
+///   `accountNotSupportedByMethod`; the cleanup destroys no event
+///   notification, which a key account refuses;
+/// - 6.2: `ShareNotification/*` is unchanged; the share endpoints write the
+///   calendar's ACL through upstream's builder, so each grant and the
+///   revocation log upstream's notification, with the rights of the level
+///   granted or revoked;
+/// - 6.7: the `edit` level holds no `Delete`, so Jane's `myRights` lack it,
+///   her destroy of the calendar is refused and John destroys it; at the
+///   `view` level her update of the name, and even her empty patch, are
+///   refused.
+async fn calendar_acl(test: &TestServer) {
+    println!("Running key-account Calendar ACL tests...");
+    let john = test.account("jdoe@example.com");
+    let jane = test.account("jane.smith@example.com");
+    let john_id = john.id_string().to_string();
+    let jane_id = jane.id_string().to_string();
+
+    // Create test calendars
+    let response = john
+        .jmap_create(
+            MethodObject::Calendar,
+            [json!({
+                "name": "Test #1",
+            })],
+            Vec::<(&str, &str)>::new(),
         )
         .await;
-    reply.list_array().assert_is_equal(json!([]));
+    let john_calendar_id = response.created(0).id().to_string();
+    let john_event_id = john
+        .jmap_create(
+            MethodObject::CalendarEvent,
+            [json!({
+                "@type": "Event",
+                "uid": "a8df6573-0474-496d-8496-033ad45d7fea",
+                "updated": "2020-01-02T18:23:04Z",
+                "title": "John's Simple Event",
+                "start": "2020-01-15T13:00:00",
+                "timeZone": "America/New_York",
+                "duration": "PT1H",
+                "calendarIds": {
+                    &john_calendar_id: true
+                },
+            })],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .created(0)
+        .id()
+        .to_string();
+    let response = jane
+        .jmap_create(
+            MethodObject::Calendar,
+            [json!({
+                "name": "Test #1",
+            })],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await;
+    let jane_calendar_id = response.created(0).id().to_string();
+    let jane_event_id = jane
+        .jmap_create(
+            MethodObject::CalendarEvent,
+            [json!({
+                "uid": "a8df6575-0474-496d-8496-033ad45d7fea",
+                "updated": "2020-01-02T18:23:04Z",
+                "title": "Jane's Simple Event",
+                "start": "2020-01-15T13:00:00",
+                "timeZone": "America/New_York",
+                "duration": "PT1H",
+                "calendarIds": {
+                    &jane_calendar_id: true
+                },
+            })],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .created(0)
+        .id()
+        .to_string();
+
+    // Verify myRights
+    john.jmap_get(
+        MethodObject::Calendar,
+        [
+            CalendarProperty::Id,
+            CalendarProperty::Name,
+            CalendarProperty::MyRights,
+            CalendarProperty::ShareWith,
+        ],
+        [john_calendar_id.as_str()],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+        "id": john_calendar_id,
+        "name": "Test #1",
+        "myRights": {
+            "mayReadItems": true,
+            "mayWriteAll": true,
+            "mayDelete": true,
+            "mayShare": true,
+            "mayWriteOwn": true,
+            "mayReadFreeBusy": true,
+            "mayUpdatePrivate": true,
+            "mayRSVP": true,
+            "maySetMetadata": true
+        },
+        "shareWith": {}
+        }));
+
+    // Obtain share notifications
+    let mut jane_share_change_id = jane
+        .jmap_get(
+            MethodObject::ShareNotification,
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+        )
+        .await
+        .state()
+        .to_string();
+
+    // Make sure Jane has no access
+    assert_eq!(
+        jane.jmap_get_account(
+            john,
+            MethodObject::Calendar,
+            Vec::<&str>::new(),
+            [john_calendar_id.as_str()],
+        )
+        .await
+        .method_response()
+        .typ(),
+        // 1.0: an account the session cannot reach is not found (RFC 8620
+        // 3.6.2); 0.16 answered forbidden.
+        "accountNotFound"
+    );
+
+    // Share calendar with Jane. Release 6 spec 6.11: a key account refuses
+    // `shareWith`; the grant is made through the account API, after the
+    // owner pins Jane's key. The share endpoints take the calendar's path
+    // name.
+    assert_eq!(
+        john.jmap_update(
+            MethodObject::Calendar,
+            [(
+                &john_calendar_id,
+                json!({
+                    "shareWith": {
+                       &jane_id : {
+                         "mayReadItems": true,
+                       }
+                    }
+                }),
+            )],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .not_updated(&john_calendar_id)
+        .typ(),
+        "forbidden"
+    );
+    let john_account_id = john.id().document_id();
+    let john_calendar_document_id = Id::from_str(&john_calendar_id).unwrap().document_id();
+    let resources = test
+        .server
+        .fetch_groupware_resources(john_account_id, john_account_id, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    let john_calendar_path = resources
+        .paths
+        .iter()
+        .find(|(_, v)| v.document_id == john_calendar_document_id && v.parent_id == common::NO_ID)
+        .map(|(chunk, v)| chunk.path_str(v).to_string())
+        .unwrap();
+    let jane_key = test
+        .server
+        .za_served_public_key(jane.id().document_id())
+        .await
+        .unwrap()
+        .unwrap();
+    za_post(
+        "contacts/pin",
+        &json!({
+            "username": john.name(),
+            "password": john.secret(),
+            "address": jane.name(),
+            "fingerprint": vault::keys::display_fingerprint(&jane_key),
+        }),
+    )
+    .await
+    .expect(200);
+    let mut sharing = json!({
+        "username": john.name(),
+        "password": john.secret(),
+        "calendar": &john_calendar_path,
+        "address": jane.name(),
+        "level": "view",
+    });
+    za_post("shares/grant", &sharing).await.expect(200);
+    john.jmap_get(
+        MethodObject::Calendar,
+        [
+            CalendarProperty::Id,
+            CalendarProperty::Name,
+            CalendarProperty::ShareWith,
+        ],
+        [john_calendar_id.as_str()],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+        "id": john_calendar_id,
+        "name": "Test #1",
+        "shareWith": {
+            &jane_id : {
+                "mayReadItems": true,
+                "mayWriteAll": false,
+                "mayDelete": false,
+                "mayShare": false,
+                "mayWriteOwn": false,
+                "mayReadFreeBusy": false,
+                "mayUpdatePrivate": false,
+                "mayRSVP": false,
+                "maySetMetadata": false
+            }
+        }
+        }));
+
+    // Verify Jane can access the event
+    jane.jmap_get_account(
+        john,
+        MethodObject::Calendar,
+        [
+            CalendarProperty::Id,
+            CalendarProperty::Name,
+            CalendarProperty::MyRights,
+        ],
+        [john_calendar_id.as_str()],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+        "id": john_calendar_id,
+        "name": "Test #1",
+        "myRights": {
+            "mayReadItems": true,
+            "mayWriteAll": false,
+            "mayDelete": false,
+            "mayShare": false,
+            "mayWriteOwn": false,
+            "mayReadFreeBusy": false,
+            "mayUpdatePrivate": false,
+            "mayRSVP": false,
+            "maySetMetadata": false
+        }
+        }));
+    jane.jmap_get_account(
+        john,
+        MethodObject::CalendarEvent,
+        [JSCalendarProperty::<Id>::Id, JSCalendarProperty::Title],
+        [john_event_id.as_str()],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+        "id": john_event_id,
+        "title": "John's Simple Event",
+        }));
+
+    // Verify Jane received a share notification. Release 6 spec 6.2:
+    // `ShareNotification/*` is unchanged. The share endpoints write the
+    // calendar's ACL through upstream's builder, which logs one notification
+    // per changed entry; the rights are those of the `view` level.
+    let response = jane
+        .jmap_changes(MethodObject::ShareNotification, &jane_share_change_id)
+        .await;
+    jane_share_change_id = response.new_state().to_string();
+    let changes = response.changes().collect::<Vec<_>>();
+    assert_eq!(changes.len(), 1);
+    let share_id = changes[0].as_created();
+    jane.jmap_get(
+        MethodObject::ShareNotification,
+        [
+            ShareNotificationProperty::Id,
+            ShareNotificationProperty::ChangedBy,
+            ShareNotificationProperty::ObjectType,
+            ShareNotificationProperty::ObjectAccountId,
+            ShareNotificationProperty::ObjectId,
+            ShareNotificationProperty::OldRights,
+            ShareNotificationProperty::NewRights,
+            ShareNotificationProperty::Name,
+        ],
+        [share_id],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+          "id": &share_id,
+          "changedBy": {
+            "principalId": &john_id,
+            "name": "John Doe",
+            "email": "jdoe@example.com"
+          },
+          "objectType": "Calendar",
+          "objectAccountId": &john_id,
+          "objectId": &john_calendar_id,
+          "oldRights": {
+            "mayReadItems": false,
+            "mayWriteAll": false,
+            "mayDelete": false,
+            "mayShare": false,
+            "mayWriteOwn": false,
+            "mayReadFreeBusy": false,
+            "mayUpdatePrivate": false,
+            "mayRSVP": false,
+            "maySetMetadata": false
+          },
+          "newRights": {
+            "mayReadItems": true,
+            "mayWriteAll": false,
+            "mayDelete": false,
+            "mayShare": false,
+            "mayWriteOwn": false,
+            "mayReadFreeBusy": false,
+            "mayUpdatePrivate": false,
+            "mayRSVP": false,
+            "maySetMetadata": false
+          },
+          "name": null
+        }));
+
+    // Updating and deleting should fail.
+    // 1.0 checks a sharee's update by what it changes: an empty patch changes
+    // nothing and is accepted; a sharing change needs `Share`. Release 6 spec
+    // 6.7: a key account's writer asks for the right to modify the caller's
+    // own entry before it looks at the patch, and a grantee at the `view`
+    // level holds none, so even the empty patch is refused.
+    assert_eq!(
+        jane.jmap_update_account(
+            john,
+            MethodObject::Calendar,
+            [(&john_calendar_id, json!({}))],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .not_updated(&john_calendar_id)
+        .typ(),
+        "forbidden"
+    );
+    assert_eq!(
+        jane.jmap_update_account(
+            john,
+            MethodObject::Calendar,
+            [(&john_calendar_id, json!({"shareWith": {}}))],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .not_updated(&john_calendar_id)
+        .typ(),
+        // Release 6 spec 6.11: `shareWith` is refused for a key account.
+        "forbidden"
+    );
+    // Release 6 spec 6.7: at the `view` level a grantee may not change its
+    // own entry of the calendar either.
+    assert_eq!(
+        jane.jmap_update_account(
+            john,
+            MethodObject::Calendar,
+            [(
+                &john_calendar_id,
+                json!({"name": "Jane's version of John's Calendar"}),
+            )],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .not_updated(&john_calendar_id)
+        .typ(),
+        "forbidden"
+    );
+    assert_eq!(
+        jane.jmap_destroy_account(
+            john,
+            MethodObject::Calendar,
+            [&john_calendar_id],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .not_destroyed(&john_calendar_id)
+        .description(),
+        "You are not allowed to delete this calendar."
+    );
+    // 1.0 checks an event update by what it changes (`groupware/src/calendar/
+    // rights.rs`), so the read-only sharee's refusal is tested with a change;
+    // 0.16 refused the empty patch with "You are not allowed to modify
+    // calendar ...".
+    assert_eq!(
+        jane.jmap_update_account(
+            john,
+            MethodObject::CalendarEvent,
+            [(&john_event_id, json!({"title": "Changed by Jane"}))],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .not_updated(&john_event_id)
+        .description(),
+        "You are not allowed to modify this event."
+    );
+    assert!(
+        jane.jmap_destroy_account(
+            john,
+            MethodObject::CalendarEvent,
+            [&john_event_id],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .not_destroyed(&john_event_id)
+        .description()
+        .contains("You are not allowed to remove events from calendar"),
+    );
+
+    // Grant Jane write access. Release 6 spec 6.11: through the account API,
+    // at the `edit` level.
+    sharing["level"] = json!("edit");
+    za_post("shares/grant", &sharing).await.expect(200);
+    jane.jmap_get_account(
+        john,
+        MethodObject::Calendar,
+        [
+            CalendarProperty::Id,
+            CalendarProperty::Name,
+            CalendarProperty::MyRights,
+        ],
+        [john_calendar_id.as_str()],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+        "id": john_calendar_id,
+        "name": "Test #1",
+        "myRights": {
+            "mayReadItems": true,
+            "mayWriteAll": true,
+            // Release 6 spec 6.7: the `edit` level holds no `Delete`.
+            "mayDelete": false,
+            "mayShare": false,
+            "mayWriteOwn": true,
+            "mayReadFreeBusy": false,
+            "mayUpdatePrivate": true,
+            "mayRSVP": true,
+            "maySetMetadata": false
+        }
+        }));
+
+    // Verify Jane received a share notification with the updated rights.
+    // Release 6 spec 6.2: upstream's notification, with the `edit` level's
+    // rights, which hold no `Delete` (6.7).
+    let response = jane
+        .jmap_changes(MethodObject::ShareNotification, &jane_share_change_id)
+        .await;
+    jane_share_change_id = response.new_state().to_string();
+    let changes = response.changes().collect::<Vec<_>>();
+    assert_eq!(changes.len(), 1);
+    let share_id = changes[0].as_created();
+    jane.jmap_get(
+        MethodObject::ShareNotification,
+        [
+            ShareNotificationProperty::Id,
+            ShareNotificationProperty::ChangedBy,
+            ShareNotificationProperty::ObjectType,
+            ShareNotificationProperty::ObjectAccountId,
+            ShareNotificationProperty::ObjectId,
+            ShareNotificationProperty::OldRights,
+            ShareNotificationProperty::NewRights,
+            ShareNotificationProperty::Name,
+        ],
+        [share_id],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+          "id": &share_id,
+          "changedBy": {
+            "principalId": &john_id,
+            "name": "John Doe",
+            "email": "jdoe@example.com"
+          },
+          "objectType": "Calendar",
+          "objectAccountId": &john_id,
+          "objectId": &john_calendar_id,
+          "oldRights": {
+            "mayReadItems": true,
+            "mayWriteAll": false,
+            "mayDelete": false,
+            "mayShare": false,
+            "mayWriteOwn": false,
+            "mayReadFreeBusy": false,
+            "mayUpdatePrivate": false,
+            "mayRSVP": false,
+            "maySetMetadata": false
+          },
+          "newRights": {
+            "mayReadItems": true,
+            "mayWriteAll": true,
+            "mayDelete": false,
+            "mayShare": false,
+            "mayWriteOwn": true,
+            "mayReadFreeBusy": false,
+            "mayUpdatePrivate": true,
+            "mayRSVP": true,
+            "maySetMetadata": false
+          },
+          "name": null
+        }));
+
+    // Creating a root folder should fail
+    assert_eq!(
+        jane.jmap_create_account(
+            john,
+            MethodObject::Calendar,
+            [json!({
+                "name": "A new shared calendar",
+            })],
+            Vec::<(&str, &str)>::new()
+        )
+        .await
+        .not_created(0)
+        .description(),
+        "Cannot create calendars in a shared account."
+    );
+
+    // Copy Jane's event into John's calendar, and John's into Jane's.
+    // Release 6 spec 6.11: `CalendarEvent/copy` is refused for key accounts.
+    let response = jane
+        .jmap_copy(
+            jane,
+            john,
+            MethodObject::CalendarEvent,
+            [(
+                &jane_event_id,
+                json!({
+                    "calendarIds": {
+                        &john_calendar_id: true
+                    }
+                }),
+            )],
+            false,
+        )
+        .await;
+    assert_eq!(
+        response.error_type_at(0),
+        Some("accountNotSupportedByMethod"),
+        "{response:?}"
+    );
+    let response = jane
+        .jmap_copy(
+            john,
+            jane,
+            MethodObject::CalendarEvent,
+            [(
+                &john_event_id,
+                json!({
+                    "calendarIds": {
+                        &jane_calendar_id: true
+                    }
+                }),
+            )],
+            false,
+        )
+        .await;
+    assert_eq!(
+        response.error_type_at(0),
+        Some("accountNotSupportedByMethod"),
+        "{response:?}"
+    );
+
+    // Update John's event
+    jane.jmap_update_account(
+        john,
+        MethodObject::CalendarEvent,
+        [(
+            &john_event_id,
+            json!({
+                "title": "John's Updated Event",
+            }),
+        )],
+        Vec::<(&str, &str)>::new(),
+    )
+    .await
+    .updated(&john_event_id);
+    jane.jmap_get_account(
+        john,
+        MethodObject::CalendarEvent,
+        [JSCalendarProperty::<Id>::Id, JSCalendarProperty::Title],
+        [john_event_id.as_str()],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+        "id": john_event_id,
+        "title": "John's Updated Event",
+        }));
+
+    // Update John's calendar name
+    jane.jmap_update_account(
+        john,
+        MethodObject::Calendar,
+        [(
+            &john_calendar_id,
+            json!({
+                "name": "Jane's version of John's Calendar",
+                "description": "This is John's calendar, but Jane can edit it now"
+            }),
+        )],
+        Vec::<(&str, &str)>::new(),
+    )
+    .await
+    .updated(&john_calendar_id);
+    jane.jmap_get_account(
+        john,
+        MethodObject::Calendar,
+        [
+            CalendarProperty::Id,
+            CalendarProperty::Name,
+            CalendarProperty::Description,
+        ],
+        [john_calendar_id.as_str()],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+        "id": john_calendar_id,
+        "name": "Jane's version of John's Calendar",
+        "description": "This is John's calendar, but Jane can edit it now"
+        }));
+
+    // John should still see the old name
+    john.jmap_get(
+        MethodObject::Calendar,
+        [
+            CalendarProperty::Id,
+            CalendarProperty::Name,
+            CalendarProperty::Description,
+        ],
+        [john_calendar_id.as_str()],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+        "id": john_calendar_id,
+        "name": "Test #1",
+        "description": null
+        }));
+
+    // Revoke Jane's access. Release 6 spec 6.11: through the account API.
+    za_post(
+        "shares/revoke",
+        &json!({
+            "username": john.name(),
+            "password": john.secret(),
+            "calendar": &john_calendar_path,
+            "grant": jane.id().document_id(),
+        }),
+    )
+    .await
+    .expect(200);
+    test.wait_for_tasks().await;
+    john.jmap_get(
+        MethodObject::Calendar,
+        [
+            CalendarProperty::Id,
+            CalendarProperty::Name,
+            CalendarProperty::ShareWith,
+        ],
+        [john_calendar_id.as_str()],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+        "id": john_calendar_id,
+        "name": "Test #1",
+        "shareWith": {}
+        }));
+
+    // Verify Jane can no longer access the calendar or its events
+    assert_eq!(
+        jane.jmap_get_account(
+            john,
+            MethodObject::Calendar,
+            Vec::<&str>::new(),
+            [john_calendar_id.as_str()],
+        )
+        .await
+        .method_response()
+        .typ(),
+        // 1.0: an account the session cannot reach is not found (RFC 8620
+        // 3.6.2); 0.16 answered forbidden.
+        "accountNotFound"
+    );
+
+    // Verify Jane received a share notification with the updated rights.
+    // Release 6 spec 6.2: upstream's notification; the old rights are the
+    // `edit` level's, which hold no `Delete` (6.7).
+    let response = jane
+        .jmap_changes(MethodObject::ShareNotification, &jane_share_change_id)
+        .await;
+    let changes = response.changes().collect::<Vec<_>>();
+    assert_eq!(changes.len(), 1);
+    let share_id = changes[0].as_created();
+    jane.jmap_get(
+        MethodObject::ShareNotification,
+        [
+            ShareNotificationProperty::Id,
+            ShareNotificationProperty::ChangedBy,
+            ShareNotificationProperty::ObjectType,
+            ShareNotificationProperty::ObjectAccountId,
+            ShareNotificationProperty::ObjectId,
+            ShareNotificationProperty::OldRights,
+            ShareNotificationProperty::NewRights,
+            ShareNotificationProperty::Name,
+        ],
+        [share_id],
+    )
+    .await
+    .list()[0]
+        .assert_is_equal(json!({
+          "id": &share_id,
+          "changedBy": {
+            "principalId": &john_id,
+            "name": "John Doe",
+            "email": "jdoe@example.com"
+          },
+          "objectType": "Calendar",
+          "objectAccountId": &john_id,
+          "objectId": &john_calendar_id,
+          "oldRights": {
+            "mayReadItems": true,
+            "mayWriteAll": true,
+            "mayDelete": false,
+            "mayShare": false,
+            "mayWriteOwn": true,
+            "mayReadFreeBusy": false,
+            "mayUpdatePrivate": true,
+            "mayRSVP": true,
+            "maySetMetadata": false
+          },
+          "newRights": {
+            "mayReadItems": false,
+            "mayWriteAll": false,
+            "mayDelete": false,
+            "mayShare": false,
+            "mayWriteOwn": false,
+            "mayReadFreeBusy": false,
+            "mayUpdatePrivate": false,
+            "mayRSVP": false,
+            "maySetMetadata": false
+          },
+          "name": null
+        }));
+
+    // Grant Jane delete access once again. Release 6 spec 6.7: the account
+    // API's `edit` level holds no `Delete`, so Jane's destroy is refused and
+    // John destroys the calendar.
+    za_post("shares/grant", &sharing).await.expect(200);
+    assert_eq!(
+        jane.jmap_destroy_account(
+            john,
+            MethodObject::Calendar,
+            [john_calendar_id.as_str()],
+            [("onDestroyRemoveEvents", true)],
+        )
+        .await
+        .not_destroyed(&john_calendar_id)
+        .description(),
+        "You are not allowed to delete this calendar."
+    );
+    assert_eq!(
+        john.jmap_destroy(
+            MethodObject::Calendar,
+            [john_calendar_id.as_str()],
+            [("onDestroyRemoveEvents", true)],
+        )
+        .await
+        .destroyed()
+        .collect::<Vec<_>>(),
+        [john_calendar_id.as_str()]
+    );
+
+    // Destroy all mailboxes. Release 6 spec 6.11: a key account's event
+    // notifications are refused over JMAP, so they are not destroyed here.
+    john.destroy_all_calendars().await;
+    jane.destroy_all_calendars().await;
+    test.assert_is_empty().await;
+}
+
+/// `principal::availability::test` in key mode (rule R44). Release 6 spec
+/// 6.11: `shareWith` is refused with `forbidden`; 6.2: every
+/// `Principal/getAvailability` of John after it is empty.
+async fn calendar_availability(test: &TestServer) {
+    println!("Running key-account Principal Availability tests...");
+    let john = test.account("jdoe@example.com");
+    let jane = test.account("jane.smith@example.com");
+    let john_id = john.id_string().to_string();
+    let jane_id = jane.id_string().to_string();
+
+    // Create test calendars
+    let response = john
+        .jmap_create(
+            MethodObject::Calendar,
+            [json!({
+                "name": "Test Calendar",
+                "includeInAvailability": "all"
+            })],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await;
+    let calendar1_id = response.created(0).id().to_string();
+
+    // Create test events
+    let event_1 = test_jscalendar_1().with_property(
+        JSCalendarProperty::<Id>::CalendarIds,
+        [calendar1_id.as_str()].into_jmap_set(),
+    );
+    let event_2 = test_jscalendar_2().with_property(
+        JSCalendarProperty::<Id>::CalendarIds,
+        [calendar1_id.as_str()].into_jmap_set(),
+    );
+    let event_3 = test_jscalendar_3()
+        .with_property(
+            JSCalendarProperty::<Id>::CalendarIds,
+            [calendar1_id.as_str()].into_jmap_set(),
+        )
+        .with_property(
+            JSCalendarProperty::<Id>::Participants,
+            json!({
+              "3f5bc8c0-c722-5345-b7d9-5a899db08a30": {
+                "calendarAddress": "mailto:jdoe@example.com",
+                "@type": "Participant",
+                "roles": {
+                  "attendee": true,
+                  "chair": true
+                },
+                "participationStatus": "accepted"
+              }
+            }),
+        );
+    let response = john
+        .jmap_create(
+            MethodObject::CalendarEvent,
+            [event_1, event_2, event_3],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await;
+    let _event_1_id = response.created(0).id().to_string();
+    let _event_2_id = response.created(1).id().to_string();
+    let event_3_id = response.created(2).id().to_string();
+
+    // Jane should not have access to John's availability
+    let response = jane
+        .jmap_method_calls(json!([[
+            "Principal/getAvailability",
+            {
+                "accountId": &jane_id,
+                "id": &john_id,
+                "utcStart": "2006-01-01T00:00:00Z",
+                "utcEnd": "2006-01-08T00:00:00Z",
+            },
+            "0"
+        ]]))
+        .await;
+    response.list_array().assert_is_equal(json!([]));
+
+    // Grant Jane free/busy access. Release 6 spec 6.11: a key account shares
+    // through the account API only, so `shareWith` is refused.
+    assert_eq!(
+        john.jmap_update(
+            MethodObject::Calendar,
+            [(
+                &calendar1_id,
+                json!({
+                    "shareWith": {
+                       &jane_id : {
+                         "mayReadFreeBusy": true,
+                       }
+                    }
+                }),
+            )],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .not_updated(&calendar1_id)
+        .typ(),
+        "forbidden"
+    );
+
+    // Jane should see John's availability now. Release 6 spec 6.2: a key
+    // principal's availability is empty (6.10: `mayGetAvailability` false).
+    let response = jane
+        .jmap_method_calls(json!([[
+            "Principal/getAvailability",
+            {
+                "accountId": &jane_id,
+                "id": &john_id,
+                "utcStart": "2006-01-01T00:00:00Z",
+                "utcEnd": "2006-01-08T00:00:00Z",
+            },
+            "0"
+        ]]))
+        .await;
+    response.list_array().assert_is_equal(json!([]));
+
+    // Update availability to none
+    john.jmap_update(
+        MethodObject::Calendar,
+        [(
+            &calendar1_id,
+            json!({
+                "includeInAvailability": "none"
+            }),
+        )],
+        Vec::<(&str, &str)>::new(),
+    )
+    .await
+    .updated(&calendar1_id);
+
+    // Jane should not see any events now
+    let response = jane
+        .jmap_method_calls(json!([[
+            "Principal/getAvailability",
+            {
+                "accountId": &jane_id,
+                "id": &john_id,
+                "utcStart": "2006-01-01T00:00:00Z",
+                "utcEnd": "2006-01-08T00:00:00Z",
+            },
+            "0"
+        ]]))
+        .await;
+    response.list_array().assert_is_equal(json!([]));
+
+    // Update availability to attending
+    john.jmap_update(
+        MethodObject::Calendar,
+        [(
+            &calendar1_id,
+            json!({
+                "includeInAvailability": "attending"
+            }),
+        )],
+        Vec::<(&str, &str)>::new(),
+    )
+    .await
+    .updated(&calendar1_id);
+
+    // Jane should only see events where John is attending. Release 6 spec
+    // 6.2: empty for a key principal.
+    let response = jane
+        .jmap_method_calls(json!([[
+            "Principal/getAvailability",
+            {
+                "accountId": &jane_id,
+                "id": &john_id,
+                "utcStart": "2006-01-01T00:00:00Z",
+                "utcEnd": "2006-01-08T00:00:00Z",
+            },
+            "0"
+        ]]))
+        .await;
+    response.list_array().assert_is_equal(json!([]));
+
+    // Update attending event to not attending
+    john.jmap_update(
+        MethodObject::CalendarEvent,
+        [(
+            &event_3_id,
+            json!({
+                "participants/3f5bc8c0-c722-5345-b7d9-5a899db08a30/participationStatus": "declined"
+            }),
+        )],
+        Vec::<(&str, &str)>::new(),
+    )
+    .await
+    .updated(&event_3_id);
+
+    // Jane should not see any events now
+    let response = jane
+        .jmap_method_calls(json!([[
+            "Principal/getAvailability",
+            {
+                "accountId": &jane_id,
+                "id": &john_id,
+                "utcStart": "2006-01-01T00:00:00Z",
+                "utcEnd": "2006-01-08T00:00:00Z",
+            },
+            "0"
+        ]]))
+        .await;
+    response.list_array().assert_is_equal(json!([]));
+
+    // Cleanup
+    john.destroy_all_calendars().await;
     test.assert_is_empty().await;
 }
 
 /// `principal::get::test` in key mode: the session object and the principal
-/// objects of key accounts do not advertise JMAP calendars (release 1 spec
-/// 9); everything else, and the plain Sales group's principal, are
-/// upstream's.
+/// objects of key accounts are upstream's, less object metadata (upgrade
+/// ruling 66), with `mayGetAvailability` false for key principals (release 6
+/// spec 6.10); the plain Sales group's principal is upstream's.
 pub async fn principal_get(test: &TestServer) {
     println!("Running key-account Principal get/query tests...");
     let john = test.account("jdoe@example.com");
@@ -3593,8 +6015,9 @@ pub async fn principal_get(test: &TestServer) {
     // options and the node types, CalendarEvent and ContactCard blobs and the
     // principals:owner capability, and drops imapsieve from the Sieve
     // extensions.
-    // Validate session object capabilities: upstream's object, minus the
-    // account's calendar capabilities (release 1 spec 9).
+    // Validate session object capabilities: upstream's object, which a key
+    // account's session now includes with the calendar capabilities (release
+    // 6 spec 6.10, D13).
     let response = john.jmap_session_object().await.into_inner();
     let john_account = response["accounts"][john_id.to_string().as_str()].clone();
     let application_server_key =
@@ -3687,6 +6110,17 @@ pub async fn principal_get(test: &TestServer) {
             },
             "urn:ietf:params:jmap:contacts:parse": {},
             "urn:ietf:params:jmap:emailpush": {},
+            // Release 6 spec 6.10: the account's calendar capability is
+            // upstream's object, as `tests/src/jmap/principal/get.rs` has it.
+            "urn:ietf:params:jmap:calendars": {
+              "maxCalendarsPerEvent": 10,
+              "minDateTime": "0001-01-01T00:00:00Z",
+              "maxDateTime": "9999-12-31T23:59:59Z",
+              "maxExpandedQueryDuration": "P52W1D",
+              "maxParticipantsPerEvent": 20,
+              "mayCreateCalendar": true
+            },
+            "urn:ietf:params:jmap:calendars:parse": {},
             "urn:ietf:params:jmap:websocket": {},
             "urn:ietf:params:jmap:sieve": {
               "maxSizeScriptName": 512,
@@ -3836,6 +6270,10 @@ pub async fn principal_get(test: &TestServer) {
         "urn:ietf:params:jmap:vacationresponse": john_id,
         "urn:ietf:params:jmap:contacts": john_id,
         "urn:ietf:params:jmap:contacts:parse": john_id,
+        // Release 6 spec 6.10 (D13): the calendar capabilities are primary
+        // for a key account; `urn:ietf:params:jmap:metadata` stays absent.
+        "urn:ietf:params:jmap:calendars": john_id,
+        "urn:ietf:params:jmap:calendars:parse": john_id,
         "urn:ietf:params:jmap:emailpush": john_id,
         "urn:ietf:params:jmap:websocket": john_id,
         "urn:ietf:params:jmap:sieve": john_id,
@@ -3908,10 +6346,32 @@ pub async fn principal_get(test: &TestServer) {
     // account is the one the session object above describes, and the other
     // principals list none. The time zone is `timeZone`. 0.16 listed every
     // principal's account capabilities and named the field `timezone`.
-    for (item, (id, email, description)) in list.iter().zip([
-        (john_id, "jdoe@example.com", "John Doe"),
-        (jane_id, "jane.smith@example.com", "Jane Smith"),
-        (bill_id, "bill@example.com", "Bill Foobar"),
+    // Release 6 spec 6.10: a key principal shows its calendar capability
+    // block with `mayGetAvailability` false. `accountId` is the principal's
+    // own account for the caller (John), null for the others; `mayShareWith`
+    // is false for the caller's own principal.
+    for (item, (id, email, description, calendar_account, may_share_with)) in list.iter().zip([
+        (
+            john_id,
+            "jdoe@example.com",
+            "John Doe",
+            json!(john_id),
+            false,
+        ),
+        (
+            jane_id,
+            "jane.smith@example.com",
+            "Jane Smith",
+            Value::Null,
+            true,
+        ),
+        (
+            bill_id,
+            "bill@example.com",
+            "Bill Foobar",
+            Value::Null,
+            true,
+        ),
     ]) {
         let accounts = if id == john_id {
             json!({ id: john_account.clone() })
@@ -3928,6 +6388,12 @@ pub async fn principal_get(test: &TestServer) {
           "capabilities": {
             "urn:ietf:params:jmap:mail": {},
             "urn:ietf:params:jmap:contacts": {},
+            "urn:ietf:params:jmap:calendars": {
+              "accountId": calendar_account,
+              "mayGetAvailability": false,
+              "mayShareWith": may_share_with,
+              "calendarAddress": format!("mailto:{email}")
+            },
             "urn:ietf:params:jmap:filenode": {},
             "urn:ietf:params:jmap:principals": {}
           },

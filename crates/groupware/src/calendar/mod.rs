@@ -23,6 +23,7 @@ pub mod notification;
 pub mod overlap;
 pub mod participants;
 pub mod pinning;
+pub mod pipeline;
 pub mod privacy;
 pub mod rights;
 pub mod schedule;
@@ -32,6 +33,8 @@ pub mod sequence_floor;
 pub mod sharing;
 pub mod storage;
 pub mod user;
+pub mod za_alerts;
+pub mod za_text;
 
 use crate::metadata::tracked_kinds;
 use calcard::icalendar::{

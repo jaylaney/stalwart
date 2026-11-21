@@ -151,10 +151,12 @@ synchronously evict.
 View grants read/query/sync and cannot write. Edit adds event and calendar-property writes,
 including shared Apple colour/order dead properties; it does not grant calendar deletion,
 re-sharing, the WebDAV `ACL` method, or free-busy-only rights. Assisted discovery makes eligible
-foreign calendars visible; the `shared_with_me.href` supports manual setup. JMAP calendars/shareWith
-stay refused for key accounts. A grantee's scheduled writes from the owner's calendar send as the
-owner with `SENT-BY` the grantee; the recipient validates it at drain. An attendee invited to a
-calendar also shared with them should respond from their **own invitation copy**. A delegated `3.8`
+foreign calendars visible; the `shared_with_me.href` supports manual setup. JMAP calendars are
+served to an owner and to a grantee; `shareWith` stays refused for key accounts (release 6). Each
+principal's colour of a shared calendar is sealed in its own personal entry, and a new grantee's
+entry starts with the owner's colour (release 6 spec D14). A grantee's scheduled writes from the
+owner's calendar send as the owner with `SENT-BY` the grantee; the recipient validates it at drain.
+An attendee invited to a calendar also shared with them should respond from their **own invitation copy**. A delegated `3.8`
 delivery refusal was decided under the grantee's pins: the owner's contacts page cannot redeliver
 it; only an event edit that builds a new message to that attendee tries again. A grantee organizing
 under its own address from the owner's calendar inherits the upstream limit that its replies are

@@ -42,6 +42,7 @@ pub mod server_set;
 pub mod set;
 pub mod user;
 pub mod validate;
+pub mod za_read;
 
 pub trait CalendarSyntheticId {
     fn new(key: RecurrenceKey, document_id: u32) -> Self;

@@ -8,10 +8,9 @@
 //! removes an expired UID creation lease and keeps a live one, with the
 //! default configuration (the in-memory store is the data store).
 
-use crate::utils::{server::TestServer, za::za_uid_leases};
-use ::registry::schema::{
-    enums::TaskStoreMaintenanceType,
-    structs::{Task, TaskStatus, TaskStoreMaintenance},
+use crate::utils::{
+    server::TestServer,
+    za::{run_purge_maintenance, za_uid_leases},
 };
 use common::za::{lease::ZaUidLease, test_hooks};
 use std::time::Duration;
@@ -43,14 +42,7 @@ pub async fn test(test: &mut TestServer) {
     // The purge, as the scheduler runs it (from code reading: the
     // `PurgeData` arm of `store_maintenance` runs `purge_store`,
     // `purge_in_memory_store` and then the sweep).
-    admin
-        .registry_create_object(Task::StoreMaintenance(TaskStoreMaintenance {
-            maintenance_type: TaskStoreMaintenanceType::PurgeData,
-            shard_index: None,
-            status: TaskStatus::now(),
-        }))
-        .await;
-    test.wait_for_tasks().await;
+    run_purge_maintenance(test, &admin).await;
     assert_eq!(
         za_uid_leases(test).await,
         1,

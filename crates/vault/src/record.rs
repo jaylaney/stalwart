@@ -4,9 +4,13 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use sha2::{Digest, Sha256};
+
 pub const VAULT_RECORD_VERSION: u8 = 1;
 /// Pending app-password wraps older than this are pruned (spec 4.1).
 pub const PENDING_WRAP_MAX_AGE_SECS: i64 = 3600;
+
+const LABEL_SESSION_BINDING: &[u8] = b"za/v1/session-binding";
 
 #[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[rkyv(compare(PartialEq), derive(Debug))]
@@ -138,6 +142,30 @@ impl VaultRecord {
     }
 }
 
+/// The credential fingerprint that binds a key account's OAuth tokens and
+/// token record (spec D19). Lengths and Argon2 parameters are u32 big-endian.
+pub fn za_session_binding(record: &VaultRecord) -> u64 {
+    let mut hash = Sha256::new();
+    hash.update(LABEL_SESSION_BINDING);
+    hash.update((record.salt.len() as u32).to_be_bytes());
+    hash.update(&record.salt);
+    hash.update(record.argon2_m_cost_kib.to_be_bytes());
+    hash.update(record.argon2_t_cost.to_be_bytes());
+    hash.update(record.argon2_p_cost.to_be_bytes());
+    hash.update((record.verifier_hash.len() as u32).to_be_bytes());
+    hash.update(&record.verifier_hash);
+    if let Some(url) = &record.totp_url {
+        hash.update([1]);
+        hash.update((url.len() as u32).to_be_bytes());
+        hash.update(url.as_bytes());
+    } else {
+        hash.update([0]);
+    }
+
+    // Upstream reads a credential version of zero as unversioned.
+    u64::from_be_bytes(*hash.finalize().first_chunk().unwrap()).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +195,75 @@ mod tests {
             setup_token_hash: vec![],
             setup_token_expires: 0,
         }
+    }
+
+    #[test]
+    fn binding_changes_only_with_credentials() {
+        use sha2::{Digest, Sha256};
+        use std::collections::HashSet;
+
+        let record = full_record();
+        let binding = za_session_binding(&record);
+        assert_ne!(binding, 0);
+        assert_eq!(binding, za_session_binding(&record));
+
+        let credential_changes: [fn(&mut VaultRecord); 7] = [
+            |record| record.salt[0] ^= 1,
+            |record| record.argon2_m_cost_kib += 1,
+            |record| record.argon2_t_cost += 1,
+            |record| record.argon2_p_cost += 1,
+            |record| record.verifier_hash[0] ^= 1,
+            |record| record.totp_url = None,
+            |record| record.totp_url.as_mut().unwrap().replace_range(24..25, "D"),
+        ];
+        let mut seen = HashSet::from([binding]);
+        for change in credential_changes {
+            let mut changed = record.clone();
+            change(&mut changed);
+            assert!(seen.insert(za_session_binding(&changed)));
+        }
+
+        let other_changes: [fn(&mut VaultRecord); 10] = [
+            |record| record.version += 1,
+            |record| record.revision += 1,
+            |record| record.state = VaultState::PendingSetup,
+            |record| record.password_wrap[0] ^= 1,
+            |record| record.recovery_wrap[0] ^= 1,
+            |record| record.app_wraps.clear(),
+            |record| record.public_key[0] ^= 1,
+            |record| record.private_key_wrap[0] ^= 1,
+            |record| record.setup_token_hash = vec![8; 32],
+            |record| record.setup_token_expires += 1,
+        ];
+        for change in other_changes {
+            let mut changed = record.clone();
+            change(&mut changed);
+            assert_eq!(za_session_binding(&changed), binding);
+        }
+
+        let mut left = record.clone();
+        left.salt = vec![1, 2];
+        left.verifier_hash = vec![3];
+        let mut right = record.clone();
+        right.salt = vec![1];
+        right.verifier_hash = vec![2, 3];
+        assert_ne!(za_session_binding(&left), za_session_binding(&right));
+
+        left = record.clone();
+        left.totp_url = None;
+        right = record;
+        right.totp_url = Some(String::new());
+        assert_ne!(za_session_binding(&left), za_session_binding(&right));
+
+        let mut hash = Sha256::new();
+        hash.update(b"za/v1/session-binding\x00\x00\x00\x10");
+        hash.update([1; 16]);
+        hash.update(b"\x00\x01\x00\x00\x00\x00\x00\x03\x00\x00\x00\x01");
+        hash.update(b"\x00\x00\x00\x20");
+        hash.update([2; 32]);
+        hash.update(b"\x01\x00\x00\x00\x1botpauth://totp/x?secret=ABC");
+        let digest = hash.finalize();
+        assert_eq!(binding, u64::from_be_bytes(digest[..8].try_into().unwrap()));
     }
 
     #[test]

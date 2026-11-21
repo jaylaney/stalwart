@@ -22,6 +22,10 @@ use groupware::{
     calendar::{
         ALERT_EMAIL, ALERT_RELATIVE_TO_END, ArchivedDefaultAlert, CALENDAR_INVISIBLE,
         CALENDAR_SUBSCRIBED, Calendar,
+        pipeline::{
+            context::{ZaReadMemo, za_foreign_calendar_contexts, za_read_calendar_view},
+            error::ZaPipelineError,
+        },
     },
 };
 use jmap_proto::{
@@ -35,7 +39,7 @@ use store::{
     roaring::RoaringBitmap,
     write::{Archive, ArchiveBytes, ValueClass},
 };
-use trc::AddContext;
+use trc::{AddContext, EventType, StoreEvent};
 use types::{
     acl::{Acl, AclGrant},
     collection::{Collection, SyncCollection},
@@ -95,11 +99,35 @@ impl CalendarGet for Server {
             )
             .await?;
         let is_owner = access_token.is_member(account_id);
-        let calendar_ids = if is_owner {
+        let mut calendar_ids = if is_owner {
             cache.document_ids(true).collect::<RoaringBitmap>()
         } else {
             cache.shared_containers(access_token, [Acl::Read, Acl::ReadItems], true)
         };
+        let za_key = self.za_is_key_account(account_id).await?;
+        let mut za_memo = za_key.then(ZaReadMemo::default);
+        if let Some(memo) = za_memo.as_mut().filter(|_| !is_owner) {
+            match za_foreign_calendar_contexts(
+                self,
+                access_token,
+                account_id,
+                calendar_ids.iter(),
+                None,
+            )
+            .await
+            {
+                Ok(contexts) => {
+                    calendar_ids = contexts.keys().copied().collect();
+                    memo.extend(
+                        contexts
+                            .into_iter()
+                            .map(|(id, ctx)| ((account_id, id), ctx)),
+                    );
+                }
+                Err(ZaPipelineError::Store(error)) => return Err(error),
+                Err(_) => calendar_ids.clear(),
+            }
+        }
         let default_calendar_id = if properties.contains(&CalendarProperty::IsDefault) {
             self.store()
                 .get_value::<u32>(ValueKey {
@@ -165,7 +193,32 @@ impl CalendarGet for Server {
                 ))
                 .await?
             {
-                calendar
+                if let Some(memo) = &mut za_memo {
+                    match za_read_calendar_view(self, access_token, account_id, document_id, memo)
+                        .await
+                    {
+                        Ok(Ok(Some((view, _)))) => view,
+                        Ok(Err(error))
+                            if error.matches(EventType::Store(StoreEvent::DataCorruption)) =>
+                        {
+                            let error = StoreEvent::DataCorruption
+                                .into_err()
+                                .account_id(account_id)
+                                .document_id(document_id)
+                                .details("zero-access: unreadable calendar");
+                            trc::error!(error);
+                            response.push_not_found(id);
+                            continue;
+                        }
+                        Ok(Err(error)) | Err(ZaPipelineError::Store(error)) => return Err(error),
+                        Ok(Ok(None)) | Err(_) => {
+                            response.push_not_found(id);
+                            continue;
+                        }
+                    }
+                } else {
+                    calendar
+                }
             } else {
                 response.push_not_found(id);
                 continue;

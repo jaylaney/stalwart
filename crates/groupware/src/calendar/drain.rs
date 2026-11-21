@@ -4,10 +4,13 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-//! Invitations spec 6: the drain. A key account's own DAV request, which
-//! holds the account's session keys, opens the pending items of the
-//! account's scheduling inbox before the request's own work (6.1), so no
-//! background code needs a key. The first pass of every session runs the
+//! Invitations spec 6: the drain. A key account's own request, which holds
+//! the account's session keys, opens the pending items of the account's
+//! scheduling inbox before the request's own work (6.1), so no background
+//! code needs a key. It runs only when the token's scope admits calendars:
+//! on every such DAV request, and on a JMAP request (release 6 spec 5.5)
+//! that holds a calendar call that parsed with its capability in `using`
+//! (PR #90 review C4617611594; `za_drain_keys`). The first pass of every session runs the
 //! self-check (key pinning spec 3.3) before enumerating, items pending or
 //! not. A pass (6.2-6.3) takes the session's lock,
 //! reads the inbox change id (the snapshot), enumerates the items whose

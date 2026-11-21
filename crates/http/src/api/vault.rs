@@ -1764,6 +1764,17 @@ async fn za_totp(
     }
     let mut record = read.record.clone();
     record.totp_url = otp_auth;
+    // A fresh salt on every second-factor change, so the session binding
+    // (D19) never returns to an earlier value: removing a factor would
+    // otherwise restore the binding the enrolment ended (final review
+    // FA-1). Same password, same MK: every other wrap still opens.
+    za_set_password(
+        &mut record,
+        account_id,
+        verified.keys.mk(),
+        &request.password,
+    )
+    .await?;
     // Only on top of the verified generation (invariant 8); the commit
     // invalidates cached authentication, so a password-only login cached
     // before an enrolment does not outlive it.
@@ -1794,6 +1805,61 @@ mod tests {
             .headers()
             .and_then(|headers| headers.get(name))
             .map(|value| value.to_str().unwrap())
+    }
+
+    /// A rejected registry write is traced by its kind only, never with the
+    /// result's payload, which can quote credential values.
+    #[test]
+    fn registry_rejections_are_named_without_their_payload() {
+        use registry::schema::prelude::Property;
+        use store::registry::write::ForeignKeyScope;
+
+        let object_id = ObjectId::new(ObjectType::Account, Id::from(7u32));
+        let cases = [
+            (RegistryWriteResult::Success(Id::from(7u32)), "success"),
+            (
+                RegistryWriteResult::CannotDeleteLinked {
+                    object_id,
+                    linked_objects: vec![object_id],
+                },
+                "cannot delete linked",
+            ),
+            (
+                RegistryWriteResult::InvalidSingletonId,
+                "invalid singleton id",
+            ),
+            (
+                RegistryWriteResult::CannotDeleteSingleton,
+                "cannot delete singleton",
+            ),
+            (RegistryWriteResult::NotFound { object_id }, "not found"),
+            (
+                RegistryWriteResult::InvalidForeignKey { object_id },
+                "invalid foreign key",
+            ),
+            (
+                RegistryWriteResult::ForeignKeyOutOfScope {
+                    object_id,
+                    scope: ForeignKeyScope::Account,
+                },
+                "foreign key out of scope",
+            ),
+            (
+                RegistryWriteResult::PrimaryKeyConflict {
+                    property: Property::Name,
+                    existing_id: object_id,
+                },
+                "primary key conflict",
+            ),
+            (
+                RegistryWriteResult::ValidationError { errors: Vec::new() },
+                "validation error",
+            ),
+            (RegistryWriteResult::NotSupported, "not supported"),
+        ];
+        for (result, name) in cases {
+            assert_eq!(registry_rejection(&result), name);
+        }
     }
 
     #[test]

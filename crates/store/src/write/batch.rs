@@ -59,6 +59,7 @@ impl BatchBuilder {
             task_types: TaskTypes::default(),
             priority: CommitPriority::Default,
             za_chunk_asserts: Vec::new(),
+            za_one_transaction: false,
         }
     }
 
@@ -677,6 +678,9 @@ impl BatchBuilder {
 
     #[inline]
     pub fn commit_point(&mut self) -> &mut Self {
+        if self.za_one_transaction {
+            return self;
+        }
         #[cfg(feature = "test_mode")]
         if self.batch_ops > 0 && crate::za_test::force_commit_split(self.current_account_id) {
             return self.add_commit_point();
@@ -1270,6 +1274,30 @@ impl BatchBuilder {
         self
     }
 
+    /// Zero-access fork (PR #90 review C4617611521): from here on
+    /// `commit_point()` adds no commit point, under `FORCE_COMMIT_SPLIT` too,
+    /// so a batch built after this call is written in one transaction. An
+    /// explicit `add_commit_point()` still adds one. The batch's size is then
+    /// the builder's own count of the whole batch (`za_exceeds_one_chunk`).
+    pub fn za_one_transaction(&mut self) -> &mut Self {
+        self.za_one_transaction = true;
+        self
+    }
+
+    /// Whether the current chunk, with `reserve` bytes still to be added,
+    /// exceeds the store's chunk size by the builder's own count
+    /// (`MAX_COMMIT_BYTES`). For a batch under `za_one_transaction` the current
+    /// chunk is the whole batch. PR #90 second review C4633314510: the caller
+    /// reserves what an operation added after the check will count.
+    pub fn za_exceeds_one_chunk(&self, reserve: usize) -> bool {
+        let size = self.batch_size.saturating_add(reserve);
+        #[cfg(feature = "test_mode")]
+        if let Some(bytes) = crate::za_test::commit_bytes_override(self.current_account_id) {
+            return size > bytes;
+        }
+        size > MAX_COMMIT_BYTES
+    }
+
     /// The assertions of `za_assert_absent_per_chunk`, pushed without
     /// changing the recorded selection.
     fn za_push_chunk_asserts(&mut self) {
@@ -1305,6 +1333,47 @@ mod tests;
 #[cfg(test)]
 mod za_chunk_assert_tests {
     use super::*;
+
+    /// PR #90 second review C4633314510: the size check counts the bytes a
+    /// later `merge_fnc` adds. A one-transaction batch counting exactly the
+    /// cap is not over by the plain check and is over with the reserve; one
+    /// counting the cap less the reserve is over neither way, and after the
+    /// `merge_fnc` it counts exactly the cap.
+    #[test]
+    fn size_check_reserves_the_fence_operation() {
+        let fence = ValueClass::from(types::field::PrincipalField::DefaultCalendarId);
+        let reserve = fence.key_len_hint();
+        let batch_of = |count: usize| {
+            let mut batch = BatchBuilder::new();
+            batch.za_one_transaction();
+            batch
+                .with_account_id(7)
+                .with_collection(Collection::Principal)
+                .with_document(0);
+            let class = ValueClass::Property(1);
+            let value = count - batch.len() - class.key_len_hint();
+            batch.set(class, vec![0u8; value]);
+            assert_eq!(batch.len(), count);
+            batch
+        };
+
+        let at_cap = batch_of(MAX_COMMIT_BYTES);
+        assert!(!at_cap.za_exceeds_one_chunk(0));
+        assert!(at_cap.za_exceeds_one_chunk(reserve));
+
+        let mut below = batch_of(MAX_COMMIT_BYTES - reserve);
+        assert!(!below.za_exceeds_one_chunk(0));
+        assert!(!below.za_exceeds_one_chunk(reserve));
+        below.merge_fnc(fence, |_, _| Ok(MergeResult::Skip));
+        assert_eq!(below.len(), MAX_COMMIT_BYTES);
+
+        // PR #90 second review RC-5: one byte over is over, on both sides.
+        let over_by_one = batch_of(MAX_COMMIT_BYTES - reserve + 1);
+        assert!(!over_by_one.za_exceeds_one_chunk(0));
+        assert!(over_by_one.za_exceeds_one_chunk(reserve));
+        let past_cap = batch_of(MAX_COMMIT_BYTES + 1);
+        assert!(past_cap.za_exceeds_one_chunk(0));
+    }
 
     const VAULT: ValueClass = ValueClass::Property(150);
 

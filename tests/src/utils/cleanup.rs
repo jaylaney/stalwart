@@ -257,7 +257,7 @@ pub async fn store_assert_is_empty(store: &Store, blob_store: BlobStore, include
         store_assert_is_empty_except_account_state(store, blob_store, include_registry).await;
     assert!(
         account_state.vault_accounts.is_empty(),
-        "Found zero-access vault, pin or search state of accounts {:?}",
+        "Found zero-access vault, pin, search or token state of accounts {:?}",
         account_state.vault_accounts
     );
     assert!(
@@ -488,10 +488,12 @@ pub async fn store_assert_is_empty_except_account_state(
                                     || key[U32_LEN + 1]
                                         == PrincipalField::ZeroAccessPins as u8
                                     || key[U32_LEN + 1]
-                                        == PrincipalField::ZeroAccessSearch as u8) =>
+                                        == PrincipalField::ZeroAccessSearch as u8
+                                    || key[U32_LEN + 1]
+                                        == PrincipalField::ZeroAccessTokens as u8) =>
                         {
-                            // Vault, pin and search-manifest records persist for the life
-                            // of the account. The caller checks that the account exists.
+                            // The account may hold vault, pin, search or token records.
+                            // The caller checks that the account exists.
                             let account_id = key.deserialize_be_u32(0).unwrap();
                             vault_accounts.push(account_id);
                             if key[U32_LEN + 1] == PrincipalField::ZeroAccessSearch as u8

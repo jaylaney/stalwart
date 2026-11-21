@@ -13,6 +13,7 @@ pub mod http_server;
 pub mod imap;
 pub mod jmap;
 pub mod milter;
+pub mod oauth;
 pub mod pop3;
 pub mod push;
 pub mod registry;

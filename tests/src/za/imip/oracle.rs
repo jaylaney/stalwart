@@ -88,7 +88,7 @@ enum Side {
 
 /// What a value is, which decides the normalizations that apply to it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
+pub(crate) enum Kind {
     /// iCalendar content: unfolded; DTSTAMP removed. An inbox item's tree and
     /// the iCalendar part of a REQUEST or REPLY email.
     Ics,
@@ -150,7 +150,7 @@ fn normalize(side: Side, kind: Kind, text: &str) -> String {
 
 /// `line` without its `SCHEDULE-STATUS` parameters, the value running to the
 /// next `;` or `:` outside double quotes.
-fn without_schedule_status(line: &str) -> String {
+pub(crate) fn without_schedule_status(line: &str) -> String {
     const PARAM: &str = ";SCHEDULE-STATUS=";
     let mut line = line.to_string();
     while let Some(at) = line.find(PARAM) {
@@ -578,14 +578,14 @@ fn item_href(party: &Party, id: u32) -> String {
 /// present and non-empty on both, and must then be equal; the values that
 /// differed before normalizing are listed, as evidence of what the permitted
 /// differences absorbed.
-struct Tally<'a> {
-    label: &'a str,
-    compared: usize,
-    absorbed: Vec<String>,
+pub(crate) struct Tally<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) compared: usize,
+    pub(crate) absorbed: Vec<String>,
 }
 
 impl Tally<'_> {
-    fn same(
+    pub(crate) fn same(
         &mut self,
         what: impl fmt::Display,
         kind: Kind,
@@ -769,7 +769,7 @@ async fn compare(
 
 /// How a sink message is matched across the sides: its recipients and its
 /// iTIP method.
-fn mail_key(message: &SinkMessage) -> (String, String) {
+pub(crate) fn mail_key(message: &SinkMessage) -> (String, String) {
     let mut rcpt = message
         .rcpt_to
         .iter()
@@ -785,7 +785,7 @@ fn mail_key(message: &SinkMessage) -> (String, String) {
 /// The parts of a sink message the oracle compares (spec 8.3): the envelope,
 /// From, To, Subject, Auto-Submitted, Reply-To, the method, the decoded
 /// text, HTML and iCalendar parts, and the presence of Message-ID and Date.
-fn mail_parts(message: &SinkMessage) -> Vec<(&'static str, Kind, Option<String>)> {
+pub(crate) fn mail_parts(message: &SinkMessage) -> Vec<(&'static str, Kind, Option<String>)> {
     let header = |name| raw_header(message, name);
     // Spec 3.3 item 4 lets only a CANCEL's copy of the attendee lines differ
     // in SCHEDULE-STATUS; a REQUEST or REPLY keeps the parameter.
@@ -813,7 +813,7 @@ fn mail_parts(message: &SinkMessage) -> Vec<(&'static str, Kind, Option<String>)
 
 /// The raw value of the message's top-level header `name`, unfolded by the
 /// caller's normalization.
-fn raw_header(message: &SinkMessage, name: &str) -> Option<String> {
+pub(crate) fn raw_header(message: &SinkMessage, name: &str) -> Option<String> {
     let data = String::from_utf8_lossy(&message.data);
     let head = data.split("\r\n\r\n").next()?;
     let mut value: Option<String> = None;

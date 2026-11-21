@@ -16,6 +16,7 @@ pub mod logout;
 pub mod openid;
 pub mod registration;
 pub mod token;
+mod za_token;
 
 #[derive(
     rkyv::Serialize,

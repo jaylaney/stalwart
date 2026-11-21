@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::za_bearer::{TOKEN_KEYS_UNAVAILABLE, za_bearer_keys, za_bearer_refusal};
 use common::{
     HttpAuthCache, Server,
     auth::{
@@ -152,7 +153,8 @@ fn za_is_impersonation(token: &str) -> bool {
 
 /// Full verification of an Authorization header, caching the result under
 /// the header's own token, given here so that no caller can cache under
-/// another key. The only place session keys are attached (spec 5).
+/// another key. Session keys are attached here on a cache miss, from Basic
+/// verification or an opened Bearer token (spec 4.6, release 1 invariant 5).
 async fn authenticate_uncached(
     server: &Server,
     mechanism: &str,
@@ -206,10 +208,10 @@ async fn authenticate_uncached(
         ))
         .await?;
 
-    #[cfg(feature = "test_mode")]
-    za_test::pause_point(access_token.account_id()).await;
-
-    // Cache credentials
+    // Cache credentials. The entry's deadline is fixed here, at verification,
+    // so the key lookup below does not extend it past the token's signed
+    // expiry (PR #90 review C4617611615); for keys opened from a Bearer token
+    // it is lowered again at publication (`za_bearer_entry`, C4633314515).
     let cache = &server.inner.cache;
     let revocations = &cache.grant_revocations;
     let account_id = access_token.account_id();
@@ -223,9 +225,19 @@ async fn authenticate_uncached(
         revision: access_token.revision(),
         token_scope: access_token.token_scope(),
     };
+
+    let (session_keys, keys_from_bearer) = if mechanism.eq_ignore_ascii_case("bearer") {
+        (za_bearer_keys(server, token, &access_token).await?, true)
+    } else {
+        (session_keys, false)
+    };
+
+    #[cfg(feature = "test_mode")]
+    za_test::pause_point(access_token.account_id()).await;
+
     match session_keys {
         None => {
-            // A keyless result for a key account (Bearer/OAuth, an
+            // A keyless result for a key account (a token without a secret, an
             // impersonation, or a password verified against the pre-setup
             // hash while setup committed) is never cached: the hit rule would
             // refuse it anyway. Only ordinary accounts are cached here, as
@@ -260,18 +272,38 @@ async fn authenticate_uncached(
             );
         }
         Some(keys) => {
-            // Generation fence (spec 5). Race defended: this login read the
-            // vault record at revision r and spent its time in Argon2 while
-            // a password change committed r+1 and called `remove_account`.
-            // Caching now would resurrect the superseded verification, so
-            // both inserts happen only if the verified generation still
-            // equals the one rebuilt from the store; otherwise the request
-            // succeeds uncached. Generation 0 is never cached. The entry
-            // also passes upstream's revocation epoch.
-            let account = server.account(account_id).await?;
+            // Generation fence (spec 4.6): a vault write can invalidate the
+            // opened keys before cache publication. Both inserts require the
+            // current generation. Basic still serves a crossed request
+            // uncached, while D23 requires Bearer to refuse it.
+            let account = server.account(account_id).await.map_err(|err| {
+                if keys_from_bearer {
+                    za_bearer_refusal(&access_token, TOKEN_KEYS_UNAVAILABLE)
+                } else {
+                    err
+                }
+            })?;
             if keys.generation != 0 && keys.generation == account.za_generation() {
-                revocations.insert(&cache.http_auth, token, entry, epoch);
-                cache.za_insert_keys(cache.za_fingerprint(token), keys.clone(), Instant::now());
+                // PR #90 review C4617611615: only a live entry is published; a
+                // key lookup that outlasted the token publishes nothing and
+                // the request is served uncached. C4633314515: a Bearer
+                // token's entry ends before its signed expiry. W-1: the keys
+                // go in only under the revocation epoch read before
+                // verification.
+                let entry = if keys_from_bearer {
+                    za_bearer_entry(server, token, entry)
+                } else {
+                    Some(entry)
+                };
+                if let Some(entry) = entry.filter(|entry| cache.http_auth.is_live(entry)) {
+                    revocations.insert(&cache.http_auth, token, entry, epoch);
+                    za_insert_keys_fenced(server, token, &keys, epoch);
+                }
+            } else if keys_from_bearer {
+                return Err(za_bearer_refusal(
+                    &access_token,
+                    "zero-access: token keys of a superseded generation",
+                ));
             }
             access_token = access_token.with_session_keys(keys);
         }
@@ -286,6 +318,56 @@ async fn authenticate_uncached(
             access_token,
             epoch,
         })
+}
+
+/// PR #90 review C4633314515: the entry of keys opened from a Bearer token
+/// ends before the token's signed expiry. Upstream fixes the deadline after
+/// the account and grant lookups from a lifetime computed at the decode, so
+/// the token is opened again here (synchronously, emitting no event) and the
+/// deadline lowered, never raised, to the cache clock's now plus the fresh
+/// remaining lifetime less one second, which absorbs the rounding of the two
+/// whole-second clocks. Any decode error (`TokenExpired`, or a token that no
+/// longer opens or is of another grant type) publishes nothing: `None`, and
+/// the request is served with its keys, uncached. The cache clock is read
+/// before the token's, so a stall between the two reads ends the entry
+/// earlier, never later (RC5-7).
+fn za_bearer_entry(
+    server: &Server,
+    token: &str,
+    mut entry: HttpAuthCache,
+) -> Option<HttpAuthCache> {
+    let now = server.inner.cache.http_auth.expires_in(0);
+    let Ok(info) =
+        server.decode_access_token(Some(common::auth::oauth::GrantType::AccessToken), token)
+    else {
+        return None;
+    };
+    let remaining = u32::try_from(info.expires_in.saturating_sub(1)).unwrap_or(u32::MAX);
+    let deadline = now.saturating_add(remaining);
+    entry.expires = entry.expires.min(deadline);
+    Some(entry)
+}
+
+/// W-1 (fix-wave review): resident keys are inserted only while the
+/// revocation epoch is the one read before verification, and removed again if
+/// it moved during the insert, as `GrantRevocations::insert` fences its entry.
+/// A grant's invalidation advances the epoch before it removes the account's
+/// keys, so keys a revocation crossed never stay resident.
+fn za_insert_keys_fenced(
+    server: &Server,
+    token: &str,
+    keys: &std::sync::Arc<vault::session::SessionKeys>,
+    epoch: RevocationEpoch,
+) {
+    let cache = &server.inner.cache;
+    let revocations = &cache.grant_revocations;
+    if revocations.epoch() == epoch {
+        let fingerprint = cache.za_fingerprint(token);
+        cache.za_insert_keys(fingerprint, keys.clone(), Instant::now());
+        if revocations.epoch() != epoch {
+            cache.za_keys.remove(&fingerprint);
+        }
+    }
 }
 
 /// Test-only pause points, each keyed on an account id and one-shot: only

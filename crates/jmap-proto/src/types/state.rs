@@ -13,7 +13,9 @@ use std::{
 use types::ChangeId;
 use utils::codec::leb128::{Leb128, Leb128Iterator};
 
-const MAX_SERIALIZED_LEN: usize = 30;
+// Release 6 spec 6.8 (D29): `z` holds two one-byte fields and four LEB128 values.
+const MAX_SERIALIZED_LEN: usize = 42;
+const ZA_CALENDAR_STATE_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JMAPIntermediateState {
@@ -28,6 +30,19 @@ pub enum State {
     Initial,
     Exact(ChangeId),
     Intermediate(JMAPIntermediateState),
+    /// Release 6 spec 6.8 (D29): a key-calendar continuation, the existing range and
+    /// count with the state its sync started from. Transient protocol data, never stored.
+    ZaCalendarIntermediate {
+        range: JMAPIntermediateState,
+        origin: ZaCalendarOrigin,
+    },
+}
+
+/// Release 6 spec 6.8 (D29): the start of a paged key-calendar sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZaCalendarOrigin {
+    Initial,
+    Exact(u64),
 }
 
 impl From<Option<ChangeId>> for State {
@@ -72,8 +87,37 @@ impl State {
                     None
                 }
             }
+            b'z' => Self::parse_za_calendar(it),
             _ => None,
         }
+    }
+
+    /// Release 6 spec 6.8 (D29): version 1, origin tag (0 Initial, 1 Exact), the nonzero
+    /// exact ID for tag 1, `from_id`, `to_id - from_id` and a positive `items_sent`.
+    /// Unknown values, missing or trailing input and arithmetic overflow are refused.
+    fn parse_za_calendar(it: std::slice::Iter<'_, u8>) -> Option<Self> {
+        let mut reader = STALWART.decoder_from_iter(it);
+        if reader.next_leb128::<u8>()? != ZA_CALENDAR_STATE_VERSION {
+            return None;
+        }
+        let origin = match reader.next_leb128::<u8>()? {
+            0 => ZaCalendarOrigin::Initial,
+            1 => ZaCalendarOrigin::Exact(reader.next_leb128::<ChangeId>().filter(|id| *id != 0)?),
+            _ => return None,
+        };
+        let from_id = reader.next_leb128::<ChangeId>()?;
+        let to_id = from_id.checked_add(reader.next_leb128::<ChangeId>()?)?;
+        let items_sent = reader.next_leb128::<usize>().filter(|sent| *sent > 0)?;
+        (reader.next().is_none() && reader.remaining().is_empty()).then_some(
+            State::ZaCalendarIntermediate {
+                range: JMAPIntermediateState {
+                    from_id,
+                    to_id,
+                    items_sent,
+                },
+                origin,
+            },
+        )
     }
 
     pub fn new_initial() -> Self {
@@ -96,6 +140,7 @@ impl State {
         match self {
             State::Exact(id) => *id,
             State::Intermediate(intermediate) => intermediate.to_id,
+            State::ZaCalendarIntermediate { range, .. } => range.to_id,
             State::Initial => ChangeId::MAX,
         }
     }
@@ -119,11 +164,18 @@ impl<'de> serde::Deserialize<'de> for ExpectedState {
     {
         Ok(ExpectedState(
             <Option<Cow<'de, str>>>::deserialize(deserializer)?.map(|value| {
-                State::parse(&value).unwrap_or(State::Intermediate(JMAPIntermediateState {
-                    from_id: 0,
-                    to_id: 0,
-                    items_sent: 0,
-                }))
+                // Release 6 spec 6.8 (D29): `z` is never a current state, so it takes the
+                // invalid string's sentinel and the precondition answers stateMismatch.
+                match State::parse(&value) {
+                    Some(State::ZaCalendarIntermediate { .. }) | None => {
+                        State::Intermediate(JMAPIntermediateState {
+                            from_id: 0,
+                            to_id: 0,
+                            items_sent: 0,
+                        })
+                    }
+                    Some(state) => state,
+                }
             }),
         ))
     }
@@ -160,6 +212,36 @@ impl fmt::Display for State {
                     .write_all(&intermediate.items_sent.to_leb128())
                     .map_err(|_| fmt::Error)?;
                 'r'
+            }
+            State::ZaCalendarIntermediate { range, origin } => {
+                bytes
+                    .write_all(&ZA_CALENDAR_STATE_VERSION.to_leb128())
+                    .map_err(|_| fmt::Error)?;
+                match origin {
+                    ZaCalendarOrigin::Initial => {
+                        bytes.write_all(&0u8.to_leb128()).map_err(|_| fmt::Error)?;
+                    }
+                    ZaCalendarOrigin::Exact(id) => {
+                        bytes.write_all(&1u8.to_leb128()).map_err(|_| fmt::Error)?;
+                        bytes.write_all(&id.to_leb128()).map_err(|_| fmt::Error)?;
+                    }
+                }
+                bytes
+                    .write_all(&range.from_id.to_leb128())
+                    .map_err(|_| fmt::Error)?;
+                bytes
+                    .write_all(
+                        &range
+                            .to_id
+                            .checked_sub(range.from_id)
+                            .ok_or(fmt::Error)?
+                            .to_leb128(),
+                    )
+                    .map_err(|_| fmt::Error)?;
+                bytes
+                    .write_all(&range.items_sent.to_leb128())
+                    .map_err(|_| fmt::Error)?;
+                'z'
             }
         };
 

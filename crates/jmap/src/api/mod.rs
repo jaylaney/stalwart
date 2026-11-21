@@ -30,6 +30,7 @@ pub mod pending_creates;
 pub mod query;
 pub mod request;
 pub mod session;
+pub mod za_calendar;
 
 impl ToHttpResponse for UploadResponse {
     fn into_http_response(self) -> HttpResponse {
