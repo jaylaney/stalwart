@@ -411,7 +411,7 @@ Release 7:
   only with long reference chains or extra identifiers; a key account keeps one Message-ID value
   per message where upstream matches every value, so a reply naming a message's other
   Message-ID threads on an ordinary account but not on a key account (rare; found in this
-  release's review, not in design 7.5); a message deleted before any keyed mail request indexed
+  release's review, not in design 7.5; issue #101); a message deleted before any keyed mail request indexed
   it gives no threading evidence; a rebuild invalidates every JMAP Email sync state, and IMAP
   `CHANGEDSINCE` never surfaces a reassigned `EMAILID` or `THREADID`; every publishing pass adds
   an `Email/changes` update of a witness message, an unsolicited IMAP `FETCH (FLAGS ...)` with an
