@@ -36,6 +36,24 @@ OBJECTS = [{"path": "debug/deps/example", "sha256": "b" * 64}]
 PROFILE = b"\xfflprofi\x81" + (14).to_bytes(8, "little") + b"\x00" * 16 + (64).to_bytes(8, "little") + b"\x00" * 88
 EXPORT = {"type": "llvm.coverage.json.export", "version": "2.0.1",
           "data": [{"files": [], "functions": [], "totals": {}}]}
+DIAGNOSTICS = (
+    ("password=synthetic-password", "password=[REDACTED]"),
+    ("token:synthetic-token", "token:[REDACTED]"),
+    ("secret_key=synthetic-secret", "secret_key=[REDACTED]"),
+    ("Basic synthetic-basic", "Basic [REDACTED]"),
+    ("password = fixture-one", "password = [REDACTED]"),
+    ("'Secret_Key'\t:\t'fixture two, with punctuation'", "'Secret_Key'\t:\t'[REDACTED]'"),
+    (r'{"TOKEN" : "fixture \"three\" and \\four", "port": 80}',
+     '{"TOKEN" : "[REDACTED]", "port": 80}'),
+    (r"{ secret = 'fixture\', token = 'fixture five' }",
+     "{ secret = '[REDACTED]', token = '[REDACTED]' }"),
+    ('password = """fixture six "with quotes""""', 'password = "[REDACTED]"'),
+    ("token = '''fixture seven 'with quotes''''", "token = '[REDACTED]'"),
+    ('password = """fixture start\n' + r'fixture \""" continues' + '\nfixture end""" status=ok',
+     'password = "[REDACTED]"\n\n status=ok'),
+    ("token = '''fixture\ncontinued''' secret = '''another\nvalue''' done",
+     "token = '[REDACTED]'\n secret = '[REDACTED]'\n done"),
+)
 
 
 def write(path, value):
@@ -150,16 +168,10 @@ class ReceiptTests(unittest.TestCase):
             "auth::tests::rejects_wrong_password: test",
             "tokens::r#type::password_lookup: benchmark",
         )
-        diagnostics = (
-            "password=synthetic-password",
-            "token:synthetic-token",
-            "secret_key=synthetic-secret",
-            "Basic synthetic-basic",
-        )
         body = "\n".join((
             "     Running unittests src/lib.rs (target/debug/deps/sample-1234)",
             *entries,
-            *diagnostics,
+            *(original for original, _ in DIAGNOSTICS),
             "",
             "2 tests, 1 benchmark",
             "",
@@ -171,9 +183,11 @@ class ReceiptTests(unittest.TestCase):
         for path in paths:
             staged = (self.inputs / "listings" / path).read_text()
             self.assertTrue(set(entries).issubset(staged.splitlines()))
-            for diagnostic in (*diagnostics, "Bearer bad-listing"):
-                self.assertNotIn(diagnostic, staged)
-            self.assertEqual(staged.count("[REDACTED]"), len(diagnostics) + 1)
+            for original, expected in DIAGNOSTICS:
+                self.assertIn("\n" + expected + "\n", staged)
+                self.assertNotIn(original, staged)
+            self.assertNotIn("bad-listing", staged)
+            self.assertIn("Bearer [REDACTED]", staged.splitlines())
         self.assertEqual(self.collect(), 0)
 
     def test_exhausted_retry_preserves_complete_coverage_but_fails(self):
@@ -237,7 +251,9 @@ class ReceiptTests(unittest.TestCase):
         logs = source / "logs"
         logs.mkdir(parents=True)
         entries = ("tokens::r#type::password_lookup: benchmark", "password: test")
-        stdout = "\n".join((*entries, "secret=synthetic-stdout: test", "1 test, 1 benchmark", ""))
+        stdout = "\n".join((*entries, "secret=synthetic-stdout: test",
+                            'password = """fixture', "private::looks_like_a_test: test", 'end"""',
+                            "1 test, 1 benchmark", ""))
         stderr = "token: test\nBearer synthetic-stderr\n"
         fake_cargo = (
             "import sys\n"
@@ -268,6 +284,7 @@ class ReceiptTests(unittest.TestCase):
                 self.assertIn("token: [REDACTED]", lines)
                 self.assertIn("secret=[REDACTED] test", lines)
                 self.assertIn("Bearer [REDACTED]", lines)
+                self.assertNotIn("private::looks_like_a_test: test", lines)
                 self.assertNotIn("token: test", lines)
                 self.assertFalse(any("synthetic-" in line for line in lines))
         unowned = self.root / "unowned"
@@ -438,6 +455,22 @@ class ReceiptTests(unittest.TestCase):
 
 
 class ShardDiagnosticTests(unittest.TestCase):
+    def test_stage_logs_redacts_assignments_and_preserves_other_bytes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "build" / "steps.tsv"
+            out = root / "staged"
+            control = b"\xff\x00\tcompiler diagnostic\r\n"
+            write(source, control + b"".join((line + "\r\n").encode() for line, _ in DIAGNOSTICS)
+                  + b'Bearer fixture-bearer\r\npassword = """fixture\r\nfixture at EOF')
+            setup = Path(__file__).resolve().with_name("retention_ci_setup.sh")
+            subprocess.run(["bash", str(setup), "stage-logs", str(out), str(source),
+                            str(root / "missing.log")], cwd=root, check=True)
+            self.assertEqual([p.name for p in out.iterdir()], ["steps.tsv"])
+            self.assertEqual((out / source.name).read_bytes(), control
+                             + b"".join((line + "\r\n").encode() for _, line in DIAGNOSTICS)
+                             + b'Bearer [REDACTED]\r\npassword = "[REDACTED]"\r\n')
+
     def test_stage_safe_diagnostics_without_usable_receipt_inputs(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "net"

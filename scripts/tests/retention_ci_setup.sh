@@ -94,23 +94,6 @@ cache_budget() {
     fi
 }
 
-redact() {
-    sed -E \
-        -e 's/(Basic|Bearer) [A-Za-z0-9._~+\/=-]+/\1 [REDACTED]/Ig' \
-        -e 's/((password|secret|token)[A-Za-z_]*["\x27]?[=:] *["\x27]?)[^"\x27 ,}[:space:]]+/\1[REDACTED]/Ig' \
-        "$1" > "$2"
-}
-
-stage_logs() {
-    local destination="$1" file
-    shift
-    mkdir -p "$destination"
-    for file in "$@"; do
-        [[ -f "$file" ]] || continue
-        redact "$file" "$destination/$(basename "$file")"
-    done
-}
-
 case "$1" in
     install-tools)
         install_tools "$2"
@@ -135,7 +118,7 @@ case "$1" in
         ;;
     stage-logs)
         shift
-        stage_logs "$@"
+        exec python3 -I "$(dirname "$0")/retention_artifacts.py" stage-logs -- "$@"
         ;;
     *)
         printf 'Unknown retention setup operation: %s\n' "$1" >&2

@@ -25,8 +25,19 @@ LISTINGS = "listings"
 PRODUCERS = (*ci_steps.COVERAGE_SHARDS, LISTINGS)
 INDEXED_PROFILE_MAGIC = b"\xfflprofi\x81"
 AUTH = re.compile(rb"((?:Basic|Bearer) )[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
-ASSIGNMENT = re.compile(rb'''((?:password|secret|token)[A-Za-z_]*["']?[=:] *["']?)[^"' ,}\s]+''',
-                        re.IGNORECASE)
+ASSIGNMENT = re.compile(
+    rb'''(?P<prefix>(?:password|secret|token)[A-Za-z_]*["']?[ \t]*[=:][ \t]*)'''
+    rb"""(?P<value>(?P<triple>"{3}|'{3})|"""
+    # JSON/TOML double-quoted strings have escapes. TOML single quotes are literal.
+    rb'''"(?:\\[^\r\n]?|[^"\\\r\n])*"?|'[^'\r\n]*'?|[^"' ,}\s]+)''',
+    re.IGNORECASE,
+)
+# A closing TOML delimiter may include one or two trailing literal quotes. In a
+# basic string, skip each escape pair before looking for an unescaped delimiter.
+TRIPLE_END = {
+    b'"""': re.compile(rb'\\[^\r\n]|("{3,5})'),
+    b"'''": re.compile(rb"('{3,5})"),
+}
 SHA256 = re.compile(r"[a-f0-9]{64}")
 LISTING_FOOTER = re.compile(r"([0-9]+) tests?, ([0-9]+) benchmarks?")
 
@@ -64,15 +75,41 @@ def file_digest(path):
     return digest.hexdigest()
 
 
+def write_diagnostic(line, output, triple):
+    line = AUTH.sub(rb"\1[REDACTED]", line)
+    offset = 0
+    while offset < len(line):
+        if triple:
+            closing = next((m for m in TRIPLE_END[triple].finditer(line, offset) if m[1]), None)
+            if closing is None:
+                output.write(line[len(line.rstrip(b"\r\n")):])
+                return triple
+            offset = closing.end()
+            triple = None
+        match = ASSIGNMENT.search(line, offset)
+        if match is None:
+            break
+        output.write(line[offset:match.start()])
+        quote = match["value"][:1]
+        if quote not in (b'"', b"'"):
+            quote = b""
+        output.write(match["prefix"] + quote + b"[REDACTED]" + quote)
+        triple = match["triple"]
+        offset = match.end()
+    output.write(line[offset:])
+    return triple
+
+
 def redacted(path, destination, *, listing=False, libtest_stdout=False):
     destination.parent.mkdir(parents=True, exist_ok=True)
     in_section = in_target = False
+    triple = None
     with path.open("rb") as source, destination.open("wb") as output:
         for line in source:
             entry_text = None
-            if libtest_stdout:
+            if libtest_stdout and not triple:
                 entry_text = line.rstrip(b"\r\n").decode("utf-8", errors="replace")
-            elif listing:
+            elif listing and not triple:
                 if line.startswith(b"## command:"):
                     in_section, in_target = True, False
                 elif line.startswith(b"## exit:"):
@@ -92,7 +129,14 @@ def redacted(path, destination, *, listing=False, libtest_stdout=False):
                        for segment in entry.group(1).split("::")):
                     output.write(line)
                     continue
-            output.write(ASSIGNMENT.sub(rb"\1[REDACTED]", AUTH.sub(rb"\1[REDACTED]", line)))
+            triple = write_diagnostic(line, output, triple)
+
+
+def stage_logs(destination, files):
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in files:
+        if path.is_file():
+            redacted(path, destination / path.name)
 
 
 def transfer(source, out, names, *, redact=False, listing=False):
@@ -523,6 +567,11 @@ def collect(inputs, out, manifest, snapshot):
 
 
 def register_evidence_commands(commands):
+    logs = commands.add_parser("stage-logs")
+    logs.add_argument("destination", type=Path)
+    logs.add_argument("files", nargs="*", type=Path)
+    logs.set_defaults(handler=lambda args: stage_logs(args.destination, args.files))
+
     producer = commands.add_parser("stage")
     producer.add_argument("--kind", choices=("shard", "listings"), required=True)
     producer.add_argument("--producer", choices=PRODUCERS, required=True)
