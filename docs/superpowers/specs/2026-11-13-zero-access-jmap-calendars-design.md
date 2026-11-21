@@ -1,6 +1,8 @@
 # Zero-access calendar: JMAP calendars and browser sign-in (release 6) design spec
 
-Date: 2026-11-13. Status: revision 7, with one wording correction of
+Date: 2026-11-13. Status: revision 7, merged as pull request #90 on
+2026-11-21 (merge commit `04145d586`; the review record was condensed
+after the merge), with one wording correction of
 2026-11-18 on Jay's decision (3.3: the UID lease covers creates; a change
 of calendars checks without it; follow-up issue #91), and with the
 changes of 2026-11-18 that follow the pull request's review. Decided by
@@ -49,8 +51,8 @@ controller's rulings, reported to the owner, 4.3, 4.4 and 4.5 (an
 access entry already expired at its write is not stored and removes
 none; two residuals of that rule).
 Revision 7 incorporates Jay's
-approved [D29 amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md),
-recorded 2026-11-15: key-calendar continuations carry their original sync
+approved D29 amendment (`2026-11-14-zero-access-jmap-paged-sync-amendment.md`,
+in the repository's history at `04145d586`), recorded 2026-11-15: key-calendar continuations carry their original sync
 start explicitly (6.8, 9.1, 9.2, 9.8 and 10 to 12). Revision 6 applies Jay's decision
 of 2026-11-14 on when a key account's browser sessions end (2, 4.3 to
 4.7, 7, 9.1, 9.2, 9.7 and 10 to 12): only a credential change ends
@@ -75,7 +77,7 @@ record's write does not follow (2, 4.3, 4.5, 4.7, 9, 10; finding 4), the
 paused-refresh test (9.2; finding 5), and the expanded form of negated
 queries (9.2; finding 6). Revision 2 answered
 Jay's codex review of revision 1
-(`2026-11-13-zero-access-jmap-calendars-design-codex-review.md`): the vault
+(the design's review, in the repository's history at `04145d586`): the vault
 assertion on every write of the token record (4.3 to 4.5, 4.7, 9, 10;
 finding 1), how a refresh reads the record against the grant's progress
 (4.5, 9; finding 2), and the event-level matcher of unexpanded text
@@ -1484,7 +1486,7 @@ The origin is never inferred from `from_id`, retained records or the
 current boundary. Source review found that an initial sync and a valid
 incremental sync can yield identical legacy continuations after normal
 log retention, then require different answers after a rename. The
-[approved amendment](2026-11-14-zero-access-jmap-paged-sync-amendment.md)
+approved amendment (in the repository's history at `04145d586`)
 records that collision; it replaces revision 6's inference rule.
 
 Use a new transient `State` variant, not a stored archive. Its opaque

@@ -132,8 +132,8 @@ Where the code lives:
   `PrincipalField::ZeroAccessSearch = 152`.
 - New at release 6 (JMAP calendars and browser sign-in, issue #22; spec
   `docs/superpowers/specs/2026-11-13-zero-access-jmap-calendars-design.md`, revision 7; plan 17,
-  `docs/superpowers/plans/2026-11-14-zero-access-17-jmap-calendars.md` with its interface sheet
-  `-interfaces.md` and group files `-tasks-{a,b,c,d1,d2,e}.md`; outcome note
+  `docs/superpowers/plans/2026-11-14-zero-access-17-jmap-calendars.md`, an index; its interface
+  sheet and group files are in the history at `04145d586`; outcome note
   `docs/superpowers/plans/2026-11-14-zero-access-plan17-outcome.md`). Vault:
   `crates/vault/src/tokens.rs` (the token record and its entries, the suffix split,
   reconciliation, eviction, refresh classification, the hand-off value), `keys.rs` (the token and
