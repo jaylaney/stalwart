@@ -16,8 +16,9 @@ extensions are required.
   token carries the account's keys); no web client is included.
 - **Invitations by email:** invite people on other servers and receive their invitations,
   replies, updates and cancellations through ordinary invitation email (iMIP). Incoming
-  invitations are processed at the next authenticated CalDAV sync, or the next keyed JMAP
-  calendar request, subject to the account's scheduling settings.
+  invitations are processed at the next DAV request (CalDAV, CardDAV or WebDAV) whose token
+  holds the account's own keys and whose scope admits calendars, or the next keyed JMAP calendar
+  request, subject to the account's scheduling settings; a keyless request does not process them.
 - **Local scheduling and sharing:** invitations between zero-access accounts on this server
   use sealed internal delivery. View/edit calendar grants use pinned recipient keys and the
   [sharing API](docs/zero-access/calendar-sharing-api.md); an editor can also schedule on

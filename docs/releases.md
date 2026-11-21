@@ -120,11 +120,13 @@ Qualification covers fresh stores only. The store schema version is unchanged fr
 `0.3.0-beta.1` is expected to open, but no automated test covers that upgrade. The database,
 blob store and configuration are backed up first; rollback restores that backup, without the
 writes made after the upgrade, and no claim is made that an older binary reads data this one
-has written (a binary built before release 6 cannot read a shared calendar that holds a
-colour). A carried-over store needs upstream's operator actions (per-account encryption at rest
-selected again, `STALWART_UPDATE_ROLE_PERMISSIONS=true` for one start); each key account's
-search index is rebuilt at its first keyed request, and key accounts' existing OAuth tokens are
-refused once. Moving from `0.1.x` remains a fresh-store rebuild.
+has written (a binary built before release 6 cannot read a shared calendar whose personal bundle
+holds a JMAP `color` preference). A carried-over store needs upstream's operator actions
+(per-account encryption at rest selected again, with each account's `encryptOnAppend` and
+`allowSpamTraining` set again where they were on, and `STALWART_UPDATE_ROLE_PERMISSIONS=true`
+for one start); each key account's search index is rebuilt at its first keyed mail request (an
+IMAP session or an HTTP JMAP mail request holding its keys), and key accounts' existing OAuth
+tokens are refused once. Moving from `0.1.x` remains a fresh-store rebuild.
 
 This prerelease uses public upstream and fork tests for qualification and adds no private-test
 dependency. Its exact-source Linux product build runs from the tag through `product-build.yml`,

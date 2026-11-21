@@ -84,19 +84,28 @@ refusals), and every message was a thread of its own.
   sealed under a search key derived from the account's master key. The index covers what
   upstream's covers (sender, recipients, subject, body, headers and extracted attachment text)
   with upstream's tokenizer and rules, so the results are an ordinary account's for the same
-  mail, apart from the differences under "Known limits". The `threadId` sort stays unsupported,
-  as upstream's is for every account. The sorts a key account's JMAP session advertises in
-  `emailQuerySortOptions` are now served, which closes #54.
-- **Threads.** Messages are grouped as upstream threads them (Message-ID, References, subject):
-  JMAP `threadId`, `Thread/*`, `collapseThreads`, the thread filters and sorts and the thread
-  counts of `Mailbox/get`; IMAP `THREAD`, `THREADID` and `EMAILID`. The thread id is sealed.
-- **Indexed during sessions.** Only a request that holds the account's keys builds, reads or
-  writes the index. Mail that arrives while nobody holds the keys is indexed by the first keyed
-  requests afterwards; until then a server search does not find it, and it threads alone. A
-  content search whose index is not current after `ZA_SEARCH_WAIT_SECS` of indexing (30 s by
-  default) is refused with "Search for this account is not available right now; try again
-  shortly." (`unsupportedFilter` or `unsupportedSort` on JMAP, `NO [CANNOT]` on IMAP), never
-  answered in part. A session without keys still cannot search the account's mail.
+  mail, under the condition and with the differences under "Known limits". The `threadId` sort
+  stays unsupported, as upstream's is for every account. The sorts a key account's JMAP session
+  advertises in `emailQuerySortOptions` are now served, which closes #54.
+- **Threads.** Messages are grouped as upstream threads them (Message-ID, References, subject),
+  within the limits under "Known limits": JMAP `threadId`, `Thread/*`, `collapseThreads`, the
+  thread filters and sorts and the thread counts of `Mailbox/get`; IMAP `THREAD`, `THREADID` and
+  `EMAILID`. The thread id is sealed.
+- **Indexed during sessions.** The index is built, read and written only in a keyed mail
+  request: in an IMAP session holding the keys, before each command in the authenticated or
+  selected state except `IDLE`, `NOOP` and `LOGOUT`, and after an `APPEND` that committed; or in
+  a JMAP request over HTTP whose token holds the account's own keys (a password, an app password
+  or an OAuth token that carries a secret) and that has an Email, Thread, Mailbox,
+  SearchSnippet, EmailSubmission or Blob call that parsed with its capability in the
+  scope-filtered `using`, with one more pass after an owner's `Email/set` create or
+  `Email/import` in it. POP3, CalDAV and CardDAV, other JMAP requests, JMAP over WebSocket or
+  EventSource, SMTP, ManageSieve and `/api/*` never index. The keyless reindex task and account
+  destruction delete the index. Mail that arrives while no keyed mail request runs is indexed by
+  the next ones; until then a server search does not find it, and it threads alone. A content
+  search keeps running passes until the index is current or `ZA_SEARCH_WAIT_SECS` (30 s by
+  default) has passed, and is then refused with "Search for this account is not available right
+  now; try again shortly." (`unsupportedFilter` or `unsupportedSort` on JMAP, `NO [CANNOT]` on
+  IMAP), never answered in part. A session without keys still cannot search the account's mail.
 - **More JMAP methods need the keys.** For a key account, every method that returns or takes an
   Email or thread id, or whose answer depends on the threads, needs the account's keys:
   `Email/query`, `/queryChanges` and `/changes`, `Thread/*` and `Mailbox/get`, which release 3
@@ -104,8 +113,8 @@ refusals), and every message was a thread of its own.
   and `Blob/lookup`. A session without keys (WebSocket, EventSource, a token without a secret)
   keeps push, mailbox listing and management, flag and mailbox updates, identities, vacation
   responses and Sieve scripts.
-- **Rebuilds.** A lost or unreadable index is rebuilt from the mail at the next keyed request
-  and starts a new identity epoch: JMAP Email sync states issued before it are refused
+- **Rebuilds.** A lost or unreadable index is rebuilt from the mail at the next keyed mail
+  request and starts a new identity epoch: JMAP Email sync states issued before it are refused
   (`cannotCalculateChanges`) and the client resyncs, and IMAP `EMAILID` and `THREADID` values
   can change with no `CHANGEDSINCE` signal. The loss of the content part alone rebuilds the
   content without changing thread identity. A key account set up before this release has no
@@ -125,11 +134,19 @@ account's JMAP calendar methods were refused and its OAuth tokens carried no key
   characters longer than upstream's, and the HTTP layer opens the account's keys from it on
   every request. A per-account token record (principal field 153) holds the master key wrapped
   under keys derived from those secrets. The device-code flow and the Bearer logins of IMAP,
-  POP3, SMTP and ManageSieve stay keyless. A token that carries a secret whose entry is gone,
-  expired or does not open is refused with 401, as an invalid token is, and the refusal is not
-  counted for banning; a client that refreshes on 401 gets a new entry. A keyed sign-in's cached
-  entry ends shortly before its token's signed expiry, so a client should refresh before
-  `expires_in`.
+  POP3, SMTP and ManageSieve stay keyless. At a cache miss, a token that carries a secret whose
+  entry is gone, expired or does not open is refused with 401, as an invalid token is, and the
+  refusal is not counted for banning. On a cache hit the token record is not read, so an access
+  token whose entry was dropped (a grant holds at most four access entries, each refresh adds
+  one, and the fifth drops the one expiring earliest) keeps working on a node that has it cached
+  until that cache entry ends, while other nodes refuse it. A keyed cache entry lasts at most the
+  token's remaining signed lifetime less one second (an access token's is an hour by default)
+  and the key cache's bounds (`ZA_KEY_IDLE_SECS`, 900 s; `ZA_KEY_MAX_AGE_SECS`, 3600 s), so a
+  client should refresh before `expires_in`. A credential change and a grant's deletion (a
+  sign-out, a revocation, a 33rd sign-in's eviction) end cached access at once on that node and
+  on the others by the cluster broadcast. A client that refreshes on 401 gets a new entry while
+  its refresh entry exists; a refresh whose entry is gone deletes the grant and answers
+  `invalid_grant`, and the user signs in again.
 - **When browser sessions end.** Only a password change, a recovery or a second-factor change
   ends a key account's browser sessions. A grant's deletion (a sign-out that revokes it) ends
   that grant's sessions, at once on the node that deletes it and on the others by the cluster
@@ -141,13 +158,16 @@ account's JMAP calendar methods were refused and its OAuth tokens carried no key
 - **JMAP calendars.** Served to the owner, and to a grantee of a shared key calendar under the
   rules CalDAV applies: `Calendar/get`, `/changes`, `/query` and `/set`; `CalendarEvent/get`,
   `/query`, `/queryChanges`, `/set` and `/changes`, and `/parse` for the keyed owner;
-  `ParticipantIdentity/get`, `/changes` and the default switch of `/set`. A JMAP write stores
-  what the CalDAV write of the same tree stores. Each object of a `/set` is its own commit: a
-  store error answers that object and every later one with "try again", and the earlier ones
-  stay committed. Still refused: granting a share through JMAP (`shareWith`; sharing stays on
-  the account page), `CalendarEventNotification/*`, `CalendarEvent/copy`, per-user event data,
-  drafts, participant-visibility flags, object metadata, inline attachment blobs, and identity
-  creates, updates and destroys.
+  `ParticipantIdentity/get`, `/changes` and the default switch of `/set`. A JMAP write stores what
+  the CalDAV write of the same tree stores. A `/set` processes creates, then updates, then
+  destroys, and commits each stored event (or calendar) on its own; when the call holds an
+  occurrence id, the updates and occurrence removals of one stored event share its commit. A store
+  error answers every id of that commit and every object processed after it ("The server could not
+  complete this change, try again."), and the objects committed before it stay. Still refused:
+  granting a share through JMAP (`shareWith`; sharing stays on the account page),
+  `CalendarEventNotification/*`, `CalendarEvent/copy`, per-user event data, drafts,
+  participant-visibility flags, object metadata, inline attachment blobs, and identity creates,
+  updates and destroys.
 - **Invitations.** A keyed JMAP request with a calendar call imports the account's pending
   invitations first, as a CalDAV request does. On both protocols only password clients, app
   passwords and tokens whose scope admits calendars import them, so an account used only through
@@ -159,19 +179,25 @@ account's JMAP calendar methods were refused and its OAuth tokens carried no key
   find an event whose details it cannot read.
 - **Default alerts.** A create or update with `useDefaultAlerts: true` writes the calendar's
   current default alerts into the event by value; the `/set` answer does not carry them.
-- **Calendar deletes.** Destroying a calendar through JMAP sends cancellations for its events, as
-  a CalDAV collection `DELETE` does. On RocksDB, SQLite, PostgreSQL and MySQL a key account's
-  calendar delete, on either protocol, removes the calendar and its events in one transaction
-  (pinned by a test on RocksDB and SQLite; for PostgreSQL and MySQL read, not run). A calendar
-  too large for one transaction (more than 5,000,000 bytes of deletions by the server's count) is
-  refused before any cancellation is sent (JMAP `forbidden`, CalDAV 403): delete some of its
-  events first. A delete that meets a concurrent write, or an event moved while it was prepared,
-  answers "try again" (JMAP `forbidden`, CalDAV 503), possibly after its cancellations went out;
-  a retry converges. FoundationDB, read replicas and the bootstrap store keep a chunked, unfenced
+- **Calendar deletes.** A key account's calendar delete, through JMAP (a non-empty calendar needs
+  `onDestroyRemoveEvents: true`, otherwise `calendarHasEvent`) or a CalDAV collection `DELETE`,
+  removes every name an event has under the calendar. An event that also has a name in another
+  calendar is kept, with its alarms rescheduled, and sends no scheduling message. Only the events
+  the calendar held alone are deleted, and only they send messages: a CANCEL for an event the
+  account organizes, a declining REPLY for one it attends, for scheduling objects whose range
+  ends after now and while the account's scheduling is not denied. On RocksDB, SQLite,
+  PostgreSQL and MySQL the delete, these changes included, is one transaction (pinned by a test
+  on RocksDB and SQLite; for PostgreSQL and MySQL read, not run). A calendar too large for one
+  transaction (more than 5,000,000 bytes of deletions by the server's count) is refused before
+  any scheduling message is sent (JMAP `forbidden`, CalDAV 403): delete some of its events
+  first. A delete that meets a concurrent write, or an event moved while it was prepared,
+  answers "try again" (JMAP `forbidden`, CalDAV 503), possibly after its messages went out; a
+  retry converges. FoundationDB, read replicas and the bootstrap store keep a chunked, unfenced
   delete.
-- **Sharing and sync.** A shared calendar's colour is carried in each principal's sealed
-  personal bundle; a new grantee's starts as the owner's. A grantee cannot delete or change
-  through JMAP an event whose details are private to its owner. A grantee's event state from
+- **Sharing and sync.** A shared calendar's JMAP `color` preference is carried in each principal's
+  sealed personal bundle; a new grantee's starts as the owner's. CalDAV's `calendar-color` stays a
+  separate property, one value for all principals. A grantee cannot delete or change through JMAP
+  an event whose details are private to its owner. A grantee's event state from
   `CalendarEvent/get` or `/query`, or from `/changes` and `/queryChanges` in one page or from an
   exact state, lies at or above the latest sharing change, so its next sync is served; a sync
   paged from the initial state can still end below one (issue #93).
@@ -250,13 +276,20 @@ Release 6 ([design section 2](docs/superpowers/specs/2026-11-13-zero-access-jmap
 ### Operator actions
 
 - **A store carried over from `0.3.0-beta.1`** (see "Upgrade and rollback"). Upstream 1.0.2
-  resets per-account encryption at rest to `Disabled`: reselect the public key in each affected
-  account's encryption settings to resume encrypting its new mail (the setting is inert for key
-  accounts). Server-wide encryption at rest moved to `atRestEnable` in the new `Encryption`
-  settings, enabled by default, so a server that had disabled it disables it again. Start once
-  with `STALWART_UPDATE_ROLE_PERMISSIONS=true` to add the default-role permissions introduced
-  after 1.0.0, then remove the variable. Third-party clients that manage app passwords, API keys
-  or account settings need upstream's new OAuth scopes. See the [upstream changelog](CHANGELOG.md).
+  removed the per-account cipher choice, and 1.0.3 reads each account's earlier encryption
+  settings as `Disabled`, losing them whole, the account's `encryptOnAppend` and
+  `allowSpamTraining` included (the setting is inert for key accounts). For each account that had
+  encryption at rest, reselect the public key, which creates fresh settings with both flags off;
+  set `encryptOnAppend` again where append encryption was in effect (the server's and the
+  account's flags both on), since IMAP `APPEND` and non-draft JMAP `Email/set` creates and
+  `Email/import` are encrypted only with it, and `allowSpamTraining` again where it was on, since
+  encrypted mail feeds spam training only with it. Upstream 1.0.2 replaced the server's
+  `Email.encryptAtRest` with `atRestEnable` in the new `Encryption` settings, enabled by default,
+  so a server that had disabled it disables it again, and removed the server's
+  `Email.encryptOnAppend`. Start once with `STALWART_UPDATE_ROLE_PERMISSIONS=true` to add the
+  default-role permissions introduced after 1.0.0, then remove the variable. Third-party clients
+  that manage app passwords, API keys or account settings need upstream's new OAuth scopes. See
+  the [upstream changelog](CHANGELOG.md).
 - **Search sizing.** Size the `ZA_SEARCH_*` environment variables (defaults and meanings in the
   developer guide) for the host: `ZA_SEARCH_MEM_MB` (1536 MiB) budgets loaded content per
   process, `ZA_SEARCH_THREAD_MEM_MB` (256 MiB, soft) loaded threads, and
@@ -270,15 +303,18 @@ Release 6 ([design section 2](docs/superpowers/specs/2026-11-13-zero-access-jmap
   `ZA_SEARCH_MEM_MB`, or `ZA_SEARCH_SEGMENTS` outside 2 to 255.
 - **After a blob-store fault.** If the blob store wrongly answered "not found", repair it, then
   run the per-account reindex task (`Task::AccountMaintenance`, type `Reindex`); for a key
-  account it resets the search index, the next keyed request rebuilds it, and clients resync.
+  account it resets the search index, the next keyed mail request rebuilds it, and clients
+  resync.
 - **Browser sign-in.** The release adds no setting. A browser client signs a key account in
-  through upstream's OAuth: the reference client's checklist registers it as an `OAuthClient`
-  with the `authorizationCode` and `refreshToken` grant types and scopes that cover calendars,
-  and allows its origin through upstream's CORS setting (`usePermissiveCors` on `Http`);
-  `ZA_ACCOUNT_PAGE_ORIGIN` governs only `/api/vault/*`. That setup has not been run against a
-  client. How long a browser stays signed in is upstream's refresh-token lifetime. The
-  maintenance purge removes expired entries, superseded refresh entries and the entries of
-  grants destroyed through the registry from token records.
+  through upstream's OAuth: the reference client's checklist registers it as an `OAuthClient` with
+  the `authorizationCode` and `refreshToken` grant types and scopes that cover calendars, and its
+  local test turns on `Http.usePermissiveCors`, the wildcard option: it adds
+  `Access-Control-Allow-Origin: *` to every HTTP response but `/api/vault/*`, allowing every
+  origin, server-wide. An origin-specific header is possible only through upstream's
+  `Http.responseHeaders`, also server-wide. `ZA_ACCOUNT_PAGE_ORIGIN` governs only `/api/vault/*`.
+  That setup has not been run against a client. How long a browser stays signed in is upstream's
+  refresh-token lifetime. The maintenance purge removes expired entries, superseded refresh
+  entries and the entries of grants destroyed through the registry from token records.
 - **Tell key-account users** that after the upgrade each existing OAuth token of a key account is
   refused once and they sign in again, and that ending every browser session takes a password
   change, a recovery or a second-factor change, or revoking the grants.
@@ -290,10 +326,11 @@ Against `0.3.0-beta.1`, in the order of issue #74:
 - **Registry types, properties and defaults:** none from the fork. Upstream `v1.0.2` and `v1.0.3`
   change the generated schema and defaults: among others the `SymmetricKey`,
   `ExternalPublicKey` and `SmimeTrustAnchor` objects, the `Encryption` settings (`atRestEnable`,
-  the per-account `encryptOnAppend`), `Application.oauthScopes`, an OIDC directory's
-  `trustedProvider`, the removal of the per-account cipher choice, and new permissions in the
-  default roles. See the upstream changelog. No machine-readable registry schema is published
-  with this release.
+  replacing the server's `Email.encryptAtRest`), the removal of the server's
+  `Email.encryptOnAppend` (each account's `EncryptionSettings` keeps its own),
+  `Application.oauthScopes`, an OIDC directory's `trustedProvider`, the removal of the
+  per-account cipher choice, and new permissions in the default roles. See the upstream
+  changelog. No machine-readable registry schema is published with this release.
 - **Environment variables and flags:** the thirteen `ZA_SEARCH_*` variables (release 7) and
   upstream's `STALWART_UPDATE_ROLE_PERMISSIONS`. Release 6 adds none. No command-line flag
   changes.
@@ -326,13 +363,13 @@ and the records say:
 - Releases 6 and 7 change no stored struct layout. They add principal fields 152 (the search
   manifest) and 153 (the token record) and principal-linked search blobs, written on demand.
 - A key account set up before release 7 has no search manifest (setup writes an empty one from
-  this release on). Its first keyed request treats the absence as loss and rebuilds the index
-  from the account's mail, over as many keyed requests as the mail needs. Until the index is
-  current, content searches answer "not available right now" and unindexed messages thread
-  alone; JMAP Email sync states issued before the rebuild are refused (`cannotCalculateChanges`)
-  and clients resync, and IMAP `EMAILID` and `THREADID` values can change. The za suite
-  exercises this path by deleting the manifest of an account the same build set up (an empty
-  one, and one holding mail); no test starts from a store `0.3.0-beta.1` wrote.
+  this release on). Its first keyed mail request treats the absence as loss and rebuilds the
+  index from the account's mail, over as many keyed mail requests as the mail needs. Until the
+  index is current, content searches answer "not available right now" and unindexed messages
+  thread alone; JMAP Email sync states issued before the rebuild are refused
+  (`cannotCalculateChanges`) and clients resync, and IMAP `EMAILID` and `THREADID` values can
+  change. The za suite exercises this path by deleting the manifest of an account the same build
+  set up (an empty one, and one holding mail); no test starts from a store `0.3.0-beta.1` wrote.
 - Each key account's existing OAuth token is refused once (its credential version changes), and
   the user signs in again.
 
@@ -340,8 +377,10 @@ Back up the complete database, blob store and configuration, and verify the rest
 replacing the binary. A rollback to `0.3.0-beta.1` restores that backup and loses every write
 made after the upgrade; this release does not claim that a `0.3.0-beta.1` binary reads data
 `0.4.0-beta.1` has written. One case is known: a binary built before release 6 refuses a shared
-calendar's personal bundle that holds a colour, so it cannot read a coloured shared calendar, and
-neither can such a node in a cluster that mixes versions.
+calendar's personal bundle that holds a JMAP `color` preference (set through JMAP, or copied from
+the owner's at a grant), so it cannot read that calendar for each principal whose own bundle
+holds one, and neither can such a node in a cluster that mixes versions. A colour set only by a
+CalDAV client (`calendar-color`) does not block a rollback.
 
 From `0.2.0-beta.1`: as above, together with the `0.3.0-beta.1` entry's notes on release 5; not
 tested either. From `0.1.x`: not supported; moving is the fresh-store rebuild the `0.2.0-beta.1`
@@ -361,16 +400,26 @@ Release 7:
   not verified. Of the mutation sample, M16, M23 and M48 survived and later gained stronger
   tests that no faulty variant was run against, M29b was not executed, and the qualification
   report lists the other exceptions and the anomalies whose causes were not established.
-- Recorded differences from an ordinary account (design section 7.5): freshness, since mail is
-  indexed only during sessions; the "not available" refusal; a message whose 16 nearest
-  referenced ancestors are absent while an older one is present threads alone; a message deleted
-  before any keyed request indexed it gives no threading evidence; a rebuild invalidates every
-  JMAP Email sync state, and IMAP `CHANGEDSINCE` never surfaces a reassigned `EMAILID` or
-  `THREADID`; every publishing pass adds an `Email/changes` update of a witness message, an
-  unsolicited IMAP `FETCH (FLAGS ...)` with an unchanged MODSEQ and a HIGHESTMODSEQ that advances
-  with no flag changed, and `Mailbox/changes` then reports every mailbox; a keyless `Email/set`
-  update or destroy accepts a stale id prefix; `EmailSubmission/get` returns a submission's
-  current `threadId`.
+- Parity with an ordinary account holds when each delivery, deletion and thread merge settles
+  before the next thread-affecting operation (design section 7.5), with these recorded
+  differences: freshness, since mail is indexed only during sessions; the "not available"
+  refusal; each message keeps at most 16 distinct identifiers (its Message-ID, In-Reply-To,
+  References from the nearest back, then Resent-Message-ID), so at most 15 go to ancestors, and
+  a message threads alone when the only link to a present relative is an identifier beyond
+  either message's 16, where an ordinary account keeps every identifier (but scans only the 256
+  newest messages of a subject at delivery, with a later merge task), so the difference shows
+  only with long reference chains or extra identifiers; a key account keeps one Message-ID value
+  per message where upstream matches every value, so a reply naming a message's other
+  Message-ID threads on an ordinary account but not on a key account (rare; found in this
+  release's review, not in design 7.5); a message deleted before any keyed mail request indexed
+  it gives no threading evidence; a rebuild invalidates every JMAP Email sync state, and IMAP
+  `CHANGEDSINCE` never surfaces a reassigned `EMAILID` or `THREADID`; every publishing pass adds
+  an `Email/changes` update of a witness message, an unsolicited IMAP `FETCH (FLAGS ...)` with an
+  unchanged MODSEQ and a HIGHESTMODSEQ that advances with no flag changed, and `Mailbox/changes`
+  then reports every mailbox; a keyless `Email/set` update or destroy accepts a stale id prefix;
+  `EmailSubmission/get` returns a submission's current `threadId`. Design section 7.5 lists the
+  rest (the thread-window superset, the one-response bound between nodes, `Initial` rendering
+  every message as created, the truncation gap case).
 - Latency: a pass finishes its compaction and commit before the wait deadline is checked again,
   so a request can take longer than `ZA_SEARCH_WAIT_SECS`. The first content search after a
   restart or eviction reads the sealed content: on 30,000 messages, about 23 to 26 s in the
@@ -385,8 +434,8 @@ items still open for the project owner):
 - **#92:** a calendar too large for one transaction is refused until some of its events are
   deleted; FoundationDB, read replicas and the bootstrap store keep the chunked, unfenced
   delete, where a failed later chunk leaves the earlier chunks' events deleted; and a delete
-  refused after its cancellations went out leaves attendees holding a cancellation for an event
-  that still exists until the retry.
+  refused after its scheduling messages went out leaves attendees holding a cancellation (or an
+  organizer holding a decline) for an event that still exists until the retry.
 - **#93:** a sync paged from the initial state can end below a sharing change, and its next call
   is refused until an event is written, the client syncs in one page, or it takes its state from
   `CalendarEvent/get` or `/query`.
