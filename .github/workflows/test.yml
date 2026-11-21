@@ -614,13 +614,6 @@ jobs:
     env:
       STORE: RocksDb
       RUST_MIN_STACK: "16777216"
-      # The coverage gate compares line counts, and the compiler's coverage
-      # mapping decides them: two hosted-runner images with different stable
-      # compilers measured the cohort half a point apart. The gates therefore
-      # measure with one named compiler, the one the deployed product was
-      # built with. Change it deliberately, together with the product's; the
-      # other jobs keep the runner's stable.
-      RUSTUP_TOOLCHAIN: "1.99.1"
       # The instrumented and plain builds share one target directory outside
       # the checkout (the hosted runner had 88 GB free on its disk).
       CARGO_TARGET_DIR: /mnt/target
@@ -637,12 +630,11 @@ jobs:
           df -h / /mnt
 
       - name: Install cargo-llvm-cov
-        # RUSTUP_TOOLCHAIN (the job's env) selects the pinned compiler for
-        # every cargo and rustc of this job, the net's and the captures'
-        # included; it is installed here with the coverage tools, and its
-        # version is printed so that a gate's figures name their compiler.
+        # The job uses the runner's stable Rust, as the other jobs do. The
+        # compiler's coverage mapping decides the gate's line counts, so its
+        # version is printed: a gate's figures then name their compiler.
         run: |
-          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component llvm-tools-preview --no-self-update
+          rustup component add llvm-tools-preview
           rustc --version --verbose
           cargo install cargo-llvm-cov --version 0.9.1 --locked
 
