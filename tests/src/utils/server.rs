@@ -58,7 +58,7 @@ use smtp::{
     queue::{QueuedMessage, manager::SpawnQueue, spool::QUEUE_REFRESH},
     reporting::scheduler::SpawnReport,
 };
-use std::{collections::VecDeque, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::VecDeque, net::Ipv4Addr, path::PathBuf, sync::Arc};
 use store::{
     Deserialize, IterateParams, RegistryStore, Store, ValueKey,
     registry::{RegistryQuery, bootstrap::Bootstrap, write::RegistryWrite},
@@ -196,19 +196,33 @@ impl TestServerBuilder {
     }
 
     pub async fn with_listener(
-        mut self,
+        self,
         protocol: NetworkListenerProtocol,
         name: &str,
         port: u16,
         tls_implicit: bool,
     ) -> Self {
+        self.with_listener_at(
+            protocol,
+            name,
+            (Ipv4Addr::LOCALHOST, port).into(),
+            tls_implicit,
+        )
+        .await
+    }
+
+    pub async fn with_listener_at(
+        mut self,
+        protocol: NetworkListenerProtocol,
+        name: &str,
+        address: std::net::SocketAddr,
+        tls_implicit: bool,
+    ) -> Self {
         if protocol == NetworkListenerProtocol::Http {
-            self.http_listener_port = port;
+            self.http_listener_port = address.port();
         }
         self.insert_object(NetworkListener {
-            bind: Map::new(vec![
-                SocketAddr::from_str(&format!("0.0.0.0:{port}")).unwrap(),
-            ]),
+            bind: Map::new(vec![SocketAddr(address)]),
             name: name.to_string(),
             protocol,
             use_tls: true,
@@ -222,6 +236,32 @@ impl TestServerBuilder {
     pub async fn with_object(self, object: impl Into<Object>) -> Self {
         self.insert_object(object).await;
         self
+    }
+
+    pub(crate) async fn assert_listeners_bind_to_loopback(&self) {
+        let registry = &self.bootstrap.registry;
+        let listeners = registry
+            .query::<Vec<Id>>(RegistryQuery::new(ObjectType::NetworkListener))
+            .await
+            .unwrap();
+
+        assert!(!listeners.is_empty());
+        for id in listeners {
+            let listener = registry
+                .object::<NetworkListener>(id)
+                .await
+                .unwrap()
+                .unwrap();
+            let [bind] = listener.bind.as_slice() else {
+                panic!("{} should bind to one address", listener.name);
+            };
+            assert_eq!(
+                bind.as_ref().ip(),
+                Ipv4Addr::LOCALHOST,
+                "{} should bind to IPv4 loopback",
+                listener.name,
+            );
+        }
     }
 
     /// Sets the cache swap tier. 1.0 fixes the tier at boot, so a suite that
