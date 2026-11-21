@@ -19,7 +19,8 @@ later work and what stays open; the last section points to the rest.
   had finished and without the reference client's checklist having been run; both were stated to
   him. The branch `release6-jmap-calendars` sat on `ade47a9ae`. The head of the
   code is `bea8a39fb` (last product change `20ca477f4`); the commits after it are the gates'
-  toolchain pin `6131cc902` and records. `git log --oneline ade47a9ae..f559febdb` lists every
+  toolchain pin `6131cc902` and records. After the merge the pin was removed (`cd6f5f417`, "CI
+  and the gates"). `git log --oneline ade47a9ae..f559febdb` lists every
   commit; the fix waves' commits are in "The pull request's findings".
 - **Command labels**, as the plan's matrices used them (the suites with
   `STORE=RocksDb RUST_MIN_STACK=16777216`): ZA is `cargo test -p tests za::za_tests -- --nocapture`
@@ -134,18 +135,27 @@ returns to an earlier value.
   Upstream Suites had passed; the rest was cancelled), and its manual run was cancelled by the
   controller as superseded by the pin. No complete CI result exists for that commit.
 - (e) The fifth push (`68a1cc2fb..f559febdb`, 2026-11-21) carried the gates' toolchain pin
-  (`6131cc902`) and its record. In the manually dispatched run on `f559febdb` the pinned gates
-  job's install step succeeded. That run had not finished when this was written; nothing is
-  claimed here for the gates on `f559febdb`.
-- **The toolchain pin** (item 26): decided by the project owner on 2026-11-21, the version and
-  its reason his: the gates job measures with Rust 1.99.1, the compiler the deployed product was
-  built with (the controller had named the current stable, 1.100.0). That the pin is made in this
-  pull request, in the gates job only, is the controller's ruling; cost if wrong: he meant a wider
-  pin or a follow-up, and one commit extends or reverts it. `6131cc902` sets
-  `RUSTUP_TOOLCHAIN: "1.99.1"` in the gates job only, installs it with `llvm-tools-preview` and
-  prints `rustc --version --verbose`; the other jobs keep the runner's stable. Limits: the
-  baseline file does not record the compiler it was measured with, and the gate's two earlier CI
-  results were measured with two different compilers. Item 27 is open.
+  (`6131cc902`) and its record. The manually dispatched run on `f559febdb` was started with the
+  pin in place, and its gates job's install step succeeded; when it finishes, its figures are one
+  more measurement on Rust 1.99.1. It had not finished when this was written; nothing is claimed
+  here for the gates on `f559febdb`.
+- **The toolchain pin, made and removed.** On 2026-11-21, before the merge, the project owner
+  decided item 26: the gates job measured with Rust 1.99.1, the compiler the deployed product was
+  built with (`6131cc902`, merged with pull request #90; the controller had named the current
+  stable, 1.100.0). On 2026-11-21, after the merge, he decided to remove that pin, since upstream
+  pins no toolchain; this reverses item 26. The change, `cd6f5f417` (the gates job of
+  `.github/workflows/test.yml` only): the job's `RUSTUP_TOOLCHAIN` entry and the toolchain install
+  are gone, and the job uses the runner's stable Rust again, as the other jobs do. Compared with
+  the workflow before the pin, one thing remains: the step "Install cargo-llvm-cov" prints the
+  compiler's version (`rustc --version --verbose`). `scripts/tests/ci_steps.py` reports 0
+  differences and `test_gates.py` passes, before and after.
+- **What the gate's figures depend on.** The coverage gate again moves with the compiler the
+  runner's image carries. The two earlier CI results show the size of that: the cohort measured
+  about half a point apart on Rust 1.99.1 (`68d905131`) and Rust 1.100.0 (`8e05a6b44`), and on
+  1.100.0 the gate passed with 62 and 49 lines to spare. The baseline file does not record the
+  compiler it was measured with.
+- **Item 27** (pin the release workflow to the gates' version) is closed: with no pin in the
+  gates job there is nothing to align. It was never made.
 - **The CI rerun** (item 25, approved by the project owner on 2026-11-20): `bea8a39fb` gives the
   key-mode JMAP step the one-rerun form of its plain-mode twin, and its entry in
   `scripts/tests/ci_steps.py` gains `rerun="same"`. The cost the controller named: a key-mode
@@ -241,8 +251,10 @@ returns to an earlier value.
   - item 25: CI's key-mode JMAP step reruns once (`bea8a39fb`);
   - the third round pushed (`68d905131..8e05a6b44`).
 - **2026-11-21**: the fourth round pushed (`8e05a6b44..68a1cc2fb`); item 26, the gates measure
-  with Rust 1.99.1; pull request #90 merged ("Status and what can be claimed"); this
-  consolidation asked for.
+  with Rust 1.99.1 (reversed after the merge, below); pull request #90 merged ("Status and what
+  can be claimed"); this consolidation asked for.
+- **2026-11-21, after the merge**: the gates' toolchain pin removed, since upstream pins no
+  toolchain (`cd6f5f417`); this reverses item 26.
 
 ## Rulings that bind later work
 
@@ -439,6 +451,18 @@ process (routing, review order, reruns of a run) are in the history.
 - **The 500 ms DAV client timeout** (`tests/src/utils/webdav.rs:100`): a helper timeout in a
   module the round did not touch, at a recorded load spike, rerun once (fix round 1 of the first
   review; row 10 of the second matrix pass).
+
+### The gates' toolchain
+
+- **The pin's scope** (history): that item 26's pin was made in pull request #90, in the gates job
+  only, was the controller's ruling; the pin was removed after the merge.
+- **The compiler's version line stays.** Keeping `rustc --version --verbose` in the step "Install
+  cargo-llvm-cov" after the pin's removal is the controller's ruling: it pins nothing, and a
+  gate's figures then name their compiler. Cost if wrong: he wanted it removed too; it is one
+  line.
+- **Where the removal is made.** The removal is made in the consolidation pull request, as a
+  commit of its own (the controller's ruling). Cost if wrong: he wanted a separate pull request
+  for a CI change.
 
 ### Tests that must keep their form
 
@@ -1016,9 +1040,9 @@ decisions"), each with the controller's recommendation where one was made:
   updates reach the same end. Recommended: accept, or a follow-up.
 - 17. FC2-15: `shareWith` is refused whatever its value, `null` and `{}` included. Recommended:
   let the reference client's checklist decide (it is in the checklist).
-- 27. The release workflow (`.github/workflows/product-build.yml`) installs "stable", so the next
-  product build takes whatever stable is then, and the gates' compiler would no longer be the
-  product's. Proposed: pin it to the gates' version and change both together. Not made.
+
+Item 27 (pin the release workflow to the gates' version) has left this list: it is closed, since
+with no pin in the gates job there is nothing to align ("CI and the gates"); it was never made.
 
 Proposed spec amendments not made (spec 3.3's lines for FC1-1, the UID lease and a non-member's
 effective privacy, which states FC2-2's difference from CalDAV, and section 10's `code` masking,
