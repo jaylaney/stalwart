@@ -17,11 +17,12 @@ later work and what stays open; the last section points to the rest.
 - **Merged.** Pull request #90 was merged by the project owner on 2026-11-21, merge commit
   `04145d586` on `main`, at head `f559febdb`. He merged before the pinned gates run on that head
   had finished and without the reference client's checklist having been run; both were stated to
-  him. The branch `release6-jmap-calendars` sat on `ade47a9ae`. The head of the
-  code is `bea8a39fb` (last product change `20ca477f4`); the commits after it are the gates'
-  toolchain pin `6131cc902` and records. After the merge the pin was removed (`cd6f5f417`, "CI
-  and the gates"). `git log --oneline ade47a9ae..f559febdb` lists every
-  commit; the fix waves' commits are in "The pull request's findings".
+  him. That run has since finished: both gates passed ("CI and the gates"). The branch
+  `release6-jmap-calendars` sat on `ade47a9ae`. The head of the code is `bea8a39fb` (last
+  product change `20ca477f4`); the commits after it are the gates' toolchain pin `6131cc902` and
+  records. After the merge the pin was removed (`cd6f5f417`, "CI and the gates").
+  `git log --oneline ade47a9ae..f559febdb` lists every commit; the fix waves' commits are in "The
+  pull request's findings".
 - **Command labels**, as the plan's matrices used them (the suites with
   `STORE=RocksDb RUST_MIN_STACK=16777216`): ZA is `cargo test -p tests za::za_tests -- --nocapture`
   with `BLOB_STORE` unset, ZA-FS the same with `BLOB_STORE=FileSystem`; SWAP is
@@ -48,8 +49,9 @@ later work and what stays open; the last section points to the rest.
   `calendar_state_slot_errors`, `precondition_matrix`, the codec and parser unit tests, and
   `query_changes_paged_origin` for `/queryChanges` from both origins.
 - **The plan's five review-focus conditions**, each passing:
-  1. the first invitation keeps the browser signed in (`scheduling::first_invitation_and_the_session`;
-     limit R31-8: it shows that a vault write happened, not that it was the pin's rewrap);
+  1. the first invitation keeps the browser signed in
+     (`scheduling::first_invitation_and_the_session`; limit R31-8: it shows that a vault write
+     happened, not that it was the pin's rewrap);
   2. a native client's dead properties survive a browser move
      (`pipeline::placement_reseals_event_container`; with the reseal removed the grantee's
      readback failed);
@@ -85,7 +87,7 @@ returns to an earlier value.
 | `68d905131`, 2026-11-20 | every job passed | key-mode JMAP failed (b); both gates passed (c) |
 | `8e05a6b44`, 2026-11-20 | every job passed | every job passed, both gates (c) |
 | `68a1cc2fb`, 2026-11-21 | cancelled (d) | cancelled (d) |
-| `f559febdb`, 2026-11-21 | every job passed | Automation Tests failed (a); gates not finished (e) |
+| `f559febdb`, 2026-11-21 | every job passed | Automation Tests (a) and the net's SMTP step failed (e); both gates passed (c) |
 
 - The runs of the Test workflow, by id (`https://github.com/jaylaney/stalwart/actions/runs/<id>`):
   pull-request runs 44189371288 (`dbd2fccc8`), 44587362075 (`d6929c89e`), 44759113100
@@ -130,15 +132,29 @@ returns to an earlier value.
     in files wave E did not change too (`crates/common/src/za/tokens.rs` 775 to 727 lines). The
     controller's classification: a change of the measurement with a newer compiler, not coverage
     lost by wave E. Cost if wrong: a real loss read as a toolchain effect.
+  - `f559febdb` (run 44924688662; the gates job 2 h 49 min), verbatim from the job's log:
+    `cohort full: lines 31455/32488 (96.82%) against 17821/18490 (96.38%): pass` and
+    `cohort runtime: lines 18353/19232 (95.43%) against 10646/11246 (94.66%): pass`, 142 lines
+    above the 31313 the full figure needs and 147 above the 18206 the runtime figure needs.
+    Inventory gate passed. The job printed its compiler, as the pin's commit made it do:
+    `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, LLVM 23.1.1; this is the first gates result whose
+    compiler is read from the job's own log.
 - (d) `68a1cc2fb` (wave F, the CI rerun and their record): its pull-request run was cancelled by
   the workflow's concurrency rule when the fifth push arrived (Check Style, Unit Tests, Test and
   Upstream Suites had passed; the rest was cancelled), and its manual run was cancelled by the
   controller as superseded by the pin. No complete CI result exists for that commit.
 - (e) The fifth push (`68a1cc2fb..f559febdb`, 2026-11-21) carried the gates' toolchain pin
-  (`6131cc902`) and its record. The manually dispatched run on `f559febdb` was started with the
-  pin in place, and its gates job's install step succeeded; when it finishes, its figures are one
-  more measurement on Rust 1.99.1. It had not finished when this was written; nothing is claimed
-  here for the gates on `f559febdb`.
+  (`6131cc902`) and its record. The manually dispatched run on `f559febdb` (44924688662) was
+  started with the pin in place. Its conclusion is "failure", from two jobs: Upstream Suites, at
+  the DKIM selector check (a); and the gates job, whose step "Coverage net (19 steps)" failed
+  because the net's `smtp` step failed twice: `smtp::queue::retry::queue_retry` failed in the
+  whole run and again when the net reran it by name. Every other step of the net passed, and all
+  19 profiles were merged. The steps after the net ran and passed: the listings, the executed
+  functions, the inventory gate and the coverage gate (c). The controller's classification of
+  the `queue_retry` failure: upstream's timing-flaky SMTP test, the pattern recorded for it under
+  "Failures classified as timing" (it has failed in a whole run and again alone); the branch
+  changes no SMTP code, and the pull request's own run passed its SMTP step on the same commit.
+  Cost if wrong: an SMTP queue regression passed as a timing failure.
 - **The toolchain pin, made and removed.** On 2026-11-21, before the merge, the project owner
   decided item 26: the gates job measured with Rust 1.99.1, the compiler the deployed product was
   built with (`6131cc902`, merged with pull request #90; the controller had named the current
@@ -152,8 +168,13 @@ returns to an earlier value.
 - **What the gate's figures depend on.** The coverage gate again moves with the compiler the
   runner's image carries. The two earlier CI results show the size of that: the cohort measured
   about half a point apart on Rust 1.99.1 (`68d905131`) and Rust 1.100.0 (`8e05a6b44`), and on
-  1.100.0 the gate passed with 62 and 49 lines to spare. The baseline file does not record the
-  compiler it was measured with.
+  1.100.0 the gate passed with 62 and 49 lines to spare. The run on `f559febdb`, on Rust 1.99.1,
+  measured the totals of the earlier 1.99.1 run again (upstream's product 398,456 lines there and
+  in the run on `68d905131`, against 387,958 in the run on `8e05a6b44`, whose image carried Rust
+  1.100.0), and the margins are back to about 140 lines. This confirms the controller's earlier
+  classification that the smaller margins on `8e05a6b44` were a change of the measurement and not
+  lost coverage. Since the pin is removed after the merge, the next gates run measures with the
+  runner's stable again. The baseline file does not record the compiler it was measured with.
 - **Item 27** (pin the release workflow to the gates' version) is closed: with no pin in the
   gates job there is nothing to align. It was never made.
 - **The CI rerun** (item 25, approved by the project owner on 2026-11-20): `bea8a39fb` gives the
@@ -312,7 +333,8 @@ process (routing, review order, reruns of a run) are in the history.
   earlier in that rare case.
 - **C4646937244 (wave F).** `put_access` takes the write's time: an access entry already expired
   at it is not stored and removes none; the refresh entry is still written.
-- **P5's cost** (recorded by the final review's re-review): after any grant deletion of a key
+- **The cost of evicting an account's resident keys when one of its grants is deleted** (P5 of
+  the final review's fix wave, recorded by its re-review): after any grant deletion of a key
   account, each Basic CalDAV client of the account pays one Argon2 verification on its next
   request and another browser session one record read; the grant arm evicts the key cache, not
   the search index cache.
@@ -396,8 +418,8 @@ process (routing, review order, reruns of a run) are in the history.
 - **Task 39's F2 and F3.** The share endpoints write the ACL through upstream's builder, which logs
   one share notification per entry change with ids and rights only (Task 39's F2). A view
   grantee's empty `Calendar/set` patch is `forbidden`: the context is taken with `Acl::Modify`
-  first (Task 39's F3); if
-  wrong, an empty update to a view-level shared calendar errors. Task 39's F1 is open item 10.
+  first (Task 39's F3); if wrong, an empty update to a view-level shared calendar errors. Task
+  39's F1 is open item 10.
 - **FC2-1, C4617611549.** For a caller that is not a member, an event whose unsealed tree is not
   public enters no text index; its update and destroy are checked against the higher of the
   stored flags' and the unsealed event's privacy (JMAP only); an event whose view does not open
@@ -411,8 +433,8 @@ process (routing, review order, reruns of a run) are in the history.
   `normalize_jscal(jscalendar_of(tree))`, since by D1 a JMAP write stores the converter's form;
   if wrong, a property the converter drops would pass (statuses and pairs are compared
   separately). The script's texts carry an explicit SEQUENCE (0 at the create, one higher at
-  each organizer step that changes the text), and M7b leaves it to the server. M6's pairs name the invitee and
-  the outside address. Open item 9.
+  each organizer step that changes the text), and M7b leaves it to the server. M6's pairs name
+  the invitee and the outside address. Open item 9.
 
 ### Sharing and sync
 
@@ -438,7 +460,9 @@ process (routing, review order, reruns of a run) are in the history.
   Afterwards it ran alone ten times on `3b2d21864` (the source of `a5e45dc2f`): 8 passed and 2
   failed, at a one-minute load of 20 to 30. It was not run on the base commit, so the base's rate
   is not measured, and the cause was not investigated. Cost if wrong: a queue-retry regression
-  passed as a flake; CI's SMTP step would show it.
+  passed as a flake; CI's SMTP step would show it. In the gates job's net on `f559febdb` it
+  failed in the whole run and again when the net reran it by name, classified the same way
+  ((e) under "CI and the gates").
 - **Upstream's `calendar::alarm` in key mode** (row 24 on `25e098520`): a timing failure, not a
   result of the round. Its first alert is due about one second after the event's create, at a
   load of 17 to 23; the suite passed in plain mode in the same run and in key mode on `7304f9236`
@@ -702,16 +726,17 @@ Wave D (tests only): `3a7d5b474`, `c71aba81d`, `c7666dd8b`, `97b1fa457`, `ce01e0
 ## Deferred findings
 
 Each with the id it has today; the note as it stood at the merge (in the history) holds each
-deferred finding in full. "Weighs more" marks one a lens of the final review found heavier
-against the whole branch than at its task.
+deferred finding in full, except the few this note marks as held by id only. "Weighs more"
+marks one a lens of the final review found heavier against the whole branch than at its task.
 
 Removed from this list as no longer true at the head, on the final review's triage reading
 (fixed by a later task, or the owed record delivered): Task 18's N1 and O1, R21-10, R22-8,
 R23-4, R23-5, R26-8, R30-9, R30-11, R32-2, R34-5, R35-3 and R38-12; and, closed by that review's
 fix wave, Task 17's length-constant line, R30-1, R32-1, R37-14, R40-8, and R41-2 with R41-3.
-R22-4, R27-1, R29-7 and R37-16 were removed as deferred lines because the record they owed was
-delivered: what stopped being true is that it was missing; each now stands under "Merge
-hotspots" (R27-1 also as an accepted residual). R28-4 and R30-10 were rewritten to what still
+On this note's reading, as Task 43's additions show, R22-4, R27-1, R29-7 and R37-16 were
+removed as deferred lines because the record they owed was delivered: what stopped being true is
+that it was missing; each now stands under "Merge hotspots" (R27-1 also as an accepted
+residual). R28-4 and R30-10 were rewritten to what still
 holds. Closed after their task: R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16
 (`d50107f12`), W-1 (`dff25d1d9`), wave B's heading nit (`90d6ad286`).
 
@@ -847,11 +872,11 @@ holds. Closed after their task: R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6
 - (Task 17) `PKCE_VERIFIER` is duplicated from `tests/src/utils/oauth.rs`; the device-code guard
   has no observed failing run.
 - R18-3 (= FA-18): run 2 of `refresh_crossed_by_credential_change` cannot catch an omitted vault
-  assertion. R18-4: no suite case reached `classify_refresh`'s `Lost` arm, presented a
-  well-formed wrong secret or read the `Lost` trace, and three-attempt exhaustion is unexercised;
-  since the coverage wave the suite case `tokens::server_token_answers` reaches the classifier's
-  `Lost` arm through the server function and, since wave E, asserts `Lost`. Task 18's N2: no za
-  case reaches the `Superseded` arm.
+  assertion. R18-4: no suite case presents a well-formed wrong secret through the endpoint or
+  reads the `Lost` trace, and three-attempt exhaustion is unexercised. What later coverage
+  reached is the classifier's `Lost` arm, through the server function: since the coverage wave
+  the suite case `tokens::server_token_answers` reaches it, and since wave E it asserts `Lost`.
+  Task 18's N2: no za case reaches the `Superseded` arm.
 - R18-9: parked refreshes hold a five-second client across Argon2 vault writes.
 - R18-11: `change_race_password` repeats `change_password`; two blocks of `za_token.rs` repeat.
 - FA-8, FA-19: test gaps on the token paths (the note at the merge gives them by id only).
@@ -1086,9 +1111,10 @@ Follow-ups not taken, each recommended by the controller:
 - **#91**: a placement change checks UID uniqueness without the UID lease, which covers creates
   only (C4617611574 = FB-3; spec 3.3 corrected in `53cf84aa9`).
 - **#92** (item 23 of the list for the owner): the calendar delete. Notes of 2026-11-18 (this
-  pull request makes it one transaction) and 2026-11-19 (what it keeps: a calendar too large for one transaction, the stores that keep
-  the chunked form, the fence's refusal after the cancellations, RA-4, a large delete retried whole
-  on a conflicting commit, RA-11, PostgreSQL and MySQL read, not run, RA-10), and a comment of
+  pull request makes it one transaction) and 2026-11-19 (what it keeps: a calendar too large
+  for one transaction, the stores that keep the chunked form, the fence's refusal after the
+  cancellations, RA-4, a large delete retried whole on a conflicting commit, RA-11, PostgreSQL
+  and MySQL read, not run, RA-10), and a comment of
   2026-11-20 on a default-calendar id written across a concurrent delete (FR-6). Its title and
   body were not edited.
 - **#93**: carry the first page's tip in the `z` state, so a paged initial sync can end above a
@@ -1143,8 +1169,8 @@ Every existing assertion the release changed carries a comment citing the spec s
   LTO) built without a warning, its version line naming source `0237a0b50` and `dirty`; the
   fresh-store unit suite (9 tests) and FRESH (9 readback checks) passed. The CalDAV client was not
   run (`python3.12` is not on the host; left to CI's `caldav-client` job, which passed in every
-  completed pull-request run). `git diff origin/main...HEAD -- tests/src/webdav` was empty, so WK runs
-  upstream's CalDAV suite unchanged.
+  completed pull-request run). `git diff origin/main...HEAD -- tests/src/webdav` was empty, so
+  WK runs upstream's CalDAV suite unchanged.
 - The key-mode JMAP step got no rerun at Task 41 (`calendar::alarm` failed in none of five local
   key-mode runs); it reruns once since `bea8a39fb` (item 25).
 - `tests/qualification/dispositions.json` gained 23 cohort entries, one per fork runtime file the
