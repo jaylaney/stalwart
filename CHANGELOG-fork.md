@@ -102,10 +102,13 @@ refusals), and every message was a thread of its own.
   EventSource, SMTP, ManageSieve and `/api/*` never index. The keyless reindex task and account
   destruction delete the index. Mail that arrives while no keyed mail request runs is indexed by
   the next ones; until then a server search does not find it, and it threads alone. A content
-  search keeps running passes until the index is current or `ZA_SEARCH_WAIT_SECS` (30 s by
-  default) has passed, and is then refused with "Search for this account is not available right
-  now; try again shortly." (`unsupportedFilter` or `unsupportedSort` on JMAP, `NO [CANNOT]` on
-  IMAP), never answered in part. A session without keys still cannot search the account's mail.
+  search tries to bring the index current within a wait budget of `ZA_SEARCH_WAIT_SECS` (30 s by
+  default). When it cannot obtain a current index, it is refused with "Search for this account
+  is not available right now; try again shortly." (`unsupportedFilter` or `unsupportedSort` on
+  JMAP, `NO [CANNOT]` on IMAP), never answered in part. That happens when the budget runs out,
+  or earlier: the account's content is over `ZA_SEARCH_ACCOUNT_MAX_MB`, a load is refused by
+  `ZA_SEARCH_MEM_MB`, the index is of a newer format, a store or transient error occurs, the
+  index is being rebuilt, or the content part cannot resolve the condition. A session without keys still cannot search the account's mail.
 - **More JMAP methods need the keys.** For a key account, every method that returns or takes an
   Email or thread id, or whose answer depends on the threads, needs the account's keys:
   `Email/query`, `/queryChanges` and `/changes`, `Thread/*` and `Mailbox/get`, which release 3
@@ -136,15 +139,19 @@ account's JMAP calendar methods were refused and its OAuth tokens carried no key
   under keys derived from those secrets. The device-code flow and the Bearer logins of IMAP,
   POP3, SMTP and ManageSieve stay keyless. At a cache miss, a token that carries a secret whose
   entry is gone, expired or does not open is refused with 401, as an invalid token is, and the
-  refusal is not counted for banning. On a cache hit the token record is not read, so an access
-  token whose entry was dropped (a grant holds at most four access entries, each refresh adds
-  one, and the fifth drops the one expiring earliest) keeps working on a node that has it cached
-  until that cache entry ends, while other nodes refuse it. A keyed cache entry lasts at most the
+  refusal is not counted for banning. On a cache hit the token record is not read. A grant holds
+  at most four access entries: each access-token issue (the code exchange, then each refresh)
+  first removes the grant's expired entries, then, if four remain, drops the earliest-expiring
+  of those stored entries before adding the new one (the new entry is never the one dropped,
+  and a new entry already expired at the write is not stored and drops nothing). The record
+  write invalidates no cache, so every node that holds a live cache entry for a dropped token
+  keeps serving it until that node's entry ends, and each node without one refuses it with 401
+  at its next request. A keyed cache entry lasts at most the
   token's remaining signed lifetime less one second (an access token's is an hour by default)
   and the key cache's bounds (`ZA_KEY_IDLE_SECS`, 900 s; `ZA_KEY_MAX_AGE_SECS`, 3600 s), so a
   client should refresh before `expires_in`. A credential change and a grant's deletion (a
-  sign-out, a revocation, a 33rd sign-in's eviction) end cached access at once on that node and
-  on the others by the cluster broadcast. A client that refreshes on 401 gets a new entry while
+  sign-out, a revocation, or a 33rd sign-in's eviction when the evicted grant's deletion
+  succeeds) end cached access at once on that node and on the others by the cluster broadcast. A client that refreshes on 401 gets a new entry while
   its refresh entry exists; a refresh whose entry is gone deletes the grant and answers
   `invalid_grant`, and the user signs in again.
 - **When browser sessions end.** Only a password change, a recovery or a second-factor change
@@ -191,8 +198,10 @@ account's JMAP calendar methods were refused and its OAuth tokens carried no key
   transaction (more than 5,000,000 bytes of deletions by the server's count) is refused before
   any scheduling message is sent (JMAP `forbidden`, CalDAV 403): delete some of its events
   first. A delete that meets a concurrent write, or an event moved while it was prepared,
-  answers "try again" (JMAP `forbidden`, CalDAV 503), possibly after its messages went out; a
-  retry converges. FoundationDB, read replicas and the bootstrap store keep a chunked, unfenced
+  answers "try again" (JMAP `forbidden`, CalDAV 503), possibly after its internal scheduling
+  items reached local key accounts' inboxes. Its email to outside and plain attendees is sent
+  only after the commit, so a failed attempt mails nothing (traced `ZA_IMIP_DROPPED`). A retry
+  converges and delivers the internal items again. FoundationDB, read replicas and the bootstrap store keep a chunked, unfenced
   delete.
 - **Sharing and sync.** A shared calendar's JMAP `color` preference is carried in each principal's
   sealed personal bundle; a new grantee's starts as the owner's. CalDAV's `calendar-color` stays a
@@ -311,7 +320,10 @@ Release 6 ([design section 2](docs/superpowers/specs/2026-11-13-zero-access-jmap
   local test turns on `Http.usePermissiveCors`, the wildcard option: it adds
   `Access-Control-Allow-Origin: *` to every HTTP response but `/api/vault/*`, allowing every
   origin, server-wide. An origin-specific header is possible only through upstream's
-  `Http.responseHeaders`, also server-wide. `ZA_ACCOUNT_PAGE_ORIGIN` governs only `/api/vault/*`.
+  `Http.responseHeaders`, also server-wide, and only with `usePermissiveCors` off: the wildcard
+  headers are applied after `responseHeaders` and replace a custom `Access-Control-Allow-Origin`,
+  `-Allow-Headers` and `-Allow-Methods`, so a fixed origin needs all three set there.
+  `ZA_ACCOUNT_PAGE_ORIGIN` governs only `/api/vault/*`.
   That setup has not been run against a client. How long a browser stays signed in is upstream's
   refresh-token lifetime. The maintenance purge removes expired entries, superseded refresh
   entries and the entries of grants destroyed through the registry from token records.
@@ -404,11 +416,13 @@ Release 7:
   before the next thread-affecting operation (design section 7.5), with these recorded
   differences: freshness, since mail is indexed only during sessions; the "not available"
   refusal; each message keeps at most 16 distinct identifiers (its Message-ID, In-Reply-To,
-  References from the nearest back, then Resent-Message-ID), so at most 15 go to ancestors, and
-  a message threads alone when the only link to a present relative is an identifier beyond
-  either message's 16, where an ordinary account keeps every identifier (but scans only the 256
-  newest messages of a subject at delivery, with a later merge task), so the difference shows
-  only with long reference chains or extra identifiers; a key account keeps one Message-ID value
+  References from the nearest back, then Resent-Message-ID), so a message with its own
+  Message-ID keeps at most 15 ancestors (one without keeps up to 16), and a message threads
+  alone when the only link to a present relative is an identifier beyond either message's 16,
+  where an ordinary account keeps every identifier, so the difference shows only with long
+  reference chains or extra identifiers; in the other direction, an ordinary account's SMTP
+  delivery looks only at the 256 newest messages of its subject, so a reply whose only relative
+  is older threads alone there, while a key account looks up the whole subject and joins it; a key account keeps one Message-ID value
   per message where upstream matches every value, so a reply naming a message's other
   Message-ID threads on an ordinary account but not on a key account (rare; found in this
   release's review, not in design 7.5; issue #101); a message deleted before any keyed mail request indexed
@@ -433,9 +447,11 @@ items still open for the project owner):
   create of the same UID in that calendar leaves two events with one UID there.
 - **#92:** a calendar too large for one transaction is refused until some of its events are
   deleted; FoundationDB, read replicas and the bootstrap store keep the chunked, unfenced
-  delete, where a failed later chunk leaves the earlier chunks' events deleted; and a delete
-  refused after its scheduling messages went out leaves attendees holding a cancellation (or an
-  organizer holding a decline) for an event that still exists until the retry.
+  delete, where a failed later chunk leaves the earlier chunks' events deleted, and the failure
+  drops the whole delete's email, so outside and plain attendees of the deleted events get no
+  cancellation or decline; and a delete refused after its internal delivery leaves local key
+  accounts holding a cancellation (or a key organizer holding a decline) for an event that
+  still exists until the retry, which delivers another.
 - **#93:** a sync paged from the initial state can end below a sharing change, and its next call
   is refused until an event is written, the client syncs in one page, or it takes its state from
   `CalendarEvent/get` or `/query`.
@@ -573,10 +589,19 @@ On `main` and for this release:
   above test its code. Its push run
   ([run 44933215636](https://github.com/jaylaney/stalwart/actions/runs/44933215636)) passed every
   job that runs on push.
+- PR #97 then merged (`b7c83694a`). It changes only test code: the shared integration-test
+  listeners bind to loopback (`tests/src/utils/server.rs`, `tests/src/system/mod.rs`,
+  `tests/src/automation/mod.rs`); no product source changed after `04145d586`. Its pull-request
+  run on `f25b6789c`, the same tree as `b7c83694a` (`d7226eff7b`),
+  ([run 44936128452](https://github.com/jaylaney/stalwart/actions/runs/44936128452)) passed
+  every pull-request job, upstream's `Test` and `Upstream Suites` included, and the push run
+  on `b7c83694a` ([run 44946844692](https://github.com/jaylaney/stalwart/actions/runs/44946844692))
+  passed every job that runs on push. The test retention gates last ran on `f559febdb`, before #97's test changes.
 - This release's preparation changes only documentation (`CHANGELOG-fork.md`, `README.md`,
-  `docs/releases.md`, `docs/zero-access/manual-checklist.md`), which `test.yml` ignores
-  (`paths-ignore`), so neither the preparation pull request nor its merge runs CI. The tagged
-  source's code is `04145d586`'s.
+  `docs/releases.md`, `docs/zero-access/manual-checklist.md`,
+  `docs/zero-access/client-jmap.md`), which `test.yml` ignores (`paths-ignore`), so neither the
+  preparation pull request nor its merge runs CI. The tagged source's product code is
+  `04145d586`'s and its test code is `b7c83694a`'s.
 - Release-preparation checks on the preparation tree (`04145d586` with this release's
   documentation changes): 9 release-metadata tests
   (`python3 -I scripts/tests/test_release_metadata.py`) and 25 product-verifier tests

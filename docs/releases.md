@@ -122,9 +122,11 @@ blob store and configuration are backed up first; rollback restores that backup,
 writes made after the upgrade, and no claim is made that an older binary reads data this one
 has written (a binary built before release 6 cannot read a shared calendar whose personal bundle
 holds a JMAP `color` preference). A carried-over store needs upstream's operator actions
-(per-account encryption at rest selected again, with each account's `encryptOnAppend` and
-`allowSpamTraining` set again where they were on, and `STALWART_UPDATE_ROLE_PERMISSIONS=true`
-for one start); each key account's search index is rebuilt at its first keyed mail request (an
+(per-account encryption at rest selected again, with each account's `encryptOnAppend` set
+again only where `0.3.0-beta.1` encrypted appends, its server-wide `Email.encryptOnAppend` and
+the account's flag both on, and `allowSpamTraining` where it was on; server-wide encryption at
+rest disabled again where it was off, since the new `atRestEnable` is on by default; and
+`STALWART_UPDATE_ROLE_PERMISSIONS=true` for one start); each key account's search index is rebuilt at its first keyed mail request (an
 IMAP session or an HTTP JMAP mail request holding its keys), and key accounts' existing OAuth
 tokens are refused once. Moving from `0.1.x` remains a fresh-store rebuild.
 

@@ -47,7 +47,12 @@ On one local machine:
    methods, to every HTTP response except `/api/vault/*`, so it allows every origin, server-wide,
    not the client's alone (`crates/common/src/config/network.rs:451-474`). An origin-specific
    header is possible only through upstream's `Http.responseHeaders`, also server-wide
-   (`crates/http/src/request.rs:1166-1180`). The release adds no CORS setting.
+   (`crates/http/src/request.rs:1166-1180`), and only with `usePermissiveCors` turned off: the
+   wildcard headers are applied after `responseHeaders` and replace a custom
+   `Access-Control-Allow-Origin`, `-Allow-Headers` and `-Allow-Methods`
+   (`crates/common/src/config/network.rs:428-474`), so a fixed origin needs all three set in
+   `responseHeaders`, with `Authorization` among the allowed headers. The release adds no CORS
+   setting.
    `ZA_ACCOUNT_PAGE_ORIGIN` governs only `/api/vault/*`, which the client does not call. Record
    the setting used.
 5. Point the client at the server's base URL, as the client's own documentation describes.
