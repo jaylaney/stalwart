@@ -49,7 +49,7 @@ impl ParticipantIdentitySet for Server {
     ) -> trc::Result<SetResponse<participant_identity::ParticipantIdentity>> {
         let account_id = request.account_id.document_id();
         let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?;
-        let will_destroy = response.collect_will_destroy(request.unwrap_destroy());
+        let mut will_destroy = response.collect_will_destroy(request.unwrap_destroy());
         if !access_token.is_account_id(account_id) {
             return reject_identity_changes(self, request, response, will_destroy, access_token)
                 .await;
@@ -75,6 +75,11 @@ impl ParticipantIdentitySet for Server {
             return Err(trc::JmapEvent::StateMismatch.into_err());
         }
         response = response.with_state(old_state);
+
+        // Release 6 spec 6.9: a key account's identities only switch their default.
+        if self.za_is_key_account(account_id).await? {
+            will_destroy = za_refuse_identity_edits(&mut request, &mut response, will_destroy);
+        }
 
         let account_info = self
             .account_info(account_id)
@@ -419,6 +424,30 @@ async fn reject_identity_changes(
         response.not_destroyed.append(id, identities_not_shared());
     }
     Ok(response)
+}
+
+/// Release 6 spec 6.9: the text of every refused identity edit of a key account.
+const ZA_IDENTITIES_FIXED: &str = "Participant identities in this account cannot be created, changed or destroyed; only the default identity can be switched.";
+
+/// Moves every create, update and destroy of the request to its `not_*` map and
+/// returns the emptied destroy list, so upstream's loops run over nothing and its
+/// tail applies `onSuccessSetIsDefault`.
+fn za_refuse_identity_edits(
+    request: &mut SetRequest<'_, participant_identity::ParticipantIdentity>,
+    response: &mut SetResponse<participant_identity::ParticipantIdentity>,
+    will_destroy: Vec<Id>,
+) -> Vec<Id> {
+    let refused = || SetError::forbidden().with_description(ZA_IDENTITIES_FIXED);
+    for (id, _) in request.unwrap_create() {
+        response.not_created.append(id, refused());
+    }
+    for (id, _) in request.unwrap_update() {
+        response.not_updated.append(id, refused());
+    }
+    for id in will_destroy {
+        response.not_destroyed.append(id, refused());
+    }
+    Vec::new()
 }
 
 fn identities_not_shared() -> SetError<ParticipantIdentityProperty> {

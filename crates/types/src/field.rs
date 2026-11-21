@@ -96,6 +96,9 @@ pub enum PrincipalField {
     /// Zero-access search manifest (search spec 4.2). 152 has never been
     /// assigned to any field in upstream's history.
     ZeroAccessSearch = 152,
+    /// Zero-access token record (release 6 spec 4.3). 153 has never been
+    /// assigned to any field in upstream's history.
+    ZeroAccessTokens = 153,
 }
 
 impl ContactField {
@@ -212,6 +215,7 @@ impl From<PrincipalField> for u8 {
             PrincipalField::ZeroAccessVault => 150,
             PrincipalField::ZeroAccessPins => 151,
             PrincipalField::ZeroAccessSearch => 152,
+            PrincipalField::ZeroAccessTokens => 153,
             PrincipalField::Archive => ARCHIVE_FIELD,
         }
     }

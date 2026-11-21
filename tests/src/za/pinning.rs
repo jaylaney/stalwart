@@ -28,7 +28,7 @@ use crate::utils::{
         new_inbox_items, open_pending_item_as, pending_ids, pin_record, raw_pins, restore_wrap,
         rewrap_legacy, saved_wrap, set_raw_pins, substitute_public_key, trigger_drain,
         vault_revision, wait_for_index_queue, wait_for_queue, wrap_mark, write_pin_record,
-        writer_key, za_post, za_unpin,
+        writer_key, za_post, za_post_from, za_unpin,
     },
 };
 use ::registry::{
@@ -106,6 +106,9 @@ pub async fn test(test: &mut TestServer) {
     pr_6_untokened_address(test).await;
     c9_redelivery_stays_internal(test).await;
     a2_remapped_pin_withholds_mail(test).await;
+    contacts_request_refusals(test).await;
+    fan_out_pin_read_failure(test).await;
+    fan_out_recipient_lookup_failure(test).await;
 }
 
 /// Spec 9 case 1: alice, who never pinned, invites bob. The fan-out pins
@@ -5258,4 +5261,165 @@ fn without_override(body: &str, recurrence_id: &str) -> String {
 /// `body` with bob's PARTSTAT set to `partstat` in the `scope` components.
 fn with_bob_partstat(body: &str, scope: Scope, partstat: &str) -> String {
     edit_attendee(body, BOB, scope, |line| Some(with_partstat(line, partstat)))
+}
+
+/// Spec 6: the contacts endpoints' request refusals. A fingerprint that does
+/// not parse and a `contacts/forget` without an `address` are 400; a
+/// `contacts/pin` naming an address that is not a key account is 409 "not a
+/// key account"; and a wrong password is 401 at every endpoint. Alice's pin
+/// record is unchanged.
+async fn contacts_request_refusals(test: &TestServer) {
+    const FAIL_IP: &str = "10.0.60.11";
+    let alice = test.account(ALICE).id().document_id();
+    let before = raw_pins(test, alice).await;
+    let fingerprint = lookup(ALICE, BOB).await.str(200, "fingerprint");
+
+    let reply = za_post(
+        "contacts/pin",
+        &json!({"username": ALICE, "password": STRONG, "address": BOB, "fingerprint": "not a fingerprint"}),
+    )
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let reply = za_post(
+        "contacts/forget",
+        &json!({"username": ALICE, "password": STRONG}),
+    )
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let reply = pin(ALICE, "plain@example.com", &fingerprint).await;
+    assert_eq!(reply.expect(409), json!({"error": "not a key account"}));
+
+    for (path, extra) in [
+        ("contacts", json!({})),
+        ("contacts/lookup", json!({"address": BOB})),
+        (
+            "contacts/pin",
+            json!({"address": BOB, "fingerprint": fingerprint}),
+        ),
+        ("contacts/forget", json!({"address": BOB})),
+    ] {
+        let mut body = json!({"username": ALICE, "password": "not the password at all"});
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        assert_eq!(
+            za_post_from(FAIL_IP, path, &body).await.status,
+            401,
+            "{path}"
+        );
+    }
+    assert_eq!(raw_pins(test, alice).await, before);
+
+    // An ordinary account presenting its own password is refused by all four.
+    for (path, extra) in [
+        ("contacts", json!({})),
+        ("contacts/lookup", json!({"address": BOB})),
+        (
+            "contacts/pin",
+            json!({"address": BOB, "fingerprint": fingerprint}),
+        ),
+        ("contacts/forget", json!({"address": BOB})),
+    ] {
+        let mut body =
+            json!({"username": "plain@example.com", "password": "plain secret with entropy 9"});
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        assert_eq!(
+            za_post(path, &body).await.expect(409)["error"],
+            "not a zero-access account",
+            "{path}"
+        );
+    }
+
+    // `contacts/forget` with null while a record exists starts over with an
+    // empty record that keeps the repair time; the prior bytes are put back.
+    let mut record = pin_record(test, alice, STRONG)
+        .await
+        .expect("alice holds a pin record");
+    record.key_repaired_at = Some(1_700_000_123);
+    write_pin_record(test, alice, STRONG, &record).await;
+    assert_eq!(forget(ALICE, None).await.expect(200), json!({"ok": true}));
+    let fresh = pin_record(test, alice, STRONG)
+        .await
+        .expect("a fresh record");
+    assert!(fresh.pins.is_empty() && fresh.withheld.is_empty());
+    assert_eq!(fresh.key_repaired_at, Some(1_700_000_123));
+    set_raw_pins(test, alice, before.as_deref()).await;
+}
+
+/// Spec 5.2 phase 1: a fan-out whose recipient lookup fails records `5.1` for
+/// the recipient and writes no item for it; the organizer's write commits.
+/// The one-shot hook is taken by the owner's own fan-out.
+async fn fan_out_recipient_lookup_failure(test: &TestServer) {
+    const UID: &str = "pin-lookup-failure";
+    let (alice, _, carol) = parties(test);
+    let carol_start = inbox_ids(test, carol.id).await;
+    let path = event_path(&alice, UID);
+    test_hooks::set_delegation_lookup_fail_once(Some((alice.id, CAROL.to_string())));
+    let status = alice
+        .client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], invite(UID, START_B, &[CAROL]))
+        .await
+        .status;
+    let armed = test_hooks::take_delegation_lookup_fail_once(alice.id, CAROL);
+    test_hooks::set_delegation_lookup_fail_once(None);
+    assert!(!armed, "the fan-out did not take the lookup failure");
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        attendee_statuses(&alice.client, &path, CAROL).await,
+        ["5.1"]
+    );
+    assert!(
+        new_inbox_items(test, carol.id, &carol_start)
+            .await
+            .is_empty(),
+        "an item was written for a recipient whose lookup failed"
+    );
+    delete_event(&alice, &path).await;
+    clear_recipient(test, &carol, &carol_start, UID).await;
+}
+
+/// Spec 5.4: a fan-out whose pin-record read fails decides nothing: the
+/// internal recipient is `5.1` and gets no item. The organizer's next edit
+/// decides and delivers.
+async fn fan_out_pin_read_failure(test: &TestServer) {
+    const UID: &str = "pin-read-failure";
+    let (alice, _, carol) = parties(test);
+    let carol_start = inbox_ids(test, carol.id).await;
+    let path = event_path(&alice, UID);
+    test_hooks::set_pin_read_fail_once(Some(alice.id));
+    alice
+        .client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], invite(UID, START_B, &[CAROL]))
+        .await
+        .with_status(StatusCode::CREATED);
+    test_hooks::set_pin_read_fail_once(None);
+    assert_eq!(
+        attendee_statuses(&alice.client, &path, CAROL).await,
+        ["5.1"]
+    );
+    assert!(
+        new_inbox_items(test, carol.id, &carol_start)
+            .await
+            .is_empty(),
+        "an item was written without a decision"
+    );
+
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body.replace(
+            &format!("fo-title {UID}"),
+            &format!("fo-title {UID} v2")
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        attendee_statuses(&alice.client, &path, CAROL).await,
+        ["1.2"]
+    );
+    assert_eq!(new_inbox_items(test, carol.id, &carol_start).await.len(), 1);
+
+    delete_event(&alice, &path).await;
+    clear_recipient(test, &carol, &carol_start, UID).await;
 }

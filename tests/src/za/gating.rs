@@ -41,7 +41,7 @@ const BUSY_EVENT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\n
 const OUTBOX_FREEBUSY: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nBEGIN:VFREEBUSY\r\nUID:fb-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20240101T000000Z\r\nDTEND:20240131T000000Z\r\nORGANIZER:mailto:plain@example.com\r\nATTENDEE:mailto:key1@example.com\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n";
 
 /// The `type` of a single method-level error, or `None` for a method result.
-fn method_error(response: &JmapResponse) -> Option<&str> {
+pub(crate) fn method_error(response: &JmapResponse) -> Option<&str> {
     let call = &response.0["methodResponses"][0];
     (call[0] == "error").then(|| call[1]["type"].as_str().unwrap_or_default())
 }
@@ -230,17 +230,20 @@ pub async fn test(test: &mut TestServer) {
         "{response:?}"
     );
 
-    // JMAP: calendars are not advertised for the key account, and stay
-    // advertised for a non-key account (also as key1's secondary account).
+    // JMAP: calendars are advertised for the key account, for every token
+    // (spec 6.10, D13; a keyless token meets the refusal per method), and
+    // stay advertised for a non-key account (also as key1's secondary
+    // account).
     let session = key1.jmap_session_object().await.into_inner();
     let caps = &session["accounts"][key1.id_string()]["accountCapabilities"];
     for capability in [
         "urn:ietf:params:jmap:calendars",
         "urn:ietf:params:jmap:calendars:parse",
     ] {
-        assert!(caps.get(capability).is_none(), "{capability}: {caps}");
-        assert!(
-            session["primaryAccounts"].get(capability).is_none(),
+        assert!(caps.get(capability).is_some(), "{capability}: {caps}");
+        assert_eq!(
+            session["primaryAccounts"][capability],
+            key1.id_string(),
             "{capability}: {session}"
         );
     }
@@ -268,8 +271,9 @@ pub async fn test(test: &mut TestServer) {
         "{plain_session}"
     );
 
-    // Principal/get: a key account's principal advertises no calendars
-    // capability; a non-key account's does. 1.0 hides other principals
+    // Principal/get: a key account's principal advertises the calendars
+    // capability block with `mayGetAvailability` false (spec 6.10); a
+    // non-key account's is upstream's. 1.0 hides other principals
     // unless directory queries are allowed (`Sharing.allowDirectoryQueries`,
     // off by default; 0.16 listed them), so the query runs with them on.
     let set_directory_queries = async |allow: bool| {
@@ -305,8 +309,16 @@ pub async fn test(test: &mut TestServer) {
     };
     let calendars = "urn:ietf:params:jmap:calendars";
     let key_principal = principal(key1.id_string());
-    assert!(
-        key_principal["capabilities"].get(calendars).is_none(),
+    // Spec 6.10: the caller `plain` has no access to the account, so
+    // `accountId` is null; `mayGetAvailability` is false for a key principal.
+    assert_eq!(
+        key_principal["capabilities"][calendars],
+        json!({
+            "accountId": null,
+            "mayGetAvailability": false,
+            "mayShareWith": true,
+            "calendarAddress": "mailto:key1@example.com",
+        }),
         "{key_principal}"
     );
     // 1.0 fills `accounts` only for a principal the caller can access, so
@@ -329,14 +341,23 @@ pub async fn test(test: &mut TestServer) {
         .find(|principal| principal["id"] == key1.id_string())
         .unwrap_or_else(|| panic!("own principal: {:?}", own.0))
         .clone();
-    assert!(
-        key_principal["capabilities"].get(calendars).is_none(),
+    // Spec 6.10: the account's own principal shows its calendar capability
+    // block (`accountId` its own, `mayShareWith` false, `mayGetAvailability`
+    // false) and its account object offers the calendar capability.
+    assert_eq!(
+        key_principal["capabilities"][calendars],
+        json!({
+            "accountId": key1.id_string(),
+            "mayGetAvailability": false,
+            "mayShareWith": false,
+            "calendarAddress": "mailto:key1@example.com",
+        }),
         "{key_principal}"
     );
     assert!(
         key_principal["accounts"][key1.id_string()]["accountCapabilities"]
             .get(calendars)
-            .is_none(),
+            .is_some(),
         "{key_principal}"
     );
     assert!(
@@ -358,48 +379,12 @@ pub async fn test(test: &mut TestServer) {
     );
     set_directory_queries(false).await;
 
-    // JMAP calendar methods on the key account are refused.
+    // Release 6 spec 6.2: some methods remain refused as the served rows move below.
     let key1_account = key1.id_string();
     for (method, args) in [
-        ("Calendar/get", json!({ "accountId": key1_account })),
-        ("Calendar/query", json!({ "accountId": key1_account })),
-        (
-            "Calendar/set",
-            json!({ "accountId": key1_account, "create": {} }),
-        ),
-        (
-            "Calendar/changes",
-            json!({ "accountId": key1_account, "sinceState": "n" }),
-        ),
-        ("CalendarEvent/get", json!({ "accountId": key1_account })),
-        ("CalendarEvent/query", json!({ "accountId": key1_account })),
-        (
-            "CalendarEvent/set",
-            json!({ "accountId": key1_account, "create": {} }),
-        ),
         (
             "CalendarEvent/copy",
             json!({ "accountId": key1_account, "fromAccountId": key1_account, "create": {} }),
-        ),
-        (
-            "CalendarEvent/parse",
-            json!({ "accountId": key1_account, "blobIds": [] }),
-        ),
-        (
-            "CalendarEvent/changes",
-            json!({ "accountId": key1_account, "sinceState": "n" }),
-        ),
-        (
-            "CalendarEvent/queryChanges",
-            json!({ "accountId": key1_account, "sinceQueryState": "n" }),
-        ),
-        (
-            "ParticipantIdentity/get",
-            json!({ "accountId": key1_account }),
-        ),
-        (
-            "ParticipantIdentity/set",
-            json!({ "accountId": key1_account, "create": {} }),
         ),
         (
             "CalendarEventNotification/get",
@@ -426,6 +411,60 @@ pub async fn test(test: &mut TestServer) {
         assert_eq!(
             method_error(&response),
             Some("accountNotSupportedByMethod"),
+            "{method}: {:?}",
+            response.0
+        );
+    }
+    for (method, args) in [
+        // Release 6 spec 6.2: Calendar/set is served, less `shareWith`.
+        (
+            "Calendar/set",
+            json!({ "accountId": key1_account, "create": {} }),
+        ),
+        // Release 6 spec 6.2: CalendarEvent/set is served (6.5).
+        (
+            "CalendarEvent/set",
+            json!({ "accountId": key1_account, "create": {} }),
+        ),
+        ("Calendar/get", json!({ "accountId": key1_account })),
+        ("Calendar/query", json!({ "accountId": key1_account })),
+        ("CalendarEvent/get", json!({ "accountId": key1_account })),
+        (
+            "Calendar/changes",
+            json!({ "accountId": key1_account, "sinceState": "n" }),
+        ),
+        (
+            "CalendarEvent/changes",
+            json!({ "accountId": key1_account, "sinceState": "n" }),
+        ),
+        // Release 6 spec 6.2: CalendarEvent/parse is served to the keyed owner.
+        (
+            "CalendarEvent/parse",
+            json!({ "accountId": key1_account, "blobIds": [] }),
+        ),
+        // Release 6 spec 6.2: CalendarEvent/query and /queryChanges are served.
+        ("CalendarEvent/query", json!({ "accountId": key1_account })),
+        (
+            "CalendarEvent/queryChanges",
+            json!({ "accountId": key1_account, "sinceQueryState": "n" }),
+        ),
+        // Release 6 spec 6.9: the identities are served; /set refuses each edit
+        // as a set error, not as a method error.
+        (
+            "ParticipantIdentity/get",
+            json!({ "accountId": key1_account }),
+        ),
+        (
+            "ParticipantIdentity/set",
+            json!({ "accountId": key1_account, "create": {} }),
+        ),
+    ] {
+        let response = key1.jmap_method_call(method, args).await;
+        assert!(
+            !matches!(
+                method_error(&response),
+                Some("accountNotSupportedByMethod" | "forbidden")
+            ),
             "{method}: {:?}",
             response.0
         );

@@ -5,7 +5,7 @@
  */
 
 use super::{GrantType, crypto::SymmetricEncrypt};
-use crate::Server;
+use crate::{Server, za::tokens::za_split_bearer};
 use encodify::base64::URL_SAFE_NO_PAD;
 use std::time::SystemTime;
 use store::{
@@ -166,13 +166,15 @@ impl Server {
     ) -> trc::Result<TokenInfo> {
         // Zero-access fork (upgrade ruling 171): an undecodable value is a
         // bearer credential (a foreign token or a misplaced password), so it
-        // is not attached to the error.
-        let token = open_token(&self.core.oauth.token_cipher, token_).map_err(|_| {
-            trc::AuthEvent::Error
-                .into_err()
-                .ctx(trc::Key::Reason, FAILED_TO_DECODE_TOKEN)
-                .caused_by(trc::location!())
-        })?;
+        // is not attached to the error. Spec 4.2: every consumer accepts
+        // the longer form by opening just the upstream token.
+        let token =
+            open_token(&self.core.oauth.token_cipher, za_split_bearer(token_).0).map_err(|_| {
+                trc::AuthEvent::Error
+                    .into_err()
+                    .ctx(trc::Key::Reason, FAILED_TO_DECODE_TOKEN)
+                    .caused_by(trc::location!())
+            })?;
 
         let now = seconds_since_oauth_epoch();
         if token.expiry <= now || token.issued_at > now {

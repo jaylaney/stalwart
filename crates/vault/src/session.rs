@@ -356,6 +356,44 @@ mod tests {
     use super::*;
     use crate::keys::{KeyError, Secret, derive_event_key, derive_mail_key, derive_search_key};
 
+    /// A ring's keys are published only when every generation has a key,
+    /// and read back only for ids of one collection and domain.
+    #[test]
+    fn authenticated_keys_need_every_generation_and_one_collection() {
+        let keys = SessionKeys::new(7, 3, Secret::random());
+        let first = CollectionKeyId {
+            owner_id: 7,
+            calendar_id: 23,
+            domain_id: [0x41; 16],
+            generation: 1,
+        };
+        let second = CollectionKeyId {
+            generation: 2,
+            ..first
+        };
+        let ring = b"ring";
+        let mut ring_keys = BTreeMap::new();
+        ring_keys.insert(1, Secret::from_bytes([0xAB; 32]));
+        keys.cache_authenticated_collection_keys(&[first, second], ring, &ring_keys);
+        assert!(keys.collection_key(&first).is_none());
+        ring_keys.insert(2, Secret::from_bytes([0xCD; 32]));
+        keys.cache_authenticated_collection_keys(&[first, second], ring, &ring_keys);
+        assert_eq!(
+            keys.authenticated_collection_keys(&[first, second], ring)
+                .map(|keys| keys.len()),
+            Some(2)
+        );
+        let other = CollectionKeyId {
+            calendar_id: 24,
+            ..first
+        };
+        keys.cache_authenticated_collection_keys(&[other], ring, &ring_keys);
+        assert!(
+            keys.authenticated_collection_keys(&[first, other], ring)
+                .is_none()
+        );
+    }
+
     #[test]
     fn collection_cache_separates_reconversions() {
         let keys = SessionKeys::new(7, 3, Secret::random());

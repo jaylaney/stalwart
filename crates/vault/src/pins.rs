@@ -328,6 +328,22 @@ mod tests {
     use super::*;
     use crate::keys::{NONCE_LEN, Secret, TAG_LEN};
 
+    /// A union with a set that holds every instance holds every instance,
+    /// and keeps no key of its own.
+    #[test]
+    fn union_with_every_instance_holds_every_instance() {
+        let mut instances = ZaInstances::default();
+        instances.add(Some((1_700_000_000, false)));
+        instances.union(&ZaInstances {
+            master: false,
+            keys: Vec::new(),
+            all: true,
+        });
+        assert!(instances.all && instances.keys.is_empty());
+        assert!(instances.contains(Some((1_800_000_000, true))));
+        assert!(instances.contains(None));
+    }
+
     /// Two pins and one entry with instances.
     fn sample_record() -> ZaPinRecord {
         let mut instances = ZaInstances::default();

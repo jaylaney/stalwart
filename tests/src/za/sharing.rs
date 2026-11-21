@@ -1903,9 +1903,11 @@ async fn conversion_contract_tests(test: &mut TestServer) {
             view.preferences[0].name,
             if empty { "default" } else { "Plain owner name" }
         );
-        assert!(
-            view.preferences[0].color.is_none(),
-            "shared format excludes JMAP personal color"
+        // Release 6 spec 6.7, D14: the conversion carries the owner's colour in its sealed personal bundle.
+        assert_eq!(
+            view.preferences[0].color.as_deref(),
+            (!empty).then_some("legacy JMAP-only"),
+            "the conversion carries the owner's colour"
         );
         if !empty {
             assert_eq!(

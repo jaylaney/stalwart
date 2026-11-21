@@ -9,7 +9,11 @@ use super::{
     za::{ZaChangesSince, za_changes_page},
 };
 use crate::{
-    api::{auth::JmapAuthorization, request::resolve_account_id},
+    api::{
+        auth::JmapAuthorization,
+        request::resolve_account_id,
+        za_calendar::{calendar_read_error, za_admit_calendar_method, za_calendar_method},
+    },
     calendar_event::query::CalendarEventQuery,
     calendar_event_notification::query::CalendarEventNotificationQuery,
     contact::query::ContactCardQuery,
@@ -27,7 +31,11 @@ use jmap_proto::{
         query_changes::{AddedItem, QueryChangesRequest, QueryChangesResponse},
     },
     object::{JmapObject, NullObject},
-    request::{QueryChangesRequestMethod, capability::CapabilityIds, method::MethodObject},
+    request::{
+        QueryChangesRequestMethod,
+        capability::CapabilityIds,
+        method::{MethodFunction, MethodObject},
+    },
 };
 use std::future::Future;
 use store::{
@@ -69,7 +77,7 @@ impl QueryChanges for Server {
                 {
                     access_token.assert_has_access(request.account_id, Collection::Email)?;
                     let max_changes = changes_limit(self, request.max_changes)?;
-                    let since = ZaChangesSince::new(request.since_query_state.clone());
+                    let since = ZaChangesSince::new(request.since_query_state.clone())?;
                     let (view, mode) = email_query_view(
                         self,
                         access_token,
@@ -311,6 +319,22 @@ impl QueryChanges for Server {
                     MethodObject::CalendarEvent,
                     access_token,
                 )?;
+                // Release 6 spec 6.1, 6.2: /queryChanges has its own row. The call to
+                // changes() below admits /changes. Repeat its access check so it answers first.
+                access_token.assert_has_access(request.account_id, Collection::CalendarEvent)?;
+                // Spec 8 (ruling R21-2): the classification taken here rebuilds the Store
+                // errors of a keyed path, from admission through the query.
+                let owner = request.account_id.document_id();
+                let za_key = self.za_is_key_account(owner).await?;
+                let keyed = move |error| calendar_read_error(za_key, owner, error);
+                za_admit_calendar_method(
+                    self,
+                    access_token,
+                    request.account_id,
+                    za_calendar_method(MethodObject::CalendarEvent, MethodFunction::QueryChanges),
+                )
+                .await
+                .map_err(keyed)?;
                 changes = self
                     .changes(
                         build_changes_request(&request),
@@ -318,7 +342,8 @@ impl QueryChanges for Server {
                         access_token,
                         using,
                     )
-                    .await?
+                    .await
+                    .map_err(keyed)?
                     .response;
                 let calculate_total = request.calculate_total.unwrap_or(false);
                 has_changes = changes.has_changes();
@@ -331,7 +356,8 @@ impl QueryChanges for Server {
                 up_to_id = request.up_to_id;
                 results = self
                     .calendar_event_query((*request).into(), access_token, using)
-                    .await?;
+                    .await
+                    .map_err(keyed)?;
             }
             QueryChangesRequestMethod::CalendarEventNotification(mut request) => {
                 // Query changes

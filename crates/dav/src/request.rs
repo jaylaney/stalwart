@@ -34,7 +34,9 @@ use crate::{
     },
     principal::{matching::PrincipalMatching, propsearch::PrincipalPropSearch},
 };
-use common::{Server, auth::AccessToken, network::memory::MEMORY_RETRY_AFTER};
+use common::{
+    Server, auth::AccessToken, network::memory::MEMORY_RETRY_AFTER, za::calendar::za_drain_keys,
+};
 use compact_str::{CompactString, ToCompactString};
 use dav_proto::{
     RequestHeaders,
@@ -666,8 +668,9 @@ impl DavRequestHandler for Server {
         // pending inbox items first. The token holds keys only for the
         // account that authenticated, so a request for another account's
         // data still drains the caller's own inbox. The drain never fails
-        // the request (invariant 14).
-        if let Some(keys) = access_token.za_keys_for(access_token.account_id()) {
+        // the request (invariant 14). Only a token whose scope admits
+        // calendars gives its keys to the drain (PR #90 review C4617611594).
+        if let Some(keys) = za_drain_keys(&access_token) {
             self.za_drain(keys).await;
         }
 

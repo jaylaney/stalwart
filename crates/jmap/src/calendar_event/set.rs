@@ -105,6 +105,8 @@ use types::{
     metadata::MetadataKinds,
 };
 
+mod za;
+
 pub trait CalendarEventSet: Sync + Send {
     fn calendar_event_set(
         &self,
@@ -187,6 +189,10 @@ impl CalendarEventSet for Server {
         using: CapabilityIds,
     ) -> trc::Result<SetResponse<calendar_event::CalendarEvent>> {
         let account_id = request.account_id.document_id();
+        // Release 6 spec 6.5: a key account's events are written by the pipeline.
+        if self.za_is_key_account(account_id).await? {
+            return za::za_calendar_event_set(self, request, access_token, using).await;
+        }
         let metadata = ObjectMetadata::new(self, access_token, using, MetadataType::CalendarEvent);
         let sampled = metadata.viewer_change_id(self, account_id).await?;
         let cache = self
@@ -1057,8 +1063,7 @@ impl CalendarEventSet for Server {
                     access_token,
                     &account_info,
                     new_content.data.event_range_end(),
-                    // The JMAP target is never a key account (za_assert_calendar_allowed): the
-                    // owner is plain and upstream's Send applies, as on DAV (spec 5.1).
+                    // A key account leaves this handler at its head (release 6 spec 5.4): the owner here is plain and upstream's Send applies.
                     false,
                 )
             } else {
@@ -1524,8 +1529,7 @@ impl CalendarEventSet for Server {
                     access_token,
                     &account_info,
                     calendar_event.inner.event_range_end(),
-                    // The JMAP target is never a key account (za_assert_calendar_allowed): the
-                    // owner is plain and upstream's Send applies, as on DAV (spec 5.1).
+                    // A key account leaves this handler at its head (release 6 spec 5.4): the owner here is plain and upstream's Send applies.
                     false,
                 )
             } else {
@@ -1883,8 +1887,7 @@ impl CalendarEventSet for Server {
                 access_token,
                 account_info,
                 content.data.event_range_end(),
-                // The JMAP target is never a key account (za_assert_calendar_allowed): the
-                // owner is plain and upstream's Send applies, as on DAV (spec 5.1).
+                // A key account leaves this handler at its head (release 6 spec 5.4): the owner here is plain and upstream's Send applies.
                 false,
             )
         } else {

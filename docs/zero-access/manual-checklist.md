@@ -137,3 +137,20 @@ and manifest counts for the key accounts. These counts come from the
 automated test server.
 
 Native status for release 7 is **pending**.
+
+## JMAP calendars and browser sign-in (release 6)
+
+See the [release 6 design](../superpowers/specs/2026-11-13-zero-access-jmap-calendars-design.md),
+sections 7 and 9.8. The reference client's checks (Bulwark Webmail 1.21.2, static edition, against
+key accounts with and without a second factor, a grantee and invitee, and an outside address at a
+local SMTP sink), their setup and the assumptions to confirm are in
+[`client-jmap.md`](client-jmap.md). Record each run there: the date, the client's version, the
+server's commit and one result per row.
+
+Its sign-in rows include the session rule (spec D19): after a key account's first invitation to
+another key account, the browser stays signed in. Only a password change, a recovery or a
+second-factor change ends a key account's browser sessions.
+
+Native status for release 6: **pending**. No browser client was run by the plan 17 execution, and
+its automated tests do not establish the client's behaviour, D29's state round trip across pages
+included.

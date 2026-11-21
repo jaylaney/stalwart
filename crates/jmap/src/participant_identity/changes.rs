@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{changes::get::IntermediateChangesResponse, participant_identity::set::identity_state};
+use crate::{
+    changes::{get::IntermediateChangesResponse, za_calendar::za_state_out_of_scope},
+    participant_identity::set::identity_state,
+};
 use common::{Server, auth::AccessToken};
 use groupware::calendar::ParticipantIdentities;
 use jmap_proto::{
@@ -54,6 +57,8 @@ impl ParticipantIdentityChanges for Server {
             State::Intermediate(_) => {
                 return Err(trc::JmapEvent::CannotCalculateChanges.into_err());
             }
+            // Release 6 spec 6.8 (D29): `z` belongs to the calendar changes methods.
+            State::ZaCalendarIntermediate { .. } => return Err(za_state_out_of_scope()),
         };
         let max_changes = match request.max_changes {
             Some(0) => {

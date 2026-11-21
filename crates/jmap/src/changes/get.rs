@@ -9,7 +9,7 @@ use crate::{
     api::{
         auth::JmapAuthorization,
         metadata::{MetadataType, ObjectMetadata, za_metadata_refused},
-        request::za_assert_calendar_allowed,
+        za_calendar::{calendar_read_error, za_admit_calendar_method, za_calendar_method},
     },
     changes::{
         page::{
@@ -18,6 +18,7 @@ use crate::{
         },
         state::{JmapCacheState, max_state},
         za::{ZaChangesSince, za_changes_page},
+        za_calendar::{za_calendar_changes, za_state_out_of_scope},
     },
     participant_identity::changes::ParticipantIdentityChanges,
 };
@@ -43,7 +44,10 @@ use jmap_proto::{
         JmapObject, NullObject, addressbook::AddressBookProperty, calendar::CalendarProperty,
         email::EmailProperty, file_node::FileNodeProperty, mailbox::MailboxProperty,
     },
-    request::{capability::CapabilityIds, method::MethodObject},
+    request::{
+        capability::CapabilityIds,
+        method::{MethodFunction, MethodObject},
+    },
     response::{ChangesResponseMethod, ResponseMethod},
     types::state::State,
 };
@@ -200,19 +204,40 @@ impl ChangesLookup for Server {
             }
             MethodObject::Calendar => {
                 access_token.assert_has_access(request.account_id, Collection::Calendar)?;
-                za_assert_calendar_allowed(self, request.account_id).await?;
-
-                (SyncCollection::Calendar, true)
+                // Release 6 spec 6.8 (D15, D29): admission, the sync boundary and origin.
+                return za_calendar_changes(self, access_token, request, object, |request| {
+                    self.changes_page(
+                        request,
+                        object,
+                        access_token,
+                        using,
+                        (SyncCollection::Calendar, true),
+                    )
+                })
+                .await;
             }
             MethodObject::CalendarEvent => {
                 access_token.assert_has_access(request.account_id, Collection::CalendarEvent)?;
-                za_assert_calendar_allowed(self, request.account_id).await?;
-
-                (SyncCollection::Calendar, false)
+                return za_calendar_changes(self, access_token, request, object, |request| {
+                    self.changes_page(
+                        request,
+                        object,
+                        access_token,
+                        using,
+                        (SyncCollection::Calendar, false),
+                    )
+                })
+                .await;
             }
             MethodObject::CalendarEventNotification => {
                 access_token.assert_has_access(request.account_id, Collection::CalendarEvent)?;
-                za_assert_calendar_allowed(self, request.account_id).await?;
+                za_admit_calendar_method(
+                    self,
+                    access_token,
+                    request.account_id,
+                    za_calendar_method(object, MethodFunction::Changes),
+                )
+                .await?;
 
                 (SyncCollection::CalendarEventNotification, false)
             }
@@ -223,13 +248,25 @@ impl ChangesLookup for Server {
             }
             MethodObject::ParticipantIdentity => {
                 access_token.assert_has_access(request.account_id, Collection::CalendarEvent)?;
-                // Spec 9: new at 1.0, a JMAP calendars method, refused for a
-                // key account as ParticipantIdentity/get and /set are.
-                za_assert_calendar_allowed(self, request.account_id).await?;
+                // Release 6 spec 6.2: the method's class determines whether
+                // /changes is served for a key account. Spec 8 (ruling R21-2): the
+                // classification taken here rebuilds the Store errors of a keyed path.
+                let owner = request.account_id.document_id();
+                let za_key = self.za_is_key_account(owner).await?;
+                let keyed = move |error| calendar_read_error(za_key, owner, error);
+                za_admit_calendar_method(
+                    self,
+                    access_token,
+                    request.account_id,
+                    za_calendar_method(object, MethodFunction::Changes),
+                )
+                .await
+                .map_err(keyed)?;
 
                 return self
                     .participant_identity_changes(request, access_token)
-                    .await;
+                    .await
+                    .map_err(keyed);
             }
             MethodObject::Quota => {
                 access_token.assert_is_member(request.account_id)?;
@@ -240,6 +277,39 @@ impl ChangesLookup for Server {
                 return Err(trc::JmapEvent::CannotCalculateChanges.into_err());
             }
         };
+        self.changes_page(
+            request,
+            object,
+            access_token,
+            using,
+            (collection, is_container),
+        )
+        .await
+    }
+}
+
+/// Upstream's changes handler after the object's access check. Release 6 spec 6.8:
+/// the calendar objects reach it through the key-calendar adapter.
+trait ChangesPage: Sync + Send {
+    fn changes_page(
+        &self,
+        request: ChangesRequest,
+        object: MethodObject,
+        access_token: &AccessToken,
+        using: CapabilityIds,
+        scope: (SyncCollection, bool),
+    ) -> impl Future<Output = trc::Result<IntermediateChangesResponse>> + Send;
+}
+
+impl ChangesPage for Server {
+    async fn changes_page(
+        &self,
+        request: ChangesRequest,
+        object: MethodObject,
+        access_token: &AccessToken,
+        using: CapabilityIds,
+        (collection, is_container): (SyncCollection, bool),
+    ) -> trc::Result<IntermediateChangesResponse> {
         // Search spec 6.2: mailbox state is keyless. Email, Thread and
         // submission changes require keys, including the queryChanges caller.
         match object {
@@ -256,7 +326,7 @@ impl ChangesLookup for Server {
         if matches!(object, MethodObject::Email | MethodObject::Thread)
             && let Some(keys) = access_token.za_keys_for(request.account_id.document_id())
         {
-            let since = ZaChangesSince::new(request.since_state);
+            let since = ZaChangesSince::new(request.since_state)?;
             let account_id = request.account_id.document_id();
             let view = self
                 .za_response_snapshot(account_id, keys, since.minimum())
@@ -428,6 +498,8 @@ impl ChangesLookup for Server {
                     (intermediate_state.items_sent, log, Coverage::Range)
                 }
             }
+            // Release 6 spec 6.8 (D29): only the calendar adapter reads `z`, as its range.
+            State::ZaCalendarIntermediate { .. } => return Err(za_state_out_of_scope()),
         };
 
         if request.since_state != State::Initial {

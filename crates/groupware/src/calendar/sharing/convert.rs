@@ -1032,4 +1032,54 @@ mod tests {
             ZaShareError::Store(error) if error.matches(trc::EventType::Store(trc::StoreEvent::UnexpectedError))
         ));
     }
+
+    /// Release 6 spec 6.7, D14: the conversion carries the owner's colour
+    /// into its sealed personal bundle, and the restore at the end of a
+    /// rollback (`seal_calendar` of the opened view) keeps it.
+    #[test]
+    fn conversion_keeps_owner_colour() {
+        use crate::calendar::seal::unseal_calendar;
+        use store::{Deserialize, Serialize, write::Archiver};
+        let archive = |calendar: &Calendar| {
+            let bytes = Archiver::new(calendar.clone()).serialize().unwrap();
+            <Archive<ArchiveBytes> as Deserialize>::deserialize(&bytes).unwrap()
+        };
+        let keys = SessionKeys::new(4, 1, Secret::random());
+        let mut calendar = Calendar {
+            preferences: vec![CalendarPreferences {
+                account_id: 4,
+                name: "Work".into(),
+                description: Some("desc".into()),
+                color: Some("#ff0000".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        seal_calendar(&mut calendar, &keys, 4).unwrap();
+        let context = ZaCalendarContext {
+            owner_id: 4,
+            calendar_id: 42,
+            personal_id: 4,
+            stored: archive(&calendar),
+            domain: ZaKeyDomain::owner(&keys),
+            boundary: None,
+        };
+        let Ok((converted, domain)) = initialize(&context, &keys) else {
+            panic!("the conversion's first phase assembles the owner's entry");
+        };
+        assert_eq!(converted.preferences[0].color, None);
+        assert!(
+            !converted.preferences[0].name.contains("ff0000"),
+            "the owner's colour is only inside its sealed bundle"
+        );
+        let mut view = calendar_view_in_domain(&archive(&converted), &domain, 4)
+            .unwrap()
+            .deserialize::<Calendar>()
+            .unwrap();
+        assert_eq!(view.preferences[0].color.as_deref(), Some("#ff0000"));
+        assert_eq!(view.preferences[0].name, "Work");
+        seal_calendar(&mut view, &keys, 4).unwrap();
+        unseal_calendar(&mut view, &keys, 4).unwrap();
+        assert_eq!(view.preferences[0].color.as_deref(), Some("#ff0000"));
+    }
 }

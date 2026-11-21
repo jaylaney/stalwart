@@ -475,6 +475,68 @@ mod tests {
         }
     }
 
+    /// Every seal error names its kind only; `entry_text` reads a text
+    /// value and nothing else; a carrier of two values or with a parameter is
+    /// not a bundle.
+    #[test]
+    fn errors_entries_and_carriers_of_other_shapes() {
+        for (error, text) in [
+            (SealError::NotSealed, "object is not sealed"),
+            (SealError::Structure("x"), "unexpected structure: x"),
+            (SealError::Format, "invalid bundle format"),
+            (SealError::Decode, "invalid bundle encoding"),
+            (SealError::Aead, "bundle authentication failed"),
+            (SealError::Policy(7), "unknown policy version 7"),
+        ] {
+            assert_eq!(error.to_string(), text);
+        }
+        let ical = parse(concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\n",
+            "UID:tree-unit\r\nDTSTART:20990301T100000Z\r\nSEQUENCE:3\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ));
+        let entry = |name: ICalendarProperty| {
+            ical.components[1]
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap()
+        };
+        assert_eq!(entry_text(entry(ICalendarProperty::Uid)), Some("tree-unit"));
+        assert_eq!(entry_text(entry(ICalendarProperty::Sequence)), None);
+        let mut carrier = text_entry(SEALED_PROP, "AAAA".into());
+        carrier.values.push(ICalendarValue::Text("BBBB".into()));
+        assert_eq!(
+            validate_bundle_carrier(&carrier, &[1]),
+            Err(SealError::Format)
+        );
+        let mut carrier = text_entry(SEALED_PROP, "AAAA".into());
+        carrier.params.push(ICalendarParameter::partstat(
+            calcard::icalendar::ICalendarParticipationStatus::Declined,
+        ));
+        assert_eq!(
+            validate_bundle_carrier(&carrier, &[1]),
+            Err(SealError::Format)
+        );
+    }
+
+    /// A public-key envelope of another policy version names it; one of the
+    /// right version but the wrong length, or an empty one, is not a bundle.
+    #[test]
+    fn pk_envelopes_of_other_shapes() {
+        let key = Secret::random();
+        assert_eq!(
+            open_pk_envelope(&[POLICY_VERSION + 1, WRAP_PK], &key, b"aad").err(),
+            Some(SealError::Policy(POLICY_VERSION + 1))
+        );
+        for envelope in [&[POLICY_VERSION, WRAP_PK, 0][..], &[][..]] {
+            assert_eq!(
+                open_pk_envelope(envelope, &key, b"aad").err(),
+                Some(SealError::Format)
+            );
+        }
+    }
+
     fn visible_only(ical: &ICalendar) -> bool {
         ical.components.iter().all(|c| {
             c.entries.iter().all(|e| {

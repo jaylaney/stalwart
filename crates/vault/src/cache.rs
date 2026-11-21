@@ -193,6 +193,16 @@ mod tests {
         Arc::new(SessionKeys::new(account_id, generation, Secret::random()))
     }
 
+    /// The effective configuration is the one the cache was built with.
+    #[test]
+    fn config_is_the_one_given() {
+        let config = KeyCache::new(cfg()).config();
+        assert_eq!(
+            (config.idle, config.max_age, config.max_entries),
+            (cfg().idle, cfg().max_age, cfg().max_entries)
+        );
+    }
+
     #[test]
     fn idle_entry_is_refused_after_timeout_and_removed_by_sweep() {
         let cache = KeyCache::new(cfg());

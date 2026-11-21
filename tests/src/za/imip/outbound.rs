@@ -179,6 +179,7 @@ pub async fn test(test: &mut TestServer) {
     commit_failures(test, &owner).await;
     store_commit_failures(test, &owner).await;
     chunked_collection_delete(test, &owner).await;
+    chunked_collection_delete_unfenced(test, &owner).await;
     rf_3_alias_attendee(test, &alias).await;
     rf_5_many_recipients(test, &owner).await;
     unrouted_local_addresses(test, &owner, &key2).await;
@@ -1184,7 +1185,11 @@ async fn store_commit_failures(test: &TestServer, owner: &Party) {
         .with_status(StatusCode::NO_CONTENT);
 }
 
-/// 5.4: a chunked collection DELETE whose second chunk fails mails nothing.
+/// 5.4, rewritten by PR #90 review C4617611521: a collection DELETE is one
+/// physical transaction, so under a forced split whose second chunk would
+/// fail it commits whole and mails every CANCEL. Release 5 pinned the partial
+/// outcome here (the first chunk's event deleted, the second's kept, nothing
+/// mailed); that residual of iMIP spec 5.4 no longer holds for a key account.
 async fn chunked_collection_delete(test: &TestServer, owner: &Party) {
     let calendar = format!("/dav/cal/{}/imip-coll/", owner.name.replace('@', "%40"));
     owner
@@ -1192,7 +1197,6 @@ async fn chunked_collection_delete(test: &TestServer, owner: &Party) {
         .request("MKCALENDAR", &calendar, MKCALENDAR)
         .await
         .with_status(StatusCode::CREATED);
-    let mut ids = Vec::new();
     for uid in ["imip-out-k1", "imip-out-k2"] {
         // Each PUT mails ATT: the raw client (5 s, PR review T-2).
         assert_eq!(
@@ -1205,12 +1209,9 @@ async fn chunked_collection_delete(test: &TestServer, owner: &Party) {
             .await,
             201
         );
-        ids.push(resource_id(test, owner.id, &format!("imip-coll/{uid}.ics")).await);
     }
-    // `delete_with_events_za` walks the children in ascending order, one
-    // commit point after each: the first chunk holds the lower id.
-    assert!(ids[0] < ids[1], "{ids:?}");
     wait_for_queue(test).await;
+    wait_for_index_queue(test, owner.id, Duration::from_secs(30)).await;
     sink().clear();
     let traced = Traced::start(&[EventType::Calendar(CalendarEvent::ItipMessageError)]);
     let split = ForceCommitSplit::new(owner.id);
@@ -1218,14 +1219,82 @@ async fn chunked_collection_delete(test: &TestServer, owner: &Party) {
     let status = delete_raw(owner.name, STRONG, calendar.clone()).await;
     drop(split);
     test_hooks::set_second_chunk_fail_once(None);
+    assert_eq!(
+        status, 204,
+        "the DELETE under a forced split did not commit"
+    );
+    for uid in ["imip-out-k1", "imip-out-k2"] {
+        assert_eq!(uid_copies(test, owner.id, uid).await, 0, "{uid} remains");
+    }
+    wait_for_queue(test).await;
+    let cancels = sink()
+        .take_to(ATT)
+        .into_iter()
+        .filter(|message| message.calendar_method().as_deref() == Some("CANCEL"))
+        .count();
+    assert_eq!(cancels, 2, "one CANCEL per event of the DELETE");
+    assert!(
+        !traced
+            .finish()
+            .await
+            .into_iter()
+            .any(|event| event.details == ZA_IMIP_DROPPED
+                && event.account_id == Some(owner.id as u64)),
+        "the committed DELETE dropped its mail"
+    );
+}
+
+/// 5.4 as release 5 pinned it, under `UnfencedCalendarDelete` (PR #90 review
+/// RA-2): the form FoundationDB, a read replica and the ephemeral store keep,
+/// a chunked collection DELETE whose second chunk fails, mails nothing.
+async fn chunked_collection_delete_unfenced(test: &TestServer, owner: &Party) {
+    const UIDS: [&str; 2] = ["imip-out-k3", "imip-out-k4"];
+    let calendar = format!(
+        "/dav/cal/{}/imip-coll-chunked/",
+        owner.name.replace('@', "%40")
+    );
+    owner
+        .client
+        .request("MKCALENDAR", &calendar, MKCALENDAR)
+        .await
+        .with_status(StatusCode::CREATED);
+    let mut ids = Vec::new();
+    for uid in UIDS {
+        // Each PUT mails ATT: the raw client (5 s, PR review T-2).
+        assert_eq!(
+            put(
+                owner.name,
+                STRONG,
+                format!("{calendar}{uid}.ics"),
+                event(uid, owner.name, &[ATT], 0, "")
+            )
+            .await,
+            201
+        );
+        ids.push(resource_id(test, owner.id, &format!("imip-coll-chunked/{uid}.ics")).await);
+    }
+    // `delete_with_events_za` walks the children in ascending order, one
+    // commit point after each: the first chunk holds the lower id.
+    assert!(ids[0] < ids[1], "{ids:?}");
+    wait_for_queue(test).await;
+    wait_for_index_queue(test, owner.id, Duration::from_secs(30)).await;
+    sink().clear();
+    let traced = Traced::start(&[EventType::Calendar(CalendarEvent::ItipMessageError)]);
+    let unfenced = test_hooks::UnfencedCalendarDelete::new(owner.id);
+    let split = ForceCommitSplit::new(owner.id);
+    test_hooks::set_second_chunk_fail_once(Some(owner.id));
+    let status = delete_raw(owner.name, STRONG, calendar.clone()).await;
+    drop(split);
+    test_hooks::set_second_chunk_fail_once(None);
+    drop(unfenced);
     assert_eq!(status, 500, "the chunked DELETE did not fail");
     assert_eq!(
-        uid_copies(test, owner.id, "imip-out-k1").await,
+        uid_copies(test, owner.id, UIDS[0]).await,
         0,
         "the first chunk's event stands deleted"
     );
     assert_eq!(
-        uid_copies(test, owner.id, "imip-out-k2").await,
+        uid_copies(test, owner.id, UIDS[1]).await,
         1,
         "the second chunk's event remains"
     );
@@ -1255,7 +1324,7 @@ async fn chunked_collection_delete(test: &TestServer, owner: &Party) {
         .client
         .request_with_headers(
             "DELETE",
-            &format!("{calendar}imip-out-k2.ics"),
+            &format!("{calendar}{}.ics", UIDS[1]),
             [NO_REPLY],
             "",
         )
