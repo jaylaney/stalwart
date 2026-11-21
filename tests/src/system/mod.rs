@@ -28,7 +28,7 @@ pub const SUBMISSION_PORT: u16 = 4467;
 
 #[tokio::test(flavor = "multi_thread")]
 pub async fn system_tests() {
-    let mut test = TestServerBuilder::new("system_tests")
+    let builder = TestServerBuilder::new("system_tests")
         .await
         .with_default_listeners()
         .await
@@ -51,9 +51,9 @@ pub async fn system_tests() {
             },
             ..Default::default()
         })
-        .await
-        .build()
         .await;
+    builder.assert_listeners_bind_to_loopback().await;
+    let mut test = builder.build().await;
 
     // Create admin account
     let admin = test

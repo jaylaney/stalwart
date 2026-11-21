@@ -17,6 +17,7 @@ use registry::{
     },
     types::list::List,
 };
+use std::net::Ipv4Addr;
 use utils::map::vec_map::VecMap;
 
 use crate::utils::server::TestServerBuilder;
@@ -26,9 +27,20 @@ async fn automation_tests() {
     crate::utils::containers::ensure_acme().await;
     let mut test = TestServerBuilder::new("automation_tests")
         .await
-        .with_listener(NetworkListenerProtocol::Http, "http", 8898, false)
+        // Pebble reaches these ACME challenge ports through Docker's host gateway.
+        .with_listener_at(
+            NetworkListenerProtocol::Http,
+            "http",
+            (Ipv4Addr::UNSPECIFIED, 8898).into(),
+            false,
+        )
         .await
-        .with_default_listeners()
+        .with_listener_at(
+            NetworkListenerProtocol::Http,
+            "jmap",
+            (Ipv4Addr::UNSPECIFIED, 8899).into(),
+            true,
+        )
         .await
         .build()
         .await;
