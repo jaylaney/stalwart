@@ -496,11 +496,19 @@ Release 6 (PR #90; the [outcome](docs/superpowers/plans/2026-11-14-zero-access-p
   17,641 / 18,583 covered lines, against the same baseline. `8e05a6b44` precedes one product
   change with its tests (an access entry expired at its write is not stored), the key-mode JMAP
   step's one rerun and the gates job's Rust 1.99.1 pin.
-- <!-- PENDING: the manually dispatched run 44924688662 on f559febdb, with the test retention
-  gates (the first run of the gates' Rust 1.99.1 pin): record its result, the inventory and
-  coverage figures and the link https://github.com/jaylaney/stalwart/actions/runs/44924688662.
-  At preparation it was still running, and its Upstream Suites job had already failed in the
-  Automation Tests step. -->
+- On `f559febdb` itself, the manually dispatched
+  [run 44924688662](https://github.com/jaylaney/stalwart/actions/runs/44924688662), the gates
+  job's first with Rust 1.99.1, concluded as failed in two jobs, and every other job passed (the
+  `Test` job's SMTP step included). Upstream Suites failed in its Automation Tests step at
+  upstream's DKIM selector assertion (`tests/src/automation/dkim.rs:89`: the selector's
+  timestamp one second off, `…269` against `…268`), the timing flake recorded in `CLAUDE.md`.
+  In the Test Retention Gates job the coverage net's SMTP step failed: upstream's
+  `smtp::queue::retry::queue_retry` failed on its attempt and on its one rerun at
+  `tests/src/smtp/queue/retry.rs:238` (retry delays measured in whole seconds as `[1, 2, 2]`
+  against `[1, 2, 3]`, under the slower coverage-instrumented build). The job's later steps ran
+  on the net's profiles and both gates passed: the inventory gate, 795 tests; coverage, full
+  31,455 / 32,488 (96.82%) and runtime-only 18,353 / 19,232 (95.43%) covered lines, 142 and 147
+  lines above the 0.16.27 baseline's fractions. The failed jobs were not rerun.
 - Locally (macOS, RocksDB, one node, debug test builds): the final matrix's 32 rows on
   `a5e45dc2f`, 30 passing on their first attempt and 2 after reruns, then validations on later
   sources; the 28-row mutation sample, all killed, and four further rows, of which one survivor
@@ -512,11 +520,14 @@ Release 6 (PR #90; the [outcome](docs/superpowers/plans/2026-11-14-zero-access-p
 
 On `main` and for this release:
 
-- <!-- PENDING: the push run 44933215636 on main at 04145d586 (the merge of PR #90): record its
-  result and link https://github.com/jaylaney/stalwart/actions/runs/44933215636. -->
-- <!-- PENDING: this preparation pull request's CI run: record the head commit, the run link and
-  its result. -->
-- <!-- PENDING: CI on main after this pull request merges: record the run link and its result. -->
+- `04145d586`, PR #90's merge, has the same tree as `f559febdb` (`dd61984b6f`), so the runs
+  above test its code. Its push run
+  ([run 44933215636](https://github.com/jaylaney/stalwart/actions/runs/44933215636)) passed every
+  job that runs on push.
+- This release's preparation changes only documentation (`CHANGELOG-fork.md`, `README.md`,
+  `docs/releases.md`, `docs/zero-access/manual-checklist.md`), which `test.yml` ignores
+  (`paths-ignore`), so neither the preparation pull request nor its merge runs CI. The tagged
+  source's code is `04145d586`'s.
 - Release-preparation checks on the preparation tree (`04145d586` with this release's
   documentation changes): 9 release-metadata tests
   (`python3 -I scripts/tests/test_release_metadata.py`) and 25 product-verifier tests
@@ -529,9 +540,8 @@ On `main` and for this release:
 Gates beyond the automated runs, recorded after publication:
 
 - the exact-source Linux shipping build and its verification, from the tag through
-  `product-build.yml`: <!-- PENDING: the product-build.yml run for fork-v0.4.0-beta.1: record the
-  run link, its result, the artifact checksums, the attestation and the measured GLIBC
-  requirement. -->
+  `product-build.yml`, recorded in the published release notes (its run, result, checksums,
+  attestation and measured GLIBC requirement), since this entry is part of the tagged source;
 - native client verification, the release 6 reference client's checklist, the release 5
   real-provider round and the clean-context whole-branch review: pending (above).
 
