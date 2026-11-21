@@ -1,14 +1,14 @@
 # Zero-access calendar: manual client checklist
 
-**Status for the `0.2.0-beta.1` prerelease (upstream `v1.0.1`): pending; no results
-recorded.** The build to test is the published `fork-v0.2.0-beta.1`
-shipping artifact (the GitHub prerelease `release-0.2.0-beta-1`), built in the shipping
-configuration (`cargo build --release --locked -p stalwart --no-default-features --features
-rocks`), whose `--version` reads `Stalwart Server fork v0.2.0-beta.1 (upstream v1.0.1
-23b69755cb3cd8ecd952fe0443c5ac067a506184; source <commit>; clean)`; record the exact line and
-the binary's checksum with the results. Run it on a fresh store (1.0 cannot open a 0.16 one),
-with accounts set up afresh. Results recorded against the 0.16-based releases (`0.1.x`) are
-not evidence for this release.
+**Status for the `0.4.0-beta.1` prerelease (upstream `v1.0.3`): pending; no results
+recorded.** The build to test is the published `fork-v0.4.0-beta.1` shipping artifact (the
+GitHub prerelease `release-0.4.0-beta-1`), built in the shipping configuration (`cargo build
+--release --locked -p stalwart --no-default-features --features rocks`), whose `--version`
+reads `Stalwart Server fork v0.4.0-beta.1 (upstream v1.0.3
+8b32686532d34623e9ce8e1237cf2bed9554af38; source <full commit>; clean)`; record the exact line
+and the binary's checksum with the results. Run it on a fresh store, with accounts set up
+afresh. Results recorded against earlier releases (`0.1.x`, `0.2.0-beta.1`, `0.3.0-beta.1`)
+are not evidence for this release.
 
 Run once per release against a server built from this branch, with TOTP
 enrolled on one of the two accounts used.
@@ -46,7 +46,7 @@ Use two disposable, setup-complete key accounts, an owner and grantee, with app 
 5. Revoke by the grant id listed by `shares`. Confirm the grantee loses it on the next refresh; grant again and confirm it reappears. Rename the owner's calendar and confirm discovery/sync after the boundary. Compare initial sync and incremental sync behavior where the client exposes it.
 6. Turn assisted discovery off and confirm Thunderbird finds the shared calendar through the second `calendar-home-set` href. DAVx5 is optional. A recipient who is also a grantee should answer an invitation from their own copy.
 
-Native status for the release-4 outcome (on the 0.16 base): **pending** for macOS Apple Calendar, iOS Apple Calendar and Thunderbird; `0.2.0-beta.1` passed on its deployed build (above). No native-client session was exercised in Task 12; qualified disposable native sessions and trusted-TLS setup remain pending. This checklist is not a completed native acceptance record. Record any unavailable device, credentials, certificate, network reachability or missing observation as pending.
+Native status for the release-4 outcome (on the 0.16 base): **pending** for macOS Apple Calendar, iOS Apple Calendar and Thunderbird; no native results are recorded for `0.2.0-beta.1` or any later release (above). No native-client session was exercised in Task 12; qualified disposable native sessions and trusted-TLS setup remain pending. This checklist is not a completed native acceptance record. Record any unavailable device, credentials, certificate, network reachability or missing observation as pending.
 
 ## Mail
 
@@ -76,7 +76,7 @@ Server-side, after the run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p
 
 ## Invitations by email (release 5)
 
-Release 5 (invitations by email, iMIP; spec `docs/superpowers/specs/2026-11-02-zero-access-imip-design.md`, section 8.7). Run against real Gmail, Outlook.com and iCloud accounts, once per release, against a server built from this branch. For `0.3.0-beta.1`, the first release that includes release 5, that is the published `fork-v0.3.0-beta.1` shipping artifact, whose `--version` reads `Stalwart Server fork v0.3.0-beta.1 (upstream v1.0.1 23b69755cb3cd8ecd952fe0443c5ac067a506184; source <commit>; clean)`; record the exact line and the binary's checksum with the results. The `0.2.0-beta.1` build named at the top of this checklist does not include release 5.
+Release 5 (invitations by email, iMIP; spec `docs/superpowers/specs/2026-11-02-zero-access-imip-design.md`, section 8.7). Run against real Gmail, Outlook.com and iCloud accounts, once per release, against a server built from this branch. For `0.3.0-beta.1`, the first release that includes release 5, that is the published `fork-v0.3.0-beta.1` shipping artifact, whose `--version` reads `Stalwart Server fork v0.3.0-beta.1 (upstream v1.0.1 23b69755cb3cd8ecd952fe0443c5ac067a506184; source <commit>; clean)`; record the exact line and the binary's checksum with the results. For `0.4.0-beta.1`, it is the build named at the top of this checklist.
 
 Preconditions: a deployment those providers reach, outbound through the relay with SPF and DKIM aligned for the key account's domain, and a key account with Apple Calendar, Thunderbird or DAVx5 connected. Item 7 needs a second key account.
 

@@ -62,9 +62,24 @@ standard event classifications, filenames and sync history. Revoking a calendar 
 fresh authorized access and rotates keys for future writes; it does not reseal existing
 events or retract copies. Prompt cache invalidation across nodes requires cluster pubsub.
 
+A browser sign-in holds a token that opens the account's keys while its grant lives (upstream's
+default: thirty days without use, an operator setting). Whoever takes a live token and the
+stored token record has the keys, as with the password and the vault record, and a token's
+scope limits what the server does for it, not what its secret opens. Browser sessions end only
+on a password change, a recovery or a second-factor change, or when their grants are revoked;
+revoking an app password does not end them. The operator learns that an account signs in from
+a browser, how many grants it holds and when each was refreshed, and whoever serves a web
+client's code can read what the user reads.
+
+The sealed mail search index leaves in the clear its manifest (the index's sizes, and so when the account's sessions indexed and how much), each
+sealed content blob's size, and that a session searched message content, and when; how long an
+indexing pass takes can reveal the processing cost of the messages it indexed.
+
 See the [calendar threat model](docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md),
-[mail design](docs/superpowers/specs/2026-10-20-zero-access-mail-design.md) and
-[email invitation design](docs/superpowers/specs/2026-11-02-zero-access-imip-design.md)
+[mail design](docs/superpowers/specs/2026-10-20-zero-access-mail-design.md),
+[email invitation design](docs/superpowers/specs/2026-11-02-zero-access-imip-design.md),
+[search design](docs/superpowers/specs/2026-11-04-zero-access-search-design.md) and
+[JMAP calendars design](docs/superpowers/specs/2026-11-13-zero-access-jmap-calendars-design.md)
 for sealed fields, visible metadata and security boundaries.
 
 ## Development

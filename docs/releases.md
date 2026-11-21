@@ -85,69 +85,58 @@ its upstream updates during merges; do not insert fork release entries there.
 
 ## Release implementation
 
-### Published releases through `0.3.0-beta.1`
+### Published releases
 
 The first preview is `0.1.0-beta.1`, tagged `fork-v0.1.0-beta.1` and titled
-`release-0.1.0-beta-1`; `0.1.1-beta.1` (tag `fork-v0.1.1-beta.1`) followed on upstream
-`v0.16.27`, and `0.2.0-beta.1` (tag `fork-v0.2.0-beta.1`) moved the fork to upstream
-`v1.0.1`. `fork-release.toml` is the fork identity source: it records the fork version and
-upstream base tag/full commit. The shipping `stalwart` package version must match it. The
-current prerelease is `0.3.0-beta.1` (tag `fork-v0.3.0-beta.1`), which adds release 5
-(invitations by email) on the same fully integrated upstream `v1.0.1`
-(`23b69755cb3cd8ecd952fe0443c5ac067a506184`). Internal upstream crate
-versions and numeric compatibility checks follow `1.0.1`; the fork-owned `vault` crate
-retains `0.16.25`. The published `fork-v0.1.0-beta.1`, `fork-v0.1.1-beta.1` and
-`fork-v0.2.0-beta.1` tags and artifacts remain immutable.
+`release-0.1.0-beta-1`, on upstream `v0.16.26`; `0.1.1-beta.1` (tag `fork-v0.1.1-beta.1`)
+followed on upstream `v0.16.27`. `0.2.0-beta.1` (tag `fork-v0.2.0-beta.1`) moved the fork to
+upstream `v1.0.1` on fresh stores: upstream 1.0 cannot open a store written by upstream 0.16 or
+by the fork's `0.1.x` releases, and the fork adds no conversion or legacy reader, so an
+installation moved by provisioning a fresh store and setting its key accounts up again, keeping
+the old store and the `0.1.x` binary for rollback. `0.3.0-beta.1` (tag `fork-v0.3.0-beta.1`)
+added release 5 (invitations by email) on the same upstream `v1.0.1`; an in-place upgrade from
+`0.2.0-beta.1` was expected to work but no automated test covered it. Each was published as a
+GitHub prerelease, and each exact-source Linux product build ran from its tag through
+`product-build.yml`. Their tags and artifacts remain immutable, and results from one release's
+base are not evidence for another. Gates still pending from them: native client verification
+(no results recorded for any release), the release 5 real-provider round (the Gmail,
+Outlook.com and iCloud section of the [manual checklist](zero-access/manual-checklist.md)), and
+the clean-context whole-branch review carried over from `0.2.0-beta.1`.
 
-`0.2.0-beta.1` was a limited prerelease. It supported fresh stores only: upstream 1.0.1 cannot
-open a store written by upstream 0.16 or by the fork's `0.1.x` releases, and the fork adds no
-conversion or legacy reader. An existing installation moved by provisioning a fresh store and
-setting its key accounts up again, keeping the old store and the `0.1.x` binary for rollback;
-rollback restores the old store as it was, without the writes made after the cutover. That
-prerelease used public upstream and fork tests for qualification, and results from the
-`0.1.x` base were not evidence for it. Its exact-source Linux product build
-ran from the tag through `product-build.yml`, and the published release notes record its
-verification. Its native client checklist has no recorded results and stays pending. Its
-other remaining gate, a clean-context whole-branch review, carries over to `0.3.0-beta.1`.
+`fork-release.toml` is the fork identity source: it records the fork version and upstream base
+tag/full commit. The shipping `stalwart` package version must match it.
 
-`0.3.0-beta.1` is a limited prerelease. It supports an in-place upgrade from `0.2.0-beta.1`:
-the store schema version is unchanged and release 5 changes no stored layout, so the
-existing store is expected to open. No automated test covers that upgrade (CI's
-fresh-store job checks a fresh store only), so the database, blob store and configuration
-are backed up first. Rollback to `0.2.0-beta.1` restores that backup, without the writes
-made after the upgrade; no claim is made that a `0.2.0-beta.1` binary reads data
-`0.3.0-beta.1` has written. It also supports fresh stores; moving from `0.1.x` remains a
-fresh-store rebuild. This prerelease uses public upstream and fork tests for qualification
-and adds no private-test dependency. Record fresh results before publication; existing
-results do not establish new backend, cluster, platform or native-client qualification. Its
-exact-source Linux product build runs from the tag through `product-build.yml`, and the
-published release notes record its verification. Its pending gates are the release 5
-real-provider round (the Gmail, Outlook.com and iCloud section of the
-[manual checklist](zero-access/manual-checklist.md)), native client verification of release
-5's flows, and the clean-context whole-branch review carried over from `0.2.0-beta.1`.
-SQL backends, clusters, other platforms and the external
-protocol suites are not qualified. It stays a prerelease until its applicable
-gates pass; the [fork changelog](../CHANGELOG-fork.md) records its automated results.
+### Current prerelease `0.4.0-beta.1`
 
-### Candidate `0.4.0-beta.1`
+The current prerelease is `0.4.0-beta.1` (tag `fork-v0.4.0-beta.1`, titled
+`release-0.4.0-beta-1`, published 2026-11-21). It integrates upstream Stalwart `v1.0.3`
+(`8b32686532d34623e9ce8e1237cf2bed9554af38`) and adds release 7 (mail search and threads for
+key accounts) and release 6 (JMAP calendars and browser sign-in for key accounts). Internal
+upstream crate versions and numeric compatibility checks follow `1.0.3`; the fork-owned `vault`
+crate retains `0.16.25`.
 
-This limited prerelease candidate integrates upstream Stalwart `v1.0.3`
-(`8b32686532d34623e9ce8e1237cf2bed9554af38`). Internal upstream crates and numeric
-compatibility checks follow `1.0.3`. Qualification covers fresh stores only.
+Qualification covers fresh stores only. The store schema version is unchanged from
+`0.3.0-beta.1` and releases 6 and 7 change no stored layout, so a store carried over from
+`0.3.0-beta.1` is expected to open, but no automated test covers that upgrade. The database,
+blob store and configuration are backed up first; rollback restores that backup, without the
+writes made after the upgrade, and no claim is made that an older binary reads data this one
+has written (a binary built before release 6 cannot read a shared calendar that holds a
+colour). A carried-over store needs upstream's operator actions (per-account encryption at rest
+selected again, `STALWART_UPDATE_ROLE_PERMISSIONS=true` for one start); each key account's
+search index is rebuilt at its first keyed request, and key accounts' existing OAuth tokens are
+refused once. Moving from `0.1.x` remains a fresh-store rebuild.
 
-If an operator carries over an existing store, previously enabled per-account encryption at
-rest resets to `Disabled`. Reselect the public key in each affected account's encryption
-settings to resume encrypting new mail. Start once with
-`STALWART_UPDATE_ROLE_PERMISSIONS=true` to add missing default-role permissions, then remove the
-variable. Third-party clients that manage app passwords, API keys or account settings need the
-applicable new OAuth scopes. See the [upstream changelog](../CHANGELOG.md).
-
-Each recipient contributes to key harvesting only after its ordinary delivery commits. Key
-accounts never contribute. Failed deliveries and outcomes that write nothing do not authorize
-harvest. Key accounts retain sealed ingest and state-only push. See the [fork changelog](../CHANGELOG-fork.md)
-and [merge outcome](superpowers/plans/2026-11-05-upstream-1.0.3-merge-outcome.md) for behavior,
-qualification and residuals. Candidate `55bb9ca67` passed local product, identity, CalDAV and
-fresh-store checks on macOS. Final-head CI and Linux ELF inspection await separate authorization.
+This prerelease uses public upstream and fork tests for qualification and adds no private-test
+dependency. Its exact-source Linux product build runs from the tag through `product-build.yml`,
+and the published release notes record its verification. Its pending gates are native client
+verification (the manual checklist, its release 6 and release 7 sections included, and the
+release 6 reference client's checklist), the release 5 real-provider round and the
+clean-context whole-branch review carried over from `0.2.0-beta.1`. Release 7's search sizing
+defaults are provisional, and its networked-store timing, multi-node and remaining mutation
+checks are open. SQL and FoundationDB backends, clusters, other platforms and the external
+protocol suites are not qualified. It stays a prerelease until its applicable gates pass; the
+[fork changelog](../CHANGELOG-fork.md) records its automated results, operator actions and
+known limits.
 
 ### Product verification and artifacts
 
