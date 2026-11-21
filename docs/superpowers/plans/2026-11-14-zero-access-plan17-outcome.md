@@ -21,6 +21,16 @@ later work and what stays open; the last section points to the rest.
   code is `bea8a39fb` (last product change `20ca477f4`); the commits after it are the gates'
   toolchain pin `6131cc902` and records. `git log --oneline ade47a9ae..f559febdb` lists every
   commit; the fix waves' commits are in "The pull request's findings".
+- **Command labels**, as the plan's matrices used them (the suites with
+  `STORE=RocksDb RUST_MIN_STACK=16777216`): ZA is `cargo test -p tests za::za_tests -- --nocapture`
+  with `BLOB_STORE` unset, ZA-FS the same with `BLOB_STORE=FileSystem`; SWAP is
+  `cargo test -p tests za::cache_swap::cache_swap_tests -- --exact --nocapture`, `BLOB_STORE`
+  unset; WP is `cargo test -p tests webdav::webdav_tests -- --nocapture` and WK the same with
+  `ZA_KEY_ACCOUNTS=1`; IP and IK, JP and JK are the same pair for `imap::imap_tests` and
+  `jmap::jmap_tests`; SHIP is `cargo check -p stalwart --no-default-features --features rocks` and
+  TM `cargo check -p tests --tests`, each with the plan's warning filter; PRODUCT is the local
+  product build with thin LTO and 16 codegen units; FRESH is
+  `python3 -B tests/product/fresh_store.py --binary target/release/stalwart --log-dir <a new directory>`.
 - **Limits.** Local results: RocksDB on one node, macOS on Apple silicon (so the release verifier
   ran without its ELF inspection), debug test builds except the full-profile product builds with
   `--locked` that the fresh-store runs used and the coverage net's instrumented builds, the
@@ -42,7 +52,8 @@ later work and what stays open; the last section points to the rest.
   2. a native client's dead properties survive a browser move
      (`pipeline::placement_reseals_event_container`; with the reseal removed the grantee's
      readback failed);
-  3. a grantee's default reminders (`sharing::grantee_default_alerts`; limit R36-5);
+  3. a grantee's default reminders (`sharing::grantee_default_alerts`; limit R36-5: the first
+     event cannot tell the grantee's copy from the owner's live entry);
   4. a browser edit keeps what an ordinary account keeps
      (`oracle::round_trip_keeps_what_an_ordinary_account_keeps`);
   5. search on a large calendar: `query::text_query_cost` printed 300 events opened in 402 ms for
@@ -60,8 +71,9 @@ Decided by the project owner on 2026-11-14 (spec D19): a key account's browser s
 on a credential change (a password change, a recovery or a second-factor change), and a grant's
 deletion ends that grant's. Every other vault write leaves them; it still evicts resident keys, a
 request whose keys were opened at a generation no longer current answers 401 (D23), and the
-client's refresh then succeeds. Every use of the rule goes through `za_session_binding`. Since the final review a second-factor change also
-draws a fresh salt (FA-1), so the binding never returns to an earlier value.
+client's refresh then succeeds. Every use of the rule goes through `za_session_binding`. Since
+the final review a second-factor change also draws a fresh salt (FA-1), so the binding never
+returns to an earlier value.
 
 ## CI and the gates
 
@@ -74,6 +86,12 @@ draws a fresh salt (FA-1), so the binding never returns to an earlier value.
 | `68a1cc2fb`, 2026-11-21 | cancelled (d) | cancelled (d) |
 | `f559febdb`, 2026-11-21 | every job passed | Automation Tests failed (a); gates not finished (e) |
 
+- The runs of the Test workflow, by id (`https://github.com/jaylaney/stalwart/actions/runs/<id>`):
+  pull-request runs 44189371288 (`dbd2fccc8`), 44587362075 (`d6929c89e`), 44759113100
+  (`68d905131`), 44804627661 (`8e05a6b44`), 44921515919 (`68a1cc2fb`, cancelled), 44924682624
+  (`f559febdb`); manually dispatched runs with the retention gates 44587698145 (`d6929c89e`),
+  44759179352 (`68d905131`), 44804659603 (`8e05a6b44`), 44921532274 (`68a1cc2fb`, cancelled),
+  44924688662 (`f559febdb`).
 - A pull-request run's jobs: Check Style, Unit Tests, Test, Upstream Suites, Zero-access Test,
   Build Product, Fresh OSS Store Restart, Independent CalDAV Client (on `dbd2fccc8` also the
   code-scanning analyses). They include the Docker suites and the CalDAV client in both modes.
@@ -121,7 +139,9 @@ draws a fresh salt (FA-1), so the binding never returns to an earlier value.
   claimed here for the gates on `f559febdb`.
 - **The toolchain pin** (item 26): decided by the project owner on 2026-11-21, the version and
   its reason his: the gates job measures with Rust 1.99.1, the compiler the deployed product was
-  built with (the controller had named the current stable, 1.100.0). `6131cc902` sets
+  built with (the controller had named the current stable, 1.100.0). That the pin is made in this
+  pull request, in the gates job only, is the controller's ruling; cost if wrong: he meant a wider
+  pin or a follow-up, and one commit extends or reverts it. `6131cc902` sets
   `RUSTUP_TOOLCHAIN: "1.99.1"` in the gates job only, installs it with `llvm-tools-preview` and
   prints `rustc --version --verbose`; the other jobs keep the runner's stable. Limits: the
   baseline file does not record the compiler it was measured with, and the gate's two earlier CI
@@ -182,6 +202,12 @@ draws a fresh salt (FA-1), so the binding never returns to an earlier value.
 
 - **2026-11-15**: approved the explicit-origin D29 amendment and its implementation
   (`af3ed8934`); origin inference is not reopened.
+- **2026-11-15 and 2026-11-16**: the routing of implementers and reviewers was changed on his
+  instructions. The routing the plan and the spec first named ran Tasks 1 to 16, Task 17's first
+  implementation and review, and Tasks 19 to 21. On his instructions of 2026-11-15, Task 17's
+  fix round, Task 18 and the tasks from Task 22 on had other implementers and reviewers; on his
+  word of 2026-11-16, every task review and scoped re-review from Task 31's fix round on was
+  routed again. The plan's and the spec's routing lines were not edited then.
 - **2026-11-17**: raised the za suites' load gate from a one-minute load of 20 to 40 for the final
   matrix ("let's raise it to 40"; the five-minute limit stays below 200). The branch pushed at
   `dbd2fccc8` and pull request #90 opened on his word.
@@ -196,7 +222,9 @@ draws a fresh salt (FA-1), so the binding never returns to an earlier value.
   - the fence against a crossing write, with a store-level test (C4617611506);
   - no code change for the UID privacy-conflict answers (C4617611630, inherited);
   - FC1-1 (= R36-10) recorded in spec 3.3, no code change (item 3);
-  - the `code` masking confirmed as an amendment of spec section 10 (FA-3, item 1).
+  - the `code` masking confirmed as an amendment of spec section 10 (FA-3, item 1);
+  - the co-author line of four documentation commits left as it is (R44F-5);
+  - the replies on the review threads posted on his word after the verifications.
 - **2026-11-19**: confirmed the fence's refusal after the cancellations as a residual (RA-4,
   item 18), the store ruling (item 19) and the search pass of a `Blob` call for a token without
   the mail scope (RB-3, item 20); RB-4 and RB-5, what a token's scope admits on DAV, no change in
@@ -272,12 +300,21 @@ process (routing, review order, reruns of a run) are in the history.
   earlier in that rare case.
 - **C4646937244 (wave F).** `put_access` takes the write's time: an access entry already expired
   at it is not stored and removes none; the refresh entry is still written.
+- **P5's cost** (recorded by the final review's re-review): after any grant deletion of a key
+  account, each Basic CalDAV client of the account pays one Argon2 verification on its next
+  request and another browser session one record read; the grant arm evicts the key cache, not
+  the search index cache.
 - **RB-17.** The post-write search pass is unchanged: it runs only after an admitted `Email/set`
   or `Email/import` committed an ingest, which a token whose scope excludes mail cannot reach. If
   wrong: one pass after a write the token could not make.
 
 ### The pipeline and the calendar delete
 
+- **Preflight: `ZaDeleted` and CalDAV's deletion behaviour stay as they are**, with no post-commit
+  receipt field or failure hook: Task 8 produces only `AccessToken` invalidations, and
+  `invalidate_caches` propagates errors only from role expansion, so a post-commit error is
+  unreachable today. If wrong: a future fallible post-commit step needs committed-receipt handling
+  first; a pre-commit hook is not post-commit coverage.
 - **Task 8.** The CalDAV delete's assertion-only no-op keeps
   `ids.change_id(owner, Calendar).unwrap_or_default()`: `last_change_id` debug-panics on the
   absent id after a concurrent unlink. The receipt is 0 only when no Calendar change was made.
@@ -301,7 +338,10 @@ process (routing, review order, reruns of a run) are in the history.
   PostgreSQL and MySQL hold it by reading. Cost: those three stores keep the partial outcome of a
   failed later chunk.
 - **`CalendarTooLarge`** answers `forbidden` with a fixed text over JMAP and 403 over CalDAV,
-  since 507 and `tooLarge` mean something else.
+  since 507 and `tooLarge` mean something else. Cost: a client meets a generic refusal whose text
+  names the remedy.
+- **RA-9.** The size count leaves out assertions and the change-log record; the size check's
+  comment says so, and the count is unchanged.
 - **C4633314478.** A listed child the build wrote nothing for refuses the delete with "try again"
   (`Busy`) before the size check and any cancellation, in the fenced branch only.
 - **C4633314492.** A keyed `COPY` inside one calendar runs the UID check and answers 403
@@ -328,7 +368,11 @@ process (routing, review order, reruns of a run) are in the history.
   the same payload-free rebuild, since a deserialization error can carry raw archive bytes. Cost:
   less detailed diagnostics.
 - **D28's trace.** The per-object store-failure trace and that of `Calendar/set`'s default write
-  are fresh events with the account id, the document id when known and a fixed reason.
+  are fresh events with the account id, the document id when known and a fixed reason, since the
+  original may carry stored bytes. Cost: less detail.
+- **Preflight: every submitted `blobId` link is refused**, a same-event embedded blob included,
+  since spec 6.5 and 6.11 refuse attachments on every patch; `za_take_rulings` lost its unused
+  stored argument. If wrong: unsupported attachment behaviour.
 - **R28-1, R28-2.** `request_alerts.accept` runs after `commit_batch` returns `Ok`. A store error
   from `za_writer_keys` is the method's store error, rebuilt at the dispatcher, not the keyless
   refusal; this binds every key writer.
@@ -338,9 +382,10 @@ process (routing, review order, reruns of a run) are in the history.
   (upstream skips a NEEDS-ACTION attendee). If wrong: a decline there would break CalDAV parity.
 - **R34-2.** The drain hook drains the caller's own inbox whatever account the methods name.
 - **Task 39's F2 and F3.** The share endpoints write the ACL through upstream's builder, which logs
-  one share notification per entry change with ids and rights only (F2). A view grantee's empty
-  `Calendar/set` patch is `forbidden`: the context is taken with `Acl::Modify` first (F3). F1 is
-  open item 10.
+  one share notification per entry change with ids and rights only (Task 39's F2). A view
+  grantee's empty `Calendar/set` patch is `forbidden`: the context is taken with `Acl::Modify`
+  first (Task 39's F3); if
+  wrong, an empty update to a view-level shared calendar errors. Task 39's F1 is open item 10.
 - **FC2-1, C4617611549.** For a caller that is not a member, an event whose unsealed tree is not
   public enters no text index; its update and destroy are checked against the higher of the
   stored flags' and the unsealed event's privacy (JMAP only); an event whose view does not open
@@ -351,9 +396,10 @@ process (routing, review order, reruns of a run) are in the history.
   protect the call, since the scheduling path raises SEQUENCE itself. The override branch inside
   upstream's function is an accepted residual (X2).
 - **The oracle (Task 38).** Items and the mail's calendar part are compared as
-  `normalize_jscal(jscalendar_of(tree))`, since by D1 a JMAP write stores the converter's form.
-  The script's texts carry an explicit SEQUENCE (0 at the create, one higher at each organizer
-  step that changes the text), and M7b leaves it to the server. M6's pairs name the invitee and
+  `normalize_jscal(jscalendar_of(tree))`, since by D1 a JMAP write stores the converter's form;
+  if wrong, a property the converter drops would pass (statuses and pairs are compared
+  separately). The script's texts carry an explicit SEQUENCE (0 at the create, one higher at
+  each organizer step that changes the text), and M7b leaves it to the server. M6's pairs name the invitee and
   the outside address. Open item 9.
 
 ### Sharing and sync
@@ -369,7 +415,7 @@ process (routing, review order, reruns of a run) are in the history.
   raised to the tip only when the log holds no event change between its last item change and the
   tip; an initial-origin continuation is never raised. Cost: the grantee's state moves on a
   container-only change; one more log read per poll when a container change is the last record
-  (RA-15); residual (a) of spec 6.8.
+  (RA-15); one log read on the last page of an exact-origin paged sync; residual (a) of spec 6.8.
 
 ### Failures classified as timing
 
@@ -385,7 +431,8 @@ process (routing, review order, reruns of a run) are in the history.
   result of the round. Its first alert is due about one second after the event's create, at a
   load of 17 to 23; the suite passed in plain mode in the same run and in key mode on `7304f9236`
   and `7bd35c4c4`; what changed under `crates/` after `7304f9236` is not on the alarm path; two
-  later runs passed. Limits: one failure in three runs, the base's rate not measured.
+  later runs passed. Limits: one failure in three runs, the base's rate not measured. Cost if
+  wrong: a regression of the alarm path in key mode passed as a timing failure.
 - **Upstream's ordinary-account thread merge**: plain `jmap_tests` once in Task 24, key mode once
   in CI on `68d905131` (b).
 - **Upstream's DKIM selector assertion**: (a) above.
@@ -425,11 +472,15 @@ table is in the history ("Where the full record is").
 
 The pull request's four reviews were an external reviewer's claims, verified against the code
 before anything changed, by the project owner's rule from the first round. No Critical or
-Important finding is open.
+Important finding is open. Every reviewer read only and ran nothing; the pull request's reviews
+were source reviews without builds or tests. The second whole-branch pass, by its own list, did
+not cover the second half of `copy_move.rs`' diff, the test hooks and the unit tests, the
+unchanged code the branch calls, most test modules, spec sections 7, 9 and 11 to 13, cluster
+behaviour, or the SQL and FoundationDB back ends beyond their write order.
 
 | Stage | Findings | Critical or Important open |
 |---|---|---|
-| Task reviews, Tasks 1 to 43 | 222 deferred lines, 40 coverage notes | none |
+| The task reviews | 222 deferred lines, 40 coverage notes | none |
 | Final whole-branch review, `5cadcd739` | 0 C, 8 I (6 distinct), 78 Minor, 1 withdrawn | none |
 | Its fix wave's re-review | 5 Minor (W-1 to W-5) | none |
 | Review of this note's record of it | 18 (R44-1 to R44-18), corrected | none |
@@ -508,7 +559,8 @@ Wave D (tests only): `3a7d5b474`, `c71aba81d`, `c7666dd8b`, `97b1fa457`, `ce01e0
   trip has a test.
 - **4.5's interrupted refresh.** If the grant advances and the record's write does not follow,
   the superseded secret and the stored record still open MK until the next write of the record,
-  the client's retry or the sweep, at most one maintenance interval.
+  the client's retry or the sweep, at most one maintenance interval. Upstream refuses the
+  superseded token itself at once.
 - **D22.** A keyed grant whose entries are gone while its own deletion failed refreshes as a
   keyless grant when presented without the secret; it opens nothing.
 - **D7 at a cache hit.** A node that has a token's keys cached serves it until that entry ends,
@@ -522,7 +574,9 @@ Wave D (tests only): `3a7d5b474`, `c71aba81d`, `c7666dd8b`, `97b1fa457`, `ce01e0
   a grant's deletion; one in-memory delete at a consent confirmation without a secret; two cached
   classification reads for `Calendar/set` and `CalendarEvent/set` (R28-8, R30-3) and three for a
   calendar `/changes` (R22-1), where spec 10 counts one. D29 adds state-codec fields and context
-  checks, with no global account lookup and no additional ordinary-account store I/O.
+  checks, with no global account lookup and no additional ordinary-account store I/O;
+  key-calendar pages carry the origin fields and classify the account when choosing the
+  continuation format.
 - **The legacy grantee restart** (6.8): a grantee's legacy `r` continuation of a key calendar
   answers `cannotCalculateChanges`, and the client restarts from Initial.
 - **4.3, a retried refresh.** The next generation's entry can outlive its token by the retry's
@@ -543,8 +597,8 @@ Wave D (tests only): `3a7d5b474`, `c71aba81d`, `c7666dd8b`, `97b1fa457`, `ce01e0
     alphabet is accepted, the suffix stripped (an every-account difference in `CLAUDE.md`);
   - FA-14: the token sweep runs only when the purge steps before it succeed;
   - FA-20: a node that missed the invalidation broadcast of a vault write that leaves the binding
-    unchanged refuses the account's uncached Bearer requests until another invalidation reaches
-    it (cluster only, unqualified);
+    unchanged refuses the account's uncached Bearer requests (a refresh does not help; Basic is
+    served) until another invalidation reaches it (cluster only, unqualified);
   - FB-2: a create without a `uid` whose commit fails after its invitations went out is retried
     under a new UID, so attendees hold an event the organizer never stored;
   - FB-7: the placement and destroy batches assert in CalDAV's order at the base;
@@ -558,16 +612,19 @@ Wave D (tests only): `3a7d5b474`, `c71aba81d`, `c7666dd8b`, `97b1fa457`, `ce01e0
     more than its rating, since a browser client loses the whole sharer account;
   - FC2-10, FC2-13 (= R22-3), FC2-14, FC2-17: `Calendar/set` reads its context before upstream's
     validation; a non-canonical `z` is accepted and echoed re-encoded; an owner's get that
-    completes a sharing boundary returns the state sampled before its write; an owner's own sync
-    completes none;
+    completes a sharing boundary returns the state sampled before its write, so the next
+    `/changes` reports that calendar as updated; an owner's own sync completes none;
   - FD-13: store errors on the issue and refresh paths keep their context in the trace;
-  - FD-16: `za_handoff_take` deletes the hand-off before it checks the secret;
+  - FD-16: `za_handoff_take` deletes the hand-off before it checks the secret, so a wrong secret
+    consumes it;
   - W-2: `sharing::revoked_and_unshared_calendars_hidden` cannot fail on the fork's fresh-context
     filter (an equivalent mutant at suite level); its comment overstates;
   - W-5: `traced_url` masks a `code` query parameter as a standard parser reads one; one
-    percent-encoded inside another parameter and a `;`-separated query pass unmasked;
+    percent-encoded inside another parameter and a `;`-separated query pass unmasked; the server
+    generates neither;
   - FC1-10, FC2-11, FA-9, FC2-12: the key writers repeat upstream's inline checks, and several
-    insertions are larger than one call; the code stays, and `CLAUDE.md` names them.
+    insertions are larger than one call; the code stays, and `docs/zero-access/release6-code-map.md`
+    names them.
 - **The first pull-request review's residuals:**
   - RA-4: the calendar delete's fence can refuse after the cancellations went out; key attendees
     then hold a CANCEL and the outside attendees' mail is dropped, until a retry, which converges;
@@ -580,11 +637,14 @@ Wave D (tests only): `3a7d5b474`, `c71aba81d`, `c7666dd8b`, `97b1fa457`, `ce01e0
     drain's scope rule limits the drain only;
   - C4617611630 (inherited): UID privacy-conflict answers to a grantee depend on events it cannot
     see;
-  - spec 6.8 case (a): a paged sync from the initial state is never raised, so it ends below any
-    sharing boundary above its last event change, and a restart that pages again ends at the same
-    state until an event is written, the client syncs in one page or it takes its state from
-    `/get` or `/query`; nothing is skipped, and a client that holds the state `/get` gave it
-    never enters this flow (issue #93);
+  - spec 6.8 case (a): a paged sync from the initial state is never raised, so it ends at the
+    range's last event change and below any sharing boundary above that change, whether the
+    boundary completed while it paged or before it began; its next call is refused, and a restart
+    that pages from the initial state again ends at the same state, until an event is written,
+    the client syncs in one page, or it takes its state from `/get` or `/query`. Nothing is
+    skipped, and a client that follows the protocol holds the state `/get` gave it and never
+    enters this flow; for this one flow the fault the pull request's review named remains. It is
+    the cost the controller's ruling accepted (issue #93);
   - the early drain: an account that lacks a calendar method's JMAP permission still drains on
     the call the dispatcher then refuses, and a call whose back-reference fails has drained.
 - **The second pull-request review's residuals:**
@@ -617,14 +677,19 @@ Wave D (tests only): `3a7d5b474`, `c71aba81d`, `c7666dd8b`, `97b1fa457`, `ce01e0
 
 ## Deferred findings
 
-Each with the id it has today; the review files in the history hold each in full. "Weighs more"
-marks one a lens of the final review found heavier against the whole branch than at its task.
+Each with the id it has today; the note as it stood at the merge (in the history) holds each
+deferred finding in full. "Weighs more" marks one a lens of the final review found heavier
+against the whole branch than at its task.
 
-No longer true at the head and removed from this list: Task 17's length-constant line, Task 18's
-N1 and O1, R21-10, R22-4, R22-8, R23-4, R23-5, R26-8, R27-1, R29-7, R30-1, R30-9, R30-11, R32-1,
-R32-2, R34-5, R35-3, R37-14, R37-16, R38-12, R40-8, R41-2 and R41-3. Closed after their task:
-R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16 (`d50107f12`), W-1
-(`dff25d1d9`), wave B's heading nit (`90d6ad286`).
+Removed from this list as no longer true at the head, on the final review's triage reading
+(fixed by a later task, or the owed record delivered): Task 18's N1 and O1, R21-10, R22-8,
+R23-4, R23-5, R26-8, R30-9, R30-11, R32-2, R34-5, R35-3 and R38-12; and, closed by that review's
+fix wave, Task 17's length-constant line, R30-1, R32-1, R37-14, R40-8, and R41-2 with R41-3.
+R22-4, R27-1, R29-7 and R37-16 were removed as deferred lines because the record they owed was
+delivered: what stopped being true is that it was missing; each now stands under "Merge
+hotspots" (R27-1 also as an accepted residual). R28-4 and R30-10 were rewritten to what still
+holds. Closed after their task: R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16
+(`d50107f12`), W-1 (`dff25d1d9`), wave B's heading nit (`90d6ad286`).
 
 ### Tokens and sessions
 
@@ -677,12 +742,14 @@ R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16 (`d50107f12`),
 - FB-4: the placement arm's exits end the mail guard as `ZA_IMIP_ABANDONED` where
   `ZA_IMIP_DROPPED` is true; nothing is mailed either way.
 - RA-10: the fence's store property is pinned on RocksDB and SQLite only; PostgreSQL and MySQL
-  hold it by reading (MySQL's abort rests on its driver rolling back a dropped transaction).
+  hold it by reading (MySQL's abort rests on its driver rolling back a dropped transaction, not
+  read). A run of the unit test against each would close it.
 - RA-11: on RocksDB a large one-transaction delete is retried whole on a conflicting commit of the
   account, up to 24 times or 10 s, then fails after the fan-out (issue #92).
 - RA-12: the placement loop's new early return leaves the mail guard unsettled; unreachable.
 - RC-3: with a name the path index hides, a keyed `COPY` or `MOVE` into that calendar is not seen
-  by the UID check, so two names in one calendar stay reachable through the inherited name race.
+  by the UID check, so two names in one calendar stay reachable through the inherited name race,
+  and a single-name delete then removes the first name under the calendar.
 - RC-9: a name whose calendar no longer exists counts as a name that keeps the event.
 - RC-10: release 4's keyed collection `COPY` with an overwrite (also a residual).
 - FR-6: `onSuccessSetIsDefault` writes the default id with no assertion, so a delete of that
@@ -700,6 +767,8 @@ R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16 (`d50107f12`),
 - R21-6: two 20-line inline blocks in upstream's `calendar/get.rs`; its re-trace arm nearly
   duplicates `za_read.rs`.
 - R21-7: the handlers classify the account again apart from the boundary's decision.
+- R21-8 (with FC2-7): the view memo never hits in `CalendarEvent/get` and keeps every opened view
+  alive to the method's end.
 - R21-9: the event row read follows the content read; a concurrent update can give a spurious
   trace and a transient `notFound`.
 - R22-1: three account classifications per calendar `/changes` request.
@@ -712,8 +781,9 @@ R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16 (`d50107f12`),
   seconds on a large calendar.
 - R28-6: a create checks `shareWith` before metadata, an update the reverse; both `forbidden`.
 - R28-8: ordinary accounts get two cached classification reads per `Calendar/set`.
-- (Task 28, F1) `calendar.clone()` copies the whole unsealed calendar for `accept`, for parity;
-  (F2) the head store error is rebuilt with "calendar read failed" details on a write method.
+- Task 28's F1: `calendar.clone()` copies the whole unsealed calendar for `accept`, for parity;
+  Task 28's F2: the head store error is rebuilt with "calendar read failed" details on a write
+  method.
 - R29-6: the overflow `false` return comes after the edit has started; unreachable.
 - R29-8 (item 6): replacing alarms by value drops acknowledged or snoozed state upstream keeps.
 - R29-9: the brief added a member fallback the spec lacks.
@@ -753,16 +823,19 @@ R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16 (`d50107f12`),
 - (Task 17) `PKCE_VERIFIER` is duplicated from `tests/src/utils/oauth.rs`; the device-code guard
   has no observed failing run.
 - R18-3 (= FA-18): run 2 of `refresh_crossed_by_credential_change` cannot catch an omitted vault
-  assertion. R18-4: no case presents a well-formed wrong secret through the refresh or reads the
-  `Lost` trace; three-attempt exhaustion is unexercised. N2: no za case reaches the `Superseded`
-  arm.
+  assertion. R18-4: no suite case reached `classify_refresh`'s `Lost` arm, presented a
+  well-formed wrong secret or read the `Lost` trace, and three-attempt exhaustion is unexercised;
+  since the coverage wave the suite case `tokens::server_token_answers` reaches the classifier's
+  `Lost` arm through the server function and, since wave E, asserts `Lost`. Task 18's N2: no za
+  case reaches the `Superseded` arm.
 - R18-9: parked refreshes hold a five-second client across Argon2 vault writes.
 - R18-11: `change_race_password` repeats `change_password`; two blocks of `za_token.rs` repeat.
-- FA-8, FA-19: test gaps on the token paths.
+- FA-8, FA-19: test gaps on the token paths (the note at the merge gives them by id only).
 - R21-3 (with R36-4): no test protects the grantee filter in `calendar/get.rs` or the
   try-next-calendar arm in `za_read.rs`; a grantee's `shareWith`, the clear fields of 6.7 and the
   description are unasserted.
-- R21-4: the R21-1 regression subscribes to `DataCorruption` only.
+- R21-4: the R21-1 regression subscribes to `DataCorruption` only and does not show that no other
+  event carries the canary.
 - R21-12 (= FC2-18 = FD-4): the served-methods loop in `gating.rs` passes on
   `serverUnavailable`.
 - R22-2: the grantee sees one calendar, so its paging asserts nothing about continuation pages.
@@ -773,10 +846,10 @@ R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16 (`d50107f12`),
   "the method writes nothing" is not asserted.
 - R25-1: no test of the `Unresolvable`/`Corrupt` mapping; R25-2: every test uses English; R25-3:
   no row covers the Owner field's second source.
-- R26-4: nothing checks that a query without a text condition opens no event. N1 to N3, O1, O2:
-  the expanded parity compares starts only, never asserts a non-empty answer, asks flat ANDs as
-  one condition, checks one negation, and the rebuilt-count check does not attribute events to
-  methods.
+- R26-4: nothing checks that a query without a text condition opens no event. Task 26's N1 to
+  N3, O1 and O2: the expanded parity compares starts only, never asserts a non-empty answer,
+  asks flat ANDs as one condition, checks one negation, and the rebuilt-count check does not
+  attribute events to methods.
 - R27-2: no golden vector pins the bundle layout; R27-3: no unit test pins `open_shared` refusing
   a colour; R27-4: that a rollback keeps the colour is shown by reading only.
 - R28-7 (= FC2-21): no commit or default-write store-failure case, no D16 decline or denied-status
@@ -804,8 +877,10 @@ R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16 (`d50107f12`),
 - R34-6, R34-7, R34-11, R34-13: discarded replies, no pending-item assertion before the query,
   `clear_inboxes` asserts only that none remains.
 - R35-4: no failing run for `mayGetAvailability` left true.
-- R36-3, R36-5 (rest), R36-6 to R36-8, R36-11 to R36-14: refusals asserted by type only; no
-  grantee case on the update path's writer argument and no update with `useDefaultAlerts: true`;
+- R36-5: `grantee_default_alerts`' first event cannot tell the grantee's copy from the owner's
+  live entry; the update path's writer argument has no grantee case; no za case sends
+  `useDefaultAlerts: true` in an update.
+- R36-3, R36-6 to R36-8, R36-11 to R36-14: refusals asserted by type only;
   sink mail counted without UID; inboxes emptied wholesale; `new_items_for`'s bool always true;
   `assert_account_not_found` has no in-helper control; `SENT-BY`'s property and owner address not
   pinned; inboxes unchecked; new pending items counted by UID only.
@@ -842,7 +917,7 @@ R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16 (`d50107f12`),
 - (coverage note, Task 40) no earlier scan meets a live token record; spec 9.5 words the iTIP-task
   rule as a scan rule while the code checks it in the module.
 - FB-9, FB-10, FC1-17, FC2-19, FD-5, FD-9: test weaknesses in the placement cases, the
-  occurrence-patch rulings and elsewhere.
+  occurrence-patch rulings and elsewhere (the note at the merge gives them by id only).
 - (coverage notes) the payload-free boundary rebuilds Store errors only; that an external search
   store receives no term is shown by reading `dispatch/search.rs` only; the email-alarm cleanup is
   shown only by the closing `wait_for_tasks`, and the lease race is exercised at one
@@ -854,9 +929,9 @@ R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16 (`d50107f12`),
 - RB-6: the closed FA-16 exit has no test. RB-7: the keys' re-check after insert and their
   removal after the epoch advances are pinned by no test. RB-15: `dff25d1d9` fails its own new
   case until `7bd35c4c4`, so a bisect can land there.
-- RC5-2, RC5-3: the liveness filter and the one-second subtraction are decided by no case. N1:
-  `expired_second_decode_publishes_nothing` can lose its power on a very loaded host, silently.
-  N2: it arms two pause slots without a drop guard.
+- RC5-2, RC5-3: the liveness filter and the one-second subtraction are decided by no case. Wave
+  C's N1: `expired_second_decode_publishes_nothing` can lose its power over the decode-error arm
+  on a very loaded host, silently. Wave C's N2: it arms two pause slots without a drop guard.
 - RC-4: no case runs the pipeline near the size cap.
 - A failing CalDAV collection `DELETE` is no longer exercised over CalDAV on a fenced store; the
   JMAP case and `chunked_collection_delete_unfenced` cover the function.
@@ -873,31 +948,39 @@ R31-2 (= FC1-7, `d86f90b31`), R34-4 (= FC2-3, `6f0704dcb`), FA-16 (`d50107f12`),
   mark.
 - RF-4, RF-5: no test pins `put_access`'s call site in the issue (passing `0` passes) or the
   retry's fresh time.
-- (Task 42) R42-2 to R42-12: some kills were observed at another catcher than named (J3, J7,
-  J16b, J19, J25), J10's and J11's iteration is not logged, the runner sets no `RUST_BACKTRACE`,
-  J26 is unit-only, and the unit rows have no command log; the unreached named catchers are not
-  shown to fail.
+- (Task 42) R42-2 to R42-5: some kills were observed at another catcher than named (J7's named
+  catcher cannot catch it; J3's kill is the indirect doubled mail; J16b's suite run, J19 and J25
+  failed in an earlier case of the same property), and J10's and J11's failing iteration is not
+  logged. R42-6: J14's kill is the gate's refusal answer, not the item-survival assertion.
+  R42-7 to R42-12: J8's mutant is the brief's stronger form; the runner sets no
+  `RUST_BACKTRACE`; J26 is unit-only evidence; J18's arm is slightly broader than the row; J1
+  keeps the lease and skips only the UID check; unit runs have no command log, and one batch
+  remark about an unused import is wrong. The unreached named catchers are not shown to fail.
 
 ### Documents and evidence records
 
-- R22-7 and R31-7: the interface sheet's §7.1 call-site list and §7.2's view-error rule no longer
+- R22-7 and R31-7: the interface sheet's §7.1 call-site list and the plan header's `za_variants`
+  row, and the sheet's §7.2 view-error rule (in `/set`, D28 makes it per object), no longer
   matched the code (the sheet is in the history only).
 - RC-7's remainder: the comment on the unfenced form in `crates/common/src/za/test_hooks.rs` does
   not say that the unwritten-child refusal is absent there.
-- N4 (wave C): two comments cite review tags. Wave B's re-review: one comment line of `drain.rs`
+- Wave C's N4: two comments cite review tags. Wave B's re-review: one comment line of `drain.rs`
   is 90 columns.
 - FD-11: new fork tests sit in `parser_restored_tests.rs`, which the gates' tooling groups as
   restored upstream tests.
 - R23-2, R30-7, R35-6, R39-7, R40-14, R40-15, R36-15, R36-16, R38-18, R41-9: comments, case names,
   panic messages and evidence strings that omit, narrate or name the wrong thing.
-- Report records: Task 17's RED file not kept; R18-10, R32-11, R33-8, R34-9, R35-7 (the
-  environmental linker note and `lsof`'s warning in logs); R27-5, R29-10, R31-14, R34-8, R34-12,
-  R36-9, R38-17, R39-8 to R39-12, R40-11, R41-1, R41-4, R41-6, R41-7 (the reports' counts, hashes,
-  commands, tables and quoted lines; R41-6 and R41-7's rerun gap closed by `bea8a39fb`); R39-9
-  (two observations with no change proposed); no Task 41
-  receipt records `git status` during the runs; RA-8 (wave A's implementer went on where its
-  brief said to stop; ruled accepted); wave D's unit count; R32-12, R32-13, R33-7, R34-10 and
-  Task 36's re-review nits (test hygiene: an unused `ids[1]`, an `assert_ne!` without a message).
+- Report records. The ids in this entry are deferred notes on the run's own reports and logs,
+  which were never in the repository; their text is in the note at the merge commit. Task 17's
+  RED file not kept; R18-10, R32-11, R33-8, R34-9, R35-7 (the environmental linker note and
+  `lsof`'s warning in logs); R27-5, R29-10, R31-14, R34-8, R34-12, R36-9, R38-17, R39-8 to R39-12,
+  R40-11, R41-1, R41-4, R41-6, R41-7 (the reports' counts, hashes, commands, tables and quoted
+  lines; R41-6 and R41-7's rerun gap closed by `bea8a39fb`); R39-9 (two observations with no
+  change proposed); no Task 41 receipt records `git status` during the runs; RA-8 (wave A's
+  implementer went on where its brief said to stop; ruled accepted); the unit count reported for
+  wave D's fix round (914 passed) could not be reconciled from the reports; R32-12, R32-13, R33-7,
+  R34-10 and Task 36's re-review nits (test hygiene: an unused `ids[1]`, an `assert_ne!` without a
+  message).
 
 ## Open for the project owner
 
@@ -978,8 +1061,8 @@ Follow-ups not taken, each recommended by the controller:
 
 - **#91**: a placement change checks UID uniqueness without the UID lease, which covers creates
   only (C4617611574 = FB-3; spec 3.3 corrected in `53cf84aa9`).
-- **#92**: the calendar delete. Notes of 2026-11-18 (this pull request makes it one transaction)
-  and 2026-11-19 (what it keeps: a calendar too large for one transaction, the stores that keep
+- **#92** (item 23 of the list for the owner): the calendar delete. Notes of 2026-11-18 (this
+  pull request makes it one transaction) and 2026-11-19 (what it keeps: a calendar too large for one transaction, the stores that keep
   the chunked form, the fence's refusal after the cancellations, RA-4, a large delete retried whole
   on a conflicting commit, RA-11, PostgreSQL and MySQL read, not run, RA-10), and a comment of
   2026-11-20 on a default-calendar id written across a concurrent delete (FR-6). Its title and
@@ -1012,10 +1095,11 @@ Every existing assertion the release changed carries a comment citing the spec s
   account's calendar capability and each principal's calendar block (6.10, D13). The variants
   `calendar_event` (the four flags refused then created without them, 6.5; `useDefaultAlerts`
   false and the alerts by value, D11; the override patch in windowed and property-subset reads,
-  F1; a duplicate UID refused in a second calendar, 3.3), `calendar_identity` (6.9),
+  Task 39's F1; a duplicate UID refused in a second calendar, 3.3), `calendar_identity` (6.9),
   `calendar_notification` (`accountNotSupportedByMethod`, 6.11), `calendar_acl` (`shareWith`
   refused and grants through the share endpoints, 6.11; share notifications with the level's
-  rights, F2; a view grantee's empty patch and rename `forbidden`, F3; upstream's assertions on
+  rights, Task 39's F2; a view grantee's empty patch and rename `forbidden`, Task 39's F3;
+  upstream's assertions on
   Jane's reads and her update and destroy at view unchanged, R39-1, R39-2) and
   `calendar_availability` (`shareWith` refused; `Principal/getAvailability` expects `[]`, 6.2).
 - `tests/src/za/sharing.rs`: the conversion carries the owner's colour in its sealed personal
@@ -1046,20 +1130,24 @@ Every existing assertion the release changed carries a comment citing the spec s
 
 ## Merge hotspots
 
-`CLAUDE.md`'s paragraphs "Release 6 added merge hotspots" and "Release 6 silent dependencies" hold
-the full list: spec 11's two lists, the additions of Task 43, the pull request's reviews and the
-third round. Ids they cite from this note:
+The paragraphs "Release 6 added merge hotspots" and "Release 6 silent dependencies", which
+`CLAUDE.md` held and which now stand in `docs/zero-access/release6-code-map.md` ("Merge hotspots",
+"Silent dependencies"; `CLAUDE.md` points there), hold the full list: spec 11's two lists, the
+additions of Task 43, the pull request's reviews and the third round. Ids they cite from this
+note:
 
 - R22-4: upstream's `changes/get.rs` body moved unchanged into `ChangesPage`.
 - R27-1: a binary rollback below release 6 cannot read a coloured personal bundle (also a
   residual).
 - R29-7: D11's recipient and description rules are copied from upstream's `alerts.rs`.
 - R37-16: the pinned 404 text.
-- R44: the calendar variants of `tests/src/jmap/za_variants.rs`.
+- R44 is plan 13's ruling (its key-mode test variants mirror upstream's bodies line for line),
+  not an id of this note; the release 6 calendar variants of `tests/src/jmap/za_variants.rs`
+  follow it.
 - FC1-10, FC2-11, FA-9, FC2-12: the key writers repeat upstream's inline checks, and several fork
   insertions are larger than one call (also residuals).
 - RA-17: upstream's `calendar_event/get.rs` lost an import line.
-- N3 (wave C): `za_bearer_entry` takes the cache clock's now from upstream's
+- Wave C's N3: `za_bearer_entry` takes the cache clock's now from upstream's
   `HttpAuthEntries::expires_in(0)`; a change there fails closed, and
   `keyed_entry_ends_before_signed_expiry` would show it.
 
@@ -1072,12 +1160,20 @@ third round. Ids they cite from this note:
   check table.
 - The plan's files at the same commit: the index as executed, the interface sheet
   (`2026-11-14-zero-access-17-jmap-calendars-interfaces.md`) and the six task files
-  (`-tasks-{a,b,c,d1,d2,e}.md`), in `docs/superpowers/plans/`.
-- The design's review record and the approved D29 amendment
-  (`2026-11-14-zero-access-jmap-paged-sync-amendment.md`), beside the spec in
-  `docs/superpowers/specs/` at the same commit (`git ls-tree 04145d586 docs/superpowers/specs/`).
-- Pull request #90: its review threads (each with a verdict reply and, where something changed,
-  an outcome reply) and its four summary comments.
-- The CI runs for the gates: the manually dispatched runs of the Test workflow on `d6929c89e`,
-  `68d905131`, `8e05a6b44` and `f559febdb`, found by their commits (the note recorded no run
-  ids).
+  (`-tasks-{a,b,c,d1,d2,e}.md`), in `docs/superpowers/plans/`. Read against the code they are
+  stale in three places: R22-7 and R31-7 (under "Deferred findings"), and the interface sheet and
+  group file C state the earlier `put_access` rule and its four-argument signature (wave E
+  changed the rule, RE5-2; wave F added a `now` parameter and the expired-entry rule). Five code
+  comments cite the interface sheet as "I §n"; the plan index gives its path in the history.
+- The design's review record,
+  `docs/superpowers/specs/2026-11-13-zero-access-jmap-calendars-design-codex-review.md`, and the
+  approved D29 amendment, `docs/superpowers/specs/2026-11-14-zero-access-jmap-paged-sync-amendment.md`,
+  at the same commit.
+- Pull request #90: every review thread of the four rounds has a reply with the verdict and,
+  where something changed, a reply with the outcome and its commits. Its four summary comments,
+  one per review round:
+  `https://github.com/jaylaney/stalwart/pull/90#issuecomment-7018100487`,
+  `https://github.com/jaylaney/stalwart/pull/90#issuecomment-7042807741`,
+  `https://github.com/jaylaney/stalwart/pull/90#issuecomment-7048964124`,
+  `https://github.com/jaylaney/stalwart/pull/90#issuecomment-7065213456`.
+- The CI runs, by id, under "CI and the gates"; the gates' runs are the manually dispatched ones.
