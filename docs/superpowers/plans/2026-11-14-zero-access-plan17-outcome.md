@@ -22,7 +22,8 @@ later work and what stays open; the last section points to the rest.
   product change `20ca477f4`); the commits after it are the gates' toolchain pin `6131cc902` and
   records. After the merge this consolidation's branch removed the pin (`cd6f5f417`); the removal
   did not survive the merge of `main` into the branch, whose retention jobs are pinned to Rust
-  1.99.1 ("CI and the gates").
+  1.99.1 until a pull request of its own makes the project owner's decision of 2026-11-22 that
+  they no longer pin it ("CI and the gates").
 - **This consolidation** is pull request #98. The controller merged `main` into its branch on
   2026-11-22 (`c08595afc`); after that merge its `.github`, `scripts`, `crates` and `tests` are
   identical to `main`'s, and the branch changes documents only.
@@ -161,31 +162,40 @@ returns to an earlier value.
   "Failures classified as timing" (it has failed in a whole run and again alone); the branch
   changes no SMTP code, and the pull request's own run passed its SMTP step on the same commit.
   Cost if wrong: an SMTP queue regression passed as a timing failure.
-- **The toolchain pin, made, removed, and kept on `main`.** On 2026-11-21, before the merge, the
-  project owner decided item 26: the gates job measured with Rust 1.99.1, the compiler the
-  deployed product was built with (`6131cc902`, merged with pull request #90; the controller had
-  named the current stable, 1.100.0). On 2026-11-21, after the merge, he decided to remove that
-  pin, since upstream pins no toolchain; this reverses item 26. The change, `cd6f5f417` (the gates
-  job of `.github/workflows/test.yml` only), took out the job's `RUSTUP_TOOLCHAIN` entry and the
-  toolchain install and kept a step printing `rustc --version --verbose`. After pull request #98
-  was opened on 2026-11-21, `main` gained pull requests #97 (loopback test listeners), #89 (the
-  parallel retention pipeline), #99 (the 0.4.0-beta.1 release preparation) and #103 (its record
-  in `CLAUDE.md`), all merged by the project owner by 2026-11-22. #89 rebuilt the retention
-  gates: one instrumented build feeds three coverage jobs, a separate job captures the listings,
-  and every retention job pins `RUSTUP_TOOLCHAIN` to Rust 1.99.1 and prints `rustc -vV`;
-  `CLAUDE.md` there says to keep the pin in step with the compiler used to build the deployed
-  product. #103 records in `CLAUDE.md` that the product build uses the runner's stable Rust,
-  unpinned, as upstream pins no toolchain, and that `0.4.0-beta.1`'s artifact was built with
-  rustc 1.100.0. In the merge of `main` into this branch (`c08595afc`),
+- **The toolchain pin, made, removed, kept on `main`, and to be removed.** On 2026-11-21, before
+  the merge, the project owner decided item 26: the gates job measured with Rust 1.99.1, the
+  compiler the deployed product was built with (`6131cc902`, merged with pull request #90; the
+  controller had named the current stable, 1.100.0). On 2026-11-21, after the merge, he decided to
+  remove that pin, since upstream pins no toolchain; this reverses item 26. The change,
+  `cd6f5f417` (the gates job of `.github/workflows/test.yml` only), took out the job's
+  `RUSTUP_TOOLCHAIN` entry and the toolchain install and kept a step printing `rustc --version
+  --verbose`. After pull request #98 was opened on 2026-11-21, `main` gained pull requests #97
+  (loopback test listeners), #89 (the parallel retention pipeline), #99 (the 0.4.0-beta.1 release
+  preparation) and #103 (its record in `CLAUDE.md`), all merged by the project owner by
+  2026-11-22. #89 rebuilt the retention gates: one instrumented build feeds three coverage jobs, a
+  separate job captures the listings, and every retention job pins `RUSTUP_TOOLCHAIN` to Rust
+  1.99.1 and prints `rustc -vV`; `CLAUDE.md` there says to keep the pin in step with the compiler
+  used to build the deployed product. #103 records in `CLAUDE.md` that the product build uses the
+  runner's stable Rust, unpinned, as upstream pins no toolchain, and that `0.4.0-beta.1`'s
+  artifact was built with rustc 1.100.0. In the merge of `main` into this branch (`c08595afc`),
   `.github/workflows/test.yml` is `main`'s, and in `CLAUDE.md` the paragraph on the `gates` job is
   `main`'s and the rest is `main`'s text with this branch's move of release 6's inventories. So
   this branch's removal of the pin (`cd6f5f417`, recorded in `ad4142c3a`) does not survive: the
   gates job it edited no longer exists in that form, and the retention jobs on `main` are pinned
-  to Rust 1.99.1. The two commits stay in the history.
-- **What the gate's figures depend on.** The retention jobs measure with Rust 1.99.1 until the
-  pin is changed. The earlier results still show how much the compiler moves the figures: the
-  cohort measured about half a point apart on Rust 1.99.1 (`68d905131`) and Rust 1.100.0
-  (`8e05a6b44`), and on 1.100.0 the gate passed with 62 and 49 lines to spare. The run on
+  to Rust 1.99.1. The two commits stay in the history. On 2026-11-22, told that `main`'s retention
+  jobs pin Rust 1.99.1 and that this branch's removal of the pin had not survived the merge, the
+  project owner decided: the retention jobs no longer pin the Rust version. It is not made in this
+  pull request but in one of its own after it, and not yet made: at this commit, and until that
+  pull request lands, the retention jobs on `main` still pin Rust 1.99.1. The design the
+  controller will brief for it: nothing pinned in the repository; the build job installs the
+  current stable Rust and reports the exact version it got, and every other retention job of the
+  run installs that same version, so the jobs that share one instrumented build still share one
+  compiler.
+- **What the gate's figures depend on.** Until that pull request lands, the retention jobs
+  measure with Rust 1.99.1; once it lands, the coverage figures follow the stable current at each
+  run. The earlier results show the size of that: the cohort measured about half a point apart
+  on Rust 1.99.1 (`68d905131`) and Rust 1.100.0 (`8e05a6b44`), and on 1.100.0 the gate passed on
+  `8e05a6b44` with 62 and 49 lines to spare. The run on
   `f559febdb`, on Rust 1.99.1, measured the totals of the earlier 1.99.1 run again (upstream's
   product 398,456 lines there and in the run on `68d905131`, against 387,958 in the run on
   `8e05a6b44`, whose image carried Rust 1.100.0), and the margins are back to about 140 lines.
@@ -299,6 +309,9 @@ returns to an earlier value.
   toolchain (`cd6f5f417`); this reverses item 26. Superseded by the retention pipeline he merged
   on 2026-11-22 (#89), which pins every retention job; the product build is unpinned on `main`
   (#103).
+- **2026-11-22**: told that `main`'s retention jobs pin Rust 1.99.1 and that this branch's removal
+  of the pin had not survived the merge, he decided: the retention jobs no longer pin the Rust
+  version. To be made in a pull request of its own; not yet made.
 
 ## Rulings that bind later work
 
@@ -509,8 +522,14 @@ process (routing, review order, reruns of a run) are in the history.
   request, were the controller's rulings; the removal did not survive the merge with `main`.
 - **`main`'s workflow in the merge.** Taking `main`'s workflow in the merge (`c08595afc`) is the
   controller's ruling, reported to the project owner: `main`'s pipeline shares one instrumented
-  build across jobs and so needs one compiler. Cost if wrong: he wants the retention jobs unpinned
-  regardless; that is a change to the pipeline of #89, not to this branch.
+  build across jobs and so needs one compiler. Cost: unpinning the retention jobs is a change to
+  the pipeline of #89, not to this branch.
+- **The unpinning in a pull request of its own.** The project owner's decision of 2026-11-22 (the
+  retention jobs no longer pin the Rust version) is not made in this pull request: making it
+  changes the retention pipeline of #89 (its two workflows, the generator and contract check
+  behind them, the setup script and the gate tools' tests) and wants a retention run to qualify
+  it, so it is a pull request of its own after this one (the controller's ruling). Cost if wrong:
+  he wanted it inside this pull request.
 
 ### Tests that must keep their form
 
@@ -1089,11 +1108,10 @@ decisions"), each with the controller's recommendation where one was made:
   updates reach the same end. Recommended: accept, or a follow-up.
 - 17. FC2-15: `shareWith` is refused whatever its value, `null` and `{}` included. Recommended:
   let the reference client's checklist decide (it is in the checklist).
-- 28. `main`'s rule ties the retention pin to the deployed product's compiler; `0.4.0-beta.1` was
-  built with rustc 1.100.0, so deploying it puts the product on 1.100.0 while the retention jobs
-  measure with 1.99.1. Moving the pin to 1.100.0 would follow the rule; on that compiler the
-  coverage gate passed on `8e05a6b44` with 62 and 49 lines to spare. Put to him by the
-  controller; nothing is changed.
+
+Item 28 (keep the retention pin in step with the deployed product's compiler) has left this
+list: with no pin, as the project owner decided on 2026-11-22, there is nothing to keep in step
+with the product's compiler ("CI and the gates").
 
 Item 27 (pin the release workflow to the gates' version) has left this list: it stays closed and
 was never made, since `main` keeps the product build unpinned on purpose (#103; "CI and the
