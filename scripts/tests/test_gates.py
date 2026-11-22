@@ -35,6 +35,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -53,6 +54,7 @@ import capture_listings  # noqa: E402
 import ci_steps  # noqa: E402
 import cohort  # noqa: E402
 import coverage_net  # noqa: E402
+import retention_workflow  # noqa: E402
 import strict_rule  # noqa: E402
 
 ROOT = gate_common.ROOT
@@ -874,9 +876,155 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertReports(self.edited_shard(original, changed), "shard", field)
 
+    # The retention toolchain: one job resolves the current stable release once per run, and
+    # every other retention job installs exactly that release (no version is written anywhere).
+    RESOLVED = "${{ needs.gates-toolchain.outputs.rust-toolchain }}"
+    TOOLCHAIN_JOBS = ("gates-build", "gates-listings", "gates")
+    SHARD_CALLS = ("gates-short", "gates-za-rocks", "gates-za-filesystem")
+
+    def job_span(self, job):
+        start = self.text.index(f"\n  {job}:\n") + 1
+        following = re.compile(r"^  [A-Za-z0-9_-]+:\n", re.M).search(self.text, start + 1)
+        return start, following.start() if following else len(self.text)
+
+    def edited_job(self, job, old, new):
+        """test.yml with one edit inside job `job` only."""
+        start, end = self.job_span(job)
+        block = self.text[start:end]
+        self.assertEqual(block.count(old), 1, f"anchor not unique in job {job}: {old!r}")
+        return ci_steps.check_workflow(
+            self.text[:start] + block.replace(old, new) + self.text[end:], self.shard)
+
+    def test_no_rust_release_is_written_in_the_retention_jobs(self):
+        jobs = ci_steps.load_yaml(self.text)["jobs"]
+        for job in self.TOOLCHAIN_JOBS:
+            with self.subTest(job=job):
+                self.assertEqual(jobs[job]["env"]["RUSTUP_TOOLCHAIN"], self.RESOLVED)
+        for job in self.SHARD_CALLS:
+            with self.subTest(job=job):
+                self.assertEqual(jobs[job]["with"]["rust-toolchain"], self.RESOLVED)
+        callee = ci_steps.load_yaml(self.shard)["jobs"]["shard"]
+        self.assertEqual(callee["env"]["RUSTUP_TOOLCHAIN"], "${{ inputs.rust-toolchain }}")
+        # The contract describes the same expressions, not a release of its own.
+        expected = retention_workflow.producer_jobs(ci_steps.BASE_ENV)
+        expected["gates"] = retention_workflow.reporter_job(ci_steps.BASE_ENV)
+        for job in self.TOOLCHAIN_JOBS:
+            with self.subTest(contract=job):
+                self.assertEqual(expected[job]["env"]["RUSTUP_TOOLCHAIN"], self.RESOLVED)
+        self.assertFalse(hasattr(retention_workflow, "RUST_TOOLCHAIN"))
+
+    def test_one_resolver_job_exposes_the_run_toolchain(self):
+        jobs = ci_steps.load_yaml(self.text)["jobs"]
+        self.assertIn("gates-toolchain", jobs)
+        resolver = jobs["gates-toolchain"]
+        self.assertEqual(resolver["name"], "Resolve Retention Toolchain")
+        self.assertEqual(resolver["needs"], "style")
+        self.assertEqual(resolver["if"], jobs["gates-build"]["if"])
+        self.assertEqual(resolver["runs-on"], jobs["gates-build"]["runs-on"])
+        self.assertLessEqual(int(resolver["timeout-minutes"]), 15)
+        self.assertEqual(resolver["permissions"], {"contents": "read"})
+        self.assertEqual(resolver["outputs"],
+                         {"rust-toolchain": "${{ steps.resolve.outputs.rust-toolchain }}"})
+        self.assertEqual(resolver["steps"][-1]["run"],
+                         "bash scripts/tests/retention_ci_setup.sh resolve-toolchain")
+        for job in (*self.TOOLCHAIN_JOBS, *self.SHARD_CALLS):
+            with self.subTest(job=job):
+                self.assertIn("gates-toolchain", jobs[job]["needs"])
+
+    def test_a_literal_or_foreign_toolchain_fails(self):
+        values = ('"9.87.6"', "stable", "${{ needs.gates-build.outputs.rust-toolchain }}")
+        for job in self.TOOLCHAIN_JOBS:
+            for value in values:
+                with self.subTest(job=job, mutation=f"env RUSTUP_TOOLCHAIN {value}"):
+                    problems = self.edited_job(job, f"RUSTUP_TOOLCHAIN: {self.RESOLVED}\n",
+                                               f"RUSTUP_TOOLCHAIN: {value}\n")
+                    self.assertReports(problems, f"job {job}.env.RUSTUP_TOOLCHAIN")
+        for job in self.SHARD_CALLS:
+            for value in values:
+                with self.subTest(job=job, mutation=f"with rust-toolchain {value}"):
+                    problems = self.edited_job(job, f"rust-toolchain: {self.RESOLVED}\n",
+                                               f"rust-toolchain: {value}\n")
+                    self.assertReports(problems, f"job {job}.with.rust-toolchain")
+
+    def test_a_retention_job_that_does_not_need_the_resolver_fails(self):
+        for job in (*self.TOOLCHAIN_JOBS, *self.SHARD_CALLS):
+            with self.subTest(job=job, mutation="gates-toolchain dropped from needs"):
+                problems = self.edited_job(job, "      - gates-toolchain\n", "")
+                self.assertReports(problems, f"job {job}.needs")
+
+    def test_the_resolver_job_cannot_be_dropped_changed_or_conditioned(self):
+        start, end = self.job_span("gates-toolchain")
+        problems = self.edited(self.text[start:end], "")
+        self.assertIn("job gates-toolchain: missing", problems)
+        when = "    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'\n"
+        run = "        run: bash scripts/tests/retention_ci_setup.sh resolve-toolchain\n"
+        for mutation, old, new, field in (
+            ("job condition always()", when, "    if: ${{ always() }}\n", ".if"),
+            ("job condition narrowed", when,
+             "    if: github.event_name == 'workflow_dispatch'\n", ".if"),
+            ("continue-on-error added", when, when + "    continue-on-error: true\n",
+             ".continue-on-error: unexpected"),
+            ("needs changed", "    needs: style\n", "    needs: gates-listings\n", ".needs"),
+            ("runner changed", "    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-latest\n",
+             ".runs-on"),
+            ("timeout lengthened", "    timeout-minutes: 10\n", "    timeout-minutes: 120\n",
+             ".timeout-minutes"),
+            ("write permission", "      contents: read\n", "      contents: write\n",
+             ".permissions.contents"),
+            ("output from another step",
+             "      rust-toolchain: ${{ steps.resolve.outputs.rust-toolchain }}\n",
+             "      rust-toolchain: ${{ steps.other.outputs.rust-toolchain }}\n",
+             ".outputs.rust-toolchain"),
+            ("channel name written as output", run,
+             "        run: printf 'rust-toolchain=stable\\n' >> \"$GITHUB_OUTPUT\"\n",
+             ", step resolve.run"),
+            ("step conditioned", run, "        if: ${{ false }}\n" + run,
+             ", step resolve.if: unexpected"),
+            ("step allowed to fail", run, "        continue-on-error: true\n" + run,
+             ", step resolve.continue-on-error: unexpected"),
+        ):
+            with self.subTest(mutation=mutation):
+                problems = self.edited_job("gates-toolchain", old, new)
+                self.assertReports(problems, f"job gates-toolchain{field}")
+
+    def test_reporter_counts_the_resolver_result(self):
+        for mutation, old, new, field in (
+            ("resolver result dropped from the loop", "for outcome in TOOLCHAIN BUILD ",
+             "for outcome in BUILD ", "run"),
+            ("resolver result removed",
+             "          TOOLCHAIN_OUTCOME: ${{ needs.gates-toolchain.result }}\n", "",
+             "env.TOOLCHAIN_OUTCOME: missing"),
+            ("resolver result replaced by success",
+             "          TOOLCHAIN_OUTCOME: ${{ needs.gates-toolchain.result }}\n",
+             "          TOOLCHAIN_OUTCOME: success\n", "env.TOOLCHAIN_OUTCOME"),
+        ):
+            with self.subTest(mutation=mutation):
+                problems = self.edited_job("gates", old, new)
+                self.assertReports(problems, "job gates, step qualify", field)
+
+    @unittest.skipUnless(shutil.which("bash"), "requires bash")
+    def test_a_failed_or_skipped_resolver_turns_the_check_red(self):
+        steps = ci_steps.load_yaml(self.text)["jobs"]["gates"]["steps"]
+        qualify = next(step for step in steps if step.get("id") == "qualify")
+        self.assertIn("TOOLCHAIN_OUTCOME", qualify["env"])
+        for result, code in (("success", 0), ("failure", 1), ("skipped", 1), ("cancelled", 1),
+                             ("", 1)):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as directory:
+                outcomes = {name: "success" for name in qualify["env"]}
+                outcomes["TOOLCHAIN_OUTCOME"] = result
+                proc = subprocess.run(
+                    ["bash", "-eo", "pipefail", "-c", qualify["run"]], cwd=directory,
+                    env={**os.environ, **outcomes,
+                         "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary")},
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
+                self.assertIn(f"TOOLCHAIN: {result}\n", proc.stdout)
+
     def test_retention_trigger_and_style_requirements_are_not_optional(self):
         checks = (
-            ("      - style\n      - gates-build\n", "      - gates-build\n", "needs"),
+            ("      - style\n      - gates-toolchain\n      - gates-build\n",
+             "      - gates-toolchain\n      - gates-build\n", "needs"),
             (" && needs.style.result == 'success'", "", "if"),
             (" && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')",
              "", "if"),

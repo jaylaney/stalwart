@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Stalwart contributors
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Offline tests of the retention build snapshot and dependency cache inputs."""
+"""Offline tests of the retention build snapshot, dependency cache inputs and toolchain setup."""
 
 import base64
 import io
@@ -229,6 +229,83 @@ class DependencyCacheTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(result.stdout, "")
                     self.assertIn("Cargo config includes", result.stderr)
+
+
+class ToolchainSetupTests(unittest.TestCase):
+    """The resolver hands each run one exact stable release; a consumer refuses anything else."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        root = Path(self.temporary.name)
+        self.commands = root / "bin"
+        self.commands.mkdir()
+        self.calls = root / "calls"
+        self.output = root / "outputs"
+        (self.commands / "rustup").write_text(
+            '#!/bin/sh\n'
+            'printf "%s\\n" "$*" >> "$FIXTURE_CALLS"\n'
+            'if [ "$1" = run ]; then shift 2; exec "$@"; fi\n'
+        )
+        (self.commands / "rustc").write_text(
+            '#!/bin/sh\n'
+            'printf "rustc %s (fixture)\\nhost: x86_64-unknown-linux-gnu\\nrelease: %s\\n" \\\n'
+            '  "$FIXTURE_RELEASE" "$FIXTURE_RELEASE"\n'
+        )
+        for tool in ("cargo", "cc", "ld", "ldd"):
+            (self.commands / tool).write_text('#!/bin/sh\nprintf "%s fixture\\n" "$0"\n')
+        for command in self.commands.iterdir():
+            command.chmod(0o755)
+
+    def run_setup(self, *args, release="9.87.6", toolchain=None):
+        self.calls.write_text("")
+        self.output.write_text("")
+        env = {key: value for key, value in os.environ.items() if key != "RUSTUP_TOOLCHAIN"}
+        env.update({
+            "PATH": f"{self.commands}{os.pathsep}{os.environ['PATH']}",
+            "GITHUB_OUTPUT": str(self.output),
+            "GATES": self.temporary.name,
+            "RETENTION_TARGET": "x86_64-unknown-linux-gnu",
+            "FIXTURE_CALLS": str(self.calls),
+            "FIXTURE_RELEASE": release,
+        })
+        if toolchain is not None:
+            env["RUSTUP_TOOLCHAIN"] = toolchain
+        return subprocess.run(["bash", str(SETUP), *args], capture_output=True, text=True,
+                              env=env)
+
+    def test_resolver_installs_stable_and_outputs_its_exact_release(self):
+        result = self.run_setup("resolve-toolchain", release="9.87.6")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), "rust-toolchain=9.87.6\n")
+        self.assertEqual(self.calls.read_text().splitlines()[0],
+                         "toolchain install stable --profile minimal --no-self-update")
+        self.assertIn("release: 9.87.6", result.stdout)
+
+    def test_resolver_outputs_nothing_but_an_exact_release(self):
+        for release in ("9.88.0-beta.2", "9.87.6-nightly", "stable", "9.87", "", " 9.87.6",
+                        "9.87.6\nrelease: 9.87.7"):
+            with self.subTest(release=release):
+                result = self.run_setup("resolve-toolchain", release=release)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.output.read_text(), "")
+
+    def test_consumer_installs_the_resolved_release(self):
+        result = self.run_setup("install-tools", "ordinary", toolchain="9.87.6")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(),
+                         ["toolchain install 9.87.6 --profile minimal --no-self-update"])
+        self.assertIn("release: 9.87.6", result.stdout)
+
+    def test_consumer_refuses_a_channel_or_inexact_toolchain_before_installing(self):
+        for lane in ("ordinary", "instrumented"):
+            for toolchain in (None, "", "stable", "beta", "nightly-2026-11-01", "9.87",
+                              "9.87.6-x86_64-unknown-linux-gnu", "9.87.6 "):
+                with self.subTest(lane=lane, toolchain=toolchain):
+                    result = self.run_setup("install-tools", lane, toolchain=toolchain)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(self.calls.read_text(), "")
+                    self.assertEqual(self.output.read_text(), "")
 
 
 @unittest.skipUnless(shutil.which("zstd"), "zstd is required for snapshot transport")
