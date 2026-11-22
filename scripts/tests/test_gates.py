@@ -373,11 +373,16 @@ class StrictRuleTests(unittest.TestCase):
 
 
 # ====================================================================== listings
-def exe(package):
-    return f"target/debug/deps/{gate_common.norm_package(package)}-0000000000000000"
+def exe(package, cargo_1_100=False):
+    crate = gate_common.norm_package(package)
+    if cargo_1_100:
+        # Cargo 1.100 runs a test executable from its unit's out/, under the package's own name.
+        unit = f"debug/build/{package.replace('_', '-')}/0000000000000000"
+        return f"/mnt/target/llvm-cov-target/{unit}/out/{crate}-0000000000000000"
+    return f"target/debug/deps/{crate}-0000000000000000"
 
 
-def capture(name, selected, universe=None):
+def capture(name, selected, universe=None, cargo_1_100=False):
     """A capture in the baseline's format: SELECTED, then UNFILTERED when it differs."""
     def body(keys):
         by_pkg = {}
@@ -385,7 +390,7 @@ def capture(name, selected, universe=None):
             by_pkg.setdefault(p, []).append(n)
         lines = []
         for p, names in sorted(by_pkg.items()):
-            lines.append(f"     Running unittests src/lib.rs ({exe(p)})")
+            lines.append(f"     Running unittests src/lib.rs ({exe(p, cargo_1_100)})")
             lines += [f"{n}: test" for n in names]
             lines.append(f"\n{len(names)} tests, 0 benchmarks")
         return "\n".join(lines)
@@ -448,14 +453,14 @@ class ListingTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def gate(self, listing=None, ignored=None, executed=None, dispositions=None):
+    def gate(self, listing=None, ignored=None, executed=None, dispositions=None, cargo_1_100=False):
         listing = self.listing if listing is None else listing
         ignored = self.ignored if ignored is None else ignored
         for d, caps in (("list", listing), ("ign", ignored)):
             shutil.rmtree(os.path.join(self.tmp, d), ignore_errors=True)
             os.makedirs(os.path.join(self.tmp, d))
             for name, (sel, uni) in caps.items():
-                write(os.path.join(self.tmp, d, name + ".txt"), capture(name, sel, uni))
+                write(os.path.join(self.tmp, d, name + ".txt"), capture(name, sel, uni, cargo_1_100))
         write_json(os.path.join(self.tmp, "functions.json"), executed or self.executed)
         if isinstance(dispositions, dict):
             write_json(os.path.join(self.tmp, "dispositions.json"), dispositions)
@@ -486,6 +491,15 @@ class ListingTests(unittest.TestCase):
             self.assertIn("'tests': 795", out)
             self.assertIn("'call_steps': 272", out)
             self.assertIn("'helper_steps': 3833", out)
+
+    def test_captures_naming_cargo_1_100_executables_pass(self):
+        # The baseline's captures name target/debug/deps/<crate>-<hash>; Cargo 1.100's name
+        # debug/build/<package>/<hash>/out/<crate>-<hash>. The package comes from the file name.
+        code, out = self.gate(dispositions=DISPOSITIONS, cargo_1_100=True)
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertIn("'tests': 795", out)
+        self.assertFails(self.gate(self.without(lambda k: k == ("tests", "za::za_tests")), cargo_1_100=True),
+                         "[missing] test tests::za::za_tests: not listed by any --listing capture")
 
     def test_a_missing_test_fails(self):
         self.assertFails(self.gate(self.without(lambda k: k == ("tests", "za::za_tests"))),

@@ -64,10 +64,25 @@ SOURCE_TOKEN = re.compile(
 )
 STRING_END = re.compile(rb'(?:\\.|[^"\\\r\n])*"')
 BLOCK_TOKEN = re.compile(rb"/\*|\*/")
-BUILD_SCRIPT_PRODUCT = re.compile(
-    r"build-script-[A-Za-z0-9_][A-Za-z0-9_-]*"
-    r"|build_script_[A-Za-z0-9_]+-[0-9a-f]{16}(?:\.d)?"
-)
+# Profiles, attempt evidence and harness state, wherever they appear in the target.
+HARNESS_STATE = {"logs", "steps", "receipts", "test-stores", "stores", ".run"}
+# Cargo 1.100 keeps every unit in debug/build/<package>/<unit hash>/: fingerprint/ and out/,
+# and run/ for a build-script run. Cargo before 1.100 used debug/deps and debug/.fingerprint.
+UNIT_HASH = re.compile(r"[0-9a-f]{16}")
+UNIT_STATE = {"fingerprint", "out", "run"}
+OLD_LAYOUT = ("deps", ".fingerprint")
+# A build-script run's state: the script's captured cargo:: lines (without them Cargo reruns
+# the script), its $OUT_DIR path, both required as before 1.100, and the time it was invoked.
+RUN_STATE = {"stdout", "root-output", "invoked.timestamp"}
+RUN_REQUIRED = {"stdout", "root-output"}
+# Named exclusions in a unit directory; any other unknown entry makes the pack refuse.
+RUN_EXCLUDED = {
+    # The build script's captured stderr, which Cargo does not read to decide freshness.
+    "stderr",
+}
+# Cargo can replay rustc diagnostics from fingerprint/output-<target> (every 1.100 compile unit
+# has one, holding rustc's unused_extern report), but does not need them to decide freshness.
+FINGERPRINT_EXCLUDED_PREFIX = "output-"
 
 
 def git(repo, *args):
@@ -131,16 +146,34 @@ def cache_key(repo, lane, triple):
     return f"retention-download-v1-{lane}-{hasher.hexdigest()}"
 
 
+def harness_state(part):
+    return (
+        part.startswith("_step_")
+        or part.endswith((".profraw", ".profdata", ".log"))
+        or part in HARNESS_STATE
+    )
+
+
+def unit_member(parts):
+    """Permit a unit's state below debug/build/<package>/<unit hash>/."""
+    if not parts:
+        return True
+    state = parts[0]
+    if state == "out":
+        # Compiled units, test executables, build-script executables and $OUT_DIR contents.
+        return True
+    if state == "fingerprint":
+        return len(parts) == 1 or len(parts) == 2 and not parts[1].startswith(FINGERPRINT_EXCLUDED_PREFIX)
+    if state == "run":
+        return len(parts) == 1 or len(parts) == 2 and parts[1] in RUN_STATE
+    return False
+
+
 def allowed(parts):
     """Permit the Cargo test build's debug tree without incremental or test state."""
     if not parts or parts[0] != COV_TARGET:
         return False
-    if any(
-        part.startswith("_step_")
-        or part.endswith((".profraw", ".profdata", ".log"))
-        or part in {"logs", "steps", "receipts", "test-stores", "stores", ".run"}
-        for part in parts
-    ):
+    if any(harness_state(part) for part in parts):
         return False
     if len(parts) == 1:
         return True
@@ -149,28 +182,20 @@ def allowed(parts):
     if len(parts) == 2:
         return True
     group = parts[2]
-    if group == ".fingerprint":
-        # Cargo can replay rustc diagnostics from output-<target> files, but it
-        # does not need them to decide whether the compiled unit is fresh.
-        return len(parts) <= 4 or not parts[4].startswith("output-")
-    if group in {"deps", "examples"}:
+    if group == "examples":
         return True
     if group == "build":
-        return (
-            len(parts) <= 4
-            or parts[4] == "out"
-            or len(parts) == 5 and (
-                parts[4] in {"output", "root-output", "invoked.timestamp"}
-                or BUILD_SCRIPT_PRODUCT.fullmatch(parts[4]) is not None
-            )
-        )
+        # build/<package>/<unit hash>/<state>/...
+        return len(parts) <= 4 or UNIT_HASH.fullmatch(parts[4]) is not None and unit_member(parts[5:])
+    if group in OLD_LAYOUT:
+        return False
     # Named Cargo bin outputs and their dep-info at the profile root, without subdirectories.
     return len(parts) == 3 and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*(?:\.d)?", group) is not None
 
 
 def is_text_state(path):
     return (
-        path.name in {"output", "root-output"}
+        path.name in {"output", "root-output", "stdout"}
         or path.suffix in SOURCE_SUFFIXES
         or path.suffix in {".json", ".toml", ".d", ".txt", ".cmake"}
     )
@@ -293,28 +318,72 @@ def check_snapshot_credentials(files, credential_values):
         raise ValueError("\n".join(findings))
 
 
+def real_dir(path):
+    return path.is_dir() and not path.is_symlink()
+
+
+def real_file(path):
+    return path.is_file() and not path.is_symlink()
+
+
+def check_unit(unit, label, unexpected):
+    """Check one unit directory's state and return whether it is a build-script run."""
+    for entry in sorted(unit.iterdir()):
+        if entry.name not in UNIT_STATE and not harness_state(entry.name):
+            raise unexpected(entry)
+    fingerprint, out, run = (unit / name for name in ("fingerprint", "out", "run"))
+    # cargo-llvm-cov tells a compile unit's out/ from a run's $OUT_DIR by these siblings.
+    if not (real_dir(fingerprint) and real_dir(out)):
+        raise ValueError(f"incomplete Cargo unit state in {label(unit)}")
+    for entry in sorted(fingerprint.iterdir()):
+        if not real_file(entry) and not harness_state(entry.name):
+            raise unexpected(entry)
+    if not (run.exists() or run.is_symlink()):
+        return False
+    if real_dir(run):
+        state = {}
+        for entry in sorted(run.iterdir()):
+            if entry.name in RUN_STATE:
+                state[entry.name] = entry
+            elif entry.name not in RUN_EXCLUDED and not harness_state(entry.name):
+                raise unexpected(entry)
+        if RUN_REQUIRED <= state.keys() and all(map(real_file, state.values())):
+            return True
+    raise ValueError(f"incomplete Cargo build-script state in {label(unit)}")
+
+
 def check_cargo_state(tree):
+    """Require Cargo 1.100's build directory, complete units and no unknown entry in them."""
     debug = tree / COV_TARGET / "debug"
-    required = (debug / ".fingerprint", debug / "deps", debug / "build")
-    if not all(path.is_dir() and not path.is_symlink() for path in required):
-        raise ValueError("missing Cargo debug, fingerprint, dependency or build-script state")
-    found_output = False
-    for output_dir in (debug / "build").iterdir():
-        if not output_dir.is_dir() or output_dir.is_symlink():
-            continue
-        output = output_dir / "output"
-        root_output = output_dir / "root-output"
-        out = output_dir / "out"
-        if any(path.exists() or path.is_symlink() for path in (output, root_output, out)):
-            if not (
-                output.is_file() and not output.is_symlink()
-                and root_output.is_file() and not root_output.is_symlink()
-                and out.is_dir() and not out.is_symlink()
-            ):
-                raise ValueError(f"incomplete Cargo build-script state for {output_dir.name}")
-            found_output = True
-    if not found_output:
-        raise ValueError("missing Cargo build-script output")
+
+    def label(path):
+        return path.relative_to(tree).as_posix()
+
+    def unexpected(path):
+        return ValueError(f"unexpected entry in Cargo build state: {label(path)}")
+
+    for name in OLD_LAYOUT:
+        if (debug / name).exists() or (debug / name).is_symlink():
+            raise ValueError(f"Cargo target layout before 1.100 is not supported: {label(debug / name)}")
+    build = debug / "build"
+    if not (real_dir(debug) and real_dir(build)):
+        raise ValueError("missing Cargo debug or build directory")
+    runs = compiles = 0
+    for package in sorted(build.iterdir()):
+        # A package named like harness state would otherwise be left out without notice.
+        if not real_dir(package) or not allowed(PurePosixPath(label(package)).parts):
+            raise unexpected(package)
+        for unit in sorted(package.iterdir()):
+            if not real_dir(unit) or not allowed(PurePosixPath(label(unit)).parts):
+                raise unexpected(unit)
+            if check_unit(unit, label, unexpected):
+                runs += 1
+            else:
+                compiles += 1
+    if not runs:
+        raise ValueError("no Cargo build-script run unit")
+    if not compiles:
+        raise ValueError("no Cargo compile unit")
 
 
 def relative_path(name):
@@ -345,9 +414,8 @@ def build_members(target, path):
     if not allowed(relative.parts):
         return
     mode = path.lstat().st_mode
-    if stat.S_ISDIR(mode) and len(relative.parts) == 3 and relative.parts[2] not in {
-        ".fingerprint", "build", "deps", "examples",
-    }:
+    # Of the profile root's directories, only build/ and examples/ (incremental/ is left out).
+    if stat.S_ISDIR(mode) and len(relative.parts) == 3 and relative.parts[2] not in {"build", "examples"}:
         return
     yield path, relative, stat.S_ISREG(mode)
     if stat.S_ISDIR(mode):
@@ -381,6 +449,23 @@ def inspect_manifest(manifest):
         raise ValueError("invalid build manifest")
 
 
+def check_manifest_objects(manifest, members):
+    """Require every coverage object the build manifest lists to be packed as a file."""
+    objects = json.loads(manifest.read_bytes()).get("objects", [])
+    if not isinstance(objects, list) or not all(
+        isinstance(entry, dict) and isinstance(entry.get("path"), str) for entry in objects
+    ):
+        raise ValueError("invalid build manifest objects")
+    packed = {relative for _path, relative, regular in members if regular}
+    for entry in objects:
+        try:
+            path = relative_path(entry["path"])
+        except ValueError:
+            path = None
+        if path not in packed:
+            raise ValueError(f"build manifest object is not a packed file: {entry['path']}")
+
+
 def require_external_output(path, target, label):
     output = path.resolve()
     target = target.resolve()
@@ -395,6 +480,7 @@ def pack_build(manifest, target, destination, credentials):
     if destination.exists() or destination.is_symlink():
         raise ValueError("snapshot archive already exists")
     members = list(build_members(target, target / COV_TARGET))
+    check_manifest_objects(manifest, members)
     files = [(manifest, BUILD_MANIFEST)]
     files.extend((path, relative.as_posix()) for path, relative, regular in members if regular)
     check_snapshot_credentials(files, credentials)
