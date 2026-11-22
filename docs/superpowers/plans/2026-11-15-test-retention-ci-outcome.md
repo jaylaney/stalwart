@@ -251,10 +251,11 @@ only the earlier one. The shards were skipped and the final check was red.
 
 The packer now accepts only Cargo 1.100's layout, in which each unit is a directory
 `debug/build/<package>/<hash>/` holding `fingerprint/`, `out/` and, for a build-script run,
-`run/`. It keeps `out/` whole, every fingerprint file but the replayed diagnostics
-(`output-*`), and a run's `stdout`, `root-output` and `invoked.timestamp` but not its
-`stderr`; incremental data, profiles and harness state stay out as before, and a run's
-`stdout` gets the credential-pattern scan the earlier `output` file got. It refuses a target
+`run/`. It keeps `out/` (harness-state names such as `*.log` stay out of it, as before),
+every fingerprint file but the replayed diagnostics (`output-*`), and a run's `stdout`,
+`root-output` and `invoked.timestamp` but not its `stderr`; incremental data, profiles and
+harness state stay out as before, and a run's `stdout` gets the credential-pattern scan the
+earlier `output` file got. It refuses a target
 in the earlier layout, an entry of the build directory it does not know, a unit without
 `fingerprint/` or `out/`, a run without `stdout` or `root-output`, and a build manifest object
 it would not pack as a file. Locally, with one small crate (`vault`) built with coverage on a
