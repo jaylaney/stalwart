@@ -83,6 +83,8 @@ jobs:
         run: |
           python3 -I scripts/tests/ci_steps.py
           python3 -I scripts/tests/test_gates.py
+          python3 -I scripts/tests/test_retention_artifacts.py
+          python3 -I scripts/tests/test_retention_evidence.py
 
   test:
     name: Test
@@ -597,125 +599,669 @@ jobs:
             ${{ runner.temp }}/fresh-store-logs/server.log
             ${{ runner.temp }}/fresh-store-logs/fresh-store.log
 
-  gates:
-    name: Test Retention Gates
+  # Retention runs weekly and on request. First build one instrumented target
+  # while capturing ordinary test listings. Each coverage job runs its assigned
+  # configurations sequentially in isolation, then the final job validates
+  # their evidence together and applies the existing inventory and coverage rules.
+  gates-build:
+    name: Build Retention Coverage Target
     needs: style
-    # The inventory and coverage gates of the 1.0 upgrade (scripts/tests,
-    # tests/qualification): the baseline's 19-step `cargo llvm-cov
-    # --no-report` net, every CI step's libtest listing, then both gates. An
-    # instrumented build of the workspace and the whole net take hours, so
-    # it runs weekly and on manual dispatch, not on pull requests or pushes.
-    # The Docker-backed automation step runs in the net here (it could not
-    # on a developer machine without Docker).
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 330
-
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      snapshot-artifact-id: ${{ steps.snapshot.outputs.artifact-id }}
     env:
       STORE: RocksDb
       RUST_MIN_STACK: "16777216"
-      # The instrumented and plain builds share one target directory outside
-      # the checkout (the hosted runner had 88 GB free on its disk).
+      # Rust's coverage mapping changes the measured line counts. All retention
+      # jobs use the deployed product's compiler. Update their pins together
+      # when the product compiler changes.
+      RUSTUP_TOOLCHAIN: "1.99.1"
+      RETENTION_TIMEOUT_MINUTES: "120"
+      RETENTION_TARGET: x86_64-unknown-linux-gnu
       CARGO_TARGET_DIR: /mnt/target
+      CARGO_HOME: /mnt/retention-ci/.cargo
+      CARGO_TERM_COLOR: never
+      GIT_OPTIONAL_LOCKS: "0"
       GATES: /mnt/gates
+      TMPDIR: /mnt/gates/tmp
 
     steps:
+      - name: Set the work deadline and prepare retention directories
+        id: prepare
+        shell: bash
+        run: |
+          # Leave the final 12 minutes for settlement, diagnostics and bounded uploads.
+          printf 'RETENTION_DEADLINE_EPOCH=%s\n' \
+            "$(( $(date +%s) + (RETENTION_TIMEOUT_MINUTES - 12) * 60 ))" >> "$GITHUB_ENV"
+          sudo mkdir -p "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+          sudo chown "$(id -u):$(id -g)" "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+          df -h "$GATES"
+
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - name: Make room on /mnt
+      - name: Install pinned coverage tools
+        id: tools
+        shell: bash
+        run: bash scripts/tests/retention_ci_setup.sh install-tools instrumented
+
+      - name: Normalize checkout mtimes
+        id: normalize
+        shell: bash
+        run: python3 -I scripts/tests/retention_artifacts.py normalize-checkout
+
+      - name: Compute instrumented dependency download key
+        id: cache-key
+        continue-on-error: true
+        shell: bash
         run: |
-          sudo mkdir -p /mnt/target /mnt/gates
-          sudo chown "$(id -u):$(id -g)" /mnt/target /mnt/gates
-          df -h / /mnt
+          key=$(python3 -I scripts/tests/retention_artifacts.py cache-key --lane instrumented \
+            --target-triple "$RETENTION_TARGET")
+          test -n "$key"
+          printf 'key=%s\n' "$key" >> "$GITHUB_OUTPUT"
 
-      - name: Install cargo-llvm-cov
-        # The job uses the runner's stable Rust, as the other jobs do. The
-        # compiler's coverage mapping decides the gate's line counts, so its
-        # version is printed: a gate's figures then name their compiler.
+      - name: Restore instrumented dependency downloads
+        id: cache-restore
+        if: ${{ steps.cache-key.outcome == 'success' && steps.cache-key.outputs.key != '' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: |
+            /mnt/retention-ci/.cargo/registry/cache
+            /mnt/retention-ci/.cargo/registry/index
+            /mnt/retention-ci/.cargo/git/db
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Fetch and materialize dependencies
+        id: fetch
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cache-restore.outputs.cache-hit }}
+          CACHE_RESULT: ${{ steps.cache-restore.outcome }}
         run: |
-          rustup component add llvm-tools-preview
-          rustc --version --verbose
-          cargo install cargo-llvm-cov --version 0.9.1 --locked
+          printf 'Dependency cache %s (exact hit: %s)\n' \
+            "${CACHE_RESULT:-skipped}" "${CACHE_HIT:-false}" | tee -a "$GITHUB_STEP_SUMMARY"
+          bash scripts/tests/retention_ci_setup.sh fetch
 
-      - name: Coverage net (19 steps)
-        id: net
-        # The driver runs each step under its own environment (the SMTP
-        # step's SPAM_RULES_URL, the key and filesystem-blob variables), runs
-        # a failed step once more (smtp: its failed tests by name) and exits
-        # nonzero if a step failed twice; the steps after it still run.
-        run: python3 -I scripts/tests/coverage_net.py --out "$GATES/net"
+      - name: Check room for scheduled dependency cache saves
+        id: cache-budget
+        if: ${{ github.event_name == 'schedule' && steps.cache-key.outcome == 'success' && steps.cache-restore.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/tests/retention_ci_setup.sh cache-budget
 
-      - name: Capture CI step listings
-        id: listings
+      - name: Save instrumented dependency downloads
+        id: cache-save
+        if: ${{ github.event_name == 'schedule' && steps.cache-budget.outputs.room == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 6
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: |
+            /mnt/retention-ci/.cargo/registry/cache
+            /mnt/retention-ci/.cargo/registry/index
+            /mnt/retention-ci/.cargo/git/db
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Build instrumented targets
+        id: build
+        shell: bash
+        run: |
+          time python3 -I scripts/tests/coverage_net.py --build-only --out "$GATES/build" \
+            --deadline-epoch "$RETENTION_DEADLINE_EPOCH"
+
+      - name: Pack the build snapshot
+        id: pack
+        shell: bash
+        run: |
+          remaining=$((RETENTION_DEADLINE_EPOCH - $(date +%s)))
+          test "$remaining" -gt 0
+          time timeout --kill-after=30s "$remaining" \
+            python3 -I scripts/tests/retention_artifacts.py pack-build \
+            --manifest "$GATES/build/build.json" --target "$CARGO_TARGET_DIR" \
+            --out "$GATES/snapshot.tar.zst"
+          printf 'Build snapshot compressed bytes: %s; target bytes: %s\n' \
+            "$(stat -c '%s' "$GATES/snapshot.tar.zst")" \
+            "$(du -sb "$CARGO_TARGET_DIR" | cut -f1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          df -h "$GATES"
+
+      - name: Upload the build snapshot
+        id: snapshot
+        timeout-minutes: 8
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: retention-build-${{ github.run_attempt }}
+          path: ${{ env.GATES }}/snapshot.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Stage sanitized build diagnostics
+        id: build-diagnostics
         if: ${{ !cancelled() }}
-        run: python3 -I scripts/tests/capture_listings.py --out "$GATES/listings"
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          bash scripts/tests/retention_ci_setup.sh stage-logs "$GATES/build-diagnostics" \
+            "$GATES/build/steps.tsv" "$GATES"/build/logs/*.log
+
+      - name: Retain build diagnostics
+        if: ${{ !cancelled() && steps.build-diagnostics.outcome == 'success' }}
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: retention-build-diagnostics-${{ github.run_attempt }}
+          path: ${{ env.GATES }}/build-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  gates-listings:
+    name: Capture Retention Test Listings
+    needs: style
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      receipt-artifact-id: ${{ steps.receipt.outputs.artifact-id }}
+    env:
+      STORE: RocksDb
+      RUST_MIN_STACK: "16777216"
+      RUSTUP_TOOLCHAIN: "1.99.1"
+      RETENTION_TIMEOUT_MINUTES: "100"
+      RETENTION_TARGET: x86_64-unknown-linux-gnu
+      CARGO_TARGET_DIR: /mnt/listing-target
+      CARGO_HOME: /mnt/retention-ci/.cargo
+      CARGO_TERM_COLOR: never
+      GIT_OPTIONAL_LOCKS: "0"
+      GATES: /mnt/gates
+      TMPDIR: /mnt/gates/tmp
+
+    steps:
+      - name: Set the work deadline and prepare retention directories
+        id: prepare
+        shell: bash
+        run: |
+          # Leave the final 12 minutes for settlement, diagnostics and bounded uploads.
+          printf 'RETENTION_DEADLINE_EPOCH=%s\n' \
+            "$(( $(date +%s) + (RETENTION_TIMEOUT_MINUTES - 12) * 60 ))" >> "$GITHUB_ENV"
+          sudo mkdir -p "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+          sudo chown "$(id -u):$(id -g)" "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+          df -h "$GATES"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned tools
+        id: tools
+        shell: bash
+        run: bash scripts/tests/retention_ci_setup.sh install-tools ordinary
+
+      - name: Normalize checkout mtimes
+        id: normalize
+        shell: bash
+        run: python3 -I scripts/tests/retention_artifacts.py normalize-checkout
+
+      - name: Compute ordinary dependency download key
+        id: cache-key
+        continue-on-error: true
+        shell: bash
+        run: |
+          key=$(python3 -I scripts/tests/retention_artifacts.py cache-key --lane ordinary \
+            --target-triple "$RETENTION_TARGET")
+          test -n "$key"
+          printf 'key=%s\n' "$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ordinary dependency downloads
+        id: cache-restore
+        if: ${{ steps.cache-key.outcome == 'success' && steps.cache-key.outputs.key != '' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: |
+            /mnt/retention-ci/.cargo/registry/cache
+            /mnt/retention-ci/.cargo/registry/index
+            /mnt/retention-ci/.cargo/git/db
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Fetch and materialize dependencies
+        id: fetch
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cache-restore.outputs.cache-hit }}
+          CACHE_RESULT: ${{ steps.cache-restore.outcome }}
+        run: |
+          printf 'Dependency cache %s (exact hit: %s)\n' \
+            "${CACHE_RESULT:-skipped}" "${CACHE_HIT:-false}" | tee -a "$GITHUB_STEP_SUMMARY"
+          bash scripts/tests/retention_ci_setup.sh fetch
+
+      - name: Check room for scheduled dependency cache saves
+        id: cache-budget
+        if: ${{ github.event_name == 'schedule' && steps.cache-key.outcome == 'success' && steps.cache-restore.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/tests/retention_ci_setup.sh cache-budget
+
+      - name: Save ordinary dependency downloads
+        id: cache-save
+        if: ${{ github.event_name == 'schedule' && steps.cache-budget.outputs.room == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 6
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: |
+            /mnt/retention-ci/.cargo/registry/cache
+            /mnt/retention-ci/.cargo/registry/index
+            /mnt/retention-ci/.cargo/git/db
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Capture all CI step listings
+        id: capture
+        shell: bash
+        run: |
+          time python3 -I scripts/tests/capture_listings.py --out "$GATES/listings" \
+            --deadline-epoch "$RETENTION_DEADLINE_EPOCH"
+
+      - name: Stage listing evidence
+        id: stage
+        if: ${{ !cancelled() }}
+        timeout-minutes: 2
+        shell: bash
+        env:
+          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+        run: |
+          python3 -I scripts/tests/retention_artifacts.py stage --kind listings \
+            --producer listings --status "$CAPTURE_OUTCOME" \
+            --source "$GATES/listings" --out "$GATES/evidence"
+
+      - name: Upload listing evidence
+        id: receipt
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
+        timeout-minutes: 4
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: retention-listings-${{ github.run_attempt }}
+          path: ${{ env.GATES }}/evidence/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Retain sanitized listing receipt
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: retention-listings-diagnostics-${{ github.run_attempt }}
+          path: ${{ env.GATES }}/evidence/receipt.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  gates-short:
+    name: Retention Coverage (short)
+    needs: gates-build
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    uses: ./.github/workflows/test-retention-shard.yml
+    with:
+      shard-id: short
+      snapshot-artifact-id: ${{ needs.gates-build.outputs.snapshot-artifact-id }}
+      rust-toolchain: "1.99.1"
+      timeout-minutes: 170
+
+  gates-za-rocks:
+    name: Retention Coverage (za-rocks)
+    needs: gates-build
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    uses: ./.github/workflows/test-retention-shard.yml
+    with:
+      shard-id: za-rocks
+      snapshot-artifact-id: ${{ needs.gates-build.outputs.snapshot-artifact-id }}
+      rust-toolchain: "1.99.1"
+      timeout-minutes: 355
+
+  gates-za-filesystem:
+    name: Retention Coverage (za-filesystem)
+    needs: gates-build
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    uses: ./.github/workflows/test-retention-shard.yml
+    with:
+      shard-id: za-filesystem
+      snapshot-artifact-id: ${{ needs.gates-build.outputs.snapshot-artifact-id }}
+      rust-toolchain: "1.99.1"
+      timeout-minutes: 355
+
+  gates:
+    name: Test Retention Gates
+    needs:
+      - style
+      - gates-build
+      - gates-short
+      - gates-za-rocks
+      - gates-za-filesystem
+      - gates-listings
+    if: ${{ !cancelled() && needs.style.result == 'success' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    env:
+      STORE: RocksDb
+      RUST_MIN_STACK: "16777216"
+      RUSTUP_TOOLCHAIN: "1.99.1"
+      RETENTION_TIMEOUT_MINUTES: "100"
+      RETENTION_TARGET: x86_64-unknown-linux-gnu
+      CARGO_TARGET_DIR: /mnt/target
+      CARGO_HOME: /mnt/retention-ci/.cargo
+      CARGO_TERM_COLOR: never
+      GIT_OPTIONAL_LOCKS: "0"
+      GATES: /mnt/gates
+      TMPDIR: /mnt/gates/tmp
+
+    steps:
+      - name: Set the work deadline and prepare retention directories
+        id: prepare
+        shell: bash
+        run: |
+          # Leave the final 12 minutes for settlement, diagnostics and bounded uploads.
+          printf 'RETENTION_DEADLINE_EPOCH=%s\n' \
+            "$(( $(date +%s) + (RETENTION_TIMEOUT_MINUTES - 12) * 60 ))" >> "$GITHUB_ENV"
+          sudo mkdir -p "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+          sudo chown "$(id -u):$(id -g)" "$GATES" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$TMPDIR"
+          df -h "$GATES"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned coverage tools
+        id: tools
+        shell: bash
+        run: bash scripts/tests/retention_ci_setup.sh install-tools instrumented
+
+      - name: Normalize checkout mtimes
+        id: normalize
+        shell: bash
+        run: python3 -I scripts/tests/retention_artifacts.py normalize-checkout
+
+      - name: Validate selected artifact IDs
+        id: artifact-ids
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          SNAPSHOT_ID: ${{ needs.gates-build.outputs.snapshot-artifact-id }}
+          SHORT_ID: ${{ needs.gates-short.outputs.receipt-artifact-id }}
+          ZA_ROCKS_ID: ${{ needs.gates-za-rocks.outputs.receipt-artifact-id }}
+          ZA_FILESYSTEM_ID: ${{ needs.gates-za-filesystem.outputs.receipt-artifact-id }}
+          LISTINGS_ID: ${{ needs.gates-listings.outputs.receipt-artifact-id }}
+        run: |
+          remaining=$((RETENTION_DEADLINE_EPOCH - $(date +%s)))
+          if (( remaining < 41 * 60 )); then
+            printf '%s\n' 'Insufficient work time for the selected artifact downloads' >&2
+            exit 1
+          fi
+          check_id() {
+            if [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+              printf '%s=true\n' "$1" >> "$GITHUB_OUTPUT"
+            else
+              printf 'Missing or invalid %s artifact ID. Re-run all jobs if artifacts expired.\n' "$1"
+              bad=1
+            fi
+          }
+          bad=0
+          check_id snapshot "$SNAPSHOT_ID"
+          check_id short "$SHORT_ID"
+          check_id za-rocks "$ZA_ROCKS_ID"
+          check_id za-filesystem "$ZA_FILESYSTEM_ID"
+          check_id listings "$LISTINGS_ID"
+          exit "$bad"
+
+      - name: Download short evidence
+        id: download-short
+        timeout-minutes: 5
+        if: ${{ !cancelled() && steps.artifact-ids.outputs.short == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.gates-short.outputs.receipt-artifact-id }}
+          path: /mnt/gates/inputs/short
+          digest-mismatch: error
+
+      - name: Download za-rocks evidence
+        id: download-za-rocks
+        timeout-minutes: 5
+        if: ${{ !cancelled() && steps.artifact-ids.outputs.za-rocks == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.gates-za-rocks.outputs.receipt-artifact-id }}
+          path: /mnt/gates/inputs/za-rocks
+          digest-mismatch: error
+
+      - name: Download za-filesystem evidence
+        id: download-za-filesystem
+        timeout-minutes: 5
+        if: ${{ !cancelled() && steps.artifact-ids.outputs.za-filesystem == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.gates-za-filesystem.outputs.receipt-artifact-id }}
+          path: /mnt/gates/inputs/za-filesystem
+          digest-mismatch: error
+
+      - name: Download listings evidence
+        id: download-listings
+        timeout-minutes: 5
+        if: ${{ !cancelled() && steps.artifact-ids.outputs.listings == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.gates-listings.outputs.receipt-artifact-id }}
+          path: /mnt/gates/inputs/listings
+          digest-mismatch: error
+
+      - name: Download the selected build snapshot
+        if: >-
+          ${{ !cancelled() && steps.artifact-ids.outcome == 'success' &&
+          steps.artifact-ids.outputs.snapshot == 'true' &&
+          steps.download-short.outcome == 'success' &&
+          steps.download-za-rocks.outcome == 'success' &&
+          steps.download-za-filesystem.outcome == 'success' &&
+          steps.download-listings.outcome == 'success' }}
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.gates-build.outputs.snapshot-artifact-id }}
+          path: /mnt/gates/snapshot
+          digest-mismatch: error
+        id: snapshot-download
+        timeout-minutes: 20
+
+      - name: Restore the instrumented build
+        id: unpack
+        if: ${{ !cancelled() && steps.snapshot-download.outcome == 'success' && steps.normalize.outcome == 'success' }}
+        shell: bash
+        run: |
+          time bash scripts/tests/retention_ci_setup.sh within-budget \
+            python3 -I scripts/tests/retention_artifacts.py unpack-build \
+            --archive "$GATES/snapshot/snapshot.tar.zst" --target "$CARGO_TARGET_DIR" \
+            --manifest-out "$GATES/build.json"
+          printf 'Expanded build bytes: %s\n' "$(du -sb "$CARGO_TARGET_DIR" | cut -f1)" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          df -h "$GATES"
+
+      - name: Compute instrumented dependency download key
+        id: cache-key
+        continue-on-error: true
+        shell: bash
+        run: |
+          key=$(python3 -I scripts/tests/retention_artifacts.py cache-key --lane instrumented \
+            --target-triple "$RETENTION_TARGET")
+          test -n "$key"
+          printf 'key=%s\n' "$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore instrumented dependency downloads
+        id: cache-restore
+        if: ${{ steps.cache-key.outcome == 'success' && steps.cache-key.outputs.key != '' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: |
+            /mnt/retention-ci/.cargo/registry/cache
+            /mnt/retention-ci/.cargo/registry/index
+            /mnt/retention-ci/.cargo/git/db
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Fetch and materialize dependencies
+        id: fetch
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cache-restore.outputs.cache-hit }}
+          CACHE_RESULT: ${{ steps.cache-restore.outcome }}
+        run: |
+          printf 'Dependency cache %s (exact hit: %s)\n' \
+            "${CACHE_RESULT:-skipped}" "${CACHE_HIT:-false}" | tee -a "$GITHUB_STEP_SUMMARY"
+          bash scripts/tests/retention_ci_setup.sh fetch
+
+      - name: Collect retention evidence
+        id: collect
+        if: >-
+          ${{ !cancelled() && steps.unpack.outcome == 'success' &&
+          steps.download-short.outcome == 'success' &&
+          steps.download-za-rocks.outcome == 'success' &&
+          steps.download-za-filesystem.outcome == 'success' &&
+          steps.download-listings.outcome == 'success' }}
+        shell: bash
+        env:
+          SNAPSHOT_ID: ${{ needs.gates-build.outputs.snapshot-artifact-id }}
+        run: |
+          status=0
+          time bash scripts/tests/retention_ci_setup.sh within-budget \
+            python3 -I scripts/tests/retention_artifacts.py collect \
+            --inputs "$GATES/inputs" --snapshot-artifact-id "$SNAPSHOT_ID" \
+            --build-manifest "$GATES/build.json" --out "$GATES/reports" || status=$?
+          printf 'code=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Prepare sources for reports
+        id: sources
+        if: ${{ !cancelled() && (steps.collect.outputs.code == '0' || steps.collect.outputs.code == '1') }}
+        shell: bash
+        run: |
+          mkdir -p "$GATES/reports/src"
+          bash scripts/tests/retention_ci_setup.sh within-budget git archive HEAD tests crates | \
+            bash scripts/tests/retention_ci_setup.sh within-budget tar -x -C "$GATES/reports/src"
+
+      - name: Merge validated profiles
+        id: merge
+        if: ${{ !cancelled() && (steps.collect.outputs.code == '0' || steps.collect.outputs.code == '1') && steps.fetch.outcome == 'success' }}
+        shell: bash
+        run: |
+          status=0
+          time python3 -I scripts/tests/coverage_net.py --merge-only \
+            --out "$GATES/reports/net" --build-manifest "$GATES/build.json" \
+            --deadline-epoch "$RETENTION_DEADLINE_EPOCH" || status=$?
+          label='Validated profiles without a per-step coverage export'
+          if [[ -s "$GATES/reports/net/merged.json" ]]; then
+            printf 'available=true\n' >> "$GITHUB_OUTPUT"
+            label='Profiles included in merged coverage without a per-step export'
+          fi
+          jq -r --arg label "$label" '.missing_exports - .missing_profiles | select(length > 0) |
+            "\($label): \(join(", "))"' \
+            "$GATES/reports/collection.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
       - name: Executed functions
         id: functions
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.sources.outcome == 'success' }}
         shell: bash
         run: |
-          mkdir -p "$GATES/src"
-          git archive HEAD tests crates | tar -x -C "$GATES/src"
-          python3 -I tests/qualification/tools/strict_rule.py functions \
-            --exports "$GATES/net/steps" --sources "$GATES/src" \
-            --out "$GATES/functions.json" 2>&1 | tee "$GATES/functions.log"
+          bash scripts/tests/retention_ci_setup.sh within-budget \
+            python3 -I tests/qualification/tools/strict_rule.py functions \
+            --exports "$GATES/reports/net/steps" --sources "$GATES/reports/src" \
+            --out "$GATES/reports/functions.json" 2>&1 | tee "$GATES/reports/functions.log"
 
       - name: Inventory gate
-        if: ${{ !cancelled() }}
+        id: inventory
+        if: ${{ !cancelled() && steps.functions.outcome == 'success' }}
         shell: bash
         run: |
-          python3 -I scripts/tests/check_test_inventory.py \
+          bash scripts/tests/retention_ci_setup.sh within-budget \
+            python3 -I scripts/tests/check_test_inventory.py \
             --baseline tests/qualification/baseline-0.16.27.json \
             --dispositions tests/qualification/dispositions.json \
-            --listing "$GATES/listings/list" --ignored-listing "$GATES/listings/ign" \
-            --executed "$GATES/functions.json" 2>&1 | tee "$GATES/inventory.out"
+            --listing "$GATES/reports/listings/list" --ignored-listing "$GATES/reports/listings/ign" \
+            --executed "$GATES/reports/functions.json" 2>&1 | tee "$GATES/reports/inventory.out"
 
       - name: Coverage gate
-        if: ${{ !cancelled() }}
+        id: coverage
+        if: ${{ !cancelled() && steps.sources.outcome == 'success' && steps.merge.outputs.available == 'true' }}
         shell: bash
         run: |
-          python3 -I scripts/tests/check_coverage.py \
+          bash scripts/tests/retention_ci_setup.sh within-budget \
+            python3 -I scripts/tests/check_coverage.py \
             --baseline tests/qualification/baseline-0.16.27.json \
             --dispositions tests/qualification/dispositions.json \
-            --merged "$GATES/net/merged.json" --sources "$GATES/src" \
-            --out "$GATES/coverage.json" 2>&1 | tee "$GATES/coverage.out"
+            --merged "$GATES/reports/net/merged.json" --sources "$GATES/reports/src" \
+            --out "$GATES/reports/coverage.json" 2>&1 | tee "$GATES/reports/coverage.out"
 
-      - name: Sanitize gate output
-        # The gates' reports, the net's step table and, by upgrade ruling
-        # 184, the net's step logs (kept on success too, for a step that
-        # passed only on its second attempt): test names, step names, counts,
-        # source locations and test output. Profiles are not uploaded. Any
-        # Basic or Bearer credential, and any password, secret or token
-        # assignment, is redacted.
+      - name: Sanitize gate diagnostics
+        id: sanitize
         if: ${{ !cancelled() }}
+        timeout-minutes: 2
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/gates-receipt/net-logs"
-          redact() {
-            sed -E \
-              -e 's/(Basic|Bearer) [A-Za-z0-9._~+\/=-]+/\1 [REDACTED]/g' \
-              -e 's/((password|secret|token)[A-Za-z_]*["]?[=:] *["]?)[^" ,}]+/\1[REDACTED]/Ig' \
-              "$1" > "$2"
-          }
-          for file in "$GATES/inventory.out" "$GATES/coverage.out" "$GATES/functions.log" \
-                      "$GATES/net/steps.tsv"; do
-            [ -f "$file" ] || continue
-            redact "$file" "$RUNNER_TEMP/gates-receipt/$(basename "$file")"
-          done
-          for file in "$GATES"/net/logs/*.log; do
-            [ -f "$file" ] || continue
-            redact "$file" "$RUNNER_TEMP/gates-receipt/net-logs/$(basename "$file")"
-          done
-          grep -h "^## exit\|^# config" "$GATES"/listings/list/*.txt "$GATES"/listings/ign/*.txt \
+          bash scripts/tests/retention_ci_setup.sh stage-logs "$RUNNER_TEMP/gates-receipt" \
+            "$GATES/reports/inventory.out" "$GATES/reports/coverage.out" \
+            "$GATES/reports/functions.log" "$GATES/reports/collection.json" \
+            "$GATES/reports/net/logs/merged.export.log" "$GATES/reports/net/merge.json"
+          grep -h "^## exit\|^# config" "$GATES"/reports/listings/list/*.txt \
+            "$GATES"/reports/listings/ign/*.txt \
             > "$RUNNER_TEMP/gates-receipt/listing-exits.txt" 2>/dev/null || true
 
-      - name: Retain sanitized gate output
-        if: ${{ !cancelled() }}
+      - name: Retain sanitized gate diagnostics
+        if: ${{ !cancelled() && steps.sanitize.outcome == 'success' }}
+        timeout-minutes: 4
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: gates-receipt
+          name: gates-receipt-${{ github.run_attempt }}
           retention-days: 7
           if-no-files-found: ignore
           path: ${{ runner.temp }}/gates-receipt/
+
+      - name: Require a complete passing retention run
+        id: qualify
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          BUILD_OUTCOME: ${{ needs.gates-build.result }}
+          SHORT_OUTCOME: ${{ needs.gates-short.result }}
+          ZA_ROCKS_OUTCOME: ${{ needs.gates-za-rocks.result }}
+          ZA_FILESYSTEM_OUTCOME: ${{ needs.gates-za-filesystem.result }}
+          LISTINGS_OUTCOME: ${{ needs.gates-listings.result }}
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+          MERGE_OUTCOME: ${{ steps.merge.outcome }}
+          FUNCTIONS_OUTCOME: ${{ steps.functions.outcome }}
+          INVENTORY_OUTCOME: ${{ steps.inventory.outcome }}
+          COVERAGE_OUTCOME: ${{ steps.coverage.outcome }}
+        run: |
+          status=0
+          for outcome in BUILD SHORT ZA_ROCKS ZA_FILESYSTEM LISTINGS COLLECT MERGE FUNCTIONS INVENTORY COVERAGE; do
+            key="${outcome}_OUTCOME"
+            printf '%s: %s\n' "$outcome" "${!key}" | tee -a "$GITHUB_STEP_SUMMARY"
+            if [[ "${!key}" != success ]]; then
+              status=1
+            fi
+          done
+          exit "$status"

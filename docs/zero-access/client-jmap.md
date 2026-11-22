@@ -41,10 +41,20 @@ On one local machine:
      exists and the request does not force the consent prompt
      (`crates/http/src/auth/oauth/auth.rs:832`); otherwise it answers that consent is required, with a consent token. Record which kind of
      client was registered and which path the sign-in took.
-4. Make the server's HTTP CORS answers allow the client's origin. The only CORS switch in the
-   registry schema is upstream's `usePermissiveCors` on the `Http` settings
-   (`crates/registry/src/schema/structs.rs`); the release adds none. `ZA_ACCOUNT_PAGE_ORIGIN`
-   governs only `/api/vault/*`, which the client does not call. Record the setting used.
+4. Make the server's HTTP CORS answers allow the client's origin. This local test uses
+   upstream's `usePermissiveCors` on the `Http` settings (`crates/registry/src/schema/structs.rs`),
+   the wildcard option: it adds `Access-Control-Allow-Origin: *`, with fixed allowed headers and
+   methods, to every HTTP response except `/api/vault/*`, so it allows every origin, server-wide,
+   not the client's alone (`crates/common/src/config/network.rs:451-474`). An origin-specific
+   header is possible only through upstream's `Http.responseHeaders`, also server-wide
+   (`crates/http/src/request.rs:1166-1180`), and only with `usePermissiveCors` turned off: the
+   wildcard headers are applied after `responseHeaders` and replace a custom
+   `Access-Control-Allow-Origin`, `-Allow-Headers` and `-Allow-Methods`
+   (`crates/common/src/config/network.rs:428-474`), so a fixed origin needs all three set in
+   `responseHeaders`, with `Authorization` among the allowed headers. The release adds no CORS
+   setting.
+   `ZA_ACCOUNT_PAGE_ORIGIN` governs only `/api/vault/*`, which the client does not call. Record
+   the setting used.
 5. Point the client at the server's base URL, as the client's own documentation describes.
 6. Accounts, all on the fresh store:
    - **A**: a key account without a second factor, provisioned through
