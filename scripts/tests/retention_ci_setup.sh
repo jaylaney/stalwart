@@ -4,8 +4,9 @@
 
 set -euo pipefail
 
-# Every retention job of a run must measure with the one compiler the run resolved, so a
-# toolchain is an exact release (X.Y.Z), never a channel that could move between jobs.
+# The resolver installs the stable channel once to learn its release. Every other retention
+# job of the run measures with that one compiler, so the toolchain it installs is an exact
+# release (X.Y.Z), never a channel that could move between jobs.
 require_exact_release() {
     if [[ ! "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         printf 'Rust toolchain "%s" is not an exact release (X.Y.Z)\n' "$1" >&2
@@ -25,9 +26,17 @@ resolve_toolchain() {
 install_tools() {
     local lane="$1"
     local asset=cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz
+    local release
     require_exact_release "$RUSTUP_TOOLCHAIN"
     rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
     test "$(rustc -vV | sed -n 's/^host: //p')" = "$RETENTION_TARGET"
+    # The compiler on the path must be the requested one, not another rustc before rustup's.
+    release=$(rustc -vV | sed -n 's/^release: //p')
+    if [[ "$release" != "$RUSTUP_TOOLCHAIN" ]]; then
+        printf 'rustc reports release "%s", not the requested toolchain "%s"\n' \
+            "$release" "$RUSTUP_TOOLCHAIN" >&2
+        return 1
+    fi
     if [[ "$lane" == instrumented ]]; then
         rustup component add --toolchain "$RUSTUP_TOOLCHAIN" llvm-tools-preview
         command -v zstd

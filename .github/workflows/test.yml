@@ -622,8 +622,8 @@ jobs:
           persist-credentials: false
 
       # Rust's coverage mapping changes the measured line counts, and the retention
-      # jobs share one instrumented build, so every retention job of a run installs
-      # this one exact release (X.Y.Z) of the current stable, never a channel name.
+      # jobs share one instrumented build, so every other retention job of a run
+      # installs this one exact release (X.Y.Z) of the current stable, never a channel.
       # A failed-jobs rerun keeps this job's first output, matching the reused artifacts.
       - name: Resolve the current stable Rust release
         id: resolve

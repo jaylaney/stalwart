@@ -242,18 +242,22 @@ class ToolchainSetupTests(unittest.TestCase):
         self.commands.mkdir()
         self.calls = root / "calls"
         self.output = root / "outputs"
+        # Both fakes log each call, so a test sees which compiler a release was read from.
         (self.commands / "rustup").write_text(
             '#!/bin/sh\n'
-            'printf "%s\\n" "$*" >> "$FIXTURE_CALLS"\n'
+            'printf "rustup %s\\n" "$*" >> "$FIXTURE_CALLS"\n'
             'if [ "$1" = run ]; then shift 2; exec "$@"; fi\n'
         )
         (self.commands / "rustc").write_text(
             '#!/bin/sh\n'
+            'printf "rustc %s\\n" "$*" >> "$FIXTURE_CALLS"\n'
             'printf "rustc %s (fixture)\\nhost: x86_64-unknown-linux-gnu\\nrelease: %s\\n" \\\n'
             '  "$FIXTURE_RELEASE" "$FIXTURE_RELEASE"\n'
         )
         for tool in ("cargo", "cc", "ld", "ldd"):
             (self.commands / tool).write_text('#!/bin/sh\nprintf "%s fixture\\n" "$0"\n')
+        # No test reaches the network, even one whose check was removed.
+        (self.commands / "curl").write_text('#!/bin/sh\nexit 22\n')
         for command in self.commands.iterdir():
             command.chmod(0o755)
 
@@ -278,8 +282,12 @@ class ToolchainSetupTests(unittest.TestCase):
         result = self.run_setup("resolve-toolchain", release="9.87.6")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.output.read_text(), "rust-toolchain=9.87.6\n")
-        self.assertEqual(self.calls.read_text().splitlines()[0],
-                         "toolchain install stable --profile minimal --no-self-update")
+        # Every rustc call goes through the stable toolchain the resolver installed.
+        self.assertEqual(self.calls.read_text().splitlines(), [
+            "rustup toolchain install stable --profile minimal --no-self-update",
+            "rustup run stable rustc -vV", "rustc -vV",
+            "rustup run stable rustc -vV", "rustc -vV",
+        ])
         self.assertIn("release: 9.87.6", result.stdout)
 
     def test_resolver_outputs_nothing_but_an_exact_release(self):
@@ -291,21 +299,42 @@ class ToolchainSetupTests(unittest.TestCase):
                 self.assertEqual(self.output.read_text(), "")
 
     def test_consumer_installs_the_resolved_release(self):
-        result = self.run_setup("install-tools", "ordinary", toolchain="9.87.6")
+        result = self.run_setup("install-tools", "ordinary", release="9.87.6", toolchain="9.87.6")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls.read_text().splitlines(),
-                         ["toolchain install 9.87.6 --profile minimal --no-self-update"])
+        # The install, then the host check, the release check and the printed identity.
+        self.assertEqual(self.calls.read_text().splitlines(), [
+            "rustup toolchain install 9.87.6 --profile minimal --no-self-update",
+            "rustc -vV", "rustc -vV", "rustc -vV",
+        ])
         self.assertIn("release: 9.87.6", result.stdout)
+
+    def test_consumer_refuses_a_compiler_that_is_not_the_requested_release(self):
+        for lane in ("ordinary", "instrumented"):
+            with self.subTest(lane=lane):
+                result = self.run_setup("install-tools", lane, release="9.87.7",
+                                        toolchain="9.87.6")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('rustc reports release "9.87.7", not the requested toolchain '
+                              '"9.87.6"', result.stderr)
+                self.assertNotIn("release: 9.87.7", result.stdout)
 
     def test_consumer_refuses_a_channel_or_inexact_toolchain_before_installing(self):
         for lane in ("ordinary", "instrumented"):
-            for toolchain in (None, "", "stable", "beta", "nightly-2026-11-01", "9.87",
-                              "9.87.6-x86_64-unknown-linux-gnu", "9.87.6 "):
+            for toolchain in ("", "stable", "beta", "nightly-2026-11-01", "9.87",
+                              "9.87.6-x86_64-unknown-linux-gnu", "9.87.6 ", "9.87.6\n"):
                 with self.subTest(lane=lane, toolchain=toolchain):
                     result = self.run_setup("install-tools", lane, toolchain=toolchain)
                     self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f'Rust toolchain "{toolchain}" is not an exact release (X.Y.Z)',
+                                  result.stderr)
                     self.assertEqual(self.calls.read_text(), "")
                     self.assertEqual(self.output.read_text(), "")
+            # Unset, the script stops at `set -u` before the check, and installs nothing.
+            with self.subTest(lane=lane, toolchain="unset"):
+                result = self.run_setup("install-tools", lane)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("RUSTUP_TOOLCHAIN: unbound variable", result.stderr)
+                self.assertEqual(self.calls.read_text(), "")
 
 
 @unittest.skipUnless(shutil.which("zstd"), "zstd is required for snapshot transport")

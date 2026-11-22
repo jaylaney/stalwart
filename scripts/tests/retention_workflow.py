@@ -9,7 +9,7 @@ RUNNER = "ubuntu-24.04"
 # No Rust release is written here: one job resolves the current stable's exact release once
 # per run, and every other retention job installs exactly that release.
 RESOLVER = "gates-toolchain"
-TOOLCHAIN = "${{ needs.gates-toolchain.outputs.rust-toolchain }}"
+TOOLCHAIN = "${{ needs." + RESOLVER + ".outputs.rust-toolchain }}"
 TARGET = "x86_64-unknown-linux-gnu"
 WHEN = "github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'"
 AFTER_FAILURE = "!cancelled()"
@@ -337,12 +337,13 @@ def reporter_job(base_env):
     id_calls = "\n".join(f'check_id {slot} "${slot.upper().replace("-", "_")}_ID"'
                          for slot in slots)
     # A failed or skipped resolver or producer job leaves the check red.
-    jobs = ("TOOLCHAIN", "BUILD", "SHORT", "ZA_ROCKS", "ZA_FILESYSTEM", "LISTINGS")
+    jobs = {"TOOLCHAIN": RESOLVER, **{
+        name: f"gates-{name.lower().replace('_', '-')}"
+        for name in ("BUILD", "SHORT", "ZA_ROCKS", "ZA_FILESYSTEM", "LISTINGS")}}
     outcomes = (*jobs, "COLLECT", "MERGE", "FUNCTIONS", "INVENTORY", "COVERAGE")
     outcome_env = {
         f"{name}_OUTCOME": expression(
-            f"needs.gates-{name.lower().replace('_', '-')}.result" if name in jobs
-            else f"steps.{name.lower()}.outcome")
+            f"needs.{jobs[name]}.result" if name in jobs else f"steps.{name.lower()}.outcome")
         for name in outcomes
     }
     download_checks = " && ".join(f"steps.download-{slot}.outcome == 'success'" for slot in slots)

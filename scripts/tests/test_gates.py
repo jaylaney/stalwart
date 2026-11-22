@@ -895,7 +895,7 @@ class WorkflowTests(unittest.TestCase):
         return ci_steps.check_workflow(
             self.text[:start] + block.replace(old, new) + self.text[end:], self.shard)
 
-    def test_no_rust_release_is_written_in_the_retention_jobs(self):
+    def test_the_six_toolchain_sites_take_the_resolvers_output(self):
         jobs = ci_steps.load_yaml(self.text)["jobs"]
         for job in self.TOOLCHAIN_JOBS:
             with self.subTest(job=job):
@@ -945,6 +945,26 @@ class WorkflowTests(unittest.TestCase):
                     problems = self.edited_job(job, f"rust-toolchain: {self.RESOLVED}\n",
                                                f"rust-toolchain: {value}\n")
                     self.assertReports(problems, f"job {job}.with.rust-toolchain")
+
+    def test_a_toolchain_at_another_scope_fails(self):
+        setting = "RUSTUP_TOOLCHAIN: stable\n"
+        tools = "        id: tools\n        shell: bash\n"
+        for job in self.TOOLCHAIN_JOBS:
+            with self.subTest(mutation=f"step env on {job}'s tools step"):
+                problems = self.edited_job(job, tools, tools + "        env:\n          " + setting)
+                self.assertReports(problems, f"job {job}, step tools.env: unexpected")
+        with self.subTest(mutation="step env on the shard's tools step"):
+            problems = self.edited_shard(tools, tools + "        env:\n          " + setting)
+            self.assertReports(problems, "job shard, step tools.env: unexpected")
+        with self.subTest(mutation="env block on the resolver job"):
+            problems = self.edited_job("gates-toolchain", "    permissions:\n",
+                                       "    env:\n      " + setting + "    permissions:\n")
+            self.assertReports(problems, "job gates-toolchain.env: unexpected")
+        with self.subTest(mutation="workflow-level RUSTUP_TOOLCHAIN"):
+            # Reported through the ordinary gated steps' effective environment (ci_steps).
+            problems = self.edited("  UNIT_TEST_FEATURES: >-\n",
+                                   "  " + setting + "  UNIT_TEST_FEATURES: >-\n")
+            self.assertReports(problems, "environment RUSTUP_TOOLCHAIN", "'stable'")
 
     def test_a_retention_job_that_does_not_need_the_resolver_fails(self):
         for job in (*self.TOOLCHAIN_JOBS, *self.SHARD_CALLS):
@@ -1002,24 +1022,51 @@ class WorkflowTests(unittest.TestCase):
                 problems = self.edited_job("gates", old, new)
                 self.assertReports(problems, "job gates, step qualify", field)
 
-    @unittest.skipUnless(shutil.which("bash"), "requires bash")
-    def test_a_failed_or_skipped_resolver_turns_the_check_red(self):
+    def run_qualify(self, outcomes):
+        """The reporter's final step under the given outcome variables: (exit code, stdout)."""
+        with tempfile.TemporaryDirectory() as directory:
+            proc = subprocess.run(
+                ["bash", "-eo", "pipefail", "-c", self.qualify()["run"]], cwd=directory,
+                env={**os.environ, **outcomes,
+                     "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary")},
+                capture_output=True, text=True,
+            )
+        return proc.returncode, proc.stdout + proc.stderr
+
+    def qualify(self):
         steps = ci_steps.load_yaml(self.text)["jobs"]["gates"]["steps"]
-        qualify = next(step for step in steps if step.get("id") == "qualify")
-        self.assertIn("TOOLCHAIN_OUTCOME", qualify["env"])
+        return next(step for step in steps if step.get("id") == "qualify")
+
+    @unittest.skipUnless(shutil.which("bash"), "requires bash")
+    def test_reporter_counts_the_resolvers_own_outcome(self):
+        # Every other outcome success: a state GitHub cannot produce, isolating the resolver's.
+        env = self.qualify()["env"]
+        self.assertEqual(env["TOOLCHAIN_OUTCOME"], "${{ needs.gates-toolchain.result }}")
         for result, code in (("success", 0), ("failure", 1), ("skipped", 1), ("cancelled", 1),
                              ("", 1)):
-            with self.subTest(result=result), tempfile.TemporaryDirectory() as directory:
-                outcomes = {name: "success" for name in qualify["env"]}
+            with self.subTest(result=result):
+                outcomes = {name: "success" for name in env}
                 outcomes["TOOLCHAIN_OUTCOME"] = result
-                proc = subprocess.run(
-                    ["bash", "-eo", "pipefail", "-c", qualify["run"]], cwd=directory,
-                    env={**os.environ, **outcomes,
-                         "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary")},
-                    capture_output=True, text=True,
-                )
-                self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
-                self.assertIn(f"TOOLCHAIN: {result}\n", proc.stdout)
+                status, output = self.run_qualify(outcomes)
+                self.assertEqual(status, code, output)
+                self.assertIn(f"TOOLCHAIN: {result}\n", output)
+
+    @unittest.skipUnless(shutil.which("bash"), "requires bash")
+    def test_a_failed_resolver_with_skipped_producers_turns_the_check_red(self):
+        # The state GitHub produces when the resolver fails: the jobs that need it are skipped,
+        # the reporter still runs (`!cancelled()`), and its gated steps are skipped after its
+        # tools step refuses the empty toolchain.
+        jobs = ci_steps.load_yaml(self.text)["jobs"]
+        self.assertNotIn("gates-toolchain", jobs["gates"]["if"])
+        outcomes = {}
+        for name, value in self.qualify()["env"].items():
+            outcomes[name] = ("failure" if "gates-toolchain" in value else "skipped")
+        self.assertEqual(sum(value == "failure" for value in outcomes.values()), 1)
+        status, output = self.run_qualify(outcomes)
+        self.assertEqual(status, 1, output)
+        self.assertIn("TOOLCHAIN: failure\n", output)
+        for producer in ("BUILD", "SHORT", "ZA_ROCKS", "ZA_FILESYSTEM", "LISTINGS"):
+            self.assertIn(f"{producer}: skipped\n", output)
 
     def test_retention_trigger_and_style_requirements_are_not_optional(self):
         checks = (
