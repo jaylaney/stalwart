@@ -201,7 +201,10 @@ account's JMAP calendar methods were refused and its OAuth tokens carried no key
   answers "try again" (JMAP `forbidden`, CalDAV 503), possibly after its internal scheduling
   items reached local key accounts' inboxes. Its email to outside and plain attendees is sent
   only after the commit, so a failed attempt mails nothing (traced `ZA_IMIP_DROPPED`). A retry
-  converges and delivers the internal items again. FoundationDB, read replicas and the bootstrap store keep a chunked, unfenced
+  rebuilds the calendar's member list and delivers the internal items again for the events it
+  still deletes; an event moved out of the calendar between the two attempts stays in its new
+  calendar, and the cancellation (or decline) the first attempt delivered for it is not undone.
+  FoundationDB, read replicas and the bootstrap store keep a chunked, unfenced
   delete.
 - **Sharing and sync.** A shared calendar's JMAP `color` preference is carried in each principal's
   sealed personal bundle; a new grantee's starts as the owner's. CalDAV's `calendar-color` stays a
@@ -451,7 +454,8 @@ items still open for the project owner):
   drops the whole delete's email, so outside and plain attendees of the deleted events get no
   cancellation or decline; and a delete refused after its internal delivery leaves local key
   accounts holding a cancellation (or a key organizer holding a decline) for an event that
-  still exists until the retry, which delivers another.
+  still exists: until a retry deletes it (and delivers another), or for good when the event was
+  moved out of the calendar meanwhile, since the retry no longer deletes it.
 - **#93:** a sync paged from the initial state can end below a sharing change, and its next call
   is refused until an event is written, the client syncs in one page, or it takes its state from
   `CalendarEvent/get` or `/query`.
@@ -599,8 +603,9 @@ On `main` and for this release:
   passed every job that runs on push. The test retention gates last ran on `f559febdb`, before #97's test changes.
 - This release's preparation changes only documentation (`CHANGELOG-fork.md`, `README.md`,
   `docs/releases.md`, `docs/zero-access/manual-checklist.md`,
-  `docs/zero-access/client-jmap.md`), which `test.yml` ignores (`paths-ignore`), so neither the
-  preparation pull request nor its merge runs CI. The tagged source's product code is
+  `docs/zero-access/client-jmap.md`), which the Test workflow (`test.yml`) ignores
+  (`paths-ignore`), so neither the preparation pull request nor its merge runs it; GitHub's CodeQL
+  default setup still runs on them. The tagged source's product code is
   `04145d586`'s and its test code is `b7c83694a`'s.
 - Release-preparation checks on the preparation tree (`04145d586` with this release's
   documentation changes): 9 release-metadata tests
