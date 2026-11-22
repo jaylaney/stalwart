@@ -546,27 +546,27 @@ class BuildSnapshotTests(unittest.TestCase):
 
     def test_unpack_refuses_unit_state_that_only_the_state_check_sees(self):
         # Every member passes the allowlist by name; the tree breaks the unit rules by shape.
-        unit = "llvm-cov-target/debug/build/fixture"
+        package = "llvm-cov-target/debug/build/fixture"
         self.write_snapshot([
             ("build.json", b"{}"),
             *((name, None) for name in ("llvm-cov-target", "llvm-cov-target/debug",
-                                        "llvm-cov-target/debug/build", unit)),
-            *((f"{unit}/1111111111111111{name}", None) for name in ("", "/fingerprint", "/out", "/run")),
-            (f"{unit}/1111111111111111/run/stdout", b""),
-            (f"{unit}/1111111111111111/run/root-output", b""),
-            (f"{unit}/2222222222222222", None),
-            (f"{unit}/2222222222222222/fingerprint", None),
-            (f"{unit}/2222222222222222/fingerprint/test-lib-fixture", b"0123456789abcdef"),
-            (f"{unit}/3333333333333333", None),
-            (f"{unit}/3333333333333333/fingerprint", b"a file, not a directory"),
-            (f"{unit}/3333333333333333/out", None),
+                                        "llvm-cov-target/debug/build", package)),
+            *((f"{package}/1111111111111111{name}", None) for name in ("", "/fingerprint", "/out", "/run")),
+            (f"{package}/1111111111111111/run/stdout", b""),
+            (f"{package}/1111111111111111/run/root-output", b""),
+            (f"{package}/2222222222222222", None),
+            (f"{package}/2222222222222222/fingerprint", None),
+            (f"{package}/2222222222222222/fingerprint/test-lib-fixture", b"0123456789abcdef"),
+            (f"{package}/3333333333333333", None),
+            (f"{package}/3333333333333333/fingerprint", b"a file, not a directory"),
+            (f"{package}/3333333333333333/out", None),
         ])
         result = self.unpack()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(f"incomplete Cargo unit state (out/ is missing): {unit}/2222222222222222\n",
+        self.assertIn(f"incomplete Cargo unit state (out/ is missing): {package}/2222222222222222\n",
                       result.stderr)
         self.assertIn(f"incomplete Cargo unit state (fingerprint/ is not a directory): "
-                      f"{unit}/3333333333333333\n", result.stderr)
+                      f"{package}/3333333333333333\n", result.stderr)
         self.assertFalse(self.consumer.exists())
         self.assertFalse(self.restored_manifest.exists())
 
@@ -587,8 +587,12 @@ class BuildSnapshotTests(unittest.TestCase):
                 os.replace(state, aside)
                 try:
                     self.assert_pack_refused(f"{kind} ({missing}): llvm-cov-target/{unit}\n")
-                    # The same name as a symlink to real state is refused too.
-                    state.symlink_to(self.binary if aside.is_file() else self.binary.parent)
+                    # The same name as a symlink to real state is refused too: to the test
+                    # executable, or to the other unit's directory of the same name.
+                    other = RUN_UNIT if unit == COMPILE_UNIT else COMPILE_UNIT
+                    real = self.binary if aside.is_file() else self.target / "llvm-cov-target" / other / name
+                    state.symlink_to(real)
+                    self.assertTrue(state.exists(), "the symlink resolves to real state")
                     self.assert_pack_refused(f"{kind} ({symlinked}): llvm-cov-target/{unit}\n")
                     state.unlink()
                 finally:
@@ -677,18 +681,58 @@ class BuildSnapshotTests(unittest.TestCase):
             f"incomplete Cargo unit state (out/ is missing): llvm-cov-target/{PACKAGE}/4444444444444444\n",
             f"unexpected entry in Cargo build state (unknown run entry output): "
             f"llvm-cov-target/{RUN_UNIT}/run/output\n",
-            "build manifest object is not a packed file: debug/missing-object\n",
+            "build manifest object is not in the tree: debug/missing-object\n",
         )
         self.assertEqual(result.stderr.count("\n"), 4, result.stderr)
         self.assertNotIn("credential", result.stderr)
 
-    def test_a_refusal_lists_twenty_kinds_of_finding_then_counts_the_rest(self):
+    def test_a_refusal_shows_every_fixed_reason_and_bounds_the_unknown_entries(self):
         for index in range(25):
             self.make(f"{COMPILE_UNIT}/unknown-{index:02}", "")
-        result = self.assert_pack_refused("unknown unit entry unknown-19)",
-                                          "5 additional kinds of finding omitted\n")
+        self.make(f"{PACKAGE}/4444444444444444/fingerprint/lib-fixture", "0123456789abcdef")
+        self.write_objects(f"{COMPILE_UNIT}/out/fixture-2222222222222222", "debug/missing-object")
+        result = self.assert_pack_refused(
+            f"incomplete Cargo unit state (out/ is missing): llvm-cov-target/{PACKAGE}/4444444444444444\n",
+            "build manifest object is not in the tree: debug/missing-object\n",
+            "unknown unit entry unknown-19)",
+            "5 additional kinds of unknown entry omitted\n",
+        )
+        lines = result.stderr.splitlines()
+        # The fixed reasons first, then twenty unknown-entry kinds and the count of the rest.
+        self.assertIn("out/ is missing", lines[0])
+        self.assertIn("debug/missing-object", lines[1])
         self.assertNotIn("unknown-20", result.stderr)
-        self.assertEqual(result.stderr.count("\n"), 21, result.stderr)
+        self.assertEqual(len(lines), 23, result.stderr)
+
+    def test_the_old_layout_beside_a_build_directory_is_reported_with_the_other_findings(self):
+        self.make("debug/deps/fixture-0123456789abcdef", "old layout\n")
+        self.make(f"{COMPILE_UNIT}/lock", "")
+        self.assert_pack_refused(
+            "Cargo target layout before 1.100 is not supported: llvm-cov-target/debug/deps\n",
+            f"unexpected entry in Cargo build state (unknown unit entry lock): "
+            f"llvm-cov-target/{COMPILE_UNIT}/lock\n",
+        )
+        # Without a build directory the unit rules cannot run: the old layout is refused alone.
+        shutil.rmtree(self.target / "llvm-cov-target/debug/build")
+        result = self.assert_pack_refused(
+            "Cargo target layout before 1.100 is not supported: llvm-cov-target/debug/deps\n")
+        self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
+
+    def test_a_listing_error_keeps_the_state_findings(self):
+        self.make(f"{RUN_UNIT}/out/back\\slash", "")
+        self.make(f"{COMPILE_UNIT}/lock", "")
+        self.assert_pack_refused(
+            f"unexpected entry in Cargo build state (unknown unit entry lock): "
+            f"llvm-cov-target/{COMPILE_UNIT}/lock\n",
+            "the build members could not be listed: invalid archive member path "
+            f"'llvm-cov-target/{RUN_UNIT}/out/back\\\\slash'\n",
+        )
+
+    def test_an_invalid_member_path_is_named_without_its_control_characters(self):
+        self.make(f"{RUN_UNIT}/out/bell\x07name", "")
+        result = self.assert_pack_refused(
+            f"invalid archive member path 'llvm-cov-target/{RUN_UNIT}/out/bell\\x07name'\n")
+        self.assertNotIn("\x07", result.stderr)
 
     def write_objects(self, *paths):
         objects = [{"path": path, "sha256": "0" * 64} for path in paths]
@@ -707,24 +751,35 @@ class BuildSnapshotTests(unittest.TestCase):
         (self.target / "llvm-cov-target/debug/examples").mkdir()
         (self.target / "llvm-cov-target/debug/examples/fixture").symlink_to(
             "../build/fixture/2222222222222222/out/fixture-2222222222222222")
+        not_in_tree, left_out, not_a_file, invalid = (
+            "is not in the tree", "is left out by the allowlist",
+            "is not a regular file or hard link", "has an invalid path")
         unpacked = (
-            f"{COMPILE_UNIT}/out/fixture-missing",
-            "debug/incremental/fixture-old",
-            f"{COMPILE_UNIT}/out",
-            "debug/examples/fixture",
-            f"{RUN_UNIT}/run/stderr",
+            (f"{COMPILE_UNIT}/out/fixture-missing", not_in_tree),
             # The pack's own namespace, not the manifest's.
-            f"llvm-cov-target/{executable}",
-            "../elsewhere/fixture",
-            "debug/./fixture",
+            (f"llvm-cov-target/{executable}", not_in_tree),
+            ("debug/incremental/fixture-old", left_out),
+            (f"{RUN_UNIT}/run/stderr", left_out),
+            (f"{COMPILE_UNIT}/out", not_a_file),
+            ("debug/examples/fixture", not_a_file),
+            ("../elsewhere/fixture", invalid),
+            ("debug/./fixture", invalid),
         )
-        for missing in unpacked:
+        for missing, why in unpacked:
+            shown = repr(missing) if why == invalid else missing
             with self.subTest(object=missing):
                 self.write_objects(executable, missing)
-                self.assert_pack_refused(f"build manifest object is not a packed file: {missing}\n")
-        self.write_objects(executable, *unpacked)
-        self.assert_pack_refused("build manifest object is not a packed file, 8 times: "
-                                 + ", ".join(unpacked[:3]) + ", and 5 more\n")
+                self.assert_pack_refused(f"build manifest object {why}: {shown}\n")
+        # All in one manifest: one line per reason, with its count and paths.
+        self.write_objects(executable, *(missing for missing, _why in unpacked))
+        self.assert_pack_refused(*(
+            f"build manifest object {why}, 2 times: {shown}\n" for why, shown in (
+                (not_in_tree, unpacked[0][0] + ", " + unpacked[1][0]),
+                (left_out, unpacked[2][0] + ", " + unpacked[3][0]),
+                (not_a_file, unpacked[4][0] + ", " + unpacked[5][0]),
+                (invalid, repr(unpacked[6][0]) + ", " + repr(unpacked[7][0])),
+            )
+        ))
 
     def test_a_manifest_without_objects_cannot_be_packed(self):
         for manifest, message in (
@@ -960,7 +1015,7 @@ class BuildSnapshotTests(unittest.TestCase):
             subprocess.run(["zstd", "-q", "-c"], input=buff.getvalue(), stdout=output, check=True)
         result = self.unpack()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("archive member path", result.stderr)
+        self.assertIn("invalid archive member path '../outside'", result.stderr)
         self.assertFalse((self.root / "outside").exists())
         self.assertFalse(self.consumer.exists())
         self.assertFalse(self.restored_manifest.exists())

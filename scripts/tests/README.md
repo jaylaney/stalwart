@@ -23,17 +23,23 @@ The **Test Retention Gates** check runs weekly and on manual dispatch of `test.y
 A first job, `gates-toolchain`, resolves the current stable Rust's exact release, and every
 other retention job of the run installs that release; no version is pinned.
 `gates-build` runs the two instrumented setup builds and uploads the target. The snapshot
-holds Cargo 1.100's build directory: each unit's `fingerprint/` and `out/`, and a build-script
-run's `run/`, without incremental data, replayed diagnostics, build-script `stderr`, profiles
-or harness state. Harness-state names (`*.log`, `*.profraw`, `_step_*` and the like) are left
-out silently wherever they appear, as before; none of Cargo's own names in a unit has that form.
-`retention_artifacts.py` refuses a target in the layout before Cargo 1.100, an unknown entry in
-the build directory, incomplete unit state, and a manifest object it would not pack, naming
-every finding in one message. Three jobs use that exact build on separate runners. One runs
-the RocksDB zero-access configuration, one runs the filesystem-blob zero-access configuration,
-and one runs the other 17 configurations sequentially. `gates-listings` captures the ordinary
-listings in parallel. The instrumented and ordinary caches store dependency downloads under
-separate keys. A cache miss falls back to a locked fetch.
+holds Cargo 1.100's build directory: each unit's `fingerprint/` and `out/`, and a
+build-script run's `run/`, without incremental data, replayed diagnostics, build-script
+`stderr`, profiles or harness state. Inside a unit (the unit directory, its `fingerprint/`,
+`run/` and `out/`), harness-state names (`*.log`, `*.profraw`, `_step_*` and the like) are
+left out silently, as before; none of Cargo's own names there has that form. A harness-named
+package directory, or such an entry directly in `build/` or in a package directory, is
+refused. `retention_artifacts.py` refuses a target in the layout before Cargo 1.100, an
+unknown entry in the build directory, incomplete unit state, and a manifest object it would
+not pack. One message names these findings: every kind with a fixed reason first, then at
+most 20 kinds of unknown entry (one kind per name) and a count of the rest, each kind with
+its count and up to three paths. A target without a build directory, and credential
+findings, are refused in messages of their own. Three jobs use that exact build on separate
+runners. One runs the RocksDB zero-access configuration, one runs the filesystem-blob
+zero-access configuration, and one runs the other 17 configurations sequentially.
+`gates-listings` captures the ordinary listings in parallel. The instrumented and ordinary
+caches store dependency downloads under separate keys. A cache miss falls back to a locked
+fetch.
 
 The reporter binds coverage to the build artifact's object inventory, validates every selected
 receipt, and runs the inventory and coverage gates. An exhausted retry can still produce

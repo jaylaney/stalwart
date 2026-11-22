@@ -255,15 +255,14 @@ The packer now accepts only Cargo 1.100's layout, in which each unit is a direct
 every fingerprint file but the replayed diagnostics (`output-*`), and a run's `stdout`,
 `root-output` and `invoked.timestamp` but not its `stderr`; incremental data, profiles and
 harness state stay out as before, and a run's `stdout` gets the credential-pattern scan the
-earlier `output` file got. It refuses a target
-in the earlier layout, an entry of the build directory it does not know, a unit without
-`fingerprint/` or `out/`, a run without `stdout` or `root-output`, and a build manifest object
-it would not pack as a file. Locally, with one small crate (`vault`) built with coverage on a
-development machine, a snapshot packed, unpacked at the same absolute path and built again
-left every unit fresh (67 `Fresh`, no `Dirty` or `Compiling` line), and cargo-llvm-cov listed
-the same object with the same digest. That is one crate on one machine, not the workspace on
-a runner: its custom build scripts, the `stalwart` bin and the snapshot's size are shown only
-by a hosted run.
+earlier `output` file got. It refuses a target in the earlier layout, an entry of the build
+directory it does not know, a unit without `fingerprint/` or `out/`, a run without `stdout`
+or `root-output`, and a build manifest object it would not pack as a file. Locally, with one
+small crate (`vault`) built with coverage on a development machine, a snapshot packed,
+unpacked at the same absolute path and built again left every unit fresh (67 `Fresh`, no
+`Dirty` or `Compiling` line), and cargo-llvm-cov listed the same object with the same
+digest. That is one crate on one machine, not the workspace on a runner: its custom build
+scripts, the `stalwart` bin and the snapshot's size are shown only by a hosted run.
 
 The qualification above was made with the pinned toolchain. Both gates depend on the
 compiler's coverage mapping: the coverage gate's line counts, and the inventory gate's
