@@ -38,8 +38,13 @@ are available. Use **Re-run all jobs** when the referenced artifacts have expire
 ## Serial reproduction
 
 Use `cargo-llvm-cov` 0.9.1 with the Rust toolchain's `llvm-tools-preview`. To compare hosted
-results, use the Rust pin from `test.yml`, an empty ordinary target for listing capture and
-the same `UNIT_TEST_FEATURES`. The serial sequence is:
+results, use the Rust release that run's retention jobs installed, an empty ordinary target
+for listing capture and the same `UNIT_TEST_FEATURES`. `test.yml` pins no release: its first
+retention job, `gates-toolchain`, resolves the current stable's exact release once per run.
+That job's "Resolve the current stable Rust release" step and every other retention job's
+"Install pinned tools" or "Install pinned coverage tools" step print `rustc -vV`; its
+`release:` line is the version to use. Coverage line counts depend on the compiler, so a run
+on another release is not comparable line for line. The serial sequence is:
 
 ```sh
 export STORE=RocksDb RUST_MIN_STACK=16777216 UNIT_TEST_FEATURES="<test.yml's list>"

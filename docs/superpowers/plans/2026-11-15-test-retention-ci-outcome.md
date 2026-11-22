@@ -226,3 +226,17 @@ test with `--exact` and passed. [Second-attempt reporter](https://github.com/jay
 The disposable replay also rejected a missing listing receipt, incompatible object set,
 and mismatched artifact ID, each with exit 2 and no gate inputs. Its four hosted fixtures
 passed for work cutoff, profile settlement and diagnostic upload. [Invalid evidence checks](https://github.com/jaylaney/stalwart/actions/runs/43764661867/job/132977601729)
+
+## Unpinned toolchain (2026-11-22)
+
+On 2026-11-22 the project owner decided that the retention jobs stop pinning the Rust
+version: upstream pins no toolchain, and the product build already uses the runner's
+stable Rust. A new first job, `gates-toolchain`, installs the current stable once per run
+and outputs its exact release. Every other retention job takes that output, refuses
+anything but an exact `X.Y.Z` release, and installs it, so all jobs of one run still share
+one compiler. The evidence checks are unchanged. A failed-jobs rerun reuses the first
+attempt's output, so it matches that attempt's artifacts.
+
+The qualification above was made with the pinned toolchain. Coverage line counts depend on
+the compiler, so the gate's figures now move with stable. The change is qualified by its
+own retention run, which its pull request names.
