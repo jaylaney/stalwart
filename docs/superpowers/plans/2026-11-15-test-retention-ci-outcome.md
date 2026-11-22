@@ -240,6 +240,30 @@ first-attempt output, so the rerun jobs match that attempt's artifacts. That reu
 GitHub's documented behaviour; this record observed it for `gates-build`'s output (the
 partial rerun above), not yet for the new job.
 
+The first manually dispatched retention run on this branch,
+[run 45050261845](https://github.com/jaylaney/stalwart/actions/runs/45050261845) on
+`e6f45daee`, resolved Rust 1.100.0 in every retention job that ran (the resolver, the build,
+the listings capture and the reporter; `TOOLCHAIN: success`) and built the instrumented
+targets. It then failed at "Pack the build snapshot" with `retention artifacts: missing Cargo
+debug, fingerprint, dependency or build-script state`: Cargo 1.100.0 always writes its new
+build-directory layout, without `debug/deps` or `debug/.fingerprint`, and the packer accepted
+only the earlier one. The shards were skipped and the final check was red.
+
+The packer now accepts only Cargo 1.100's layout, in which each unit is a directory
+`debug/build/<package>/<hash>/` holding `fingerprint/`, `out/` and, for a build-script run,
+`run/`. It keeps `out/` whole, every fingerprint file but the replayed diagnostics
+(`output-*`), and a run's `stdout`, `root-output` and `invoked.timestamp` but not its
+`stderr`; incremental data, profiles and harness state stay out as before, and a run's
+`stdout` gets the credential-pattern scan the earlier `output` file got. It refuses a target
+in the earlier layout, an entry of the build directory it does not know, a unit without
+`fingerprint/` or `out/`, a run without `stdout` or `root-output`, and a build manifest object
+it would not pack as a file. Locally, with one small crate (`vault`) built with coverage on a
+development machine, a snapshot packed, unpacked at the same absolute path and built again
+left every unit fresh (67 `Fresh`, no `Dirty` or `Compiling` line), and cargo-llvm-cov listed
+the same object with the same digest. That is one crate on one machine, not the workspace on
+a runner: its custom build scripts, the `stalwart` bin and the snapshot's size are shown only
+by a hosted run.
+
 The qualification above was made with the pinned toolchain. Both gates depend on the
 compiler's coverage mapping: the coverage gate's line counts, and the inventory gate's
 executed-function rule, which reads region counts from the same exports

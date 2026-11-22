@@ -22,8 +22,12 @@ Task 1's rulings 7, 8, 25, 31 and 32 set their rules.
 The **Test Retention Gates** check runs weekly and on manual dispatch of `test.yml`.
 A first job, `gates-toolchain`, resolves the current stable Rust's exact release, and every
 other retention job of the run installs that release; no version is pinned.
-`gates-build` runs the two instrumented setup builds and uploads the target. Three jobs use
-that exact build on separate runners. One runs the RocksDB zero-access configuration, one
+`gates-build` runs the two instrumented setup builds and uploads the target. The snapshot
+holds Cargo 1.100's build directory: each unit's `fingerprint/` and `out/`, and a build-script
+run's `run/`, without incremental data, replayed diagnostics, profiles or harness state.
+`retention_artifacts.py` refuses a target in the layout before Cargo 1.100, an unknown entry in
+the build directory, incomplete unit state, and a manifest object it would not pack.
+Three jobs use that exact build on separate runners. One runs the RocksDB zero-access configuration, one
 runs the filesystem-blob zero-access configuration, and one runs the other 17 configurations
 sequentially. `gates-listings` captures the ordinary listings in parallel. The instrumented
 and ordinary caches store dependency downloads under separate keys. A cache miss falls back
@@ -130,8 +134,10 @@ The tool's docstring lists every check. Each failure line gives:
 
 **`--listing`** is a directory holding one file per configuration. Each file is the output of
 one `cargo test ... -- --list` command, stdout and stderr together. Cargo prints the
-`Running ... (target/debug/deps/<crate>-<hash>)` lines that name each test's package on
-stderr, so capture both with `2>&1`.
+`Running ...` lines that name each test's package on stderr, so capture both with `2>&1`.
+The gate takes the package from the executable's file name, `<crate>-<hash>`: Cargo 1.100
+prints `(target/debug/build/<package>/<hash>/out/<crate>-<hash>)`, and earlier releases,
+whose form the baseline's captures keep, `(target/debug/deps/<crate>-<hash>)`.
 - **Naming.** A file is named `<configuration>.txt`, or it starts with
   `# config: <configuration>`.
 - **Configurations.** The names are the baseline's: `libtest.configurations` in the baseline
@@ -223,7 +229,10 @@ python3 -I scripts/tests/test_retention_evidence.py -v
 The snapshot tests need Git and `zstd`. The two `--real` tests below skip by default.
 The offline tests cover:
 - the strict rule on synthetic exports, run through `strict_rule.py functions`;
-- listing faults against a candidate built from the committed baseline's own records;
+- listing faults against a candidate built from the committed baseline's own records, and
+  that candidate with Cargo 1.100's executable paths;
+- the build snapshot on fixture targets in Cargo 1.100's layout: what it keeps and leaves out,
+  each refusal and the credential scans;
 - coverage exports one line below each threshold, with a restored test file that would
   otherwise offset the drop;
 - the CI workflow against `ci_steps.STEPS`: the committed test.yml matches it, and edited copies
