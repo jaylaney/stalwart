@@ -443,7 +443,7 @@ Release 7:
   report's optimized builds on one machine.
 
 Release 6 (the [outcome](docs/superpowers/plans/2026-11-14-zero-access-plan17-outcome.md)'s
-"Accepted residuals" holds the full list, and its "Decisions and remaining qualification" the
+"Accepted residuals" holds the full list, and its "Open for the project owner" the
 items still open for the project owner):
 
 - **#91:** moving an event into a calendar does not take the UID lease, so a move that crosses a
