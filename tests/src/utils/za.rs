@@ -14,6 +14,7 @@ use crate::{
         pop3::{Pop3Connection, ResponseType as Pop3Reply},
         server::TestServer,
         storage::wait_for_tasks_with_poll_interval,
+        tls::fixture_https_client_builder,
     },
     za::tracing::{WsStream, ws_call},
 };
@@ -228,9 +229,8 @@ async fn za_post_with(request: HttpRequest, path: &str, body: &impl Serialize) -
 /// suite enables forwarded addresses), for fail2ban tests that must not ban
 /// the loopback address the rest of the suite uses.
 pub async fn za_post_from(remote_ip: &str, path: &str, body: &impl Serialize) -> VaultReply {
-    let response = reqwest::Client::builder()
+    let response = fixture_https_client_builder()
         .timeout(Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
         .build()
         .unwrap()
         .post(format!("{SERVER_URL}/api/vault/{path}"))
@@ -258,9 +258,8 @@ pub async fn za_post_concurrent(path: &str, bodies: &[Value]) -> Vec<VaultReply>
     let barrier = Arc::new(tokio::sync::Barrier::new(bodies.len()));
     let mut tasks = Vec::with_capacity(bodies.len());
     for (i, body) in bodies.iter().enumerate() {
-        let client = reqwest::Client::builder()
+        let client = fixture_https_client_builder()
             .timeout(Duration::from_secs(5))
-            .danger_accept_invalid_certs(true)
             .build()
             .unwrap();
         // Read to the end so the connection returns to the pool for reuse.
@@ -319,9 +318,8 @@ pub async fn za_setup(username: &str, token: &str, password: &str) -> String {
 /// `fail_ip`, so a module's deliberate failures do not consume the loopback
 /// address's fail2ban budget.
 pub async fn caldav_from(fail_ip: &str, name: &str, secret: &str, status: StatusCode) {
-    let mut request = reqwest::Client::builder()
+    let mut request = fixture_https_client_builder()
         .timeout(Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
         .build()
         .unwrap()
         .request(
@@ -2578,8 +2576,7 @@ pub async fn finish_bulk_delivery_indexing(test: &TestServer, account: &Account)
         "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
         "methodCalls": [["Email/get", { "accountId": account.id_string(), "ids": [] }, "0"]],
     });
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let client = fixture_https_client_builder()
         .timeout(Duration::from_secs(45))
         .build()
         .unwrap();
@@ -2647,8 +2644,7 @@ pub async fn finish_bulk_delivery_indexing(test: &TestServer, account: &Account)
 
 /// Complete pending keyed indexing with a real content query.
 pub async fn za_index_current(account: &Account) {
-    let payload = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let payload = fixture_https_client_builder()
         // Allow the default 30 s content wait, the 2 s request-triggered
         // pass, and transport overhead in the canonical test configuration.
         .timeout(Duration::from_secs(45))
@@ -2734,8 +2730,7 @@ impl Keyless {
     /// One method call; its response.
     pub async fn call(&mut self, account: &Account, method: &str, args: Value) -> Value {
         let reply: Value = match self {
-            Keyless::Bearer(token) => reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+            Keyless::Bearer(token) => fixture_https_client_builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap()
@@ -2778,8 +2773,7 @@ impl Keyless {
         calls: Value,
     ) -> crate::utils::jmap::JmapResponse {
         let reply: Value = match self {
-            Keyless::Bearer(token) => reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+            Keyless::Bearer(token) => fixture_https_client_builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap()
@@ -3195,8 +3189,7 @@ pub async fn sharing_dav_request(
     headers: &[(&str, &str)],
     body: &str,
 ) -> crate::utils::http::HttpResponseFull {
-    let mut request = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let mut request = fixture_https_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap()

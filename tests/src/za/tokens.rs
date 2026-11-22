@@ -17,6 +17,7 @@ use crate::utils::{
     account::Account,
     pop3::{Pop3Connection, ResponseType as Pop3Reply},
     server::TestServer,
+    tls::fixture_https_client_builder,
     webdav::DummyWebDavClient,
     za::{
         CALENDAR_JMAP_USING, Conn, HookParked, Parked, SERVER_URL, VaultReply, ZA_SIGNIN_SCOPE,
@@ -424,9 +425,8 @@ async fn tampered_or_foreign_secret_is_401(test: &TestServer, owner: &Account) {
 
 /// `GET /jmap/session` with `token`, sent from `ip` through `X-Forwarded-For`.
 async fn bearer_session_from(ip: &str, token: &str) -> u16 {
-    reqwest::Client::builder()
+    fixture_https_client_builder()
         .timeout(Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
         .build()
         .unwrap()
         .get(format!("{SERVER_URL}/jmap/session"))
@@ -540,9 +540,8 @@ async fn bearer_crossed_by_vault_write_is_refused(test: &mut TestServer, id: u32
 /// `GET /jmap/session` with `token`, through a client whose timeout outlasts
 /// a parked request.
 async fn slow_session_status(token: String) -> u16 {
-    reqwest::Client::builder()
+    fixture_https_client_builder()
         .timeout(Duration::from_secs(30))
-        .danger_accept_invalid_certs(true)
         .build()
         .unwrap()
         .get(format!("{SERVER_URL}/jmap/session"))
@@ -1744,8 +1743,7 @@ async fn handoff_gone_after_redemption_and_expiry(test: &TestServer, app: &ZaOAu
 }
 
 async fn device_grant(client: &ZaOAuthClient) -> OAuthResponse {
-    let http = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let http = fixture_https_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
@@ -1872,9 +1870,8 @@ const RAW_TOKEN_IP: &str = "10.0.60.10";
 /// A raw token request through a five-second client: the status and the
 /// JSON body, or `Null` when the body is not JSON.
 async fn token_form(form: &[(&str, &str)]) -> (u16, Value) {
-    let response = reqwest::Client::builder()
+    let response = fixture_https_client_builder()
         .timeout(Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
         .build()
         .unwrap()
         .post(format!("{SERVER_URL}/auth/token"))
@@ -2159,9 +2156,8 @@ async fn sign_in_crossed_by_vault_write_issues_no_code(
                 ("code_challenge_method", "S256"),
                 ("state", "za-token-sign-in-race"),
             ]);
-            reqwest::Client::builder()
+            fixture_https_client_builder()
                 .timeout(Duration::from_secs(5))
-                .danger_accept_invalid_certs(true)
                 .build()
                 .unwrap()
                 .post(format!("{SERVER_URL}/api/auth"))
@@ -2382,9 +2378,8 @@ async fn traced_urls_mask_the_code(test: &TestServer) {
             .is_some()
     );
     let traced = Traced::start(EventType::variants());
-    let response = reqwest::Client::builder()
+    let response = fixture_https_client_builder()
         .timeout(Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
         .build()
         .unwrap()
         .post(format!("{SERVER_URL}/jmap?code={URL_CANARY}&state=x"))

@@ -5,8 +5,8 @@
  */
 
 use super::{
-    account::Account, jmap::JmapResponse, server::TestServer, webdav::DummyWebDavClient,
-    za::SERVER_URL,
+    account::Account, jmap::JmapResponse, server::TestServer, tls::fixture_https_client_builder,
+    webdav::DummyWebDavClient, za::SERVER_URL,
 };
 use common::{
     BuildServer, Core, Inner, KV_OAUTH,
@@ -423,9 +423,8 @@ pub fn za_bearer_dav(account: &Account, token: &str) -> DummyWebDavClient {
 }
 
 fn bearer_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    fixture_https_client_builder()
         .timeout(Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
         .build()
         .unwrap()
 }

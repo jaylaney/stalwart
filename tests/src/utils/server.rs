@@ -13,6 +13,7 @@ use crate::{
         registry::UnwrapRegistryId,
         storage::{RegistryEnvStores, assert_is_empty, build_data_store, wait_for_tasks},
         temp_dir::TempDir,
+        tls::fixture_tls_server_key,
     },
 };
 use ahash::AHashMap;
@@ -158,6 +159,10 @@ impl TestServerBuilder {
     pub async fn with_http_listener(self, port: u16) -> Self {
         self.with_listener(NetworkListenerProtocol::Http, "jmap", port, true)
             .await
+    }
+
+    pub(crate) fn http_listener_port(&self) -> u16 {
+        self.http_listener_port
     }
 
     pub async fn with_smtp_listener(self, port: u16) -> Self {
@@ -418,7 +423,8 @@ impl TestServerBuilder {
 
         // Parse components
         let core = Box::pin(Core::parse(&mut self.bootstrap, storage)).await;
-        let data = Data::parse(&mut self.bootstrap).await;
+        let mut data = Data::parse(&mut self.bootstrap).await;
+        data.tls_self_signed_cert = Some(fixture_tls_server_key());
         let (cache, swap_rx) = Caches::parse(&mut self.bootstrap, &core.storage).await;
 
         // Enable telemetry. As boot does: there is no test licence (upgrade

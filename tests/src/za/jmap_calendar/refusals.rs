@@ -14,6 +14,7 @@ use crate::{
         account::Account,
         jmap::JmapResponse,
         server::TestServer,
+        tls::fixture_https_client_builder,
         webdav::DummyWebDavClient,
         za::{
             CALENDAR_JMAP_USING, Keyless, SERVER_URL, assert_no_event_preferences, pending_ids,
@@ -318,8 +319,7 @@ fn assert_calendar_keyless(reply: &JmapResponse, what: &str) {
 /// login, `account%master`), under the calendar capabilities.
 async fn jmap_basic(user: &str, secret: &str, calls: Value) -> JmapResponse {
     JmapResponse(
-        reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
+        fixture_https_client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap()

@@ -5,7 +5,9 @@
  */
 
 use super::{email_create, email_id, import_args, mailbox_ids, mapped, method, upload};
-use crate::utils::{account::Account, jmap::JmapResponse, server::TestServer};
+use crate::utils::{
+    account::Account, jmap::JmapResponse, server::TestServer, tls::fixture_https_client_builder,
+};
 use serde_json::json;
 use types::id::Id;
 
@@ -419,8 +421,7 @@ async fn parked_submission(
     account: &Account,
     arguments: serde_json::Value,
 ) -> crate::utils::jmap::JmapResponse {
-    let response = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let response = fixture_https_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap()
