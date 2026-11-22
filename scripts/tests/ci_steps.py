@@ -4,7 +4,7 @@
 """The CI steps the C10 gates measure: one table, and the check that ties it to test.yml.
 
 Usage:
-  ci_steps.py [--workflow PATH]
+  ci_steps.py [--workflow PATH] [--shard-workflow PATH]
 
 `STEPS` holds every `cargo test` step of test.yml's test, unit-tests, upstream-suites and
 zero-access jobs: its command as test.yml writes it, the environment it adds, its `if`
@@ -21,8 +21,8 @@ diagnostic does not rewrite that qualification baseline or claim it was measured
 difference: a step missing or renamed, a changed command (a narrowed filter, a dropped feature),
 a changed environment, a changed `if`, a changed rerun, a step that may fail without failing its
 job (`continue-on-error`), a `cargo test` step the table does not hold, or a gates job that runs
-the net or the capture on fewer steps, or a style job that no longer runs this check and
-`test_gates.py` on every trigger. `test_gates.py` runs it on the committed workflow (it must
+the net or the capture on fewer steps, or a style job that no longer runs the gate self-tests
+on every trigger. The distributed contract includes `test-retention-shard.yml`. `test_gates.py` runs it on the committed workflow (it must
 find nothing) and on edited copies. Run as a command, it checks the committed workflow, or PATH,
 and exits 1 if it finds a difference.
 
@@ -39,9 +39,20 @@ import sys
 
 REPO = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO / ".github" / "workflows" / "test.yml"
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import retention_workflow  # noqa: E402
 
 # Every gated job sets these for all its steps.
 BASE_ENV = {"STORE": "RocksDb", "RUST_MIN_STACK": "16777216"}
+COVERAGE_SHARDS = {
+    "za-rocks": ("za-tests",),
+    "za-filesystem": ("za-tests-fs-blob",),
+    "short": ("leak-unit-test", "unit-tests", "webdav-plain", "webdav-key", "imap-plain",
+              "imap-key", "jmap-plain", "jmap-key", "smtp", "system-tests", "store-tests",
+              "blob-tests", "lookup-tests", "search-tests", "telemetry-tests", "cal-query-tests",
+              "automation-tests"),
+}
 # Kept separate from the historical capture/net environment; no arbitrary extras are allowed.
 JOB_DIAGNOSTIC_ENV = {"zero-access": {"RUST_BACKTRACE": "1"}}
 SPAM_URL = ("https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.4/"
@@ -63,20 +74,13 @@ JOBS = {
     "zero-access": dict(when=None, env={**BASE_ENV, **JOB_DIAGNOSTIC_ENV["zero-access"]}),
 }
 
-# The gates job, and the two commands that must run the whole net and every capture.
-GATES_JOB = "gates"
-GATES_WHEN = "github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'"
-GATES_COMMANDS = {
-    "Coverage net (19 steps)": 'python3 -I scripts/tests/coverage_net.py --out "$GATES/net"',
-    "Capture CI step listings":
-        'python3 -I scripts/tests/capture_listings.py --out "$GATES/listings"',
-}
-
 # Final review N14: the style job's step that runs this check and the gates' self-tests on every
 # trigger. Dropping it, renaming it or giving it (or its job) an `if` would silence both.
 STYLE_JOB = "style"
 STYLE_STEP = "Check Gates"
-STYLE_COMMANDS = ["python3 -I scripts/tests/ci_steps.py", "python3 -I scripts/tests/test_gates.py"]
+STYLE_COMMANDS = [f"python3 -I scripts/tests/{name}.py" for name in (
+    "ci_steps", "test_gates", "test_retention_artifacts", "test_retention_evidence",
+)]
 
 # Keys a gated step may have. Anything else (continue-on-error, working-directory, ...) can change
 # what the step runs or whether its failure counts.
@@ -435,8 +439,8 @@ def _env_problems(where, actual, expected):
     return problems
 
 
-def check_workflow(text):
-    """One line per difference between `STEPS` (and the gates job) and test.yml's text."""
+def check_workflow(text, shard_text=None):
+    """One line per difference in the ordinary or distributed retention workflows."""
     try:
         workflow = load_yaml(text)
     except YamlSubsetError as error:
@@ -531,46 +535,36 @@ def check_workflow(text):
             if lines != STYLE_COMMANDS:
                 problems.append(f"{where}: runs {lines}, expected {STYLE_COMMANDS}")
 
-    gates = jobs.get(GATES_JOB)
-    if not isinstance(gates, dict):
-        problems.append(f"job {GATES_JOB}: missing")
-    else:
-        where = f"job {GATES_JOB}"
-        if _condition(gates.get("if")) != _condition(GATES_WHEN):
-            problems.append(f"{where}: if is {gates.get('if')!r}, expected {GATES_WHEN!r}")
-        for key in sorted(JOB_FORBIDDEN & set(gates)):
-            problems.append(f"{where}: has {key}")
-        gates_env = _env(gates.get("env"))
-        if UNIT_FEATURES in gates_env:
-            problems.append(f"{where}: overrides the workflow-level {UNIT_FEATURES}")
-        for key, value in BASE_ENV.items():
-            if gates_env.get(key) != value:
-                problems.append(f"{where}: environment {key} is {gates_env.get(key)!r}, "
-                                f"expected {value!r}")
-        steps = {item.get("name"): item for item in gates.get("steps") or []
-                 if isinstance(item, dict)}
-        for name, command in GATES_COMMANDS.items():
-            item = steps.get(name)
-            if item is None:
-                problems.append(f"{where}, step {name!r}: missing")
-                continue
-            if (item.get("run") or "").strip() != command:
-                problems.append(f"{where}, step {name!r}: runs {item.get('run')!r}, expected "
-                                f"{command!r} (every step, every configuration)")
-            for key in sorted(set(item) - {"name", "id", "if", "run", "shell"}):
-                problems.append(f"{where}, step {name!r}: has {key}")
+    try:
+        shard = load_yaml(shard_text) if shard_text is not None else None
+    except (YamlSubsetError, ValueError) as error:
+        problems.append(f"{retention_workflow.SHARD_WORKFLOW_NAME}: {error}")
+        return problems
+    if shard is not None and not isinstance(shard, dict):
+        problems.append(f"{retention_workflow.SHARD_WORKFLOW_NAME}: expected a workflow mapping")
+        return problems
+    problems.extend(retention_workflow.check(workflow, shard, BASE_ENV, COVERAGE_SHARDS))
     return problems
 
 
-def refuse_diverged_workflow(workflow=WORKFLOW):
-    """Ruling 186: the captures and the net run only while test.yml matches `STEPS`. Prints
-    each difference to stderr and answers True when there is one."""
-    problems = check_workflow(Path(workflow).read_text())
+def workflow_problems(workflow, shard_workflow=None):
+    caller = Path(workflow)
+    callee = (Path(shard_workflow) if shard_workflow is not None else
+              caller.with_name(retention_workflow.SHARD_WORKFLOW_NAME))
+    try:
+        return check_workflow(caller.read_text(encoding="utf-8"), callee.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as error:
+        return [f"cannot read retention workflow: {error}"]
+
+
+def refuse_diverged_workflow(workflow=WORKFLOW, shard_workflow=None):
+    """Refuse captures and coverage when either part of the workflow has diverged."""
+    problems = workflow_problems(workflow, shard_workflow)
     for problem in problems:
         print("FAIL", problem, file=sys.stderr)
     if problems:
-        print(f"refusing to run: {len(problems)} difference(s) between ci_steps.STEPS and "
-              f"{workflow} (see scripts/tests/ci_steps.py)", file=sys.stderr)
+        print(f"refusing to run: {len(problems)} workflow difference(s) "
+              "(see scripts/tests/ci_steps.py)", file=sys.stderr)
     return bool(problems)
 
 
@@ -578,11 +572,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workflow", type=Path, default=WORKFLOW)
+    parser.add_argument("--shard-workflow", type=Path,
+                        help="path to the called shard workflow (default: beside --workflow)")
     args = parser.parse_args()
-    problems = check_workflow(args.workflow.read_text())
+    problems = workflow_problems(args.workflow, args.shard_workflow)
     for problem in problems:
         print("FAIL", problem)
-    print(f"{len(problems)} difference(s) between ci_steps.STEPS and {args.workflow}")
+    print(f"{len(problems)} difference(s) between ci_steps.STEPS and the retention workflows")
     return 1 if problems else 0
 
 
