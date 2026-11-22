@@ -230,13 +230,20 @@ passed for work cutoff, profile settlement and diagnostic upload. [Invalid evide
 ## Unpinned toolchain (2026-11-22)
 
 On 2026-11-22 the project owner decided that the retention jobs stop pinning the Rust
-version: upstream pins no toolchain, and the product build already uses the runner's
-stable Rust. A new first job, `gates-toolchain`, installs the current stable once per run
-and outputs its exact release. Every other retention job takes that output, refuses
-anything but an exact `X.Y.Z` release, and installs it, so all jobs of one run still share
-one compiler. The evidence checks are unchanged. A failed-jobs rerun reuses the first
-attempt's output, so it matches that attempt's artifacts.
+version: upstream pins no toolchain, and the product build workflow (`product-build.yml`)
+already installs the current stable itself, unpinned. A new first job, `gates-toolchain`,
+installs the current stable once per run and outputs its exact release. Every other
+retention job takes that output, refuses anything but an exact `X.Y.Z` release, installs it
+and checks that its compiler reports that release, so all jobs of one run still share one
+compiler. The evidence checks are unchanged. A failed-jobs rerun keeps the resolver's
+first-attempt output, so the rerun jobs match that attempt's artifacts. That reuse is
+GitHub's documented behaviour; this record observed it for `gates-build`'s output (the
+partial rerun above), not yet for the new job.
 
-The qualification above was made with the pinned toolchain. Coverage line counts depend on
-the compiler, so the gate's figures now move with stable. The change is qualified by its
-own retention run, which its pull request names.
+The qualification above was made with the pinned toolchain. Both gates depend on the
+compiler's coverage mapping: the coverage gate's line counts, and the inventory gate's
+executed-function rule, which reads region counts from the same exports
+(`tests/qualification/tools/strict_rule.py`). Their figures, and either gate's result, can
+therefore move with stable. No retention run qualifies this change yet. It is to be qualified
+by a manually dispatched retention run on its final head before it merges, and its pull
+request names that run.

@@ -20,6 +20,8 @@ Task 1's rulings 7, 8, 25, 31 and 32 set their rules.
 ## Hosted runs
 
 The **Test Retention Gates** check runs weekly and on manual dispatch of `test.yml`.
+A first job, `gates-toolchain`, resolves the current stable Rust's exact release, and every
+other retention job of the run installs that release; no version is pinned.
 `gates-build` runs the two instrumented setup builds and uploads the target. Three jobs use
 that exact build on separate runners. One runs the RocksDB zero-access configuration, one
 runs the filesystem-blob zero-access configuration, and one runs the other 17 configurations
@@ -43,8 +45,11 @@ for listing capture and the same `UNIT_TEST_FEATURES`. `test.yml` pins no releas
 retention job, `gates-toolchain`, resolves the current stable's exact release once per run.
 That job's "Resolve the current stable Rust release" step and every other retention job's
 "Install pinned tools" or "Install pinned coverage tools" step print `rustc -vV`; its
-`release:` line is the version to use. Coverage line counts depend on the compiler, so a run
-on another release is not comparable line for line. The serial sequence is:
+`release:` line is the version to use. Both gates depend on the compiler's coverage mapping:
+the coverage gate counts lines, and the inventory gate's executed-function rule
+(`tests/qualification/tools/strict_rule.py`) reads region counts from the same exports. A run
+on another release is therefore not comparable line for line, and either gate's result can
+differ. The serial sequence is:
 
 ```sh
 export STORE=RocksDb RUST_MIN_STACK=16777216 UNIT_TEST_FEATURES="<test.yml's list>"
