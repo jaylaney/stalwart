@@ -187,10 +187,10 @@ returns to an earlier value.
   project owner decided: the retention jobs no longer pin the Rust version. It is not made in this
   pull request but in one of its own after it, and not yet made: at this commit, and until that
   pull request lands, the retention jobs on `main` still pin Rust 1.99.1. The design the
-  controller will brief for it: nothing pinned in the repository; the build job installs the
-  current stable Rust and reports the exact version it got, and every other retention job of the
-  run installs that same version, so the jobs that share one instrumented build still share one
-  compiler.
+  controller will brief for it: nothing pinned in the repository; a first retention job installs
+  the current stable Rust and reports the exact version it got, and every other retention job of
+  the run installs that same version, so the jobs that share one instrumented build still share
+  one compiler.
 - **What the gate's figures depend on.** Until that pull request lands, the retention jobs
   measure with Rust 1.99.1; once it lands, the coverage figures follow the stable current at each
   run. The earlier results show the size of that: the cohort measured about half a point apart
