@@ -49,8 +49,7 @@ fn tls_certificate_error(error: &reqwest::Error) -> Option<&CertificateError> {
     }
 }
 
-async fn assert_fixture_tls(test: &TestServer) {
-    let port = test.account("admin").http_listener_port;
+async fn assert_fixture_tls(test: &TestServer, port: u16) {
     let loopback = (Ipv4Addr::LOCALHOST, port).into();
     let timeout = Duration::from_secs(5);
     let client = fixture_https_client_builder()
@@ -149,8 +148,9 @@ pub async fn system_tests() {
         })
         .await;
     builder.assert_listeners_bind_to_loopback().await;
+    let http_port = builder.http_listener_port();
     let mut test = builder.build().await;
-    assert_fixture_tls(&test).await;
+    assert_fixture_tls(&test, http_port).await;
 
     // Create admin account
     let admin = test

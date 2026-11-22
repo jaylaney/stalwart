@@ -161,6 +161,10 @@ impl TestServerBuilder {
             .await
     }
 
+    pub(crate) fn http_listener_port(&self) -> u16 {
+        self.http_listener_port
+    }
+
     pub async fn with_smtp_listener(self, port: u16) -> Self {
         self.with_listener(NetworkListenerProtocol::Smtp, "smtp", port, false)
             .await
