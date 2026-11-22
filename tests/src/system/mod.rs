@@ -24,11 +24,30 @@ use registry::schema::{
     enums::NetworkListenerProtocol,
     structs::{Expression, Imap, MtaStageAuth},
 };
-use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+use rustls::CertificateError;
+use std::{error::Error, io, net::Ipv4Addr, sync::Arc, time::Duration};
 
 /// Submission over implicit TLS: 1.0 offers the bearer SASL mechanisms
 /// only over TLS, so `oidc::test` authenticates with OAUTHBEARER here.
 pub const SUBMISSION_PORT: u16 = 4467;
+
+fn tls_certificate_error(error: &reqwest::Error) -> Option<&CertificateError> {
+    let mut cause: &(dyn Error + 'static) = error;
+    loop {
+        if let Some(rustls::Error::InvalidCertificate(reason)) =
+            cause.downcast_ref::<rustls::Error>()
+        {
+            return Some(reason);
+        }
+
+        // An io::Error's source can skip the stored error itself.
+        cause = if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+            io_error.get_ref()?
+        } else {
+            cause.source()?
+        };
+    }
+}
 
 async fn assert_fixture_tls(test: &TestServer) {
     let port = test.account("admin").http_listener_port;
@@ -58,11 +77,19 @@ async fn assert_fixture_tls(test: &TestServer) {
         .send()
         .await
         .expect_err("fixture HTTPS client accepted a mismatched hostname");
-    assert!(wrong_name.is_connect(), "{wrong_name:?}");
+    assert!(
+        matches!(
+            tls_certificate_error(&wrong_name),
+            Some(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. }
+            )
+        ),
+        "expected a TLS hostname mismatch, got {wrong_name:?}"
+    );
 
-    // Install a certificate for the same hosts from a different CA. A fresh
-    // connection must use this certificate ahead of the fixture fallback.
-    let alternate = FixtureTls::generate();
+    // A distinct issuer name exercises issuer lookup. The alternate certificate
+    // must take precedence over the fixture fallback on a fresh connection.
+    let alternate = FixtureTls::generate("Stalwart Alternate Test CA");
     let certificates = &test.server.inner.data.tls_certificates;
     let original = certificates.swap(Arc::new(
         [("*".into(), alternate.server_key)].into_iter().collect(),
@@ -87,7 +114,11 @@ async fn assert_fixture_tls(test: &TestServer) {
     certificates.store(original);
 
     let untrusted = untrusted.expect_err("fixture HTTPS client trusted a different CA");
-    assert!(untrusted.is_connect(), "{untrusted:?}");
+    assert_eq!(
+        tls_certificate_error(&untrusted),
+        Some(&CertificateError::UnknownIssuer),
+        "{untrusted:?}"
+    );
     assert_eq!(trusted.unwrap().status(), reqwest::StatusCode::OK);
 }
 

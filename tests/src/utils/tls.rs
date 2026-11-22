@@ -11,7 +11,8 @@ use rcgen::{
 use rustls::{crypto::aws_lc_rs, pki_types::PrivatePkcs8KeyDer, sign::CertifiedKey};
 use std::sync::{Arc, LazyLock};
 
-static FIXTURE_TLS: LazyLock<FixtureTls> = LazyLock::new(FixtureTls::generate);
+static FIXTURE_TLS: LazyLock<FixtureTls> =
+    LazyLock::new(|| FixtureTls::generate("Stalwart Integration Test CA"));
 
 pub(crate) struct FixtureTls {
     pub(crate) ca: reqwest::Certificate,
@@ -19,11 +20,9 @@ pub(crate) struct FixtureTls {
 }
 
 impl FixtureTls {
-    pub(crate) fn generate() -> Self {
+    pub(crate) fn generate(ca_name: &str) -> Self {
         let mut params = CertificateParams::default();
-        params
-            .distinguished_name
-            .push(DnType::CommonName, "Stalwart Integration Test CA");
+        params.distinguished_name.push(DnType::CommonName, ca_name);
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
         let issuer = CertifiedIssuer::self_signed(
