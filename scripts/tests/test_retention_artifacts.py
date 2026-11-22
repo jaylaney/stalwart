@@ -352,7 +352,10 @@ class BuildSnapshotTests(unittest.TestCase):
         self.target = self.root / "producer"
         self.archive = self.root / "snapshot.tar.zst"
         self.manifest = self.root / "build.json"
-        self.manifest.write_text(json.dumps({"schema": 1, "commit": "a" * 40}) + "\n")
+        # coverage_net.py stores each object's path relative to llvm-cov-target.
+        self.manifest.write_text(json.dumps({"schema": 1, "commit": "a" * 40, "objects": [
+            {"path": f"{COMPILE_UNIT}/out/fixture-2222222222222222", "sha256": "0" * 64},
+        ]}) + "\n")
         self.consumer = self.root / "consumer"
         self.restored_manifest = self.root / "restored/build.json"
         # A build-script run unit: its captured output and $OUT_DIR.
@@ -390,6 +393,22 @@ class BuildSnapshotTests(unittest.TestCase):
             "unpack-build", "--archive", archive or self.archive, "--target", self.consumer,
             "--manifest-out", self.restored_manifest,
         )
+
+    def write_snapshot(self, members):
+        """Write an archive of (name, content) members; a content of None is a directory."""
+        buff = io.BytesIO()
+        with tarfile.open(fileobj=buff, mode="w", format=tarfile.PAX_FORMAT) as snapshot:
+            for name, content in members:
+                entry = tarfile.TarInfo(name)
+                if content is None:
+                    entry.type = tarfile.DIRTYPE
+                    entry.mode = 0o755
+                    snapshot.addfile(entry)
+                else:
+                    entry.size = len(content)
+                    snapshot.addfile(entry, io.BytesIO(content))
+        with self.archive.open("wb") as output:
+            subprocess.run(["zstd", "-q", "-c"], input=buff.getvalue(), stdout=output, check=True)
 
     def assert_pack_refused(self, *needles):
         result = self.pack()
@@ -510,55 +529,82 @@ class BuildSnapshotTests(unittest.TestCase):
         self.assertEqual(packed.returncode, 0, packed.stderr)
 
     def test_snapshot_with_a_member_of_the_old_layout_is_refused(self):
-        buff = io.BytesIO()
-        with tarfile.open(fileobj=buff, mode="w", format=tarfile.PAX_FORMAT) as snapshot:
-            manifest = tarfile.TarInfo("build.json")
-            manifest.size = 2
-            snapshot.addfile(manifest, io.BytesIO(b"{}"))
-            for name in ("llvm-cov-target", "llvm-cov-target/debug", "llvm-cov-target/debug/deps"):
-                directory = tarfile.TarInfo(name)
-                directory.type = tarfile.DIRTYPE
-                directory.mode = 0o755
-                snapshot.addfile(directory)
-            member = tarfile.TarInfo("llvm-cov-target/debug/deps/fixture-0123456789abcdef")
-            member.size = 4
-            snapshot.addfile(member, io.BytesIO(b"test"))
-        with self.archive.open("wb") as output:
-            subprocess.run(["zstd", "-q", "-c"], input=buff.getvalue(), stdout=output, check=True)
+        self.write_snapshot([
+            ("build.json", b"{}"),
+            ("llvm-cov-target", None),
+            ("llvm-cov-target/debug", None),
+            ("llvm-cov-target/debug/deps", None),
+            ("llvm-cov-target/debug/deps/fixture-0123456789abcdef", b"test"),
+        ])
         result = self.unpack()
         self.assertNotEqual(result.returncode, 0)
         # Refused at the old layout's directory itself, before any of its contents.
-        self.assertIn("unexpected snapshot entry llvm-cov-target/debug/deps\n", result.stderr)
+        self.assertIn("Cargo target layout before 1.100 is not supported: llvm-cov-target/debug/deps\n",
+                      result.stderr)
+        self.assertFalse(self.consumer.exists())
+        self.assertFalse(self.restored_manifest.exists())
+
+    def test_unpack_refuses_unit_state_that_only_the_state_check_sees(self):
+        # Every member passes the allowlist by name; the tree breaks the unit rules by shape.
+        unit = "llvm-cov-target/debug/build/fixture"
+        self.write_snapshot([
+            ("build.json", b"{}"),
+            *((name, None) for name in ("llvm-cov-target", "llvm-cov-target/debug",
+                                        "llvm-cov-target/debug/build", unit)),
+            *((f"{unit}/1111111111111111{name}", None) for name in ("", "/fingerprint", "/out", "/run")),
+            (f"{unit}/1111111111111111/run/stdout", b""),
+            (f"{unit}/1111111111111111/run/root-output", b""),
+            (f"{unit}/2222222222222222", None),
+            (f"{unit}/2222222222222222/fingerprint", None),
+            (f"{unit}/2222222222222222/fingerprint/test-lib-fixture", b"0123456789abcdef"),
+            (f"{unit}/3333333333333333", None),
+            (f"{unit}/3333333333333333/fingerprint", b"a file, not a directory"),
+            (f"{unit}/3333333333333333/out", None),
+        ])
+        result = self.unpack()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"incomplete Cargo unit state (out/ is missing): {unit}/2222222222222222\n",
+                      result.stderr)
+        self.assertIn(f"incomplete Cargo unit state (fingerprint/ is not a directory): "
+                      f"{unit}/3333333333333333\n", result.stderr)
         self.assertFalse(self.consumer.exists())
         self.assertFalse(self.restored_manifest.exists())
 
     def test_incomplete_unit_state_cannot_be_packed(self):
         aside = self.root / "aside"
-        cases = (
-            (f"{COMPILE_UNIT}/fingerprint", "incomplete Cargo unit state", COMPILE_UNIT),
-            (f"{COMPILE_UNIT}/out", "incomplete Cargo unit state", COMPILE_UNIT),
-            (f"{RUN_UNIT}/fingerprint", "incomplete Cargo unit state", RUN_UNIT),
-            (f"{RUN_UNIT}/out", "incomplete Cargo unit state", RUN_UNIT),
-            (f"{RUN_UNIT}/run/stdout", "incomplete Cargo build-script state", RUN_UNIT),
-            (f"{RUN_UNIT}/run/root-output", "incomplete Cargo build-script state", RUN_UNIT),
+        unit_state, run_state = "incomplete Cargo unit state", "incomplete Cargo build-script state"
+        cases = tuple(
+            (unit, name, unit_state, f"{name}/ is missing", f"{name}/ is not a directory")
+            for unit in (COMPILE_UNIT, RUN_UNIT) for name in ("fingerprint", "out")
+        ) + (
+            (RUN_UNIT, "run/stdout", run_state, "run/stdout is missing", "run/stdout is not a regular file"),
+            (RUN_UNIT, "run/root-output", run_state, "run/root-output is missing",
+             "run/root-output is not a regular file"),
         )
-        for path, message, unit in cases:
-            with self.subTest(missing=path):
-                state = self.target / "llvm-cov-target" / path
+        for unit, name, kind, missing, symlinked in cases:
+            with self.subTest(unit=unit, state=name):
+                state = self.target / "llvm-cov-target" / unit / name
                 os.replace(state, aside)
                 try:
-                    self.assert_pack_refused(message, unit)
+                    self.assert_pack_refused(f"{kind} ({missing}): llvm-cov-target/{unit}\n")
                     # The same name as a symlink to real state is refused too.
                     state.symlink_to(self.binary if aside.is_file() else self.binary.parent)
-                    self.assert_pack_refused(message, unit)
+                    self.assert_pack_refused(f"{kind} ({symlinked}): llvm-cov-target/{unit}\n")
                     state.unlink()
                 finally:
                     os.replace(aside, state)
+        run = self.target / "llvm-cov-target" / RUN_UNIT / "run"
+        os.replace(run, aside)
+        run.write_text("a file, not a directory\n")
+        self.assert_pack_refused(f"{run_state} (run is not a directory): llvm-cov-target/{RUN_UNIT}\n")
+        run.unlink()
+        os.replace(aside, run)
         # The run's invoked.timestamp is kept when present, as before 1.100, but not required.
-        timestamp = self.target / "llvm-cov-target" / RUN_UNIT / "run/invoked.timestamp"
+        timestamp = run / "invoked.timestamp"
         os.replace(timestamp, aside)
         timestamp.symlink_to(self.stdout)
-        self.assert_pack_refused("incomplete Cargo build-script state", RUN_UNIT)
+        self.assert_pack_refused(f"{run_state} (run/invoked.timestamp is not a regular file): "
+                                 f"llvm-cov-target/{RUN_UNIT}\n")
         timestamp.unlink()
         packed = self.pack()
         self.assertEqual(packed.returncode, 0, packed.stderr)
@@ -578,22 +624,24 @@ class BuildSnapshotTests(unittest.TestCase):
                     os.replace(self.root / "aside", path)
 
     def test_unknown_entries_of_the_build_directory_are_refused_and_named(self):
+        not_a_unit = "not a unit directory named by 16 lowercase hex digits"
         unknown = (
-            (f"{COMPILE_UNIT}/.cargo-lock", f"{COMPILE_UNIT}/.cargo-lock"),
-            (f"{COMPILE_UNIT}/extra/state", f"{COMPILE_UNIT}/extra"),
-            (f"{COMPILE_UNIT}/fingerprint/nested/state", f"{COMPILE_UNIT}/fingerprint/nested"),
-            (f"{RUN_UNIT}/run/output", f"{RUN_UNIT}/run/output"),
-            (f"{RUN_UNIT}/run/nested/state", f"{RUN_UNIT}/run/nested"),
-            (f"{PACKAGE}/not-a-unit-hash/fingerprint/state", f"{PACKAGE}/not-a-unit-hash"),
-            (f"{PACKAGE}/0123456789ABCDEF/fingerprint/state", f"{PACKAGE}/0123456789ABCDEF"),
-            (f"{PACKAGE}/stray-file", f"{PACKAGE}/stray-file"),
-            ("debug/build/stray-file", "debug/build/stray-file"),
+            (f"{COMPILE_UNIT}/.cargo-lock", f"{COMPILE_UNIT}/.cargo-lock", "unknown unit entry .cargo-lock"),
+            (f"{COMPILE_UNIT}/extra/state", f"{COMPILE_UNIT}/extra", "unknown unit entry extra"),
+            (f"{COMPILE_UNIT}/fingerprint/nested/state", f"{COMPILE_UNIT}/fingerprint/nested",
+             "fingerprint entry that is not a regular file"),
+            (f"{RUN_UNIT}/run/output", f"{RUN_UNIT}/run/output", "unknown run entry output"),
+            (f"{RUN_UNIT}/run/nested/state", f"{RUN_UNIT}/run/nested", "unknown run entry nested"),
+            (f"{PACKAGE}/not-a-unit-hash/fingerprint/state", f"{PACKAGE}/not-a-unit-hash", not_a_unit),
+            (f"{PACKAGE}/0123456789ABCDEF/fingerprint/state", f"{PACKAGE}/0123456789ABCDEF", not_a_unit),
+            (f"{PACKAGE}/stray-file", f"{PACKAGE}/stray-file", not_a_unit),
+            ("debug/build/stray-file", "debug/build/stray-file", "not a package directory"),
         )
-        for path, named in unknown:
+        for path, named, kind in unknown:
             with self.subTest(path=path):
                 self.make(path, "unknown\n")
-                self.assert_pack_refused("unexpected entry in Cargo build state",
-                                         f"llvm-cov-target/{named}")
+                self.assert_pack_refused(f"unexpected entry in Cargo build state ({kind}): "
+                                         f"llvm-cov-target/{named}\n")
                 entry = self.target / "llvm-cov-target" / named
                 if entry.is_dir():
                     shutil.rmtree(entry)
@@ -609,18 +657,47 @@ class BuildSnapshotTests(unittest.TestCase):
                 self.make(f"{unit}/fingerprint/lib-{package}", "0123456789abcdef")
                 self.make(f"{unit}/out/lib{package}-6666666666666666.rlib", "rlib\n")
                 # The package directory itself is named, before any of its units.
-                self.assert_pack_refused("unexpected entry in Cargo build state: "
-                                         f"llvm-cov-target/debug/build/{package}\n")
+                self.assert_pack_refused("unexpected entry in Cargo build state (package named like "
+                                         f"harness state): llvm-cov-target/debug/build/{package}\n")
                 shutil.rmtree(self.target / "llvm-cov-target/debug/build" / package)
 
-    def write_objects(self, *paths, objects=None):
-        if objects is None:
-            objects = [{"path": path, "sha256": "0" * 64} for path in paths]
+    def test_a_refusal_names_every_finding_grouped_and_before_the_credential_scan(self):
+        lock_units = [f"{PACKAGE}/{index:016x}" for index in range(0xa00, 0xa00 + 25)]
+        for unit in lock_units:
+            self.make(f"{unit}/fingerprint/lib-fixture", "0123456789abcdef")
+            self.make(f"{unit}/out/libfixture.rlib", "rlib\n")
+            self.make(f"{unit}/lock", "")
+        self.make(f"{PACKAGE}/4444444444444444/fingerprint/lib-fixture", "0123456789abcdef")
+        self.make(f"{RUN_UNIT}/run/output", "unknown\n")
+        self.stdout.write_text("cargo::warning=secret=fixture_never_print_this\n")
+        self.write_objects(f"{COMPILE_UNIT}/out/fixture-2222222222222222", "debug/missing-object")
+        result = self.assert_pack_refused(
+            "unexpected entry in Cargo build state (unknown unit entry lock), 25 times: "
+            + ", ".join(f"llvm-cov-target/{unit}/lock" for unit in lock_units[:3]) + ", and 22 more\n",
+            f"incomplete Cargo unit state (out/ is missing): llvm-cov-target/{PACKAGE}/4444444444444444\n",
+            f"unexpected entry in Cargo build state (unknown run entry output): "
+            f"llvm-cov-target/{RUN_UNIT}/run/output\n",
+            "build manifest object is not a packed file: debug/missing-object\n",
+        )
+        self.assertEqual(result.stderr.count("\n"), 4, result.stderr)
+        self.assertNotIn("credential", result.stderr)
+
+    def test_a_refusal_lists_twenty_kinds_of_finding_then_counts_the_rest(self):
+        for index in range(25):
+            self.make(f"{COMPILE_UNIT}/unknown-{index:02}", "")
+        result = self.assert_pack_refused("unknown unit entry unknown-19)",
+                                          "5 additional kinds of finding omitted\n")
+        self.assertNotIn("unknown-20", result.stderr)
+        self.assertEqual(result.stderr.count("\n"), 21, result.stderr)
+
+    def write_objects(self, *paths):
+        objects = [{"path": path, "sha256": "0" * 64} for path in paths]
         self.manifest.write_text(json.dumps({"schema": 1, "objects": objects}) + "\n")
 
     def test_every_manifest_object_is_a_packed_file(self):
-        hard_link = "llvm-cov-target/debug/fixture"
-        self.write_objects(self.binary.relative_to(self.target).as_posix(), hard_link)
+        # Paths relative to llvm-cov-target, as coverage_net.py writes them; the hard link too.
+        executable = f"{COMPILE_UNIT}/out/fixture-2222222222222222"
+        self.write_objects(executable, "debug/fixture")
         packed = self.pack()
         self.assertEqual(packed.returncode, 0, packed.stderr)
         self.archive.unlink()
@@ -630,23 +707,36 @@ class BuildSnapshotTests(unittest.TestCase):
         (self.target / "llvm-cov-target/debug/examples").mkdir()
         (self.target / "llvm-cov-target/debug/examples/fixture").symlink_to(
             "../build/fixture/2222222222222222/out/fixture-2222222222222222")
-        for missing in (
-            f"llvm-cov-target/{COMPILE_UNIT}/out/fixture-missing",
-            "llvm-cov-target/debug/incremental/fixture-old",
-            f"llvm-cov-target/{COMPILE_UNIT}/out",
-            "llvm-cov-target/debug/examples/fixture",
-            f"llvm-cov-target/{RUN_UNIT}/run/stderr",
-            "elsewhere/fixture",
-            "llvm-cov-target/./debug/fixture",
-        ):
+        unpacked = (
+            f"{COMPILE_UNIT}/out/fixture-missing",
+            "debug/incremental/fixture-old",
+            f"{COMPILE_UNIT}/out",
+            "debug/examples/fixture",
+            f"{RUN_UNIT}/run/stderr",
+            # The pack's own namespace, not the manifest's.
+            f"llvm-cov-target/{executable}",
+            "../elsewhere/fixture",
+            "debug/./fixture",
+        )
+        for missing in unpacked:
             with self.subTest(object=missing):
-                self.write_objects(hard_link, missing)
-                self.assert_pack_refused(f"build manifest object is not a packed file: {missing}")
+                self.write_objects(executable, missing)
+                self.assert_pack_refused(f"build manifest object is not a packed file: {missing}\n")
+        self.write_objects(executable, *unpacked)
+        self.assert_pack_refused("build manifest object is not a packed file, 8 times: "
+                                 + ", ".join(unpacked[:3]) + ", and 5 more\n")
 
-        for objects in ({"path": hard_link}, [hard_link], [{"sha256": "0" * 64}]):
-            with self.subTest(objects=objects):
-                self.write_objects(objects=objects)
-                self.assert_pack_refused("invalid build manifest objects")
+    def test_a_manifest_without_objects_cannot_be_packed(self):
+        for manifest, message in (
+            ({"schema": 1}, "build manifest lists no objects"),
+            ({"schema": 1, "objects": []}, "build manifest lists no objects"),
+            ({"schema": 1, "objects": {"path": "debug/fixture"}}, "invalid build manifest objects"),
+            ({"schema": 1, "objects": ["debug/fixture"]}, "invalid build manifest objects"),
+            ({"schema": 1, "objects": [{"sha256": "0" * 64}]}, "invalid build manifest objects"),
+        ):
+            with self.subTest(manifest=manifest):
+                self.manifest.write_text(json.dumps(manifest) + "\n")
+                self.assert_pack_refused(f"{message}: build.json\n")
 
     def encoder_without_reader(self):
         # Leave enough space for tar output to stay in Python's buffer until stdin.close().

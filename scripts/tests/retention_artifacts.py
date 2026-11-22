@@ -83,6 +83,7 @@ RUN_EXCLUDED = {
 # Cargo can replay rustc diagnostics from fingerprint/output-<target> (every 1.100 compile unit
 # has one, holding rustc's unused_extern report), but does not need them to decide freshness.
 FINGERPRINT_EXCLUDED_PREFIX = "output-"
+UNEXPECTED = "unexpected entry in Cargo build state"
 
 
 def git(repo, *args):
@@ -326,64 +327,118 @@ def real_file(path):
     return path.is_file() and not path.is_symlink()
 
 
-def check_unit(unit, label, unexpected):
-    """Check one unit directory's state and return whether it is a build-script run."""
+def present(path):
+    return path.exists() or path.is_symlink()
+
+
+def unit_findings(unit, label):
+    """Return one unit directory's findings and whether it is a build-script run."""
+    findings = []
     for entry in sorted(unit.iterdir()):
+        # Harness-state names are left out silently, as before 1.100. Cargo's own names here
+        # (fingerprint, out, run; <kind>-<target>, dep-, output- and the fixed run file names
+        # below them) never end in .profraw, .profdata or .log, start with _step_ or are in
+        # HARNESS_STATE, so no Cargo state is dropped that way.
         if entry.name not in UNIT_STATE and not harness_state(entry.name):
-            raise unexpected(entry)
-    fingerprint, out, run = (unit / name for name in ("fingerprint", "out", "run"))
+            findings.append((f"{UNEXPECTED} (unknown unit entry {entry.name})", label(entry)))
     # cargo-llvm-cov tells a compile unit's out/ from a run's $OUT_DIR by these siblings.
-    if not (real_dir(fingerprint) and real_dir(out)):
-        raise ValueError(f"incomplete Cargo unit state in {label(unit)}")
-    for entry in sorted(fingerprint.iterdir()):
-        if not real_file(entry) and not harness_state(entry.name):
-            raise unexpected(entry)
-    if not (run.exists() or run.is_symlink()):
-        return False
-    if real_dir(run):
-        state = {}
-        for entry in sorted(run.iterdir()):
-            if entry.name in RUN_STATE:
-                state[entry.name] = entry
-            elif entry.name not in RUN_EXCLUDED and not harness_state(entry.name):
-                raise unexpected(entry)
-        if RUN_REQUIRED <= state.keys() and all(map(real_file, state.values())):
-            return True
-    raise ValueError(f"incomplete Cargo build-script state in {label(unit)}")
+    for name in ("fingerprint", "out"):
+        if not real_dir(unit / name):
+            problem = "is not a directory" if present(unit / name) else "is missing"
+            findings.append((f"incomplete Cargo unit state ({name}/ {problem})", label(unit)))
+    if real_dir(unit / "fingerprint"):
+        for entry in sorted((unit / "fingerprint").iterdir()):
+            if not real_file(entry) and not harness_state(entry.name):
+                findings.append((f"{UNEXPECTED} (fingerprint entry that is not a regular file)",
+                                 label(entry)))
+    run = unit / "run"
+    if not present(run):
+        return findings, False
+    if not real_dir(run):
+        findings.append(("incomplete Cargo build-script state (run is not a directory)", label(unit)))
+        return findings, True
+    for entry in sorted(run.iterdir()):
+        if entry.name not in RUN_STATE | RUN_EXCLUDED and not harness_state(entry.name):
+            findings.append((f"{UNEXPECTED} (unknown run entry {entry.name})", label(entry)))
+    for name in sorted(RUN_STATE):
+        if present(run / name) and not real_file(run / name):
+            problem = f"run/{name} is not a regular file"
+        elif not present(run / name) and name in RUN_REQUIRED:
+            problem = f"run/{name} is missing"
+        else:
+            continue
+        findings.append((f"incomplete Cargo build-script state ({problem})", label(unit)))
+    return findings, True
 
 
-def check_cargo_state(tree):
-    """Require Cargo 1.100's build directory, complete units and no unknown entry in them."""
+def cargo_state_findings(tree):
+    """Return every finding against Cargo 1.100's build directory, its units and their state.
+
+    The earlier layout and a missing build directory are refused at once: the unit rules do not
+    apply to them.
+    """
     debug = tree / COV_TARGET / "debug"
 
     def label(path):
         return path.relative_to(tree).as_posix()
 
-    def unexpected(path):
-        return ValueError(f"unexpected entry in Cargo build state: {label(path)}")
-
-    for name in OLD_LAYOUT:
-        if (debug / name).exists() or (debug / name).is_symlink():
-            raise ValueError(f"Cargo target layout before 1.100 is not supported: {label(debug / name)}")
+    old = [debug / name for name in OLD_LAYOUT if present(debug / name)]
+    if old:
+        raise ValueError("\n".join(f"Cargo target layout before 1.100 is not supported: {label(path)}"
+                                   for path in old))
     build = debug / "build"
     if not (real_dir(debug) and real_dir(build)):
         raise ValueError("missing Cargo debug or build directory")
+    findings = []
     runs = compiles = 0
     for package in sorted(build.iterdir()):
+        if not real_dir(package):
+            findings.append((f"{UNEXPECTED} (not a package directory)", label(package)))
+            continue
         # A package named like harness state would otherwise be left out without notice.
-        if not real_dir(package) or not allowed(PurePosixPath(label(package)).parts):
-            raise unexpected(package)
+        if not allowed(PurePosixPath(label(package)).parts):
+            findings.append((f"{UNEXPECTED} (package named like harness state)", label(package)))
+            continue
         for unit in sorted(package.iterdir()):
             if not real_dir(unit) or not allowed(PurePosixPath(label(unit)).parts):
-                raise unexpected(unit)
-            if check_unit(unit, label, unexpected):
+                findings.append((f"{UNEXPECTED} (not a unit directory named by 16 lowercase hex digits)",
+                                 label(unit)))
+                continue
+            unit_found, is_run = unit_findings(unit, label)
+            findings.extend(unit_found)
+            if is_run:
                 runs += 1
             else:
                 compiles += 1
     if not runs:
-        raise ValueError("no Cargo build-script run unit")
+        findings.append(("no Cargo build-script run unit", label(build)))
     if not compiles:
-        raise ValueError("no Cargo compile unit")
+        findings.append(("no Cargo compile unit", label(build)))
+    return findings
+
+
+def refusal(findings, limit=20, examples=3):
+    """One message for every finding: one line per kind, with a count and example paths."""
+    kinds = {}
+    for reason, name in findings:
+        kinds.setdefault(reason, []).append(name)
+    lines = []
+    for reason, names in list(kinds.items())[:limit]:
+        if len(names) == 1:
+            lines.append(f"{reason}: {names[0]}")
+        else:
+            rest = f", and {len(names) - examples} more" if len(names) > examples else ""
+            lines.append(f"{reason}, {len(names)} times: {', '.join(names[:examples])}{rest}")
+    if len(kinds) > limit:
+        lines.append(f"{len(kinds) - limit} additional kinds of finding omitted")
+    return "\n".join(lines)
+
+
+def check_cargo_state(tree):
+    """Refuse a tree with any finding against Cargo 1.100's build directory, naming them all."""
+    findings = cargo_state_findings(tree)
+    if findings:
+        raise ValueError(refusal(findings))
 
 
 def relative_path(name):
@@ -449,21 +504,29 @@ def inspect_manifest(manifest):
         raise ValueError("invalid build manifest")
 
 
-def check_manifest_objects(manifest, members):
-    """Require every coverage object the build manifest lists to be packed as a file."""
-    objects = json.loads(manifest.read_bytes()).get("objects", [])
+def manifest_object_findings(manifest, members):
+    """Return a finding for every coverage object the build manifest lists but does not pack.
+
+    coverage_net.py stores each object's path relative to the llvm-cov-target directory; the
+    members are relative to the pack's target, which holds that directory.
+    """
+    objects = json.loads(manifest.read_bytes()).get("objects")
+    if objects is None or objects == []:
+        return [("build manifest lists no objects", BUILD_MANIFEST)]
     if not isinstance(objects, list) or not all(
         isinstance(entry, dict) and isinstance(entry.get("path"), str) for entry in objects
     ):
-        raise ValueError("invalid build manifest objects")
+        return [("invalid build manifest objects", BUILD_MANIFEST)]
     packed = {relative for _path, relative, regular in members if regular}
+    findings = []
     for entry in objects:
         try:
-            path = relative_path(entry["path"])
+            path = PurePosixPath(COV_TARGET) / relative_path(entry["path"])
         except ValueError:
             path = None
         if path not in packed:
-            raise ValueError(f"build manifest object is not a packed file: {entry['path']}")
+            findings.append(("build manifest object is not a packed file", entry["path"]))
+    return findings
 
 
 def require_external_output(path, target, label):
@@ -476,11 +539,14 @@ def require_external_output(path, target, label):
 def pack_build(manifest, target, destination, credentials):
     require_external_output(destination, target, "snapshot archive")
     inspect_manifest(manifest)
-    check_cargo_state(target)
+    findings = cargo_state_findings(target)
     if destination.exists() or destination.is_symlink():
         raise ValueError("snapshot archive already exists")
     members = list(build_members(target, target / COV_TARGET))
-    check_manifest_objects(manifest, members)
+    # Every state and object finding in one refusal, before the credential scan.
+    findings.extend(manifest_object_findings(manifest, members))
+    if findings:
+        raise ValueError(refusal(findings))
     files = [(manifest, BUILD_MANIFEST)]
     files.extend((path, relative.as_posix()) for path, relative, regular in members if regular)
     check_snapshot_credentials(files, credentials)
@@ -521,6 +587,8 @@ def extract_snapshot(archive, directory):
         if name in seen:
             raise ValueError(f"duplicate snapshot entry {name}")
         is_manifest = name == PurePosixPath(BUILD_MANIFEST)
+        if name.parts[:2] == (COV_TARGET, "debug") and len(name.parts) > 2 and name.parts[2] in OLD_LAYOUT:
+            raise ValueError(f"Cargo target layout before 1.100 is not supported: {name}")
         if (is_manifest and not member.isfile()) or (not is_manifest and not allowed(name.parts)):
             raise ValueError(f"unexpected snapshot entry {name}")
         if len(name.parts) > 1 and (

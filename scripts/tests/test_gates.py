@@ -376,7 +376,8 @@ class StrictRuleTests(unittest.TestCase):
 def exe(package, cargo_1_100=False):
     crate = gate_common.norm_package(package)
     if cargo_1_100:
-        # Cargo 1.100 runs a test executable from its unit's out/, under the package's own name.
+        # Cargo 1.100 runs a test executable from its unit's out/, in a directory named by the
+        # package (here the normalized name, hyphenated); the gate reads the file name only.
         unit = f"debug/build/{package.replace('_', '-')}/0000000000000000"
         return f"/mnt/target/llvm-cov-target/{unit}/out/{crate}-0000000000000000"
     return f"target/debug/deps/{crate}-0000000000000000"
