@@ -20,7 +20,12 @@ later work and what stays open; the last section points to the rest.
   him. That run has since finished: both gates passed ("CI and the gates"). The branch
   `release6-jmap-calendars` sat on `ade47a9ae`. The head of the code is `bea8a39fb` (last
   product change `20ca477f4`); the commits after it are the gates' toolchain pin `6131cc902` and
-  records. After the merge the pin was removed (`cd6f5f417`, "CI and the gates").
+  records. After the merge this consolidation's branch removed the pin (`cd6f5f417`); the removal
+  did not survive the merge of `main` into the branch, whose retention jobs are pinned to Rust
+  1.99.1 ("CI and the gates").
+- **This consolidation** is pull request #98. The controller merged `main` into its branch on
+  2026-11-22 (`c08595afc`); after that merge its `.github`, `scripts`, `crates` and `tests` are
+  identical to `main`'s, and the branch changes documents only.
   `git log --oneline ade47a9ae..f559febdb` lists every commit; the fix waves' commits are in "The
   pull request's findings".
 - **Command labels**, as the plan's matrices used them (the suites with
@@ -104,7 +109,8 @@ returns to an earlier value.
   assertion (`tests/src/automation/dkim.rs:89`). On `d6929c89e` the key was generated a second
   after the test read the clock, and the same step passed in the pull-request run on that
   commit. On `f559febdb` the selector was one second later than the clock the test read: the
-  failure recorded for 2026-11-19, seen a second time. The controller's classification, both
+  failure recorded for 2026-11-19, seen a second time. It was seen a third time in pull request
+  #98's own run (below). The controller's classification, both
   times: a timing failure of that test. Cost if wrong: a regression there passed as timing; the
   step runs on every pull-request run.
 - (b) The step "JMAP Tests (key accounts)", which had no rerun then, failed at
@@ -155,28 +161,43 @@ returns to an earlier value.
   "Failures classified as timing" (it has failed in a whole run and again alone); the branch
   changes no SMTP code, and the pull request's own run passed its SMTP step on the same commit.
   Cost if wrong: an SMTP queue regression passed as a timing failure.
-- **The toolchain pin, made and removed.** On 2026-11-21, before the merge, the project owner
-  decided item 26: the gates job measured with Rust 1.99.1, the compiler the deployed product was
-  built with (`6131cc902`, merged with pull request #90; the controller had named the current
-  stable, 1.100.0). On 2026-11-21, after the merge, he decided to remove that pin, since upstream
-  pins no toolchain; this reverses item 26. The change, `cd6f5f417` (the gates job of
-  `.github/workflows/test.yml` only): the job's `RUSTUP_TOOLCHAIN` entry and the toolchain install
-  are gone, and the job uses the runner's stable Rust again, as the other jobs do. Compared with
-  the workflow before the pin, one thing remains: the step "Install cargo-llvm-cov" prints the
-  compiler's version (`rustc --version --verbose`). `scripts/tests/ci_steps.py` reports 0
-  differences and `test_gates.py` passes, before and after.
-- **What the gate's figures depend on.** The coverage gate again moves with the compiler the
-  runner's image carries. The two earlier CI results show the size of that: the cohort measured
-  about half a point apart on Rust 1.99.1 (`68d905131`) and Rust 1.100.0 (`8e05a6b44`), and on
-  1.100.0 the gate passed with 62 and 49 lines to spare. The run on `f559febdb`, on Rust 1.99.1,
-  measured the totals of the earlier 1.99.1 run again (upstream's product 398,456 lines there and
-  in the run on `68d905131`, against 387,958 in the run on `8e05a6b44`, whose image carried Rust
-  1.100.0), and the margins are back to about 140 lines. This confirms the controller's earlier
-  classification that the smaller margins on `8e05a6b44` were a change of the measurement and not
-  lost coverage. Since the pin is removed after the merge, the next gates run measures with the
-  runner's stable again. The baseline file does not record the compiler it was measured with.
-- **Item 27** (pin the release workflow to the gates' version) is closed: with no pin in the
-  gates job there is nothing to align. It was never made.
+- **The toolchain pin, made, removed, and kept on `main`.** On 2026-11-21, before the merge, the
+  project owner decided item 26: the gates job measured with Rust 1.99.1, the compiler the
+  deployed product was built with (`6131cc902`, merged with pull request #90; the controller had
+  named the current stable, 1.100.0). On 2026-11-21, after the merge, he decided to remove that
+  pin, since upstream pins no toolchain; this reverses item 26. The change, `cd6f5f417` (the gates
+  job of `.github/workflows/test.yml` only), took out the job's `RUSTUP_TOOLCHAIN` entry and the
+  toolchain install and kept a step printing `rustc --version --verbose`. After pull request #98
+  was opened on 2026-11-21, `main` gained pull requests #97 (loopback test listeners), #89 (the
+  parallel retention pipeline), #99 (the 0.4.0-beta.1 release preparation) and #103 (its record
+  in `CLAUDE.md`), all merged by the project owner by 2026-11-22. #89 rebuilt the retention
+  gates: one instrumented build feeds three coverage jobs, a separate job captures the listings,
+  and every retention job pins `RUSTUP_TOOLCHAIN` to Rust 1.99.1 and prints `rustc -vV`;
+  `CLAUDE.md` there says to keep the pin in step with the compiler used to build the deployed
+  product. #103 records in `CLAUDE.md` that the product build uses the runner's stable Rust,
+  unpinned, as upstream pins no toolchain, and that `0.4.0-beta.1`'s artifact was built with
+  rustc 1.100.0. In the merge of `main` into this branch (`c08595afc`),
+  `.github/workflows/test.yml` is `main`'s, and in `CLAUDE.md` the paragraph on the `gates` job is
+  `main`'s and the rest is `main`'s text with this branch's move of release 6's inventories. So
+  this branch's removal of the pin (`cd6f5f417`, recorded in `ad4142c3a`) does not survive: the
+  gates job it edited no longer exists in that form, and the retention jobs on `main` are pinned
+  to Rust 1.99.1. The two commits stay in the history.
+- **What the gate's figures depend on.** The retention jobs measure with Rust 1.99.1 until the
+  pin is changed. The earlier results still show how much the compiler moves the figures: the
+  cohort measured about half a point apart on Rust 1.99.1 (`68d905131`) and Rust 1.100.0
+  (`8e05a6b44`), and on 1.100.0 the gate passed with 62 and 49 lines to spare. The run on
+  `f559febdb`, on Rust 1.99.1, measured the totals of the earlier 1.99.1 run again (upstream's
+  product 398,456 lines there and in the run on `68d905131`, against 387,958 in the run on
+  `8e05a6b44`, whose image carried Rust 1.100.0), and the margins are back to about 140 lines.
+  This confirms the controller's earlier classification that the smaller margins on `8e05a6b44`
+  were a change of the measurement and not lost coverage. The baseline file does not record the
+  compiler it was measured with.
+- **Item 27** (pin the release workflow to the gates' version) stays closed and was never made:
+  `main` keeps the product build unpinned on purpose (#103).
+- **Pull request #98's own CI**, before the merge with `main` (run 44943408483 on `37abc08ea`):
+  the first attempt failed in Upstream Suites at upstream's DKIM selector check
+  (`tests/src/automation/dkim.rs:89`), the third occurrence of that timing failure; the failed job
+  was rerun and passed, so every job of the run passed. No CI has run on `c08595afc` or later.
 - **The CI rerun** (item 25, approved by the project owner on 2026-11-20): `bea8a39fb` gives the
   key-mode JMAP step the one-rerun form of its plain-mode twin, and its entry in
   `scripts/tests/ci_steps.py` gains `rerun="same"`. The cost the controller named: a key-mode
@@ -275,7 +296,9 @@ returns to an earlier value.
   with Rust 1.99.1 (reversed after the merge, below); pull request #90 merged ("Status and what
   can be claimed"); this consolidation asked for.
 - **2026-11-21, after the merge**: the gates' toolchain pin removed, since upstream pins no
-  toolchain (`cd6f5f417`); this reverses item 26.
+  toolchain (`cd6f5f417`); this reverses item 26. Superseded by the retention pipeline he merged
+  on 2026-11-22 (#89), which pins every retention job; the product build is unpinned on `main`
+  (#103).
 
 ## Rulings that bind later work
 
@@ -471,7 +494,8 @@ process (routing, review order, reruns of a run) are in the history.
   wrong: a regression of the alarm path in key mode passed as a timing failure.
 - **Upstream's ordinary-account thread merge**: plain `jmap_tests` once in Task 24, key mode once
   in CI on `68d905131` (b).
-- **Upstream's DKIM selector assertion**: (a) above.
+- **Upstream's DKIM selector assertion**: (a) above; three occurrences, the third in pull request
+  #98's own run.
 - **The 500 ms DAV client timeout** (`tests/src/utils/webdav.rs:100`): a helper timeout in a
   module the round did not touch, at a recorded load spike, rerun once (fix round 1 of the first
   review; row 10 of the second matrix pass).
@@ -479,14 +503,14 @@ process (routing, review order, reruns of a run) are in the history.
 ### The gates' toolchain
 
 - **The pin's scope** (history): that item 26's pin was made in pull request #90, in the gates job
-  only, was the controller's ruling; the pin was removed after the merge.
-- **The compiler's version line stays.** Keeping `rustc --version --verbose` in the step "Install
-  cargo-llvm-cov" after the pin's removal is the controller's ruling: it pins nothing, and a
-  gate's figures then name their compiler. Cost if wrong: he wanted it removed too; it is one
-  line.
-- **Where the removal is made.** The removal is made in the consolidation pull request, as a
-  commit of its own (the controller's ruling). Cost if wrong: he wanted a separate pull request
-  for a CI change.
+  only, was the controller's ruling; this branch removed that pin after the merge.
+- **The removal's version line and place** (history): keeping the compiler's version line after
+  the pin's removal, and making the removal a commit of its own in the consolidation pull
+  request, were the controller's rulings; the removal did not survive the merge with `main`.
+- **`main`'s workflow in the merge.** Taking `main`'s workflow in the merge (`c08595afc`) is the
+  controller's ruling, reported to the project owner: `main`'s pipeline shares one instrumented
+  build across jobs and so needs one compiler. Cost if wrong: he wants the retention jobs unpinned
+  regardless; that is a change to the pipeline of #89, not to this branch.
 
 ### Tests that must keep their form
 
@@ -1065,9 +1089,15 @@ decisions"), each with the controller's recommendation where one was made:
   updates reach the same end. Recommended: accept, or a follow-up.
 - 17. FC2-15: `shareWith` is refused whatever its value, `null` and `{}` included. Recommended:
   let the reference client's checklist decide (it is in the checklist).
+- 28. `main`'s rule ties the retention pin to the deployed product's compiler; `0.4.0-beta.1` was
+  built with rustc 1.100.0, so deploying it puts the product on 1.100.0 while the retention jobs
+  measure with 1.99.1. Moving the pin to 1.100.0 would follow the rule; on that compiler the
+  coverage gate passed on `8e05a6b44` with 62 and 49 lines to spare. Put to him by the
+  controller; nothing is changed.
 
-Item 27 (pin the release workflow to the gates' version) has left this list: it is closed, since
-with no pin in the gates job there is nothing to align ("CI and the gates"); it was never made.
+Item 27 (pin the release workflow to the gates' version) has left this list: it stays closed and
+was never made, since `main` keeps the product build unpinned on purpose (#103; "CI and the
+gates").
 
 Proposed spec amendments not made (spec 3.3's lines for FC1-1, the UID lease and a non-member's
 effective privacy, which states FC2-2's difference from CalDAV, and section 10's `code` masking,
