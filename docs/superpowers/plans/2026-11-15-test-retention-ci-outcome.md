@@ -268,6 +268,39 @@ The qualification above was made with the pinned toolchain. Both gates depend on
 compiler's coverage mapping: the coverage gate's line counts, and the inventory gate's
 executed-function rule, which reads region counts from the same exports
 (`tests/qualification/tools/strict_rule.py`). Their figures, and either gate's result, can
-therefore move with stable. No retention run qualifies this change yet. It is to be qualified
-by a manually dispatched retention run on its final head before it merges, and its pull
-request names that run.
+therefore move with stable.
+
+[Run 45061623236](https://github.com/jaylaney/stalwart/actions/runs/45061623236), manually
+dispatched on `ef239bc10` on 2026-11-22, the pull request's final code head, is the run that
+qualifies the change: its retention part passed. Every retention job that ran installed and
+printed Rust 1.100.0: the resolver, the build, the listings capture, the three coverage shards
+and the reporter. The instrumented build took about 22 minutes. "Pack the build snapshot"
+passed in about one minute: 4,527,676,245 compressed bytes from a 19,332,540,741-byte target
+(on Rust 1.99.1, in the record above: 4,517,418,610 and 19,281,127,901). Each shard restored
+the snapshot in 55 to 77 seconds and ran its steps with exit status 0: the short shard's 17
+steps (its first step ended six seconds after it started), `za-tests` on RocksDB (41 minutes)
+and `za-tests-fs-blob` (46 minutes). No shard's job log holds a `Compiling` line. Each shard's
+build verification passed (the shard step fails otherwise). The reporter verified 39 report
+objects, and every outcome reads success: `TOOLCHAIN`, `BUILD`, `SHORT`, `ZA_ROCKS`,
+`ZA_FILESYSTEM`, `LISTINGS`, `COLLECT`, `MERGE`, `FUNCTIONS`, `INVENTORY`, `COVERAGE`. The
+inventory gate checked 795 tests, result OK. The coverage gate, against the 0.16.27 baseline:
+cohort full 30,818 / 31,909 lines (96.58% against 96.38%), 63 lines above the baseline's
+fraction; cohort runtime-only 17,645 / 18,588 (94.93% against 94.66%), 48 lines above.
+
+The run's other jobs passed (style, unit tests, upstream's suites, the product build, the
+independent CalDAV client, the fresh-store restart and the zero-access suite) except the
+upstream `Test` job, which failed in its SMTP step: upstream's
+`smtp::queue::retry::queue_retry` failed on its attempt and on its one rerun at
+`tests/src/smtp/queue/retry.rs:238`. So the run as a whole concluded as failed; the failed job
+was not rerun. That test is one of the timing-flaky upstream SMTP tests `CLAUDE.md` lists, and
+the same job passed in the pull-request run on the same head
+([run 45061617304](https://github.com/jaylaney/stalwart/actions/runs/45061617304)), in which
+every pull-request job passed. This branch changes no crate and no test.
+
+Its limits: it is one run, on Rust 1.100.0, on hosted Linux runners. The margins are small (63
+and 48 lines) and move with each stable release, as said above. The failure paths were not
+exercised: a resolver that fails or times out, a rerun of only the failed jobs reusing the
+resolver's output, and a refused pack on a runner; they rest on the tools' tests and on
+GitHub's documented behaviour. The fail-closed unit rules were taken from one small crate's
+tree and held for the whole workspace in this run; a later Cargo release that changes a unit
+directory's contents stops the pack until the rule is extended.
