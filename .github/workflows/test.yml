@@ -295,8 +295,23 @@ jobs:
       - name: Automation Tests
         if: ${{ !cancelled() }}
         # Needs Docker: ensure_acme and ensure_powerdns build and start the
-        # Pebble, challtestsrv and PowerDNS test servers.
-        run: cargo test -p tests automation::automation_tests -- --nocapture
+        # Pebble, challtestsrv and PowerDNS test servers. Upstream's DKIM
+        # selector assertion (tests/src/automation/dkim.rs:89) is timing-flaky:
+        # the selector holds a timestamp, and the assertion fails when the key
+        # is generated a second after the test read the clock. One rerun keeps
+        # that from failing the job. A real regression fails both runs. The
+        # test server wipes its data directory at start (NO_INSERT is unset),
+        # and the DKIM test's DNS server is in memory and cleared at its start.
+        # The containers are started by name with reuse, so the rerun finds
+        # them running: the Pebble and challtestsrv ports are mapped again, and
+        # the PowerDNS zone init is a no-op when the zone exists. The suite's
+        # PowerDNS records are replaced by set_rrset, so a leftover one does not
+        # matter.
+        run: |
+          cargo test -p tests automation::automation_tests -- --nocapture || {
+            echo "::warning title=automation_tests::run failed; retrying once (known DKIM selector timing flake)"
+            cargo test -p tests automation::automation_tests -- --nocapture
+          }
 
   zero-access:
     name: Zero-access Test

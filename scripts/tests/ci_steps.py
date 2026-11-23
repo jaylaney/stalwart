@@ -152,7 +152,7 @@ STEPS = [
          "cargo test -p tests system::system_tests -- --nocapture", net="system-tests"),
     Step("test.yml__upstream-suites__automation-tests", "upstream-suites", "Automation Tests",
          "cargo test -p tests automation::automation_tests -- --nocapture",
-         net="automation-tests"),
+         rerun="same", net="automation-tests"),
     # zero-access
     Step("test.yml__zero-access__vault-and-groupware-unit-tests", "zero-access",
          "Vault and Groupware Unit Tests",
