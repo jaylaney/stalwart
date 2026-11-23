@@ -20,12 +20,26 @@ Task 1's rulings 7, 8, 25, 31 and 32 set their rules.
 ## Hosted runs
 
 The **Test Retention Gates** check runs weekly and on manual dispatch of `test.yml`.
-`gates-build` runs the two instrumented setup builds and uploads the target. Three jobs use
-that exact build on separate runners. One runs the RocksDB zero-access configuration, one
-runs the filesystem-blob zero-access configuration, and one runs the other 17 configurations
-sequentially. `gates-listings` captures the ordinary listings in parallel. The instrumented
-and ordinary caches store dependency downloads under separate keys. A cache miss falls back
-to a locked fetch.
+A first job, `gates-toolchain`, resolves the current stable Rust's exact release, and every
+other retention job of the run installs that release; no version is pinned.
+`gates-build` runs the two instrumented setup builds and uploads the target. The snapshot
+holds Cargo 1.100's build directory: each unit's `fingerprint/` and `out/`, and a
+build-script run's `run/`, without incremental data, replayed diagnostics, build-script
+`stderr`, profiles or harness state. Inside a unit (the unit directory, its `fingerprint/`,
+`run/` and `out/`), harness-state names (`*.log`, `*.profraw`, `_step_*` and the like) are
+left out silently, as before; none of Cargo's own names there has that form. A harness-named
+package directory, or such an entry directly in `build/` or in a package directory, is
+refused. `retention_artifacts.py` refuses a target in the layout before Cargo 1.100, an
+unknown entry in the build directory, incomplete unit state, and a manifest object it would
+not pack. One message names these findings: every kind with a fixed reason first, then at
+most 20 kinds of unknown entry (one kind per name) and a count of the rest, each kind with
+its count and up to three paths. A target without a build directory, and credential
+findings, are refused in messages of their own. Three jobs use that exact build on separate
+runners. One runs the RocksDB zero-access configuration, one runs the filesystem-blob
+zero-access configuration, and one runs the other 17 configurations sequentially.
+`gates-listings` captures the ordinary listings in parallel. The instrumented and ordinary
+caches store dependency downloads under separate keys. A cache miss falls back to a locked
+fetch.
 
 The reporter binds coverage to the build artifact's object inventory, validates every selected
 receipt, and runs the inventory and coverage gates. An exhausted retry can still produce
@@ -38,8 +52,16 @@ are available. Use **Re-run all jobs** when the referenced artifacts have expire
 ## Serial reproduction
 
 Use `cargo-llvm-cov` 0.9.1 with the Rust toolchain's `llvm-tools-preview`. To compare hosted
-results, use the Rust pin from `test.yml`, an empty ordinary target for listing capture and
-the same `UNIT_TEST_FEATURES`. The serial sequence is:
+results, use the Rust release that run's retention jobs installed, an empty ordinary target
+for listing capture and the same `UNIT_TEST_FEATURES`. `test.yml` pins no release: its first
+retention job, `gates-toolchain`, resolves the current stable's exact release once per run.
+That job's "Resolve the current stable Rust release" step and every other retention job's
+"Install pinned tools" or "Install pinned coverage tools" step print `rustc -vV`; its
+`release:` line is the version to use. Both gates depend on the compiler's coverage mapping:
+the coverage gate counts lines, and the inventory gate's executed-function rule
+(`tests/qualification/tools/strict_rule.py`) reads region counts from the same exports. A run
+on another release is therefore not comparable line for line, and either gate's result can
+differ. The serial sequence is:
 
 ```sh
 export STORE=RocksDb RUST_MIN_STACK=16777216 UNIT_TEST_FEATURES="<test.yml's list>"
@@ -120,8 +142,10 @@ The tool's docstring lists every check. Each failure line gives:
 
 **`--listing`** is a directory holding one file per configuration. Each file is the output of
 one `cargo test ... -- --list` command, stdout and stderr together. Cargo prints the
-`Running ... (target/debug/deps/<crate>-<hash>)` lines that name each test's package on
-stderr, so capture both with `2>&1`.
+`Running ...` lines that name each test's package on stderr, so capture both with `2>&1`.
+The gate takes the package from the executable's file name, `<crate>-<hash>`: Cargo 1.100
+prints `(target/debug/build/<package>/<hash>/out/<crate>-<hash>)`, and earlier releases,
+whose form the baseline's captures keep, `(target/debug/deps/<crate>-<hash>)`.
 - **Naming.** A file is named `<configuration>.txt`, or it starts with
   `# config: <configuration>`.
 - **Configurations.** The names are the baseline's: `libtest.configurations` in the baseline
@@ -213,7 +237,10 @@ python3 -I scripts/tests/test_retention_evidence.py -v
 The snapshot tests need Git and `zstd`. The two `--real` tests below skip by default.
 The offline tests cover:
 - the strict rule on synthetic exports, run through `strict_rule.py functions`;
-- listing faults against a candidate built from the committed baseline's own records;
+- listing faults against a candidate built from the committed baseline's own records, and
+  that candidate with Cargo 1.100's executable paths;
+- the build snapshot on fixture targets in Cargo 1.100's layout: what it keeps and leaves out,
+  each refusal and the credential scans;
 - coverage exports one line below each threshold, with a restored test file that would
   otherwise offset the drop;
 - the CI workflow against `ci_steps.STEPS`: the committed test.yml matches it, and edited copies

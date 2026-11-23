@@ -599,13 +599,42 @@ jobs:
             ${{ runner.temp }}/fresh-store-logs/server.log
             ${{ runner.temp }}/fresh-store-logs/fresh-store.log
 
-  # Retention runs weekly and on request. First build one instrumented target
-  # while capturing ordinary test listings. Each coverage job runs its assigned
-  # configurations sequentially in isolation, then the final job validates
-  # their evidence together and applies the existing inventory and coverage rules.
+  # Retention runs weekly and on request. First resolve the run's Rust toolchain,
+  # then build one instrumented target while capturing ordinary test listings.
+  # Each coverage job runs its assigned configurations sequentially in isolation,
+  # then the final job validates their evidence together and applies the
+  # existing inventory and coverage rules.
+  gates-toolchain:
+    name: Resolve Retention Toolchain
+    needs: style
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      rust-toolchain: ${{ steps.resolve.outputs.rust-toolchain }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Rust's coverage mapping changes the measured line counts, and the retention
+      # jobs share one instrumented build, so every other retention job of a run
+      # installs this one exact release (X.Y.Z) of the current stable, never a channel.
+      # A failed-jobs rerun keeps this job's first output, matching the reused artifacts.
+      - name: Resolve the current stable Rust release
+        id: resolve
+        shell: bash
+        run: bash scripts/tests/retention_ci_setup.sh resolve-toolchain
+
   gates-build:
     name: Build Retention Coverage Target
-    needs: style
+    needs:
+      - style
+      - gates-toolchain
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -617,10 +646,8 @@ jobs:
     env:
       STORE: RocksDb
       RUST_MIN_STACK: "16777216"
-      # Rust's coverage mapping changes the measured line counts. All retention
-      # jobs use the deployed product's compiler. Update their pins together
-      # when the product compiler changes.
-      RUSTUP_TOOLCHAIN: "1.99.1"
+      # The exact release gates-toolchain resolved for this run (see there).
+      RUSTUP_TOOLCHAIN: ${{ needs.gates-toolchain.outputs.rust-toolchain }}
       RETENTION_TIMEOUT_MINUTES: "120"
       RETENTION_TARGET: x86_64-unknown-linux-gnu
       CARGO_TARGET_DIR: /mnt/target
@@ -768,7 +795,9 @@ jobs:
 
   gates-listings:
     name: Capture Retention Test Listings
-    needs: style
+    needs:
+      - style
+      - gates-toolchain
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 100
@@ -780,7 +809,7 @@ jobs:
     env:
       STORE: RocksDb
       RUST_MIN_STACK: "16777216"
-      RUSTUP_TOOLCHAIN: "1.99.1"
+      RUSTUP_TOOLCHAIN: ${{ needs.gates-toolchain.outputs.rust-toolchain }}
       RETENTION_TIMEOUT_MINUTES: "100"
       RETENTION_TARGET: x86_64-unknown-linux-gnu
       CARGO_TARGET_DIR: /mnt/listing-target
@@ -916,41 +945,48 @@ jobs:
 
   gates-short:
     name: Retention Coverage (short)
-    needs: gates-build
+    needs:
+      - gates-toolchain
+      - gates-build
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     uses: ./.github/workflows/test-retention-shard.yml
     with:
       shard-id: short
       snapshot-artifact-id: ${{ needs.gates-build.outputs.snapshot-artifact-id }}
-      rust-toolchain: "1.99.1"
+      rust-toolchain: ${{ needs.gates-toolchain.outputs.rust-toolchain }}
       timeout-minutes: 170
 
   gates-za-rocks:
     name: Retention Coverage (za-rocks)
-    needs: gates-build
+    needs:
+      - gates-toolchain
+      - gates-build
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     uses: ./.github/workflows/test-retention-shard.yml
     with:
       shard-id: za-rocks
       snapshot-artifact-id: ${{ needs.gates-build.outputs.snapshot-artifact-id }}
-      rust-toolchain: "1.99.1"
+      rust-toolchain: ${{ needs.gates-toolchain.outputs.rust-toolchain }}
       timeout-minutes: 355
 
   gates-za-filesystem:
     name: Retention Coverage (za-filesystem)
-    needs: gates-build
+    needs:
+      - gates-toolchain
+      - gates-build
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     uses: ./.github/workflows/test-retention-shard.yml
     with:
       shard-id: za-filesystem
       snapshot-artifact-id: ${{ needs.gates-build.outputs.snapshot-artifact-id }}
-      rust-toolchain: "1.99.1"
+      rust-toolchain: ${{ needs.gates-toolchain.outputs.rust-toolchain }}
       timeout-minutes: 355
 
   gates:
     name: Test Retention Gates
     needs:
       - style
+      - gates-toolchain
       - gates-build
       - gates-short
       - gates-za-rocks
@@ -962,7 +998,7 @@ jobs:
     env:
       STORE: RocksDb
       RUST_MIN_STACK: "16777216"
-      RUSTUP_TOOLCHAIN: "1.99.1"
+      RUSTUP_TOOLCHAIN: ${{ needs.gates-toolchain.outputs.rust-toolchain }}
       RETENTION_TIMEOUT_MINUTES: "100"
       RETENTION_TARGET: x86_64-unknown-linux-gnu
       CARGO_TARGET_DIR: /mnt/target
@@ -1245,6 +1281,7 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         env:
+          TOOLCHAIN_OUTCOME: ${{ needs.gates-toolchain.result }}
           BUILD_OUTCOME: ${{ needs.gates-build.result }}
           SHORT_OUTCOME: ${{ needs.gates-short.result }}
           ZA_ROCKS_OUTCOME: ${{ needs.gates-za-rocks.result }}
@@ -1257,7 +1294,7 @@ jobs:
           COVERAGE_OUTCOME: ${{ steps.coverage.outcome }}
         run: |
           status=0
-          for outcome in BUILD SHORT ZA_ROCKS ZA_FILESYSTEM LISTINGS COLLECT MERGE FUNCTIONS INVENTORY COVERAGE; do
+          for outcome in TOOLCHAIN BUILD SHORT ZA_ROCKS ZA_FILESYSTEM LISTINGS COLLECT MERGE FUNCTIONS INVENTORY COVERAGE; do
             key="${outcome}_OUTCOME"
             printf '%s: %s\n' "$outcome" "${!key}" | tee -a "$GITHUB_STEP_SUMMARY"
             if [[ "${!key}" != success ]]; then

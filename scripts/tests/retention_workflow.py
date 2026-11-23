@@ -6,7 +6,10 @@ import textwrap
 
 SHARD_WORKFLOW_NAME = "test-retention-shard.yml"
 RUNNER = "ubuntu-24.04"
-RUST_TOOLCHAIN = "1.99.1"
+# No Rust release is written here: one job resolves the current stable's exact release once
+# per run, and every other retention job installs exactly that release.
+RESOLVER = "gates-toolchain"
+TOOLCHAIN = "${{ needs." + RESOLVER + ".outputs.rust-toolchain }}"
 TARGET = "x86_64-unknown-linux-gnu"
 WHEN = "github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'"
 AFTER_FAILURE = "!cancelled()"
@@ -156,16 +159,34 @@ def unpack_step(condition=None):
     """, condition=condition)
 
 
+def resolver_job():
+    """The run's one compiler: the exact release (X.Y.Z) of the current stable channel."""
+    return {
+        "name": "Resolve Retention Toolchain",
+        "needs": "style",
+        "if": WHEN,
+        "runs-on": RUNNER,
+        "timeout-minutes": "10",
+        "permissions": READ_ONLY,
+        "outputs": {"rust-toolchain": expression("steps.resolve.outputs.rust-toolchain")},
+        "steps": [
+            action("Checkout", "actions/checkout@v7", {"persist-credentials": "false"}),
+            shell("Resolve the current stable Rust release", "resolve",
+                  f"{SETUP} resolve-toolchain"),
+        ],
+    }
+
+
 def producer_jobs(base_env):
     build = {
         "name": "Build Retention Coverage Target",
-        "needs": "style",
+        "needs": ["style", RESOLVER],
         "if": WHEN,
         "runs-on": RUNNER,
         "timeout-minutes": "120",
         "permissions": READ_ACTIONS,
         "outputs": {"snapshot-artifact-id": expression("steps.snapshot.outputs.artifact-id")},
-        "env": job_env(base_env, "120", "instrumented", RUST_TOOLCHAIN),
+        "env": job_env(base_env, "120", "instrumented", TOOLCHAIN),
         "steps": [
             *prepare_steps("instrumented"),
             *cache_steps("instrumented", save=True),
@@ -199,13 +220,13 @@ def producer_jobs(base_env):
     }
     listings = {
         "name": "Capture Retention Test Listings",
-        "needs": "style",
+        "needs": ["style", RESOLVER],
         "if": WHEN,
         "runs-on": RUNNER,
         "timeout-minutes": "100",
         "permissions": READ_ACTIONS,
         "outputs": {"receipt-artifact-id": RECEIPT_ID},
-        "env": job_env(base_env, "100", "ordinary", RUST_TOOLCHAIN),
+        "env": job_env(base_env, "100", "ordinary", TOOLCHAIN),
         "steps": [
             *prepare_steps("ordinary"),
             *cache_steps("ordinary", save=True),
@@ -315,13 +336,15 @@ def reporter_job(base_env):
                     for slot, value in artifact_ids.items()}
     id_calls = "\n".join(f'check_id {slot} "${slot.upper().replace("-", "_")}_ID"'
                          for slot in slots)
-    outcomes = ("BUILD", "SHORT", "ZA_ROCKS", "ZA_FILESYSTEM", "LISTINGS", "COLLECT", "MERGE",
-                "FUNCTIONS", "INVENTORY", "COVERAGE")
+    # A failed or skipped resolver or producer job leaves the check red.
+    jobs = {"TOOLCHAIN": RESOLVER, **{
+        name: f"gates-{name.lower().replace('_', '-')}"
+        for name in ("BUILD", "SHORT", "ZA_ROCKS", "ZA_FILESYSTEM", "LISTINGS")}}
+    outcomes = (*jobs, "COLLECT", "MERGE", "FUNCTIONS", "INVENTORY", "COVERAGE")
     outcome_env = {
         f"{name}_OUTCOME": expression(
-            f"needs.gates-{name.lower().replace('_', '-')}.result" if index < 5
-            else f"steps.{name.lower()}.outcome")
-        for index, name in enumerate(outcomes)
+            f"needs.{jobs[name]}.result" if name in jobs else f"steps.{name.lower()}.outcome")
+        for name in outcomes
     }
     download_checks = " && ".join(f"steps.download-{slot}.outcome == 'success'" for slot in slots)
     lines = f"""
@@ -345,11 +368,11 @@ def reporter_job(base_env):
     """
     return {
         "name": "Test Retention Gates",
-        "needs": ["style", "gates-build", *(f"gates-{slot}" for slot in slots)],
+        "needs": ["style", RESOLVER, "gates-build", *(f"gates-{slot}" for slot in slots)],
         "if": expression(REPORT_WHEN),
         "runs-on": RUNNER,
         "timeout-minutes": "100",
-        "env": job_env(base_env, "100", "instrumented", RUST_TOOLCHAIN),
+        "env": job_env(base_env, "100", "instrumented", TOOLCHAIN),
         "steps": [
             *prepare_steps("instrumented"),
             shell("Validate selected artifact IDs", "artifact-ids", lines,
@@ -486,7 +509,7 @@ def check(workflow, callee, base_env, shard_names):
                 problems.append(f"test.yml: on.{event}: expected an event mapping")
     else:
         problems = ["test.yml: on: expected a workflow trigger mapping"]
-    expected = producer_jobs(base_env)
+    expected = {RESOLVER: resolver_job(), **producer_jobs(base_env)}
     if set(shard_names) != set(SHARD_TIMEOUTS):
         problems.append("test.yml: coverage shard partition and workflow callers disagree")
     for shard in shard_names:
@@ -494,13 +517,13 @@ def check(workflow, callee, base_env, shard_names):
             continue
         expected[f"gates-{shard}"] = {
             "name": f"Retention Coverage ({shard})",
-            "needs": "gates-build",
+            "needs": [RESOLVER, "gates-build"],
             "if": WHEN,
             "uses": f"./.github/workflows/{SHARD_WORKFLOW_NAME}",
             "with": {
                 "shard-id": shard,
                 "snapshot-artifact-id": SNAPSHOT_ID,
-                "rust-toolchain": RUST_TOOLCHAIN,
+                "rust-toolchain": TOOLCHAIN,
                 "timeout-minutes": SHARD_TIMEOUTS[shard],
             },
         }
