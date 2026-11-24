@@ -132,8 +132,8 @@ jobs:
         # upstream's developer machine (file:///Users/me/code/spam-filter/...),
         # the UpdateRules task fails three times and stays in the queue as
         # Failed, and the test waits for it forever. The URL pins a rules
-        # release (v3.0.4); raise it deliberately. Six SMTP tests are timing-flaky
-        # when the whole filter runs in parallel (dkim2_dsn_is_signed, lmtp_delivery, queue_retry,
+        # release (v3.0.4); raise it deliberately. Five SMTP tests are timing-flaky
+        # when the whole filter runs in parallel (dkim2_dsn_is_signed, lmtp_delivery,
         # manage_reports, and at 1.0 antispam and dkim2_all_disclosed) and
         # pass when rerun by name. The step reruns the
         # failed ones once, taking their names from libtest's final failures
