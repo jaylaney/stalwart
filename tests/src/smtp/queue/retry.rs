@@ -24,7 +24,10 @@ use registry::{
     },
     types::list::List,
 };
-use smtp::queue::spool::{QUEUE_REFRESH, SmtpSpool};
+use smtp::queue::{
+    Status,
+    spool::{QUEUE_REFRESH, SmtpSpool},
+};
 use std::time::Duration;
 use store::write::now;
 
@@ -179,7 +182,24 @@ async fn queue_retry() {
     let mut in_fight = AHashSet::new();
     let attempt = local.expect_message_for_queue_then_deliver("default").await;
     let mut dsn = Vec::new();
-    let mut retries = Vec::new();
+    // Each retry is checked against the queue's own clock read (issue #107).
+    // The queue sets a recipient's retry due time to `now() + interval` in the
+    // delivery task, and `now()` has whole-second resolution, so a second
+    // boundary between that read and the test's own makes a reading taken
+    // later than the attempt come out short. Read the clock immediately
+    // before each attempt starts and immediately after its WorkerDone arrives
+    // (the stored recipient is read after it): the queue's read falls between
+    // the two, so `start + interval <= due <= finish + interval` holds on any
+    // sub-second phase. The loop starts each attempt without the old 100 ms
+    // pause, which keeps that bracket narrow: a one-second interval change
+    // escapes only when a second boundary falls inside the narrow window
+    // between the queue's clock read and the test's (the queue does not expose
+    // its own clock read, so the check cannot be exact). The persisted queue
+    // wake-up is checked exactly instead, below.
+    let original_id = attempt.queue_id;
+    let mut attempt_start = now();
+    let mut retry_records: Vec<(u32, u64, u64, u64)> = Vec::new();
+    let mut last_retry = 0;
     in_fight.insert(attempt.queue_id);
     attempt.try_deliver(local.server.clone());
 
@@ -192,6 +212,79 @@ async fn queue_retry() {
                 match &status {
                     QueueEventStatus::Completed | QueueEventStatus::Deferred => (),
                     _ => panic!("unexpected status {queue_id}: {status:?}"),
+                }
+                if queue_id == original_id {
+                    let attempt_finish = now();
+                    // None after the final, expired attempt: the message is gone.
+                    if let Some(message) = local
+                        .server
+                        .read_message(queue_id, QueueName::default())
+                        .await
+                        .unwrap()
+                    {
+                        if matches!(status, QueueEventStatus::Deferred) {
+                            // Checks the persisted wake-up exactly, with no clock reads.
+                            let mut pending = Vec::new();
+                            let mut expected: Option<u64> = None;
+                            for rcpt in &message.message.recipients {
+                                if matches!(
+                                    rcpt.status,
+                                    Status::Scheduled | Status::TemporaryFailure(_)
+                                ) {
+                                    let expiry = rcpt.expiration_time(message.message.created);
+                                    let earliest =
+                                        [Some(rcpt.retry.due), Some(rcpt.notify.due), expiry]
+                                            .into_iter()
+                                            .flatten()
+                                            .min()
+                                            .unwrap();
+                                    expected = Some(expected.map_or(earliest, |e| e.min(earliest)));
+                                    pending.push((
+                                        rcpt.address().to_string(),
+                                        rcpt.retry.due,
+                                        rcpt.notify.due,
+                                        expiry,
+                                    ));
+                                }
+                            }
+                            let events = local
+                                .read_queued_events()
+                                .await
+                                .into_iter()
+                                .filter(|event| event.queue_id == queue_id)
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                events.len(),
+                                1,
+                                "expected one queue event for {queue_id}, found {events:?}"
+                            );
+                            assert_eq!(
+                                Some(events[0].due),
+                                expected,
+                                "queue event due {} != expected {expected:?}; pending recipients \
+                                 (address, retry due, notify due, expiry): {pending:?}",
+                                events[0].due
+                            );
+                        }
+                        let retry = &message
+                            .message
+                            .recipients
+                            .iter()
+                            .find(|rcpt| rcpt.address() == "jane@_dns_error.org")
+                            .unwrap()
+                            .retry;
+                        // An attempt that only sent a notification leaves
+                        // `inner` unchanged and records nothing.
+                        if retry.inner > last_retry {
+                            last_retry = retry.inner;
+                            retry_records.push((
+                                retry.inner,
+                                retry.due,
+                                attempt_start,
+                                attempt_finish,
+                            ));
+                        }
+                    }
                 }
             }
             Some(QueueEvent::Refresh(_)) | Some(QueueEvent::ReloadSettings) => (),
@@ -227,15 +320,30 @@ async fn queue_retry() {
                     .await;
                 dsn.push(message);
             } else {
-                retries.push(event.due.saturating_sub(now));
                 in_fight.insert(event.queue_id);
+                // `now` is shadowed by this pass's reading above.
+                attempt_start = store::write::now();
                 event.try_deliver(local.server.clone());
-                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
     local.assert_queue_is_empty().await;
-    assert_eq!(retries, vec![1, 2, 3]);
+    assert_eq!(
+        retry_records
+            .iter()
+            .map(|(inner, ..)| *inner)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "retry records (inner, due, start, finish): {retry_records:?}"
+    );
+    for &(inner, due, start, finish) in &retry_records {
+        let interval = [1u64, 2, 3][inner as usize - 1];
+        assert!(
+            start + interval <= due && due <= finish + interval,
+            "retry {inner} due {due} outside [{start} + {interval}, {finish} + {interval}]; \
+             retry records (inner, due, start, finish): {retry_records:?}"
+        );
+    }
     assert_eq!(dsn.len(), 4);
     let mut dsn = dsn.into_iter();
 
