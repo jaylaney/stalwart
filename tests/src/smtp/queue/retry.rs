@@ -24,7 +24,10 @@ use registry::{
     },
     types::list::List,
 };
-use smtp::queue::spool::{QUEUE_REFRESH, SmtpSpool};
+use smtp::queue::{
+    Status,
+    spool::{QUEUE_REFRESH, SmtpSpool},
+};
 use std::time::Duration;
 use store::write::now;
 
@@ -187,7 +190,12 @@ async fn queue_retry() {
     // before each attempt starts and immediately after its WorkerDone arrives
     // (the stored recipient is read after it): the queue's read falls between
     // the two, so `start + interval <= due <= finish + interval` holds on any
-    // sub-second phase.
+    // sub-second phase. The loop starts each attempt without the old 100 ms
+    // pause, which keeps that bracket narrow: a one-second interval change
+    // escapes only when a second boundary falls inside the narrow window
+    // between the queue's clock read and the test's (the queue does not expose
+    // its own clock read, so the check cannot be exact). The persisted queue
+    // wake-up is checked exactly instead, below.
     let original_id = attempt.queue_id;
     let mut attempt_start = now();
     let mut retry_records: Vec<(u32, u64, u64, u64)> = Vec::new();
@@ -214,6 +222,50 @@ async fn queue_retry() {
                         .await
                         .unwrap()
                     {
+                        if matches!(status, QueueEventStatus::Deferred) {
+                            // Checks the persisted wake-up exactly, with no clock reads.
+                            let mut pending = Vec::new();
+                            let mut expected: Option<u64> = None;
+                            for rcpt in &message.message.recipients {
+                                if matches!(
+                                    rcpt.status,
+                                    Status::Scheduled | Status::TemporaryFailure(_)
+                                ) {
+                                    let expiry = rcpt.expiration_time(message.message.created);
+                                    let earliest =
+                                        [Some(rcpt.retry.due), Some(rcpt.notify.due), expiry]
+                                            .into_iter()
+                                            .flatten()
+                                            .min()
+                                            .unwrap();
+                                    expected = Some(expected.map_or(earliest, |e| e.min(earliest)));
+                                    pending.push((
+                                        rcpt.address().to_string(),
+                                        rcpt.retry.due,
+                                        rcpt.notify.due,
+                                        expiry,
+                                    ));
+                                }
+                            }
+                            let events = local
+                                .read_queued_events()
+                                .await
+                                .into_iter()
+                                .filter(|event| event.queue_id == queue_id)
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                events.len(),
+                                1,
+                                "expected one queue event for {queue_id}, found {events:?}"
+                            );
+                            assert_eq!(
+                                Some(events[0].due),
+                                expected,
+                                "queue event due {} != expected {expected:?}; pending recipients \
+                                 (address, retry due, notify due, expiry): {pending:?}",
+                                events[0].due
+                            );
+                        }
                         let retry = &message
                             .message
                             .recipients
@@ -272,7 +324,6 @@ async fn queue_retry() {
                 // `now` is shadowed by this pass's reading above.
                 attempt_start = store::write::now();
                 event.try_deliver(local.server.clone());
-                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
